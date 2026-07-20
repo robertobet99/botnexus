@@ -18,7 +18,18 @@ public sealed class ProvisioningSmokeTests
     [SkippableFact]
     public void FixtureCompletedProvisioningAndStartedGateway()
     {
-        Skip.IfNot(_fx.Succeeded, $"Fixture initialization failed: {_fx.Error}");
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("BOTNEXUS_E2E_REQUIRE_FIXTURE"),
+                "true",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            _fx.Succeeded.ShouldBeTrue($"Fixture initialization failed: {_fx.Error}");
+        }
+        else
+        {
+            Skip.IfNot(_fx.Succeeded, $"Fixture initialization failed: {_fx.Error}");
+        }
+
         File.Exists(Path.Combine(_fx.Home, "config.json")).ShouldBeTrue();
     }
 

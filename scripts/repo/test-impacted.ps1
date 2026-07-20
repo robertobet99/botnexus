@@ -74,19 +74,27 @@ function Invoke-FirewallAction {
 function Invoke-FullTestSuite {
     param([string[]]$Projects)
 
-    $arguments = @('test', $slnxPath, '--nologo', '--tl:off', '-c', $Configuration)
-    if ($NoBuild) { $arguments += '--no-build' }
+    # Run projects sequentially. A solution-level `dotnet test` starts multiple
+    # testhosts concurrently; integration projects mutate process-wide configuration
+    # and can then interfere through shared ports and filesystem state. Sequential
+    # project execution is slower than unlimited fan-out but makes a green full run
+    # authoritative instead of occasionally radioactive.
     $leasePath = Join-Path ([IO.Path]::GetTempPath()) ("botnexus-fw-lease-{0}" -f [guid]::NewGuid().ToString('N'))
-    $exitCode = 1
+    $failed = $false
     try {
         Invoke-FirewallAction -Projects $Projects -Action Ensure -LeasePath $leasePath
-        & dotnet @arguments | Out-Host
-        $exitCode = $LASTEXITCODE
+        foreach ($project in $Projects) {
+            $arguments = @('test', $project, '--nologo', '--tl:off', '-c', $Configuration)
+            if ($NoBuild) { $arguments += '--no-build' }
+            Write-Host "Testing: $([IO.Path]::GetFileNameWithoutExtension($project))" -ForegroundColor White
+            & dotnet @arguments | Out-Host
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+        }
     }
     finally {
         Invoke-FirewallAction -Projects $Projects -Action Cleanup -LeasePath $leasePath
     }
-    return $exitCode
+    return $(if ($failed) { 1 } else { 0 })
 }
 
 # Projects that always run regardless of what changed (cross-cutting safety net)
