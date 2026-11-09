@@ -67,7 +67,7 @@ jobs:
   # CI and the remote container gate agree on what core means.
   core-tests:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -109,6 +109,20 @@ jobs:
         if: always()
         shell: pwsh
         run: ./scripts/repo/Assert-TestResultContract.ps1 -ResultsDirectory '${{ github.workspace }}/artifacts/test-results' -CompletionPath '${{ github.workspace }}/artifacts/test-results/completion-core.json' -MinimumTotal 12000 -SummaryPath '${{ github.workspace }}/artifacts/test-results/contract-core.json'
+
+      - name: List failed tests (fork-only diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(artifacts/test-results/*.trx)
+          echo "trx files: ${#files[@]}"
+          : > failed-tests.txt
+          if [ ${#files[@]} -gt 0 ]; then
+            grep -h -o '<UnitTestResult [^>]*outcome="Failed"[^>]*>' "${files[@]}" | grep -o 'testName="[^"]*"' | sort >> failed-tests.txt || true
+          fi
+          cat failed-tests.txt
+          echo "FAILED_TEST_COUNT=$(wc -l < failed-tests.txt)"
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
