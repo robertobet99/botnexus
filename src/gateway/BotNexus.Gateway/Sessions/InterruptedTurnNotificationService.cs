@@ -1,4 +1,5 @@
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Domain.World;
 using BotNexus.Gateway.Abstractions.Activity;
 using BotNexus.Gateway.Abstractions.Agents;
@@ -40,6 +41,13 @@ namespace BotNexus.Gateway.Sessions;
 /// source of truth: clients recover missed live events by hydrating the persisted transcript, while
 /// broader startup reconciliation belongs at the session/conversation projection boundary rather
 /// than in this one-shot recovery service. <see cref="GatewayActivity"/> remains telemetry only.
+/// </remarks>
+/// <remarks>
+/// The same recovery also runs live, when an agent-only API run settles as failed in this process
+/// (<see cref="SessionLifecycleEventType.TerminalFailure"/>). The two are told apart by
+/// <see cref="RecoveryCause"/>: a restart notice is true whatever admission decides, so the startup scan
+/// writes it first and its texts never change. A run-failure notice states the failure and then what
+/// admission actually did, so it is written afterwards and never claims a restart.
 /// </remarks>
 public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
 {
@@ -83,6 +91,36 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
             attempt,
             maxAttempts,
             originalContent);
+
+    /// <summary>
+    /// Banner prepended before a replacement admitted after a LIVE run failure. It keeps the discipline of
+    /// <see cref="ReplayBannerTemplate"/> (the completion state is unknown, so verify before repeating
+    /// anything that writes) and states only what the gateway knows: the run ended with an error. Nothing
+    /// restarted, so it must never say so. <c>{0}</c> is the attempt number, <c>{1}</c> the configured
+    /// maximum and <c>{2}</c> the original message verbatim.
+    /// </summary>
+    internal const string RunFailureReplayBannerTemplate =
+        "[AUTOMATIC RECOVERY {0} of {1}]\n" +
+        "Your previous turn ended with an error, so that turn was cut off at an unknown point. Some of the " +
+        "work described above may have completed and some may not have. Do not assume either. Before " +
+        "taking any action - especially anything that writes, mutates, or is otherwise not safely " +
+        "repeatable - verify the current state directly with your tools, then continue from wherever you " +
+        "actually are.\n\n" +
+        "This is the original message that started the interrupted loop, repeated verbatim below:\n\n{2}";
+
+    /// <summary>Builds the live run-failure banner for a given attempt and original message.</summary>
+    internal static string BuildRunFailureBanner(string originalContent, int attempt, int maxAttempts)
+        => string.Format(
+            System.Globalization.CultureInfo.InvariantCulture,
+            RunFailureReplayBannerTemplate,
+            attempt,
+            maxAttempts,
+            originalContent);
+
+    private const int MaxFailureDetailLength = 240;
+    private const string Ellipsis = "...";
+    private const string RunFailureNoticeLead = "The previous agent run ended with an error";
+    private const string ResumeHint = "Post a message to the conversation to resume it.";
 
     private readonly ISessionStore _sessions;
     private readonly IAgentRegistry _agentRegistry;
@@ -188,7 +226,8 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
                         var isAgentOnlyConversation = await IsAgentOnlyConversationAsync(session, cancellationToken)
                             .ConfigureAwait(false);
                         var outcome = await RecoverSessionAsync(
-                            session, row.AgentId, isAgentOnlyConversation, cancellationToken).ConfigureAwait(false);
+                            session, row.AgentId, isAgentOnlyConversation, RecoveryCause.GatewayRestart, cancellationToken)
+                            .ConfigureAwait(false);
                         if (outcome.ReplayAccepted) replayed++;
                         switch (outcome.Persistence)
                         {
@@ -266,7 +305,8 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
             if (!session.History.Any(static entry => entry.IsCrashSentinel))
                 return;
 
-            await RecoverSessionAsync(session, session.AgentId, isAgentOnlyConversation: true, cancellationToken)
+            await RecoverSessionAsync(
+                    session, session.AgentId, isAgentOnlyConversation: true, RecoveryCause.RunFailure, cancellationToken)
                 .ConfigureAwait(false);
         }
         finally
@@ -285,32 +325,79 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
     // Posting precedes persistence: an accepted replay remains accepted even if the save fails.
     private readonly record struct RecoveryOutcome(bool ReplayAccepted, RecoveryPersistence Persistence);
 
+    private enum ReplayStatus
+    {
+        /// <summary>Recovery did not try to replay: replay is not enabled or not possible for this session.</summary>
+        NotAttempted,
+
+        /// <summary>The orchestrator accepted the replacement. Acceptance only enqueues it.</summary>
+        Queued,
+
+        /// <summary>The session already spent its replay budget, so no replacement was offered.</summary>
+        AttemptsExhausted,
+
+        /// <summary>No authoritative initiating message exists to replay, so no replacement was offered.</summary>
+        NoInitiatingInput,
+
+        /// <summary>The orchestrator refused the replacement. The budget is untouched.</summary>
+        AdmissionRefused
+    }
+
+    private readonly record struct ReplayAttempt(
+        ReplayStatus Status,
+        int Attempt = 0,
+        string InitiatingContent = "",
+        string[]? OutcomeUnknownToolCallIds = null)
+    {
+        internal static ReplayAttempt None => new(ReplayStatus.NotAttempted);
+    }
+
     private async Task<RecoveryOutcome> RecoverSessionAsync(
         GatewaySession session,
         AgentId agentId,
         bool isAgentOnlyConversation,
+        RecoveryCause cause,
         CancellationToken cancellationToken)
     {
         var writeFence = SessionWriteFence.Capture(session);
-        var notificationContent = isAgentOnlyConversation
-            ? AgentOnlyNotificationContent
-            : NotificationContent;
-        var notification = new SessionEntry
-        {
-            Role = MessageRole.Notification,
-            Content = notificationContent,
-            Timestamp = DateTimeOffset.UtcNow
-        };
-        session.AddEntry(notification);
-
         var shouldAttemptReplay = (_options.AutoReplayInterruptedTurns
                 || isAgentOnlyConversation
                 || _shutdownMarker?.PreviousShutdownWasPlanned == true)
             && session.IsInteractive
             && _orchestrator is not null;
-        var didReplay = shouldAttemptReplay
-            && await TryAutoReplayAsync(session, agentId, cancellationToken).ConfigureAwait(false);
 
+        async Task<ReplayAttempt> AttemptReplayAsync()
+            => shouldAttemptReplay
+                ? await TryAutoReplayAsync(session, agentId, cancellationToken).ConfigureAwait(false)
+                : ReplayAttempt.None;
+
+        // A restart notice states a fact that holds whatever admission decides, so it is written before the
+        // replay is attempted and the banner follows it. A run-failure notice reports what admission did, so
+        // it can only be written afterwards.
+        SessionEntry notification;
+        ReplayAttempt replay;
+        string activityMessage;
+        if (cause == RecoveryCause.GatewayRestart)
+        {
+            var restartNotice = isAgentOnlyConversation ? AgentOnlyNotificationContent : NotificationContent;
+            notification = AddNotification(session, restartNotice);
+            replay = await AttemptReplayAsync().ConfigureAwait(false);
+            activityMessage = replay.Status == ReplayStatus.Queued ? $"{restartNotice} (auto-replaying)" : restartNotice;
+        }
+        else
+        {
+            replay = await AttemptReplayAsync().ConfigureAwait(false);
+            activityMessage = BuildRunFailureNotice(
+                FormatFailureDetail(session.RunCompletion?.Detail), replay, _options.MaxAutoReplayAttempts);
+            notification = AddNotification(session, activityMessage);
+        }
+
+        var didReplay = replay.Status == ReplayStatus.Queued;
+        if (didReplay)
+            session.AddEntry(BuildBannerEntry(replay, cause));
+
+        // Sentinel retention is the rule this service has always had, for both causes: an accepted replay
+        // consumes it, and so does a session replay does not apply to; anything else leaves the marker.
         if (didReplay || !shouldAttemptReplay)
             session.RemoveCrashSentinels();
 
@@ -343,7 +430,7 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
                 AgentId = agentId.Value,
                 SessionId = session.SessionId.Value,
                 ConversationId = session.ConversationId.IsInitialized() ? session.ConversationId.Value : null,
-                Message = didReplay ? $"{notificationContent} (auto-replaying)" : notificationContent
+                Message = activityMessage
             }, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
@@ -352,7 +439,88 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
                 "Failed to publish activity for persisted interrupted-turn notification in session {SessionId}",
                 session.SessionId.Value);
         }
+
         return new RecoveryOutcome(didReplay, RecoveryPersistence.Persisted);
+    }
+
+    private static SessionEntry AddNotification(GatewaySession session, string content)
+    {
+        var notification = new SessionEntry
+        {
+            Role = MessageRole.Notification,
+            Content = content,
+            Timestamp = DateTimeOffset.UtcNow
+        };
+        session.AddEntry(notification);
+        return notification;
+    }
+
+    private SessionEntry BuildBannerEntry(ReplayAttempt replay, RecoveryCause cause)
+    {
+        var banner = cause == RecoveryCause.GatewayRestart
+            ? BuildReplayBanner(replay.InitiatingContent, replay.Attempt, _options.MaxAutoReplayAttempts)
+            : BuildRunFailureBanner(replay.InitiatingContent, replay.Attempt, _options.MaxAutoReplayAttempts);
+        var outcomeUnknownToolCallIds = replay.OutcomeUnknownToolCallIds ?? [];
+        if (outcomeUnknownToolCallIds.Length > 0)
+        {
+            banner += "\n\nOutcome is unknown for these recent tool calls; verify each before repeating it: "
+                + string.Join(", ", outcomeUnknownToolCallIds);
+        }
+
+        return new SessionEntry
+        {
+            Role = MessageRole.System,
+            Content = banner,
+            Timestamp = DateTimeOffset.UtcNow,
+            IsReplayBanner = true
+        };
+    }
+
+    /// <summary>
+    /// The status row for a LIVE run failure, written after admission is known so it never claims more than
+    /// happened: the failure first, then either that a replacement is queued (queued, not started, because
+    /// admission only enqueues it) or why none was, with the next step for the reader. It never mentions a
+    /// restart, because nothing restarted.
+    /// </summary>
+    private static string BuildRunFailureNotice(string? failureDetail, ReplayAttempt replay, int maxAttempts)
+    {
+        var failure = failureDetail is null
+            ? RunFailureNoticeLead + "."
+            : $"{RunFailureNoticeLead}: {failureDetail}";
+        var recovery = replay.Status switch
+        {
+            ReplayStatus.Queued =>
+                $"Automatic recovery was queued (attempt {replay.Attempt} of {maxAttempts}).",
+            ReplayStatus.AttemptsExhausted =>
+                $"Automatic recovery was not queued: all {maxAttempts} automatic recovery attempts for this conversation are used. {ResumeHint}",
+            ReplayStatus.NoInitiatingInput =>
+                $"Automatic recovery was not queued: no initiating message could be identified to replay. {ResumeHint}",
+            ReplayStatus.AdmissionRefused =>
+                $"Automatic recovery was not queued: the gateway could not accept the replacement message right now. {ResumeHint}",
+            _ =>
+                $"Automatic recovery was not queued: it is not available for this session. {ResumeHint}"
+        };
+
+        return $"{failure} {recovery}";
+    }
+
+    /// <summary>
+    /// Bounds a failed run's detail for a status row: one line, free of control characters, ending like a
+    /// sentence so the next sentence reads cleanly, and never longer than <see cref="MaxFailureDetailLength"/>
+    /// characters INCLUDING that ending. <see langword="null"/> when the run supplied no usable detail.
+    /// </summary>
+    private static string? FormatFailureDetail(string? detail)
+    {
+        // One character past the bound is enough to know the detail has to be cut.
+        var text = detail.SanitizeExternalText(MaxFailureDetailLength + 1);
+        if (text.Length == 0)
+            return null;
+
+        // Add the ending first and bound the finished sentence, so the period can never push it past the limit.
+        var sentence = text[^1] is '.' or '!' or '?' ? text : text + ".";
+        return sentence.Length <= MaxFailureDetailLength
+            ? sentence
+            : sentence.SafeTruncate(MaxFailureDetailLength - Ellipsis.Length, Ellipsis);
     }
 
     private async Task PublishPersistedNotificationAsync(
@@ -445,7 +613,7 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
         }
     }
 
-    private Task<bool> TryAutoReplayAsync(GatewaySession session, AgentId agentId, CancellationToken cancellationToken)
+    private Task<ReplayAttempt> TryAutoReplayAsync(GatewaySession session, AgentId agentId, CancellationToken cancellationToken)
     {
         // Read existing replay count from metadata.
         var replayCount = 0;
@@ -465,7 +633,7 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
             _logger.LogWarning(
                 "Session {SessionId} has reached max auto-replay attempts ({Max}); falling back to notification only",
                 session.SessionId.Value, _options.MaxAutoReplayAttempts);
-            return Task.FromResult(false);
+            return Task.FromResult(new ReplayAttempt(ReplayStatus.AttemptsExhausted, replayCount));
         }
 
         // Human requests are authoritative user entries. Agent-origin API requests are authoritative
@@ -486,7 +654,7 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
             _logger.LogWarning(
                 "Session {SessionId} has no authoritative initiating message; recovery remains retryable",
                 session.SessionId.Value);
-            return Task.FromResult(false);
+            return Task.FromResult(new ReplayAttempt(ReplayStatus.NoInitiatingInput));
         }
 
         var channelType = session.ChannelType ?? ChannelKey.From("internal");
@@ -528,26 +696,11 @@ public sealed class InterruptedTurnNotificationService : IHostedLifecycleService
             outcomeUnknownToolCallIds.Length);
 
         if (!accepted)
-            return Task.FromResult(false);
+            return Task.FromResult(new ReplayAttempt(ReplayStatus.AdmissionRefused));
 
         session.Metadata[MetadataKeyReplayCount] = replayCount + 1;
-        var bannerContent = BuildReplayBanner(
-            initiatingEntry.Content, replayCount + 1, _options.MaxAutoReplayAttempts);
-        if (outcomeUnknownToolCallIds.Length > 0)
-        {
-            bannerContent += "\n\nOutcome is unknown for these recent tool calls; verify each before repeating it: "
-                + string.Join(", ", outcomeUnknownToolCallIds);
-        }
-
-        session.AddEntry(new SessionEntry
-        {
-            Role = MessageRole.System,
-            Content = bannerContent,
-            Timestamp = DateTimeOffset.UtcNow,
-            IsReplayBanner = true
-        });
-
-        return Task.FromResult(true);
+        return Task.FromResult(new ReplayAttempt(
+            ReplayStatus.Queued, replayCount + 1, initiatingEntry.Content, outcomeUnknownToolCallIds));
     }
 
     private static bool IsSynthesizedIncompleteResult(SessionEntry entry)
