@@ -243,6 +243,46 @@ public sealed class SessionWarmupServiceTests
         store.Verify(value => value.ListAsync(It.IsAny<BotNexus.Domain.Primitives.AgentId?>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    // Proves: a TerminalFailure event only refreshes the warmup cache from summaries; it never mutates the session it describes or writes to the store.
+    [Fact]
+    public async Task WarmupService_TerminalFailureEvent_RefreshesTheCacheWithoutMutatingTheSession()
+    {
+        var session = CreateSession("failed-run", "agent-a", SessionStatus.Active, DateTimeOffset.UtcNow.AddMinutes(-1));
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "run the nightly job" });
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "Agent stream error: boom" });
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[turn in progress]", IsCrashSentinel = true });
+        session.RunCompletion = new RunCompletionSignal("Failed", [], null, "boom", null, null, null, 0);
+        var historyBefore = session.GetHistorySnapshot();
+        var completionBefore = session.RunCompletion;
+        var updatedAtBefore = session.UpdatedAt;
+        var store = CreateSessionStore(session);
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var service = new SessionWarmupService(
+            store.Object,
+            CreateRegistry("agent-a"),
+            Options.Create(new SessionWarmupOptions()),
+            NullLogger<SessionWarmupService>.Instance,
+            lifecycle);
+        await service.StartAsync(CancellationToken.None);
+        var refreshesBefore = CountStoreCalls(store, nameof(ISessionStore.ListSummariesAsync));
+
+        await lifecycle.PublishAsync(new SessionLifecycleEvent("failed-run", "agent-a", SessionLifecycleEventType.TerminalFailure, session));
+
+        CountStoreCalls(store, nameof(ISessionStore.ListSummariesAsync))
+            .ShouldBe(refreshesBefore + 1, "the event refreshes the agent's cache from summaries");
+        store.Invocations.Select(call => call.Method.Name).Distinct()
+            .ShouldBe([nameof(ISessionStore.ListSummariesAsync)], "nothing else may touch the store");
+        session.GetHistorySnapshot().ShouldBe(historyBefore);
+        session.GetHistorySnapshot().ShouldContain(entry => entry.IsCrashSentinel);
+        session.RunCompletion.ShouldBeSameAs(completionBefore);
+        session.UpdatedAt.ShouldBe(updatedAtBefore);
+        (await service.GetAvailableSessionsAsync(CancellationToken.None))
+            .ShouldContain(summary => summary.SessionId == "failed-run");
+    }
+
+    private static int CountStoreCalls(Mock<ISessionStore> store, string methodName)
+        => store.Invocations.Count(call => call.Method.Name == methodName);
+
     private static SessionWarmupService CreateService(
         ISessionStore sessionStore,
         IAgentRegistry registry,

@@ -592,6 +592,7 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                 }, cancellationToken);
 
                 var sessionSaved = false;
+                var terminalFailure = false;
                 AgentResponse? blockingResponse = null;
                 var evaluationRunId = RunId.Create();
                 var agentDescriptor = _registry?.Get(typedAgentId);
@@ -773,6 +774,7 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                         finalSaveFence: runFence,
                         cancellationToken: cancellationToken);
 
+                    terminalFailure = TerminalRunOutcome.IsFailure(streamingResult.Completion);
                     DispatchPostRunEvaluation(
                         streamingResult.FinalSaveOutcome,
                         RunOutcomeSnapshot.FromStreamingResult(
@@ -836,9 +838,23 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                     {
                         _activeLoopTracker?.TrackEnd(blockingLoopRegistration);
                     }
+
+                    // A settled run that ended Failed is recoverable work, exactly as on the streaming
+                    // branch: one error row, the crash sentinel kept, one TerminalFailure after the save.
+                    // Cancellation (AgentPromptInterruptedException above) and infrastructure exceptions
+                    // (the generic handler below) never get here. They are not provider failures: they
+                    // publish nothing, write no error row and keep the sentinel as they always did.
+                    terminalFailure = TerminalRunOutcome.IsFailure(response.Completion);
+
                     if (IsHeartbeatAck(response.Content))
                     {
                         _logger.LogDebug("Heartbeat ack from agent '{AgentId}' session '{SessionId}'", agentId, sessionId);
+                    }
+                    else if (terminalFailure && string.IsNullOrWhiteSpace(response.Content))
+                    {
+                        _logger.LogDebug(
+                            "Agent '{AgentId}' session '{SessionId}' failed without output; nothing to deliver to the channel.",
+                            agentId, sessionId);
                     }
                     else if (ResolveChannelAdapter(message.ChannelType) is { } ch)
                     {
@@ -898,12 +914,29 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
 
                     // NO_REPLY responses are intentional silences — do not persist them
                     // in the session store. Channel adapters already suppress delivery (#1237).
-                    if (!IsNoReply(response.Content))
+                    // A failed run that produced no text stores no reply at all: the failure gets its
+                    // own row below, not an empty assistant row that reads as a completed silent turn.
+                    if (!IsNoReply(response.Content) && !(terminalFailure && string.IsNullOrWhiteSpace(response.Content)))
                         session.AddEntry(new SessionEntry { AgentRunId = response.AgentRunId, Role = MessageRole.Assistant, Content = response.Content, Kind = StampKind(responseKind) });
+
+                    if (terminalFailure)
+                    {
+                        session.AddEntry(TerminalRunOutcome.CreateErrorEntry(
+                            response.AgentRunId,
+                            TerminalRunOutcome.ResolveDetail(response.TerminalError, response.Completion)));
+                    }
+
+                    // The authoritative completion, as the streaming finalizer records it. Assigned even
+                    // when null so a later run without a signal cannot leave an earlier outcome (such as
+                    // Failed) behind.
+                    session.RunCompletion = response.Completion;
                 }
 
-                // Remove crash sentinel on clean turn completion (#363).
-                session.RemoveCrashSentinels();
+                // Remove crash sentinel on clean turn completion (#363). A failed run keeps it: it is
+                // recovery's durable marker. After streaming the finalizer has already applied this policy
+                // and saved, so touching the aggregate again could only make it diverge from the stored row.
+                if (!sessionSaved && !terminalFailure)
+                    session.RemoveCrashSentinels();
 
                 if (!sessionSaved)
                 {
@@ -949,6 +982,19 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                             sessionId);
                     }
 
+                    // A failure is announced only once its evidence is durable, and only as TerminalFailure:
+                    // the blocking branch has never published Closed, which starts per-session work (memory
+                    // indexing, Ralph) that blocking runs have never triggered.
+                    if (terminalFailure)
+                    {
+                        await TerminalRunOutcome.PublishAfterSaveAsync(
+                            _sessionLifecycleEvents,
+                            session,
+                            SessionLifecycleEventType.TerminalFailure,
+                            finalizerOutcome,
+                            cancellationToken);
+                    }
+
                     if (finalizerOutcome is { } persistedOutcome && blockingResponse is { } settledResponse)
                     {
                         DispatchPostRunEvaluation(
@@ -967,8 +1013,12 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                 // The assistant content + conversation id are already in hand from the in-memory
                 // session we just saved — pass them in so fan-out does not re-read the session from
                 // the store purely to recover the last assistant entry (#1394).
-                var lastAssistantContent = session.GetHistorySnapshot()
-                    .LastOrDefault(e => e.Role == MessageRole.Assistant)?.Content;
+                // A failed run has no reply to deliver. Without this guard the last assistant entry is
+                // whatever preceded the run, such as the inbound message itself when an agent sent it
+                // (stored with the assistant role), and it would be fanned out as the agent's answer.
+                var lastAssistantContent = terminalFailure
+                    ? null
+                    : session.GetHistorySnapshot().LastOrDefault(e => e.Role == MessageRole.Assistant)?.Content;
                 await _deliverer.FanOutAsync(message, typedSessionId, lastAssistantContent, session.ConversationId, cancellationToken);
 
                 // Bump UpdatedAt on the conversation so the portal list ordering and
@@ -1035,6 +1085,10 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
             }
             catch (Exception ex)
             {
+                // Not a terminal run failure (see TerminalRunOutcome): an exception that escaped the run
+                // (handle creation, a disposed or busy handle, a fault in this method) has no settled
+                // completion. It stays an activity Error with no error row and no TerminalFailure, and
+                // the sentinel written before the run stays too.
                 executionTimer.Stop();
                 executionActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                 GatewayTelemetry.AgentExecutionDurationMs.Record(executionTimer.Elapsed.TotalMilliseconds,

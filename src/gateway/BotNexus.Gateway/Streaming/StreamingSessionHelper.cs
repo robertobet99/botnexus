@@ -255,12 +255,7 @@ public static class StreamingSessionHelper
 
                     break;
                 case AgentStreamEventType.Error when options.IncludeErrorsInHistory && !string.IsNullOrWhiteSpace(evt.ErrorMessage):
-                    streamedHistory.Add(new SessionEntry
-                    {
-                        AgentRunId = agentRunId,
-                        Role = MessageRole.System,
-                        Content = $"Agent stream error: {evt.ErrorMessage}"
-                    });
+                    streamedHistory.Add(TerminalRunOutcome.CreateErrorEntry(agentRunId, evt.ErrorMessage));
                     allHistoryEntries.Add(streamedHistory[^1]);
                     break;
                 case AgentStreamEventType.TurnEnd when streamedHistory.Count > 0 || streamedContent.Length > 0:
@@ -455,10 +450,7 @@ public static class StreamingSessionHelper
         // A failed terminal completion is recoverable work, not a clean lease release. Keep the
         // sentinel through the authoritative save so the live recovery subscriber (or startup scan
         // after a crash) has the same durable marker to accept-before-consume (#4406).
-        var terminalFailure = string.Equals(
-            runCompletion?.Status,
-            "Failed",
-            StringComparison.OrdinalIgnoreCase);
+        var terminalFailure = TerminalRunOutcome.IsFailure(runCompletion);
         if (!terminalFailure)
             session.RemoveCrashSentinels();
 
@@ -470,18 +462,14 @@ public static class StreamingSessionHelper
             ? await sessionStore.SaveAsync(session, fence, cancellationToken)
             : await SaveUnfencedAsync(sessionStore, session, cancellationToken);
 
-        if (finalOutcome == SessionSaveOutcome.Persisted && lifecycleEvents is not null)
-        {
-            await lifecycleEvents.PublishAsync(
-                new SessionLifecycleEvent(
-                    session.SessionId.Value,
-                    session.AgentId.Value,
-                    terminalFailure
-                        ? SessionLifecycleEventType.TerminalFailure
-                        : SessionLifecycleEventType.Closed,
-                    session),
-                cancellationToken);
-        }
+        await TerminalRunOutcome.PublishAfterSaveAsync(
+            lifecycleEvents,
+            session,
+            terminalFailure
+                ? SessionLifecycleEventType.TerminalFailure
+                : SessionLifecycleEventType.Closed,
+            finalOutcome,
+            cancellationToken);
 
         // #2613: materialise the tool timeline through the single shared policy, so the streaming
         // boundary hands back exactly the record shape the blocking boundary produces.
