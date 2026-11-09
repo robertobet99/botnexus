@@ -217,10 +217,54 @@ public sealed class GatewaySession
     public SessionStreamReplay StreamReplay => Runtime.StreamReplay;
 
     /// <summary>
-    /// Removes any crash-sentinel entries from the session history.
-    /// Call on clean turn completion to prevent sentinels from persisting after a successful run.
+    /// Removes the crash-sentinel entries of runs that have ended or died from the session history.
+    /// Call on clean turn completion to prevent sentinels from persisting after a successful run. A pending
+    /// reservation, a replacement that recovery has queued and that has not started, is left in place: it
+    /// is not the marker of a finished or dead run, and removing it would cancel the replacement. Every
+    /// other sentinel goes, whichever run wrote it; see <see cref="GatewaySessionRuntime.RemoveCrashSentinels"/>.
     /// </summary>
     public void RemoveCrashSentinels() => Runtime.RemoveCrashSentinels();
+
+    /// <summary>
+    /// True when <see cref="RemoveCrashSentinels"/> would remove a sentinel, that is, when the history holds
+    /// one that is not a pending reservation.
+    /// </summary>
+    /// <returns><see langword="true"/> when a scrub of the sentinels would change the history.</returns>
+    public bool HasRemovableCrashSentinel() => Runtime.HasRemovableCrashSentinel();
+
+    /// <summary>
+    /// Replaces the run lease on the crash sentinel that carries <paramref name="leaseId"/>, leaving every
+    /// other entry, including other sentinels, untouched. Used to record a run's outcome on its own lease.
+    /// </summary>
+    /// <param name="leaseId">The lease to update.</param>
+    /// <param name="update">Computes the replacement from the lease as it currently is.</param>
+    /// <returns><see langword="true"/> when a sentinel carried the lease.</returns>
+    public bool TryUpdateRunLease(RunLeaseId leaseId, Func<RunLease, RunLease> update)
+        => Runtime.TryUpdateRunLease(leaseId, update);
+
+    /// <summary>Finds the run lease with <paramref name="leaseId"/> on any crash sentinel in the history.</summary>
+    /// <param name="leaseId">The lease to find.</param>
+    /// <returns>The lease as it is now, or <see langword="null"/> when no sentinel carries it.</returns>
+    public RunLease? FindRunLease(RunLeaseId leaseId) => Runtime.FindRunLease(leaseId);
+
+    /// <summary>
+    /// Removes the one crash sentinel whose lease is <paramref name="leaseId"/> and no other, leaving every
+    /// other sentinel, including a follow-up's, untouched.
+    /// </summary>
+    /// <param name="leaseId">The lease whose sentinel is consumed.</param>
+    /// <param name="removed">The sentinel that was removed, so a failed save can put it back.</param>
+    /// <returns><see langword="true"/> when a sentinel carried the lease and was removed.</returns>
+    public bool TryRemoveCrashSentinel(RunLeaseId leaseId, out SessionEntry? removed)
+        => Runtime.TryRemoveCrashSentinel(leaseId, out removed);
+
+    /// <summary>
+    /// Removes exactly the stored entry instance <paramref name="stored"/>, matched by reference, to take
+    /// back a row the caller appended, whether its save did not persist or a later save retracts it, without
+    /// touching anything another writer added meanwhile.
+    /// </summary>
+    /// <param name="stored">The instance held in the history, as returned by an append.</param>
+    /// <returns><see langword="true"/> when that instance was in the history and was removed.</returns>
+    public bool TryRemoveEntry(SessionEntry stored) => Runtime.TryRemoveEntry(stored);
 
     /// <summary>
     /// Creates an isolated candidate for a fenced aggregate write. History entries, metadata
@@ -449,6 +493,20 @@ public sealed record SessionEntry
     /// Sentinels are removed on clean turn completion and must not be forwarded to the LLM.
     /// </summary>
     public bool IsCrashSentinel { get; init; }
+
+    /// <summary>
+    /// The run lease the gateway wrote on this crash sentinel when it admitted the run: which stored input
+    /// the run was started for, which attempt it is, and, once the run fails, what is known about the
+    /// failure. Null on every other entry and on sentinels written before leases existed.
+    /// </summary>
+    /// <remarks>
+    /// A lease is written only by the gateway code that admitted the run and lives and dies with its
+    /// sentinel, so recovery can trust it where it cannot trust a transcript row's role or sender label. It
+    /// is never forwarded to the model. Omitted from JSON when null so ordinary rows serialize exactly as
+    /// they did before.
+    /// </remarks>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public RunLease? RunLease { get; init; }
 
     /// <summary>
     /// True if this entry has been folded into a later compaction summary and must NOT be

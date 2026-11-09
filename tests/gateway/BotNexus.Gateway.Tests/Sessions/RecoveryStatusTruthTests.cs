@@ -15,12 +15,9 @@ namespace BotNexus.Gateway.Tests.Sessions;
 /// <remarks>
 /// In-process component integration through the real controller or <c>conversation</c> tool and the real
 /// recovery service subscribed to live lifecycle events. The startup scan is not run, so any restart
-/// wording here would be a false claim by construction. Fixtures are chosen to be valid at the commit
-/// that introduces the behaviour: a user-voiced agent message is a recovery input the existing selection
-/// already supports, so it exercises the queued path; an API kickoff has no identifiable input until
-/// the association work lands, so it exercises the final "not queued" blocker. That blocker is the
-/// truthful outcome of this commit and is replaced by a queued recovery when kickoffs gain an input, at
-/// which point the kickoff fixtures below are expected to change with the behaviour they describe.
+/// wording here would be a false claim by construction. Both routes recover through the run lease the
+/// gateway wrote when it admitted the run, so an API kickoff (an assistant-voiced row with no sender
+/// label) and a user-voiced agent message are queued the same way.
 /// </remarks>
 public sealed class RecoveryStatusTruthTests
 {
@@ -57,9 +54,9 @@ public sealed class RecoveryStatusTruthTests
         history.HasCrashSentinel().ShouldBeFalse($"the settled recovery leaves no sentinel behind{Environment.NewLine}{diagnostics}");
     }
 
-    // Proves: the API route, where recovery cannot yet name an input, reports the failed run with a truthful not-queued blocker and a next step, admits nothing, never claims a restart, and leaves the sentinel exactly as it did before this reporting existed.
+    // Proves: the API route, where the kickoff is an assistant-voiced row with no sender label, is recovered through the gateway's own record of what it admitted: the replacement is queued, reported as queued with a banner, and nothing claims a restart.
     [Fact]
-    public async Task ApiKickoff_LiveFailure_ReportsANotQueuedBlockerAndLeavesTheSentinelAsItWas()
+    public async Task ApiKickoff_LiveFailure_QueuesTheReplacementAndNeverClaimsARestart()
     {
         await using var harness = await RecoveryIngressHarness.StartAsync(ApiFailureScript());
 
@@ -68,20 +65,20 @@ public sealed class RecoveryStatusTruthTests
         var history = (await harness.ReadSessionAsync(receipt.SessionId)).GetHistorySnapshot();
         var diagnostics = await harness.DescribeAsync();
         AssertNoRestartClaims(harness, history, diagnostics);
+        harness.Orchestrator.AcceptedReplayPosts.Count.ShouldBe(1, $"the kickoff's input must be identified and replayed{Environment.NewLine}{diagnostics}");
         var notice = history.StatusRows().ShouldHaveSingleItem(diagnostics).Content;
         notice.Mentions("error").ShouldBeTrue($"a failed run must be reported as such{Environment.NewLine}{diagnostics}");
-        notice.Mentions("not queued").ShouldBeTrue($"no replacement was queued, and the notice must say so{Environment.NewLine}{diagnostics}");
-        notice.Mentions("post a message").ShouldBeTrue($"the notice must say what the reader can do next{Environment.NewLine}{diagnostics}");
-        history.HasCrashSentinel().ShouldBeTrue(
-            $"only an accepted replay consumes the sentinel, as before{Environment.NewLine}{diagnostics}");
-        history.BannerRows().ShouldBeEmpty(diagnostics);
-        harness.Orchestrator.ReplayPosts.ShouldBeEmpty(diagnostics);
-        harness.Provider.CallCount.ShouldBe(2, $"nothing may reach the model after the failure{Environment.NewLine}{diagnostics}");
+        notice.Mentions("queued").ShouldBeTrue($"a replacement was queued, and the notice must say so{Environment.NewLine}{diagnostics}");
+        notice.Mentions("not queued").ShouldBeFalse($"the replacement was admitted{Environment.NewLine}{diagnostics}");
+        history.BannerRows().ShouldHaveSingleItem(diagnostics);
+        history.HasCrashSentinel().ShouldBeFalse($"the clean replacement leaves no sentinel behind{Environment.NewLine}{diagnostics}");
+        harness.Provider.CallCount.ShouldBe(3, $"one tool call, one failing call, one replacement call{Environment.NewLine}{diagnostics}");
+        harness.Effects.EffectCount.ShouldBe(1, $"the completed effect must not be repeated{Environment.NewLine}{diagnostics}");
         harness.Activities.Items.Any(item => item.Type == GatewayActivityType.System && item.Message == notice)
             .ShouldBeTrue($"the published activity must mirror the persisted notice{Environment.NewLine}{diagnostics}");
     }
 
-    // Proves: when the replacement fails too and the attempt budget is spent, the second failure is reported as not queued with a next step, no further replacement is admitted, and the sentinel is left as it always was.
+    // Proves: when the replacement fails too and the input's attempt budget is spent, the second failure is reported as not queued with a next step, no further replacement is admitted, and that lease is consumed.
     [Fact]
     public async Task ConversationToolUserMessage_ReplacementFailsAgain_ReportsTheSpentBudgetAndAdmitsNothingFurther()
     {
@@ -113,8 +110,8 @@ public sealed class RecoveryStatusTruthTests
         notices[1].Content.Mentions("not queued").ShouldBeTrue($"the second failure had no budget left{Environment.NewLine}{diagnostics}");
         notices[1].Content.Mentions("post a message").ShouldBeTrue($"the notice must say what the reader can do next{Environment.NewLine}{diagnostics}");
         history.BannerRows().Count.ShouldBe(1, $"only the one admitted replacement has a banner{Environment.NewLine}{diagnostics}");
-        history.HasCrashSentinel().ShouldBeTrue(
-            $"only an accepted replay consumes the sentinel, as before{Environment.NewLine}{diagnostics}");
+        history.HasCrashSentinel().ShouldBeFalse(
+            $"a spent budget is final: it is reported once and its lease is consumed{Environment.NewLine}{diagnostics}");
     }
 
     private static RecoveryIngressOptions QueuedRecoveryScript() => new(

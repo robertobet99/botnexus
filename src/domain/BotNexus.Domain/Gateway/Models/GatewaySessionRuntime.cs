@@ -103,19 +103,148 @@ public sealed class GatewaySessionRuntime
     }
 
     /// <summary>
-    /// Removes any crash-sentinel entries from the session history.
+    /// Removes the crash-sentinel entries of runs that have ended or died from the session history.
     /// Called on clean turn completion to ensure the sentinel does not persist
-    /// as a real history entry after a successful run (#363).
+    /// as a real history entry after a successful run (#363), and by the write-time self-heal of orphans.
     /// </summary>
+    /// <remarks>
+    /// A pending reservation is the one sentinel this leaves alone. It is not the marker of a run that
+    /// ended or died: it is a replacement that recovery has queued and that has not started yet, possibly
+    /// behind another message for the same session. Removing it would cancel that replacement, so it is
+    /// only ever consumed by its identity: adopted by the replacement it was reserved for, or taken back
+    /// by recovery.
+    /// <para>
+    /// Every other sentinel goes, whichever run wrote it, and that is deliberate. Removal by the completing
+    /// run's own lease alone would leave the sentinels of earlier failed or interrupted runs behind once a
+    /// later run succeeds, so the next startup would report and replay inputs the session has already
+    /// moved past. That would make the separate follow-up-sentinel defect, which is out of scope for
+    /// recovery, worse. Consuming one sentinel by its identity is <see cref="TryRemoveCrashSentinel"/>.
+    /// </para>
+    /// </remarks>
     public void RemoveCrashSentinels()
     {
         lock (_lock)
         {
             // Only bump the destructive version when removal actually had effect.
             // A no-op scrub must not force concurrent compactions to abort.
-            var removed = Session.History.RemoveAll(static e => e.IsCrashSentinel);
+            var removed = Session.History.RemoveAll(IsRemovableCrashSentinel);
             if (removed > 0)
                 _destructiveVersion++;
+        }
+    }
+
+    /// <summary>
+    /// True when the history holds a crash sentinel that <see cref="RemoveCrashSentinels"/> would remove,
+    /// that is, one that is not a pending reservation.
+    /// </summary>
+    /// <returns><see langword="true"/> when a scrub of the sentinels would change the history.</returns>
+    public bool HasRemovableCrashSentinel()
+    {
+        lock (_lock)
+            return Session.History.Exists(IsRemovableCrashSentinel);
+    }
+
+    private static bool IsRemovableCrashSentinel(SessionEntry entry)
+        => entry.IsCrashSentinel && entry.RunLease is not { State: RunLeaseState.Pending };
+
+    /// <summary>
+    /// Replaces the run lease on the crash sentinel that carries <paramref name="leaseId"/>, in place.
+    /// The change is applied under the history lock and is a destructive mutation: the row already exists
+    /// in storage, so the next save must reconcile it rather than append, and a concurrent compaction that
+    /// snapshotted the old row must abort rather than write it back.
+    /// </summary>
+    /// <param name="leaseId">The lease to update. Only a crash sentinel carrying this exact id is touched.</param>
+    /// <param name="update">Computes the replacement from the lease as it is under the lock.</param>
+    /// <returns><see langword="true"/> when the lease was found and replaced.</returns>
+    public bool TryUpdateRunLease(RunLeaseId leaseId, Func<RunLease, RunLease> update)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        lock (_lock)
+        {
+            for (var index = 0; index < Session.History.Count; index++)
+            {
+                var entry = Session.History[index];
+                if (!entry.IsCrashSentinel || entry.RunLease is not { } lease || lease.LeaseId != leaseId)
+                    continue;
+
+                var replacement = update(lease);
+                if (ReferenceEquals(replacement, lease))
+                    return true;
+
+                Session.History[index] = entry with { RunLease = replacement };
+                _destructiveVersion++;
+                Session.UpdatedAt = DateTimeOffset.UtcNow;
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>Finds the run lease with <paramref name="leaseId"/> on any crash sentinel in the history.</summary>
+    /// <param name="leaseId">The lease to find.</param>
+    /// <returns>The lease as it is now, or <see langword="null"/> when no sentinel carries it.</returns>
+    public RunLease? FindRunLease(RunLeaseId leaseId)
+    {
+        lock (_lock)
+        {
+            foreach (var entry in Session.History)
+            {
+                if (entry.IsCrashSentinel && entry.RunLease is { } lease && lease.LeaseId == leaseId)
+                    return lease;
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Removes the one crash sentinel whose lease is <paramref name="leaseId"/> and no other. Like every
+    /// removal of a stored row this is a destructive mutation, so the next save reconciles it.
+    /// </summary>
+    /// <param name="leaseId">The lease whose sentinel is consumed.</param>
+    /// <param name="removed">The sentinel that was removed, so a failed save can put it back.</param>
+    /// <returns><see langword="true"/> when a sentinel carried the lease and was removed.</returns>
+    public bool TryRemoveCrashSentinel(RunLeaseId leaseId, out SessionEntry? removed)
+    {
+        lock (_lock)
+        {
+            var index = Session.History.FindIndex(entry =>
+                entry.IsCrashSentinel && entry.RunLease is { } lease && lease.LeaseId == leaseId);
+            if (index < 0)
+            {
+                removed = null;
+                return false;
+            }
+
+            removed = Session.History[index];
+            Session.History.RemoveAt(index);
+            _destructiveVersion++;
+            Session.UpdatedAt = DateTimeOffset.UtcNow;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Removes exactly the stored entry instance <paramref name="stored"/>, matched by reference. It takes
+    /// back a row the caller appended, whether its save did not persist or a later save retracts it, without
+    /// touching anything another writer added meanwhile.
+    /// </summary>
+    /// <param name="stored">The instance held in the history, as returned by an append.</param>
+    /// <returns><see langword="true"/> when that instance was in the history and was removed.</returns>
+    public bool TryRemoveEntry(SessionEntry stored)
+    {
+        ArgumentNullException.ThrowIfNull(stored);
+        lock (_lock)
+        {
+            var index = Session.History.FindIndex(entry => ReferenceEquals(entry, stored));
+            if (index < 0)
+                return false;
+
+            Session.History.RemoveAt(index);
+            _destructiveVersion++;
+            Session.UpdatedAt = DateTimeOffset.UtcNow;
+            return true;
         }
     }
 

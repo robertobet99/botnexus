@@ -53,6 +53,10 @@ internal static class RecoverySessionProbe
     internal static bool HasCrashSentinel(this IEnumerable<SessionEntry> history)
         => history.Any(entry => entry.IsCrashSentinel);
 
+    /// <summary>The run leases the transcript's crash sentinels carry, in transcript order; a sentinel without a lease contributes none.</summary>
+    internal static IReadOnlyList<RunLease> SentinelLeases(this IEnumerable<SessionEntry> history)
+        => [.. history.Where(entry => entry.IsCrashSentinel).Select(entry => entry.RunLease).OfType<RunLease>()];
+
     /// <summary>Case-insensitive containment that tolerates missing text.</summary>
     internal static bool Mentions(this string? text, string needle)
         => text?.Contains(needle, StringComparison.OrdinalIgnoreCase) == true;

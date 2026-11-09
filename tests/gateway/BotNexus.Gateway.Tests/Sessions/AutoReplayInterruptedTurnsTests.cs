@@ -475,13 +475,48 @@ public sealed class AutoReplayInterruptedTurnsTests
             .Contains("please resend", StringComparison.OrdinalIgnoreCase).ShouldBeFalse();
     }
 
+    // The sentinel the gateway writes when it admits a run, carrying the lease that names the stored input the
+    // run was started for. This is the only thing recovery trusts to say what a run was started with.
+    private static SessionEntry LeasedSentinel(SessionEntry input, RunLeaseState state, int attempt = 0)
+        => new()
+        {
+            Role = MessageRole.System,
+            Content = "[agent turn in progress — gateway restarted if visible]",
+            IsCrashSentinel = true,
+            RunLease = new RunLease
+            {
+                LeaseId = RunLeaseId.Create(),
+                State = state,
+                Attempt = attempt,
+                Input = InputRef.For(input),
+                Origin = InputRef.For(input),
+                FailedAt = state == RunLeaseState.Failed ? DateTimeOffset.UtcNow : null,
+                FailureDetail = state == RunLeaseState.Failed ? "the backend rejected the request" : null
+            }
+        };
+
+    // An agent-only API session whose run was admitted for a kickoff: an assistant-voiced row with no sender
+    // label, which is how an API caller's instruction is stored.
+    private static (GatewaySession Session, RunLease Lease) CreateLeasedKickoffSession(
+        string sessionId,
+        string agentId,
+        string kickoff,
+        RunLeaseState state,
+        string callerId = "api:issue-delivery-pump")
+    {
+        var session = CreateSession(sessionId, agentId, withSentinel: false,
+            callerId: callerId, channelType: ChannelKey.From("api"),
+            lastUserContent: kickoff, initiatingRole: MessageRole.Assistant);
+        var sentinel = LeasedSentinel(session.History.Single(e => e.Content == kickoff), state);
+        session.AddEntry(sentinel);
+        return (session, sentinel.RunLease.ShouldNotBeNull());
+    }
+
     [Fact]
     public async Task AutoReplay_WhenDisabled_AndAgentOnlyApiKickoffIsAssistantOrigin_ReplaysWithProvenance()
     {
-        var session = CreateSession("sess-agent-api", "agent-api", withSentinel: true,
-            callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
-            lastUserContent: "execute issue 4370", initiatingRole: MessageRole.Assistant,
-            initiatingSenderId: "api:issue-delivery-pump");
+        var (session, lease) = CreateLeasedKickoffSession(
+            "sess-agent-api", "agent-api", "execute issue 4370", RunLeaseState.Running);
         var store = CreateStore(session);
         var conversations = CreateConversationStore(session, hasHuman: false);
         var orchestrator = CreateOrchestrator();
@@ -494,20 +529,23 @@ public sealed class AutoReplayInterruptedTurnsTests
         orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m =>
             m.Content == "execute issue 4370" &&
             m.ChannelType == ChannelKey.From("api") &&
-            m.SenderId == "api:issue-delivery-pump" &&
+            m.SenderId == session.CallerId &&
+            m.Sender == CitizenId.Of(session.AgentId) &&
             m.SpeakAs == MessageRole.Assistant &&
             m.RoutingHints!.RequestedAgentId == session.AgentId &&
             m.RoutingHints.RequestedSessionId == session.SessionId &&
-            m.RoutingHints.RequestedConversationId == session.ConversationId)), Times.Once);
+            m.RoutingHints.RequestedConversationId == session.ConversationId &&
+            m.Recovery != null &&
+            m.Recovery.Attempt == 1 &&
+            m.Recovery.SuccessorLeaseId != lease.LeaseId)), Times.Once,
+            "the input comes from the gateway's own lease, not from any sender label on the row");
     }
 
     [Fact]
     public async Task AutoReplay_WhenAdmissionRejected_PreservesCrashSentinelAndDoesNotConsumeAttempt()
     {
-        var session = CreateSession("sess-rejected", "agent-rejected", withSentinel: true,
-            callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
-            lastUserContent: "execute issue 4370", initiatingRole: MessageRole.Assistant,
-            initiatingSenderId: "api:issue-delivery-pump");
+        var (session, lease) = CreateLeasedKickoffSession(
+            "sess-rejected", "agent-rejected", "execute issue 4370", RunLeaseState.Running);
         var store = CreateStore(session);
         var conversations = CreateConversationStore(session, hasHuman: false);
         var orchestrator = CreateOrchestrator(postAccepted: false);
@@ -518,6 +556,7 @@ public sealed class AutoReplayInterruptedTurnsTests
         await service.StartedAsync(CancellationToken.None);
 
         session.History.ShouldContain(e => e.IsCrashSentinel);
+        session.FindRunLease(lease.LeaseId).ShouldBe(lease, "the refused reservation is undone: the same lease, the same attempt");
         session.History.ShouldNotContain(e => e.IsReplayBanner);
         session.Metadata.ContainsKey(InterruptedTurnNotificationService.MetadataKeyReplayCount).ShouldBeFalse();
     }
@@ -525,10 +564,8 @@ public sealed class AutoReplayInterruptedTurnsTests
     [Fact]
     public async Task LiveTerminalFailure_AgentOnlyApiTurn_ReusesBoundedReplayWithoutRestart()
     {
-        var session = CreateSession("sess-live", "agent-live", withSentinel: true,
-            callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
-            lastUserContent: "execute issue 4406", initiatingRole: MessageRole.Assistant,
-            initiatingSenderId: "api:issue-delivery-pump");
+        var (session, lease) = CreateLeasedKickoffSession(
+            "sess-live", "agent-live", "execute issue 4406", RunLeaseState.Failed);
         var store = CreateStore(session);
         var conversations = CreateConversationStore(session, hasHuman: false);
         var orchestrator = CreateOrchestrator();
@@ -540,30 +577,32 @@ public sealed class AutoReplayInterruptedTurnsTests
 
         await lifecycle.PublishAsync(new SessionLifecycleEvent(
             session.SessionId.Value, session.AgentId.Value,
-            SessionLifecycleEventType.TerminalFailure, session));
+            SessionLifecycleEventType.TerminalFailure, session, lease.LeaseId));
 
         orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m =>
             m.Content == "execute issue 4406" && m.SpeakAs == MessageRole.Assistant)), Times.Once);
         session.History.Count(e => e.IsReplayBanner).ShouldBe(1);
-        session.History.ShouldNotContain(e => e.IsCrashSentinel);
-        session.Metadata[InterruptedTurnNotificationService.MetadataKeyReplayCount].ShouldBe(1);
+        session.FindRunLease(lease.LeaseId).ShouldBeNull("the failed lease is consumed by the accepted replacement");
+        var reservation = session.History.Single(e => e.IsCrashSentinel).RunLease.ShouldNotBeNull();
+        reservation.State.ShouldBe(RunLeaseState.Pending, "the durable reservation the replacement takes over");
+        reservation.Attempt.ShouldBe(1, "the attempt is counted on the input's own lease");
+        session.Metadata.ShouldNotContainKey(InterruptedTurnNotificationService.MetadataKeyReplayCount,
+            "a leased recovery never touches the session-wide counter that lease-less sentinels are refused on");
 
         await lifecycle.PublishAsync(new SessionLifecycleEvent(
             session.SessionId.Value, session.AgentId.Value,
-            SessionLifecycleEventType.TerminalFailure, session));
+            SessionLifecycleEventType.TerminalFailure, session, lease.LeaseId));
 
         orchestrator.Verify(o => o.Post(It.IsAny<InboundMessage>()), Times.Once,
-            "the accepted replacement consumes the marker, making duplicate failure signals no-ops");
+            "the accepted replacement consumes the failed lease, making duplicate failure signals no-ops");
         session.History.Count(e => e.IsReplayBanner).ShouldBe(1);
     }
 
     [Fact]
     public async Task LiveTerminalFailure_WhenAdmissionRejected_PreservesMarkerAndAttemptBudget()
     {
-        var session = CreateSession("sess-live-rejected", "agent-live", withSentinel: true,
-            callerId: "api:pump", channelType: ChannelKey.From("api"),
-            lastUserContent: "continue", initiatingRole: MessageRole.Assistant,
-            initiatingSenderId: "api:pump");
+        var (session, lease) = CreateLeasedKickoffSession(
+            "sess-live-rejected", "agent-live", "continue", RunLeaseState.Failed, callerId: "api:pump");
         var store = CreateStore(session);
         var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
         var service = CreateService(store.Object, CreateRegistry("agent-live"),
@@ -574,9 +613,10 @@ public sealed class AutoReplayInterruptedTurnsTests
 
         await lifecycle.PublishAsync(new SessionLifecycleEvent(
             session.SessionId.Value, session.AgentId.Value,
-            SessionLifecycleEventType.TerminalFailure, session));
+            SessionLifecycleEventType.TerminalFailure, session, lease.LeaseId));
 
         session.History.ShouldContain(e => e.IsCrashSentinel);
+        session.FindRunLease(lease.LeaseId).ShouldBe(lease, "the failed lease and its attempt are exactly as they were");
         session.History.ShouldNotContain(e => e.IsReplayBanner);
         session.Metadata.ShouldNotContainKey(InterruptedTurnNotificationService.MetadataKeyReplayCount);
     }
@@ -586,8 +626,8 @@ public sealed class AutoReplayInterruptedTurnsTests
     {
         var session = CreateSession("sess-tools", "agent-tools", withSentinel: false,
             callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
-            lastUserContent: "execute issue 4370", initiatingRole: MessageRole.Assistant,
-            initiatingSenderId: "api:issue-delivery-pump");
+            lastUserContent: "execute issue 4370", initiatingRole: MessageRole.Assistant);
+        var kickoff = session.History.Single(e => e.Content == "execute issue 4370");
         session.AddEntry(new SessionEntry
         {
             Role = MessageRole.Tool,
@@ -597,12 +637,7 @@ public sealed class AutoReplayInterruptedTurnsTests
             ToolArgs = "{}",
             Kind = MessageKind.ToolStart
         });
-        session.AddEntry(new SessionEntry
-        {
-            Role = MessageRole.System,
-            Content = "[agent turn in progress — gateway restarted if visible]",
-            IsCrashSentinel = true
-        });
+        session.AddEntry(LeasedSentinel(kickoff, RunLeaseState.Running));
         session.AddEntry(new SessionEntry
         {
             Role = MessageRole.Tool,

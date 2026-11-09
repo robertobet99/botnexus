@@ -1057,6 +1057,141 @@ public sealed class StreamingSessionHelperTests
         terminalFailures.ShouldBe(0);
     }
 
+    // Proves: a failed stream records the failure on the run's own lease in the very save that persists the error row, and leaves a follow-up's lease exactly as it was.
+    [Fact]
+    public async Task ProcessAndSaveAsync_FailedRun_MarksTheRunsLeaseFailedInTheSaveThatPersistsTheErrorRow()
+    {
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From("session-lease-failed"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        var ownLease = AddLeasedSentinel(session, "first message");
+        var followUpLease = AddLeasedSentinel(session, "queued follow-up");
+        var runId = BotNexus.Domain.Primitives.AgentRunId.Create();
+        IReadOnlyList<SessionEntry>? historyAtSave = null;
+        var store = new Mock<ISessionStore>();
+        store.Setup(s => s.SaveAsync(session, It.IsAny<CancellationToken>()))
+            .Callback<GatewaySession, CancellationToken>((s, _) => historyAtSave = s.GetHistorySnapshot())
+            .Returns(Task.CompletedTask);
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.Error, ErrorMessage = "provider rejected the request", AgentRunId = runId },
+                new AgentStreamEvent
+                {
+                    Type = AgentStreamEventType.RunEnded,
+                    AgentRunId = runId,
+                    Completion = new RunCompletionSignal("Failed", [], null, "provider rejected the request", null, null, null, 0)
+                }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(IncludeErrorsInHistory: true, RunLeaseId: ownLease.LeaseId));
+
+        var persisted = historyAtSave.ShouldNotBeNull();
+        persisted.ShouldContain(entry => !entry.IsCrashSentinel && entry.Role == MessageRole.System
+            && entry.AgentRunId == runId && entry.Content.Contains("provider rejected the request"));
+        var leases = persisted.Where(entry => entry.IsCrashSentinel).Select(entry => entry.RunLease.ShouldNotBeNull()).ToList();
+        leases.Count.ShouldBe(2);
+        leases[0].LeaseId.ShouldBe(ownLease.LeaseId);
+        leases[0].State.ShouldBe(RunLeaseState.Failed);
+        leases[0].FailedRunId.ShouldBe(runId);
+        leases[0].FailureDetail.ShouldBe("provider rejected the request");
+        leases[0].Input.ShouldBe(ownLease.Input);
+        leases[0].Origin.ShouldBe(ownLease.Origin);
+        leases[1].ShouldBe(followUpLease);
+    }
+
+    // Proves: a failed run whose lease is no longer on the session keeps the sentinel as it was, says so, and still announces the failure after its save.
+    [Fact]
+    public async Task ProcessAndSaveAsync_FailedRunWhoseLeaseIsGone_KeepsTheSentinelWarnsAndStillPublishes()
+    {
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From("session-lease-gone"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        session.AddEntry(NewCrashSentinel());
+        var store = new Mock<ISessionStore>();
+        var logger = new CapturingLogger();
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var published = new List<SessionLifecycleEvent>();
+        lifecycle.SessionChanged += (evt, _) =>
+        {
+            published.Add(evt);
+            return Task.CompletedTask;
+        };
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent
+                {
+                    Type = AgentStreamEventType.RunEnded,
+                    Completion = new RunCompletionSignal("Failed", [], null, "provider failed", null, null, null, 0)
+                }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(Logger: logger, RunLeaseId: BotNexus.Domain.Primitives.RunLeaseId.Create()),
+            lifecycleEvents: lifecycle);
+
+        var sentinel = session.GetHistorySnapshot().Single(entry => entry.IsCrashSentinel);
+        sentinel.RunLease.ShouldBeNull();
+        logger.Entries.ShouldContain(entry => entry.Level == Microsoft.Extensions.Logging.LogLevel.Warning
+            && entry.Message.Contains("session-lease-gone"));
+        published.ShouldHaveSingleItem().Type.ShouldBe(SessionLifecycleEventType.TerminalFailure);
+    }
+
+    // Proves: a clean run releases its sentinel and the lease on it, so only a failed run leaves a lease behind.
+    [Fact]
+    public async Task ProcessAndSaveAsync_CleanRun_ReleasesTheRunsLeasedSentinel()
+    {
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From("session-lease-clean"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        var lease = AddLeasedSentinel(session, "first message");
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "done", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m1" },
+                new AgentStreamEvent
+                {
+                    Type = AgentStreamEventType.RunEnded,
+                    Completion = new RunCompletionSignal("Completed", [], null, null, null, null, null, 0)
+                }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(RunLeaseId: lease.LeaseId));
+
+        session.GetHistorySnapshot().ShouldNotContain(entry => entry.IsCrashSentinel || entry.RunLease != null);
+    }
+
+    // An inbound message plus the sentinel the host writes for it, carrying the run's lease.
+    private static RunLease AddLeasedSentinel(GatewaySession session, string content)
+    {
+        var input = new SessionEntry { Role = MessageRole.User, Content = content };
+        session.AddEntry(input);
+        var lease = RunLease.Admit(InputRef.For(input));
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.System,
+            Content = "[agent turn in progress - gateway restarted if visible]",
+            IsCrashSentinel = true,
+            RunLease = lease
+        });
+        return lease;
+    }
+
     [Fact]
     public async Task ProcessAndSaveAsync_ToolStartWriteAhead_RetainsCrashSentinel()
     {

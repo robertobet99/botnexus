@@ -110,6 +110,8 @@ internal static class SqliteDataReaderExtensions
             ToolCallId = GetNullableString(reader, "tool_call_id"),
             AgentRunId = GetNullableString(reader, "agent_run_id") is { } run ? BotNexus.Domain.Primitives.AgentRunId.From(run) : null,
             ToolIsIncomplete = GetBool(reader, "tool_is_incomplete"),
+            // The run lease on a crash sentinel. NULL for every other row and every pre-lease sentinel.
+            RunLease = SqliteRunLeaseJson.Deserialize(GetNullableString(reader, "run_lease_json")),
             IsCompactionSummary = GetBool(reader, "is_compaction_summary"),
             // #3046: gateway-authored restart-replay banner. False for every pre-#3046 row.
             IsReplayBanner = GetBool(reader, "is_replay_banner"),

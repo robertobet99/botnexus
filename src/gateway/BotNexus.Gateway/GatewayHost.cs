@@ -401,6 +401,21 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                     new KeyValuePair<string, object?>("botnexus.channel.type", message.ChannelType));
             }
 
+            // A replacement queued by recovery runs only as the holder of the reservation recovery made for
+            // it. The context is not trusted on its own: if a pending lease with that identity is not on the
+            // session (another replacement took it, the reservation was rolled back, or it never existed),
+            // the message is dropped here, before it writes a row or reaches the model. That is what makes
+            // admitting the same recovery twice harmless.
+            if (message.Recovery is { } reservation
+                && session.FindRunLease(reservation.SuccessorLeaseId) is not { State: RunLeaseState.Pending })
+            {
+                _logger.LogWarning(
+                    "Dropping a recovery replacement for session '{SessionId}': no pending reservation {LeaseId} is on the session, " +
+                    "so it was already taken, rolled back or never made.",
+                    sessionId, reservation.SuccessorLeaseId);
+                continue;
+            }
+
             // Write-time self-heal of orphaned crash sentinels (#2030). A turn that died
             // mid-flight (sub-agent bail, provider stream death, host sleep, unhandled crash)
             // leaves a crash sentinel that wedges the session: every later user message queues
@@ -410,8 +425,11 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
             // per-session FIFO queue guarantees no concurrent turn for this session is running),
             // so clear it and proceed - the session unblocks the instant the user retries, no
             // restart required. If a turn IS live the sentinel is legitimate and left untouched.
-            if (!_turnTracker.HasLiveTurn(sessionId)
-                && session.History.Any(static e => e.IsCrashSentinel))
+            //
+            // A pending reservation is not an orphan. It is a recovery replacement that is queued, possibly
+            // behind this very message, and it has no run to be dead yet. The scrub leaves it, both here and
+            // when this run completes, so the replacement can still adopt it and run once.
+            if (!_turnTracker.HasLiveTurn(sessionId) && session.HasRemovableCrashSentinel())
             {
                 _logger.LogInformation(
                     "Self-healing orphaned crash sentinel for session '{SessionId}' (no live turn); "
@@ -528,7 +546,9 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                 ? MessageKind.SubAgentResponse
                 : MessageKind.Message;
 
-            session.AddEntry(new SessionEntry
+            // The entry as stored: redaction can replace the one passed in with a redacted copy, and the
+            // run lease written below names the stored row, so it must be built from that copy.
+            var inboundEntry = session.AddEntryAndSnapshot(new SessionEntry
             {
                 // Hybrid rule (#1650): an agent posting into a channel (e.g. via the
                 // conversation tool, cross-channel relays) defaults to the assistant
@@ -541,7 +561,7 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                 ProcessedContentParts = processedParts,
                 // Persist null for the default so legacy/ordinary rows stay unstamped (#2149).
                 Kind = StampKind(inboundKind)
-            });
+            }).Snapshot.Entries[^1];
 
             // Write-ahead Layer 1: persist user message before starting the LLM call.
             // Ensures user input survives a gateway restart mid-turn (#363).
@@ -566,13 +586,23 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
             // write-ahead crash sentinel (#363) -- is extracted into PrepareTurnAsync so
             // ProcessAsync no longer inlines it. The method mutates+persists the session in
             // the exact prior order (compaction -> abandoned-turn handle-stop+notify ->
-            // crash sentinel save); none of its locals escape into the execution path below,
-            // so applying it here preserves the prior control flow and side-effect ordering.
+            // crash sentinel save). The one value it hands back is the run lease on that
+            // sentinel, which the run keeps so its outcome is recorded on its own lease.
             // Mark this session as having a live turn for the duration of execution so the
             // write-time self-heal above never mistakes a genuinely in-flight turn's sentinel
             // for an orphan (#2030). Disposed at the end of this per-agent iteration.
             using var turnScope = _turnTracker.BeginTurn(sessionId);
-            await PrepareTurnAsync(session, message, typedAgentId, typedSessionId, sessionId, cancellationToken);
+            var preparedLease = await PrepareTurnAsync(session, message, inboundEntry, typedAgentId, typedSessionId, sessionId, cancellationToken);
+            if (preparedLease is null)
+            {
+                _logger.LogWarning(
+                    "Dropping a recovery replacement for session '{SessionId}': its reservation was taken or removed " +
+                    "between admission and the start of the turn, so another replacement owns it.",
+                    sessionId);
+                continue;
+            }
+
+            var runLease = preparedLease;
 
             // #1518: capture the run's authoritative session identity (id + conversation) NOW,
             // before the agent run starts. Every post-run finalizer write below is fenced against
@@ -698,6 +728,8 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                         new StreamingSessionOptions(
                             IncludeErrorsInHistory: true,
                             AssistantMessageKind: responseKind,
+                            // The run's own lease: a failed run records its outcome on this one lease.
+                            RunLeaseId: runLease.LeaseId,
                             // #2921: surface a run that terminates on an empty assistant completion.
                             Logger: _logger,
                             // #3535: and when that emptiness is context exhaustion, tell the user.
@@ -921,9 +953,17 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
 
                     if (terminalFailure)
                     {
-                        session.AddEntry(TerminalRunOutcome.CreateErrorEntry(
-                            response.AgentRunId,
-                            TerminalRunOutcome.ResolveDetail(response.TerminalError, response.Completion)));
+                        var failureDetail = TerminalRunOutcome.ResolveDetail(response.TerminalError, response.Completion);
+                        session.AddEntry(TerminalRunOutcome.CreateErrorEntry(response.AgentRunId, failureDetail));
+
+                        // The run's own lease is recorded as failed in the same fenced save as the error
+                        // row below, exactly as the streaming finalizer does.
+                        if (!TerminalRunOutcome.MarkLeaseFailed(session, runLease.LeaseId, failureDetail, response.AgentRunId))
+                        {
+                            _logger.LogWarning(
+                                "The failed run's lease was not found on session '{SessionId}'; recovery will treat the sentinel as unleased.",
+                                sessionId);
+                        }
                     }
 
                     // The authoritative completion, as the streaming finalizer records it. Assigned even
@@ -935,6 +975,13 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                 // Remove crash sentinel on clean turn completion (#363). A failed run keeps it: it is
                 // recovery's durable marker. After streaming the finalizer has already applied this policy
                 // and saved, so touching the aggregate again could only make it diverge from the stored row.
+                //
+                // The sweep stays blanket: every sentinel that is not a pending reservation goes, whichever
+                // run wrote it. Narrowing it to this run's own lease would leave the sentinels of earlier
+                // failed or interrupted runs behind once a later run succeeds, so the next startup would
+                // report and replay inputs the session has already moved past. That would make the separate
+                // follow-up-sentinel defect, which is out of scope here, worse. A pending reservation is
+                // exempt because it is a queued replacement, not a dead run.
                 if (!sessionSaved && !terminalFailure)
                     session.RemoveCrashSentinels();
 
@@ -992,7 +1039,8 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
                             session,
                             SessionLifecycleEventType.TerminalFailure,
                             finalizerOutcome,
-                            cancellationToken);
+                            cancellationToken,
+                            runLease.LeaseId);
                     }
 
                     if (finalizerOutcome is { } persistedOutcome && blockingResponse is { } settledResponse)
@@ -1320,12 +1368,18 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
     /// (2) abandoned-turn detection (#790) -- if the previous turn stalled mid-tool, stop the stale
     /// handle so the supervisor rebuilds clean context and append a user-visible notification, and
     /// (3) the write-ahead crash sentinel (#363) persisted before the LLM call. Every step mutates
-    /// and persists <paramref name="session"/> exactly as the inlined block did; no value produced
-    /// here is consumed by the caller, so the extraction is behaviour-preserving.
+    /// and persists <paramref name="session"/> exactly as the inlined block did.
     /// </summary>
-    private async Task PrepareTurnAsync(
+    /// <returns>
+    /// The run lease for this run: the one written on the crash sentinel, or, for a replacement queued by
+    /// recovery, the reservation it took over. The caller keeps it so the run's outcome is recorded on this
+    /// lease, and no other. <see langword="null"/> when a replacement's reservation was already taken or is
+    /// gone, in which case nothing was written and the run must not start.
+    /// </returns>
+    private async Task<RunLease?> PrepareTurnAsync(
         GatewaySession session,
         InboundMessage message,
+        SessionEntry inboundEntry,
         AgentId typedAgentId,
         SessionId typedSessionId,
         string sessionId,
@@ -1390,14 +1444,42 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
         // Write-ahead Layer 2: crash sentinel written before the LLM call.
         // If the gateway restarts mid-turn, this sentinel survives in the session store,
         // showing an interrupted-turn marker to the user rather than a silent gap (#363).
+        //
+        // The sentinel carries the run lease: the gateway's own record of WHICH stored input this run
+        // was admitted for. Recovery reads it back instead of inferring an input from transcript rows,
+        // whose role and sender labels a caller can influence. It is written here, for every route,
+        // channel and branch, before any provider call, so a run that dies at any later point leaves it.
+        //
+        // A replacement queued by recovery writes no sentinel of its own: the reservation recovery made for
+        // it is already on the session, and the replacement takes it over. Exactly one replacement can,
+        // because only a pending lease is adopted, so a duplicate finds nothing to take and does not run.
+        if (message.Recovery is { } recovery)
+        {
+            RunLease? adopted = null;
+            session.TryUpdateRunLease(recovery.SuccessorLeaseId, lease =>
+            {
+                var running = lease.Adopt(InputRef.For(inboundEntry));
+                if (!ReferenceEquals(running, lease))
+                    adopted = running;
+                return running;
+            });
+            if (adopted is not null)
+                await _sessions.SaveAsync(session, cancellationToken);
+
+            return adopted;
+        }
+
+        var runLease = RunLease.Admit(InputRef.For(inboundEntry));
         var crashSentinel = new SessionEntry
         {
             Role = MessageRole.System,
             Content = "[agent turn in progress — gateway restarted if visible]",
-            IsCrashSentinel = true
+            IsCrashSentinel = true,
+            RunLease = runLease
         };
         session.AddEntry(crashSentinel);
         await _sessions.SaveAsync(session, cancellationToken);
+        return runLease;
     }
 
     private async Task SendSessionStatusRejectedAsync(
@@ -2098,7 +2180,14 @@ public sealed class GatewayHost : BackgroundService, IChannelDispatcher, IInboun
         // fix was reachable only from this call site, so steer/redirect/follow-up kept dropping
         // attachments. Datetime injection runs first so the injected prefix stays at the head of
         // the message and the attachment blocks are appended after it, exactly as before.
-        var content = InjectDateTimeIfEnabled(message.Content, descriptor);
+        //
+        // A recovery replacement also carries what recovery knows about the interrupted work. It is put
+        // ahead of the original input here, in the provider-bound text only, so the model is told what is
+        // already done and what to verify before it acts, while the transcript keeps the input as it was sent.
+        var text = message.Recovery is { } recovery
+            ? RecoveryFraming.Prepend(recovery, message.Content)
+            : message.Content;
+        var content = InjectDateTimeIfEnabled(text, descriptor);
         return AgentUserMessageComposer.Compose(content, contentParts);
     }
 

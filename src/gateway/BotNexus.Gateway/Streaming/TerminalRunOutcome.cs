@@ -8,7 +8,7 @@ namespace BotNexus.Gateway.Streaming;
 /// <summary>
 /// The one definition of a terminal run failure, shared by the streaming finalizer and the blocking
 /// branch of <see cref="GatewayHost"/> so both leave the same evidence behind: a single error row, the
-/// crash sentinel kept as recovery's durable marker, and one
+/// crash sentinel kept as recovery's durable marker with the run's lease recorded as failed, and one
 /// <see cref="SessionLifecycleEventType.TerminalFailure"/> published only after the fenced final save
 /// persisted.
 /// </summary>
@@ -51,22 +51,43 @@ internal static class TerminalRunOutcome
         };
 
     /// <summary>
+    /// Records on the run's own lease that the run failed, so the one fenced final save that records the
+    /// error row also records what recovery needs: which lease failed, when, why, and which run's tool rows
+    /// to inspect. Only the lease the run was admitted under is touched, never "the sentinel" or "the
+    /// latest lease", so a follow-up's or a later run's lease cannot be marked by mistake.
+    /// </summary>
+    /// <param name="session">The session whose sentinel carries the lease.</param>
+    /// <param name="leaseId">The lease the run was admitted under, or null when the run was started without one.</param>
+    /// <param name="detail">The failure detail the error row carries; the lease bounds it itself.</param>
+    /// <param name="failedRunId">The failed run's execution identity, when it reported one.</param>
+    /// <returns>
+    /// <see langword="true"/> when the lease was found and recorded as failed; <see langword="false"/> when the
+    /// run had no lease or its sentinel is gone.
+    /// </returns>
+    internal static bool MarkLeaseFailed(GatewaySession session, RunLeaseId? leaseId, string detail, AgentRunId? failedRunId)
+        => leaseId is { } id
+            && session.TryUpdateRunLease(id, lease => lease.MarkFailed(DateTimeOffset.UtcNow, detail, failedRunId));
+
+    /// <summary>
     /// Publishes a lifecycle event for <paramref name="session"/> only when the run's final save
     /// persisted. A save that was skipped (the session was deleted, reset or rebound mid-run) or that
     /// never completed means the evidence a subscriber would act on is not durable, so nothing is announced.
+    /// A failure carries the lease of the run that failed, fixed here at publication, so a subscriber that
+    /// handles it later acts on that run's lease and cannot be pointed at a later run's.
     /// </summary>
     internal static async Task PublishAfterSaveAsync(
         SessionLifecycleEvents? lifecycleEvents,
         GatewaySession session,
         SessionLifecycleEventType type,
         SessionSaveOutcome? saveOutcome,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RunLeaseId? failedLeaseId = null)
     {
         if (lifecycleEvents is null || saveOutcome != SessionSaveOutcome.Persisted)
             return;
 
         await lifecycleEvents.PublishAsync(
-            new SessionLifecycleEvent(session.SessionId.Value, session.AgentId.Value, type, session),
+            new SessionLifecycleEvent(session.SessionId.Value, session.AgentId.Value, type, session, failedLeaseId),
             cancellationToken);
     }
 }

@@ -407,4 +407,113 @@ public sealed class SqliteSessionStoreMigrationTests : IDisposable
         Convert.ToInt32(await valueCmd.ExecuteScalarAsync()).ShouldBe(0,
             "a pre-existing row must not read back as a restart banner");
     }
+
+    // ─── run lease: run_lease_json column ──────────────────────────────────
+
+    /// <summary>
+    /// A run lease written on a crash sentinel must survive a cold read, and recording the run's outcome on
+    /// it must update that one stored row in place: a second sentinel row, or a lease that stops reading
+    /// back, would make recovery act on the wrong thing or on nothing.
+    /// </summary>
+    [Fact]
+    public async Task RunLease_RoundTripsThroughStore_AndIsUpdatedInPlace()
+    {
+        var connectionString = $"Data Source={_sessionDbPath};Pooling=False";
+        var sessionId = SessionId.From("s-lease-1");
+        var session = new GatewaySession
+        {
+            SessionId = sessionId,
+            AgentId = AgentId.From("agent-lease"),
+            Status = SessionStatus.Active,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        var input = new SessionEntry { Role = MessageRole.User, Content = "do the thing" };
+        session.AddEntry(input);
+        var lease = RunLease.Admit(InputRef.For(input));
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.System,
+            Content = "[agent turn in progress]",
+            IsCrashSentinel = true,
+            RunLease = lease
+        });
+        await CreateSessionStore(CreateConversationStore()).SaveAsync(session, CancellationToken.None);
+
+        var cold = (await CreateSessionStore(CreateConversationStore()).GetAsync(sessionId, CancellationToken.None)).ShouldNotBeNull();
+        var storedSentinel = cold.History.Single(entry => entry.IsCrashSentinel);
+        storedSentinel.RunLease.ShouldBe(lease);
+        lease.Input.Resolve(cold.History).Entry.ShouldNotBeNull().Content.ShouldBe("do the thing");
+        var storedRowId = storedSentinel.PersistenceId;
+
+        cold.TryUpdateRunLease(lease.LeaseId, current => current.MarkFailed(DateTimeOffset.UtcNow, "the backend rejected the request", AgentRunId.From("run-1")))
+            .ShouldBeTrue();
+        await CreateSessionStore(CreateConversationStore()).SaveAsync(cold, CancellationToken.None);
+
+        var afterFailure = (await CreateSessionStore(CreateConversationStore()).GetAsync(sessionId, CancellationToken.None)).ShouldNotBeNull();
+        afterFailure.History.Count.ShouldBe(2, "recording the outcome must not add or drop a row");
+        var failedSentinel = afterFailure.History.Single(entry => entry.IsCrashSentinel);
+        failedSentinel.PersistenceId.ShouldBe(storedRowId, "the same stored row must have been updated in place");
+        var failed = failedSentinel.RunLease.ShouldNotBeNull();
+        failed.State.ShouldBe(RunLeaseState.Failed);
+        failed.LeaseId.ShouldBe(lease.LeaseId);
+        failed.FailureDetail.ShouldBe("the backend rejected the request");
+        failed.FailedRunId.ShouldBe(AgentRunId.From("run-1"));
+
+        await using var verifyConn = new SqliteConnection(connectionString);
+        await verifyConn.OpenAsync();
+        await using var countCmd = verifyConn.CreateCommand();
+        countCmd.CommandText = "SELECT COUNT(*) FROM session_history WHERE session_id = 's-lease-1' AND run_lease_json IS NOT NULL";
+        Convert.ToInt32(await countCmd.ExecuteScalarAsync()).ShouldBe(1, "only the sentinel row carries a lease");
+    }
+
+    /// <summary>
+    /// A database created before leases existed has no <c>run_lease_json</c> column. Opening it must add the
+    /// column rather than throw, an existing sentinel must read back lease-less (recovery's fallback path,
+    /// not a spurious lease), and a lease written afterwards must persist.
+    /// </summary>
+    [Fact]
+    public async Task RunLease_PreExistingDatabase_GainsColumnAndReadsLeaseless()
+    {
+        var connectionString = $"Data Source={_sessionDbPath};Pooling=False";
+        var sessionId = SessionId.From("s-lease-legacy");
+        var legacy = new GatewaySession
+        {
+            SessionId = sessionId,
+            AgentId = AgentId.From("agent-lease"),
+            Status = SessionStatus.Active,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        legacy.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "legacy turn" });
+        legacy.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[agent turn in progress]", IsCrashSentinel = true });
+        await CreateSessionStore(CreateConversationStore()).SaveAsync(legacy, CancellationToken.None);
+
+        // Make the database look as it did before the column existed.
+        await using (var conn = new SqliteConnection(connectionString))
+        {
+            await conn.OpenAsync();
+            await using var dropColumn = conn.CreateCommand();
+            dropColumn.CommandText = "ALTER TABLE session_history DROP COLUMN run_lease_json";
+            await dropColumn.ExecuteNonQueryAsync();
+        }
+        (await ColumnExistsAsync(connectionString, "session_history", "run_lease_json")).ShouldBeFalse("fixture: the column must be gone");
+
+        // Opening the store runs MigrateAsync, which must add the column back.
+        var reopened = CreateSessionStore(CreateConversationStore());
+        var loaded = (await reopened.GetAsync(sessionId, CancellationToken.None)).ShouldNotBeNull();
+
+        (await ColumnExistsAsync(connectionString, "session_history", "run_lease_json")).ShouldBeTrue(
+            "MigrateAsync must add run_lease_json to a database that predates it on first open");
+        var sentinel = loaded.History.Single(entry => entry.IsCrashSentinel);
+        sentinel.RunLease.ShouldBeNull("a pre-lease sentinel must read back lease-less, not as a spurious lease");
+
+        // The migrated database accepts a lease on the next write.
+        var input = loaded.History.Single(entry => entry.Role == MessageRole.User);
+        var lease = RunLease.Admit(InputRef.For(input));
+        loaded.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[agent turn in progress]", IsCrashSentinel = true, RunLease = lease });
+        await reopened.SaveAsync(loaded, CancellationToken.None);
+
+        var afterWrite = (await CreateSessionStore(CreateConversationStore()).GetAsync(sessionId, CancellationToken.None)).ShouldNotBeNull();
+        afterWrite.History.Where(entry => entry.IsCrashSentinel).Select(entry => entry.RunLease)
+            .ShouldContain(lease);
+    }
 }

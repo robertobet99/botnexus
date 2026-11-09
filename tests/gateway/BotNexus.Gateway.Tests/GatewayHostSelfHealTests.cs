@@ -136,4 +136,126 @@ public sealed partial class GatewayHostTests
         sentinelPresentAtFirstSave.ShouldBe(true,
             "sentinel must be preserved at ingress when a turn is live so the message keeps queuing (#2030)");
     }
+
+    // Proves: the ingress self-heal clears an orphaned sentinel but leaves a pending reservation, and so does the run's own clean completion, because the reservation belongs to a recovery replacement that is queued behind this message and has not started.
+    [Theory]
+    [InlineData("web", true)]
+    [InlineData("web", false)]
+    [InlineData("api", false)]
+    public async Task DispatchAsync_PendingReservationWithNoLiveTurn_IsNotSelfHealedAndSurvivesTheRunsCompletion(string channelType, bool streams)
+    {
+        var router = new Mock<IMessageRouter>();
+        router.Setup(r => r.ResolveAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(["agent-reserved"]);
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("session-reserved"), AgentId.From("agent-reserved"));
+        var origin = new SessionEntry { Role = MessageRole.Assistant, Content = "Apply the scheduled change.", Timestamp = DateTimeOffset.UtcNow.AddMinutes(-1) };
+        session.AddEntry(origin);
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[orphaned sentinel]", IsCrashSentinel = true });
+        var reservation = RunLease.Admit(InputRef.For(origin)).QueueSuccessor("instance-a");
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.System,
+            Content = "[agent turn in progress]",
+            IsCrashSentinel = true,
+            RunLease = reservation
+        });
+        IReadOnlyList<SessionEntry>? historyWhenTheModelIsCalled = null;
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(h => h.AgentId).Returns(AgentId.From("agent-reserved"));
+        handle.SetupGet(h => h.SessionId).Returns(SessionId.From("session-reserved"));
+        handle.Setup(h => h.IsRunning).Returns(false);
+        handle.Setup(h => h.PromptAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                historyWhenTheModelIsCalled = session.GetHistorySnapshot();
+                return Task.FromResult(new AgentResponse { Content = "ok" });
+            });
+        handle.Setup(h => h.StreamAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                historyWhenTheModelIsCalled = session.GetHistorySnapshot();
+                return ToAsyncEnumerable([new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "ok" }]);
+            });
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(s => s.GetOrCreateAsync(AgentId.From("agent-reserved"), SessionId.From("session-reserved"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(handle.Object);
+        var adapter = channelType == "api" ? null : CreateChannelAdapter(channelType, supportsStreaming: streams).Object;
+        await using var host = CreateHost(
+            supervisor.Object, router.Object, sessions, new RecordingActivityBroadcaster(),
+            CreateChannelManager(adapter), turnTracker: new StubTurnTracker(hasLiveTurn: false));
+
+        await host.DispatchAsync(CreateMessage("a follow-up", sessionId: "session-reserved", channelType: channelType));
+
+        var leasesDuringTheRun = historyWhenTheModelIsCalled.ShouldNotBeNull()
+            .Where(entry => entry.IsCrashSentinel)
+            .Select(entry => entry.RunLease)
+            .ToList();
+        leasesDuringTheRun.Count.ShouldBe(2, "the orphan is cleared; the reservation and the follow-up's own lease remain");
+        leasesDuringTheRun.ShouldContain(
+            lease => lease != null && lease.LeaseId == reservation.LeaseId && lease.State == RunLeaseState.Pending,
+            "the reservation is not an orphan");
+        leasesDuringTheRun.ShouldContain(
+            lease => lease != null && lease.State == RunLeaseState.Running,
+            "the follow-up runs under a lease of its own");
+        session.GetHistorySnapshot().Where(entry => entry.IsCrashSentinel).ShouldHaveSingleItem().RunLease.ShouldBe(
+            reservation, "the run's clean completion removes its own marker and leaves the reservation for its replacement");
+    }
+
+    // Proves: a recovery replacement adopts its own reservation and leaves another pending reservation alone, so every queued replacement still finds the one reserved for it.
+    [Fact]
+    public async Task DispatchAsync_RecoveryReplacement_LeavesAnotherPendingReservationAlone()
+    {
+        const string input = "Apply the scheduled change.";
+        var router = new Mock<IMessageRouter>();
+        router.Setup(r => r.ResolveAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(["agent-reserved"]);
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("session-reserved"), AgentId.From("agent-reserved"));
+        var origin = new SessionEntry { Role = MessageRole.Assistant, Content = input, Timestamp = DateTimeOffset.UtcNow.AddMinutes(-2) };
+        var otherOrigin = new SessionEntry { Role = MessageRole.Assistant, Content = "Send the report.", Timestamp = DateTimeOffset.UtcNow.AddMinutes(-1) };
+        session.AddEntry(origin);
+        session.AddEntry(otherOrigin);
+        var own = RunLease.Admit(InputRef.For(origin)).QueueSuccessor("instance-a");
+        var other = RunLease.Admit(InputRef.For(otherOrigin)).QueueSuccessor("instance-a");
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[agent turn in progress]", IsCrashSentinel = true, RunLease = own });
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[agent turn in progress]", IsCrashSentinel = true, RunLease = other });
+        IReadOnlyList<SessionEntry>? historyWhenTheModelIsCalled = null;
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(h => h.AgentId).Returns(AgentId.From("agent-reserved"));
+        handle.SetupGet(h => h.SessionId).Returns(SessionId.From("session-reserved"));
+        handle.Setup(h => h.IsRunning).Returns(false);
+        handle.Setup(h => h.PromptAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                historyWhenTheModelIsCalled = session.GetHistorySnapshot();
+                return Task.FromResult(new AgentResponse { Content = "ok" });
+            });
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(s => s.GetOrCreateAsync(AgentId.From("agent-reserved"), SessionId.From("session-reserved"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(handle.Object);
+        await using var host = CreateHost(
+            supervisor.Object, router.Object, sessions, new RecordingActivityBroadcaster(),
+            CreateChannelManager(), turnTracker: new StubTurnTracker(hasLiveTurn: false));
+
+        await host.DispatchAsync(CreateMessage(input, sessionId: "session-reserved", channelType: "api")
+            with
+            {
+                SpeakAs = MessageRole.Assistant,
+                Recovery = new RecoveryContext { SuccessorLeaseId = own.LeaseId, Attempt = 1, MaxAttempts = 2 }
+            });
+
+        var leasesDuringTheRun = historyWhenTheModelIsCalled.ShouldNotBeNull()
+            .Where(entry => entry.IsCrashSentinel)
+            .Select(entry => entry.RunLease)
+            .ToList();
+        leasesDuringTheRun.ShouldContain(
+            lease => lease != null && lease.LeaseId == own.LeaseId && lease.State == RunLeaseState.Running,
+            "the replacement runs under the reservation made for it");
+        leasesDuringTheRun.ShouldContain(
+            lease => lease != null && lease.LeaseId == other.LeaseId && lease.State == RunLeaseState.Pending,
+            "another queued replacement's reservation is not an orphan");
+        session.GetHistorySnapshot().Where(entry => entry.IsCrashSentinel).ShouldHaveSingleItem().RunLease.ShouldBe(
+            other, "only the other reservation remains once the replacement has finished");
+    }
 }

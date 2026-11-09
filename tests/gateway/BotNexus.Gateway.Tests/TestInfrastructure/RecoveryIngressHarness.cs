@@ -13,6 +13,7 @@ using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Activity;
 using BotNexus.Gateway.Api.Controllers;
 using BotNexus.Gateway.Configuration;
+using BotNexus.Gateway.Conversations;
 using BotNexus.Gateway.Dispatching;
 using BotNexus.Gateway.Extensions;
 using BotNexus.Gateway.Sessions;
@@ -46,6 +47,13 @@ internal sealed record RecoveryIngressOptions(IReadOnlyList<ScriptStep> Script)
     /// test can exercise the host's generic failure handler rather than a settled run.
     /// </summary>
     internal bool FailAgentCreation { get; init; }
+
+    /// <summary>
+    /// Keeps the conversation and session stores (SQLite) and the effects marker on this disk instead of in
+    /// memory, so a second harness started over the same disk is a genuine cold restart: a fresh service
+    /// graph, with no object in common with the first, over what the first made durable.
+    /// </summary>
+    internal DurableTestDisk? Durable { get; init; }
 }
 
 /// <summary>The conversation and session an ingress call landed on.</summary>
@@ -75,6 +83,14 @@ internal sealed record IngressReceipt(ConversationId ConversationId, SessionId S
 /// after an exhaustion failure must not use that shape, because the provider stays suspended.
 /// </para>
 /// <para>
+/// Stores are in memory unless <see cref="RecoveryIngressOptions.Durable"/> names a <see cref="DurableTestDisk"/>.
+/// On a disk the conversation and session stores are SQLite files, and a second harness started over the same
+/// disk is a genuine cold restart: a fresh service graph, sharing no object with the first, over what the
+/// first made durable. A test can make the first graph "crash" at a chosen save
+/// (<see cref="RecordingSessionStore.CrashAfterSaveThat"/>), after which none of its session writes reaches
+/// the session file. Only the session store is crashed: the conversation file stays writable.
+/// </para>
+/// <para>
 /// Completion is observed through an explicit signal, the gateway's per-turn terminal activity
 /// (<see cref="AwaitTurnsAsync"/>), never through disposal: disposal completes queue writers and can
 /// change admission. Assert first, dispose last. Disposal itself never abandons the graph: it stops the
@@ -93,6 +109,7 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
     private readonly IHost _host;
     private readonly GatewayHost _gateway;
     private readonly string _tempRoot;
+    private readonly DurableTestDisk? _disk;
     private readonly ConversationMessagesController _controller;
     private readonly ConversationTool _conversationTool;
     private readonly List<SessionId> _knownSessions = [];
@@ -101,6 +118,7 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
     private RecoveryIngressHarness(
         IHost host,
         string tempRoot,
+        DurableTestDisk? disk,
         ScriptedLlmProvider provider,
         SideEffectToolContributor effects,
         RecordingOrchestrator orchestrator,
@@ -113,6 +131,7 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
     {
         _host = host;
         _tempRoot = tempRoot;
+        _disk = disk;
         Provider = provider;
         Effects = effects;
         Orchestrator = orchestrator;
@@ -128,6 +147,9 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
         Saves = SessionStore as RecordingSessionStore
             ?? throw new InvalidOperationException("The harness session store must be the recording decorator.");
         ConversationStore = host.Services.GetRequiredService<IConversationStore>();
+
+        // Last, so a start that failed above never leaves the disk looking occupied.
+        _disk?.GraphStarted();
     }
 
     /// <summary>The agent that owns every conversation this harness creates.</summary>
@@ -173,7 +195,8 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
         IHost? host = null;
         try
         {
-            var effects = new SideEffectToolContributor(Path.Combine(tempRoot, "effects", "applied.log"));
+            var effects = new SideEffectToolContributor(
+                options.Durable?.EffectsMarkerPath ?? Path.Combine(tempRoot, "effects", "applied.log"));
             var provider = new ScriptedLlmProvider(options.Script);
             var deliverer = new RecordingDeliverer();
             var clock = new HarnessClock();
@@ -226,7 +249,7 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
                 conversationRouter: container.GetRequiredService<IConversationRouter>());
 
             return new RecoveryIngressHarness(
-                host, tempRoot, provider, effects, orchestrator, activities, lifecycle, deliverer, recovery, controller, conversationTool);
+                host, tempRoot, options.Durable, provider, effects, orchestrator, activities, lifecycle, deliverer, recovery, controller, conversationTool);
         }
         catch
         {
@@ -332,7 +355,21 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
             new RecordingOrchestrator(serviceProvider.GetRequiredService<GatewayHost>().Orchestrator)));
 
         // The composition root's own store (with its archive drain attached) is wrapped, not replaced, so
-        // the store under test is exactly the one production would build.
+        // the store under test is exactly the one production would build. On a durable disk the stores are
+        // the SQLite ones production's default composition builds, over the disk's own files; the
+        // conversation store is durable with the session store because a session store over a conversation
+        // store that lacks the session's conversation removes the session at start-up as dangling.
+        if (options.Durable is { } disk)
+        {
+            services.Replace(ServiceDescriptor.Singleton<IConversationStore>(_ =>
+                new SqliteConversationStore(disk.ConversationsConnectionString, NullLogger<SqliteConversationStore>.Instance)));
+            services.Replace(ServiceDescriptor.Singleton<ISessionStore>(serviceProvider =>
+                new SqliteSessionStore(
+                    disk.SessionsConnectionString,
+                    NullLogger<SqliteSessionStore>.Instance,
+                    serviceProvider.GetRequiredService<IConversationStore>())));
+        }
+
         var storeFactory = services.Last(descriptor => descriptor.ServiceType == typeof(ISessionStore)).ImplementationFactory
             ?? throw new InvalidOperationException("The session store is expected to be registered through a factory.");
         services.Replace(ServiceDescriptor.Singleton<ISessionStore>(serviceProvider =>
@@ -352,7 +389,9 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
             serviceProvider.GetService<IInboundMessageOrchestrator>(),
             serviceProvider.GetService<IOptions<GatewayOptions>>(),
             serviceProvider.GetService<IConversationStore>(),
-            serviceProvider.GetService<SessionLifecycleEvents>()));
+            serviceProvider.GetService<SessionLifecycleEvents>(),
+            shutdownMarker: null,
+            turnTracker: serviceProvider.GetService<ISessionTurnTracker>()));
     }
 
     /// <summary>Creates an empty, user-facing conversation owned by the harness agent.</summary>
@@ -491,6 +530,12 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
         text.AppendLine("fenced saves: " + string.Join(
             ", ",
             Saves.FencedSaves.Select(save => $"{(save.Outcome?.ToString() ?? "threw")}@{save.Sequence}")));
+        if (Saves.RefusedWrites.Count > 0)
+        {
+            text.AppendLine("writes refused after the crash: " + string.Join(
+                ", ",
+                Saves.RefusedWrites.Select(write => $"{write.Operation}{(write.Fenced ? "(fenced)" : string.Empty)}@{write.Sequence}")));
+        }
         text.AppendLine("activities: " + string.Join(", ", Activities.Items.Select(item => item.Type)));
         text.AppendLine("fan-outs offered: " + string.Join(
             "; ",
@@ -541,6 +586,7 @@ internal sealed class RecoveryIngressHarness : IAsyncDisposable
         await WithinDeadlineAsync(DisposeHostAsync(_host), "disposing the service graph");
 
         TryDeleteDirectory(_tempRoot);
+        _disk?.GraphStopped();
     }
 
     private static async Task WithinDeadlineAsync(Task work, string step)

@@ -116,6 +116,12 @@ public sealed class SqliteSessionDataReaderExtensionsTests
     [Fact]
     public void MapHistoryEntry_FullRow_MapsEveryColumn()
     {
+        var lease = RunLease.Admit(InputRef.For(new SessionEntry
+        {
+            Role = MessageRole.User,
+            Content = "Apply the scheduled change.",
+            Timestamp = DateTimeOffset.Parse("2026-01-02T03:04:05.0000000+00:00")
+        }));
         using var connection = OpenMemory();
         using var reader = Read(connection, """
             SELECT
@@ -135,11 +141,13 @@ public sealed class SqliteSessionDataReaderExtensionsTests
                 'thinking...' AS thinking_content,
                 'subagent-response' AS message_kind,
                 'api:cron:pr-doctor' AS sender_id,
-                1 AS is_replay_banner, 'run-42' AS agent_run_id, 1 AS tool_is_incomplete
-            """);
+                1 AS is_replay_banner, 'run-42' AS agent_run_id, 1 AS tool_is_incomplete,
+            """ + $"'{SqliteRunLeaseJson.Serialize(lease)}' AS run_lease_json");
 
         var entry = reader.MapHistoryEntry();
 
+        // The run lease on a crash sentinel maps from the run_lease_json column.
+        entry.RunLease.ShouldBe(lease);
         entry.PersistenceId.ShouldBe(42);
         entry.PersistenceKey.ShouldBe("key-42");
         entry.Role.ShouldBe(MessageRole.Assistant);
@@ -177,7 +185,8 @@ public sealed class SqliteSessionDataReaderExtensionsTests
                 NULL AS tool_call_id, 0 AS is_compaction_summary, NULL AS tool_args,
                 0 AS tool_is_error, 0 AS is_crash_sentinel, 0 AS is_history,
                 NULL AS trigger_type, NULL AS thinking_content, NULL AS message_kind,
-                NULL AS sender_id, 0 AS is_replay_banner, NULL AS agent_run_id, 0 AS tool_is_incomplete
+                NULL AS sender_id, 0 AS is_replay_banner, NULL AS agent_run_id, 0 AS tool_is_incomplete,
+                NULL AS run_lease_json
             """);
 
         var entry = reader.MapHistoryEntry();
@@ -204,6 +213,33 @@ public sealed class SqliteSessionDataReaderExtensionsTests
         entry.IsReplayBanner.ShouldBeFalse();
         entry.AgentRunId.ShouldBeNull();
         entry.ToolIsIncomplete.ShouldBeFalse();
+        // A NULL run_lease_json maps to no lease: every ordinary row and every pre-lease sentinel.
+        entry.RunLease.ShouldBeNull();
+    }
+
+    [Theory]
+    [InlineData("{not json")]
+    [InlineData("{}")]
+    [InlineData("\"just a string\"")]
+    [InlineData("{\"leaseId\":\" \",\"state\":\"Running\",\"attempt\":0,\"input\":{\"role\":\"user\",\"timestamp\":\"2026-01-02T03:04:05.0000000+00:00\",\"contentSha256\":\"abc\"},\"origin\":{\"role\":\"user\",\"timestamp\":\"2026-01-02T03:04:05.0000000+00:00\",\"contentSha256\":\"abc\"}}")]
+    public void MapHistoryEntry_UnreadableRunLease_MapsToNoLeaseInsteadOfFailingTheSession(string storedDocument)
+    {
+        using var connection = OpenMemory();
+        using var reader = Read(connection, """
+            SELECT
+                45 AS id,
+                NULL AS persistence_key,
+                'system' AS role, 'sentinel' AS content, NULL AS timestamp, NULL AS tool_name,
+                NULL AS tool_call_id, 0 AS is_compaction_summary, NULL AS tool_args,
+                0 AS tool_is_error, 1 AS is_crash_sentinel, 0 AS is_history,
+                NULL AS trigger_type, NULL AS thinking_content, NULL AS message_kind,
+                NULL AS sender_id, 0 AS is_replay_banner, NULL AS agent_run_id, 0 AS tool_is_incomplete,
+            """ + $"'{storedDocument}' AS run_lease_json");
+
+        var entry = reader.MapHistoryEntry();
+
+        entry.IsCrashSentinel.ShouldBeTrue("the row itself must still load");
+        entry.RunLease.ShouldBeNull("a lease that cannot be read is no lease; it must never make the session unreadable");
     }
 
     [Fact]

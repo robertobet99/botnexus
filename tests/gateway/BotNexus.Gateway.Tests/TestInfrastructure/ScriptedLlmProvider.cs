@@ -275,6 +275,12 @@ internal sealed class ProviderCall
     /// <summary>The prompt this call is answering: the last conversational user message.</summary>
     internal string? FinalUserText => UserTexts.Count == 0 ? null : UserTexts[^1];
 
+    /// <summary>
+    /// How many tool results the context carries. A warm agent still holds the interrupted turn's; an agent
+    /// rebuilt from the transcript holds none, because the transcript replays only user and assistant text.
+    /// </summary>
+    internal int ToolResultCount => _toolResultTexts.Count;
+
     /// <summary>True when any user, assistant or tool-result text in the context contains <paramref name="text"/>.</summary>
     internal bool ContextContains(string text)
         => UserTexts.Any(candidate => candidate.Contains(text, StringComparison.Ordinal))

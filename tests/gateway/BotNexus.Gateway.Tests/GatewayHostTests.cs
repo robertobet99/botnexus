@@ -2171,6 +2171,205 @@ public sealed partial class GatewayHostTests
             "crash sentinel must be removed from session history on clean turn completion (#363)");
     }
 
+    // Proves: every run, streaming or blocking and whichever channel started it, is admitted under a Running lease that names the stored inbound message before the model is called.
+    [Theory]
+    [InlineData("web", true)]
+    [InlineData("web", false)]
+    [InlineData("api", false)]
+    public async Task DispatchAsync_AdmitsTheRunUnderARunningLeaseNamingTheInboundMessage_BeforeTheModelIsCalled(string channelType, bool streams)
+    {
+        var router = new Mock<IMessageRouter>();
+        router.Setup(r => r.ResolveAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(["agent-lease"]);
+        var sessions = new InMemorySessionStore();
+        IReadOnlyList<SessionEntry>? historyWhenTheModelIsCalled = null;
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(h => h.AgentId).Returns(AgentId.From("agent-lease"));
+        handle.SetupGet(h => h.SessionId).Returns(SessionId.From("session-lease"));
+        handle.Setup(h => h.IsRunning).Returns(false);
+        handle.Setup(h => h.PromptAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(async (AgentUserMessage _, CancellationToken _) =>
+            {
+                historyWhenTheModelIsCalled = (await sessions.GetAsync(SessionId.From("session-lease")))?.GetHistorySnapshot();
+                return new AgentResponse { Content = "ok" };
+            });
+        handle.Setup(h => h.StreamAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()))
+            .Returns((AgentUserMessage _, CancellationToken _) => StreamAfterCapturingHistory());
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(s => s.GetOrCreateAsync(AgentId.From("agent-lease"), SessionId.From("session-lease"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(handle.Object);
+        var adapter = channelType == "api" ? null : CreateChannelAdapter(channelType, supportsStreaming: streams).Object;
+        await using var host = CreateHost(supervisor.Object, router.Object, sessions, new RecordingActivityBroadcaster(),
+            CreateChannelManager(adapter));
+
+        await host.DispatchAsync(CreateMessage("hello lease", sessionId: "session-lease", channelType: channelType));
+
+        var history = historyWhenTheModelIsCalled.ShouldNotBeNull();
+        var sentinel = history.Where(entry => entry.IsCrashSentinel).ShouldHaveSingleItem();
+        var lease = sentinel.RunLease.ShouldNotBeNull();
+        lease.State.ShouldBe(RunLeaseState.Running);
+        lease.Attempt.ShouldBe(0);
+        lease.Origin.ShouldBe(lease.Input);
+        var resolution = lease.Input.Resolve(history);
+        resolution.Match.ShouldBe(InputRefMatch.Single);
+        var inbound = resolution.Entry.ShouldNotBeNull();
+        inbound.Role.ShouldBe(MessageRole.User);
+        inbound.Content.ShouldBe("hello lease");
+
+        async IAsyncEnumerable<AgentStreamEvent> StreamAfterCapturingHistory()
+        {
+            historyWhenTheModelIsCalled = (await sessions.GetAsync(SessionId.From("session-lease")))?.GetHistorySnapshot();
+            yield return new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "ok" };
+        }
+    }
+
+    // Proves: two runs admitted for the same session get different leases, so recovery can tell a stale signal for the first from the second.
+    [Fact]
+    public async Task DispatchAsync_GivesEachRunItsOwnLeaseId()
+    {
+        var router = new Mock<IMessageRouter>();
+        router.Setup(r => r.ResolveAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(["agent-lease"]);
+        var sessions = new InMemorySessionStore();
+        var leaseIds = new List<RunLeaseId>();
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(h => h.AgentId).Returns(AgentId.From("agent-lease"));
+        handle.SetupGet(h => h.SessionId).Returns(SessionId.From("session-lease"));
+        handle.Setup(h => h.IsRunning).Returns(false);
+        handle.Setup(h => h.PromptAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(async (AgentUserMessage _, CancellationToken _) =>
+            {
+                var history = (await sessions.GetAsync(SessionId.From("session-lease")))?.GetHistorySnapshot() ?? [];
+                leaseIds.Add(history.Single(entry => entry.IsCrashSentinel).RunLease.ShouldNotBeNull().LeaseId);
+                return new AgentResponse { Content = "ok" };
+            });
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(s => s.GetOrCreateAsync(AgentId.From("agent-lease"), SessionId.From("session-lease"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(handle.Object);
+        await using var host = CreateHost(supervisor.Object, router.Object, sessions, new RecordingActivityBroadcaster(), CreateChannelManager());
+
+        await host.DispatchAsync(CreateMessage("first", sessionId: "session-lease", channelType: "api"));
+        await host.DispatchAsync(CreateMessage("second", sessionId: "session-lease", channelType: "api"));
+
+        leaseIds.Count.ShouldBe(2);
+        leaseIds[0].ShouldNotBe(leaseIds[1]);
+    }
+
+    // Proves: a replacement queued by recovery takes over its pending reservation instead of writing a sentinel of its own, runs under that very lease on the reserved attempt for its own stored copy of the input, clears every other orphaned sentinel, and gives the model the recovery block ahead of the original input while the transcript keeps the input exactly as sent.
+    [Fact]
+    public async Task DispatchAsync_RecoveryReplacement_AdoptsItsReservationAndFramesThePromptForTheModelOnly()
+    {
+        const string input = "Apply the scheduled change exactly once.";
+        var router = new Mock<IMessageRouter>();
+        router.Setup(r => r.ResolveAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(["agent-lease"]);
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("session-lease"), AgentId.From("agent-lease"));
+        var origin = new SessionEntry { Role = MessageRole.Assistant, Content = input, Timestamp = DateTimeOffset.UtcNow.AddMinutes(-1) };
+        session.AddEntry(origin);
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[orphaned sentinel]", IsCrashSentinel = true });
+        var reservation = RunLease.Admit(InputRef.For(origin)).QueueSuccessor("instance-a");
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.System,
+            Content = "[agent turn in progress]",
+            IsCrashSentinel = true,
+            RunLease = reservation
+        });
+        AgentUserMessage? sent = null;
+        IReadOnlyList<SessionEntry>? historyAtCall = null;
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(h => h.AgentId).Returns(AgentId.From("agent-lease"));
+        handle.SetupGet(h => h.SessionId).Returns(SessionId.From("session-lease"));
+        handle.Setup(h => h.IsRunning).Returns(false);
+        handle.Setup(h => h.PromptAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()))
+            .Returns((AgentUserMessage message, CancellationToken _) =>
+            {
+                sent = message;
+                historyAtCall = session.GetHistorySnapshot();
+                return Task.FromResult(new AgentResponse { Content = "ok" });
+            });
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(s => s.GetOrCreateAsync(AgentId.From("agent-lease"), SessionId.From("session-lease"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(handle.Object);
+        await using var host = CreateHost(supervisor.Object, router.Object, sessions, new RecordingActivityBroadcaster(), CreateChannelManager());
+        var recovery = new RecoveryContext
+        {
+            SuccessorLeaseId = reservation.LeaseId,
+            Attempt = 1,
+            MaxAttempts = 2,
+            CompletedCalls = [new RecoveredToolCall("call-1", "update_record", null)]
+        };
+
+        await host.DispatchAsync(CreateMessage(input, sessionId: "session-lease", channelType: "api")
+            with { SpeakAs = MessageRole.Assistant, Recovery = recovery });
+
+        var prompt = sent.ShouldNotBeNull().Content;
+        prompt.ShouldStartWith("[AUTOMATIC RECOVERY 1 of 2]");
+        prompt.ShouldContain("update_record");
+        prompt.ShouldEndWith(input);
+        var history = historyAtCall.ShouldNotBeNull();
+        var lease = history.Where(entry => entry.IsCrashSentinel).ShouldHaveSingleItem("the orphan is cleared and no second sentinel is written").RunLease.ShouldNotBeNull();
+        lease.LeaseId.ShouldBe(reservation.LeaseId, "the replacement runs under the reservation it was queued for");
+        lease.State.ShouldBe(RunLeaseState.Running);
+        lease.Attempt.ShouldBe(1);
+        lease.Origin.ShouldBe(reservation.Origin);
+        lease.QueuedBy.ShouldBeNull();
+        var ownCopy = lease.Input.Resolve(history).Entry.ShouldNotBeNull();
+        ReferenceEquals(ownCopy, origin).ShouldBeFalse("the run is admitted for the replacement's own stored copy");
+        ownCopy.Content.ShouldBe(input);
+        history.ShouldNotContain(entry => entry.Content.Contains("AUTOMATIC RECOVERY", StringComparison.Ordinal),
+            "the recovery block is for the model only and is never stored");
+    }
+
+    // Proves: a replacement whose reservation is missing, or already taken by a running lease, is dropped before it writes a row, writes a sentinel or reaches the model, so one reservation can never run twice.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DispatchAsync_RecoveryReplacementWithoutAPendingReservation_IsDroppedBeforeAnythingIsWritten(bool reservationAlreadyTaken)
+    {
+        const string input = "Apply the scheduled change exactly once.";
+        var router = new Mock<IMessageRouter>();
+        router.Setup(r => r.ResolveAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(["agent-lease"]);
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("session-lease"), AgentId.From("agent-lease"));
+        var origin = new SessionEntry { Role = MessageRole.Assistant, Content = input, Timestamp = DateTimeOffset.UtcNow.AddMinutes(-1) };
+        session.AddEntry(origin);
+        var reservationId = RunLeaseId.Create();
+        if (reservationAlreadyTaken)
+        {
+            var taken = RunLease.Admit(InputRef.For(origin)) with { LeaseId = reservationId };
+            session.AddEntry(new SessionEntry
+            {
+                Role = MessageRole.System,
+                Content = "[agent turn in progress]",
+                IsCrashSentinel = true,
+                RunLease = taken
+            });
+        }
+
+        var before = session.GetHistorySnapshot();
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(h => h.AgentId).Returns(AgentId.From("agent-lease"));
+        handle.SetupGet(h => h.SessionId).Returns(SessionId.From("session-lease"));
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(s => s.GetOrCreateAsync(AgentId.From("agent-lease"), SessionId.From("session-lease"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(handle.Object);
+        await using var host = CreateHost(supervisor.Object, router.Object, sessions, new RecordingActivityBroadcaster(), CreateChannelManager());
+
+        await host.DispatchAsync(CreateMessage(input, sessionId: "session-lease", channelType: "api")
+            with
+            {
+                SpeakAs = MessageRole.Assistant,
+                Recovery = new RecoveryContext { SuccessorLeaseId = reservationId, Attempt = 1, MaxAttempts = 2 }
+            });
+
+        handle.Verify(h => h.PromptAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()), Times.Never);
+        handle.Verify(h => h.StreamAsync(It.IsAny<AgentUserMessage>(), It.IsAny<CancellationToken>()), Times.Never);
+        session.GetHistorySnapshot().ShouldBe(before, "a dropped replacement writes nothing at all");
+    }
+
     [Fact]
     public async Task DispatchAsync_WhenPreviousTurnAbandonedMidTool_StopsHandleAndNotifiesUser()
     {

@@ -281,6 +281,7 @@ public sealed class DomainArchitectureTests
     [InlineData(typeof(MarketplaceId))]
     [InlineData(typeof(WorkingDir))]
     [InlineData(typeof(ConversationTitle))]
+    [InlineData(typeof(RunLeaseId))]
     public void Phase3ValueObject_IsVogenAndHasNoImplicitStringConversion(Type type)
     {
         var attribute = type.GetCustomAttributes()

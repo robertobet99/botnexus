@@ -130,6 +130,57 @@ public sealed class TerminalRunOutcomeTests
         => await Should.NotThrowAsync(() => TerminalRunOutcome.PublishAfterSaveAsync(
             null, NewSession(), SessionLifecycleEventType.TerminalFailure, SessionSaveOutcome.Persisted, CancellationToken.None));
 
+    // Proves: a failure is recorded on the run's own lease and on no other, so a follow-up's or a later run's lease can never be marked by mistake.
+    [Fact]
+    public void MarkLeaseFailed_RecordsTheFailureOnTheRunsOwnLeaseOnly()
+    {
+        var session = NewSession();
+        var ownLease = AddLeasedSentinel(session, "first message");
+        var otherLease = AddLeasedSentinel(session, "second message");
+        var runId = DomainAgentRunId.Create();
+
+        var marked = TerminalRunOutcome.MarkLeaseFailed(session, ownLease.LeaseId, "provider rejected the request", runId);
+
+        marked.ShouldBeTrue();
+        var leases = session.GetHistorySnapshot().Where(entry => entry.IsCrashSentinel)
+            .Select(entry => entry.RunLease.ShouldNotBeNull()).ToList();
+        leases.Count.ShouldBe(2);
+        leases[0].LeaseId.ShouldBe(ownLease.LeaseId);
+        leases[0].State.ShouldBe(RunLeaseState.Failed);
+        leases[0].FailureDetail.ShouldBe("provider rejected the request");
+        leases[0].FailedRunId.ShouldBe(runId);
+        leases[0].FailedAt.ShouldNotBeNull();
+        leases[1].ShouldBe(otherLease, "another run's lease must be left exactly as it was");
+    }
+
+    // Proves: a run started without a lease, or whose lease is no longer on the session, marks nothing and says so.
+    [Fact]
+    public void MarkLeaseFailed_WithoutAMatchingLease_ReturnsFalseAndChangesNothing()
+    {
+        var session = NewSession();
+        var lease = AddLeasedSentinel(session, "first message");
+        var before = session.GetHistorySnapshot();
+
+        TerminalRunOutcome.MarkLeaseFailed(session, null, "boom", null).ShouldBeFalse("no lease id");
+        TerminalRunOutcome.MarkLeaseFailed(session, RunLeaseId.Create(), "boom", null).ShouldBeFalse("a lease that is not on the session");
+
+        session.GetHistorySnapshot().ShouldBe(before);
+        session.GetHistorySnapshot().Single(entry => entry.IsCrashSentinel).RunLease.ShouldBe(lease);
+    }
+
+    // Proves: the failure detail a lease keeps is bounded by the lease itself, however long the run's error text was.
+    [Fact]
+    public void MarkLeaseFailed_BoundsALongFailureDetail()
+    {
+        var session = NewSession();
+        var lease = AddLeasedSentinel(session, "first message");
+
+        TerminalRunOutcome.MarkLeaseFailed(session, lease.LeaseId, new string('x', 5000), null).ShouldBeTrue();
+
+        var detail = session.GetHistorySnapshot().Single(entry => entry.IsCrashSentinel).RunLease.ShouldNotBeNull().FailureDetail.ShouldNotBeNull();
+        detail.Length.ShouldBeLessThanOrEqualTo(RunLease.MaxFailureDetailLength);
+    }
+
     // The blocking boundary reads the settled response; the stream boundary emits an Error event first from the terminal turn, else at run end.
     private static void AssertBothBoundariesAgree(AssistantAgentMessage? terminalTurn, RunCompletionResult completion, string expected)
     {
@@ -157,6 +208,16 @@ public sealed class TerminalRunOutcomeTests
 
     private static GatewaySession NewSession()
         => new() { SessionId = SessionId.From("session-terminal-outcome"), AgentId = AgentId.From("agent-terminal-outcome") };
+
+    // An inbound message and the sentinel the host would write for it, as a run starting now would leave them.
+    private static RunLease AddLeasedSentinel(GatewaySession session, string content)
+    {
+        var input = new SessionEntry { Role = MessageRole.User, Content = content };
+        session.AddEntry(input);
+        var lease = RunLease.Admit(InputRef.For(input));
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "[agent turn in progress]", IsCrashSentinel = true, RunLease = lease });
+        return lease;
+    }
 
     private static (SessionLifecycleEvents Events, List<SessionLifecycleEvent> Published) Subscribe()
     {

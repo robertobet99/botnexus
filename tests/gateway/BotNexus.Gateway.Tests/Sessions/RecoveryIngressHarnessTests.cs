@@ -1,4 +1,6 @@
 using System.Reflection;
+using BotNexus.Domain.Primitives;
+using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Tests.TestInfrastructure;
 
@@ -166,5 +168,99 @@ public sealed class RecoveryIngressHarnessTests
         saves[runSaves.Count + 2].Persisted.ShouldBeTrue(diagnostics);
         for (var index = 1; index < saves.Count; index++)
             saves[index].Sequence.ShouldBeGreaterThan(saves[index - 1].Sequence, "completion order is sequence order");
+    }
+
+    // Proves: once the armed save has persisted, the recording store refuses every later write, fenced or not, records each refusal, still serves reads, and leaves the save that triggered the crash durable.
+    [Fact]
+    public async Task RecordingSessionStore_AfterTheArmedSave_RefusesEveryWriteAndStillServesReads()
+    {
+        await using var harness = await RecoveryIngressHarness.StartAsync(new RecoveryIngressOptions(
+        [
+            ScriptStep.Text("The thread is open.")
+        ]));
+        var conversation = await harness.CreateConversationAsync();
+        var receipt = await harness.PostViaControllerAsync(conversation.ConversationId, "Open the thread.");
+        await harness.AwaitTurnsAsync(1);
+        var session = await harness.ReadSessionAsync(receipt.SessionId);
+        var fence = SessionWriteFence.Capture(session);
+        harness.Saves.CrashAfterSaveThat(history => history.Any(entry => entry.Content == "marker-before-the-crash"));
+
+        session.AddEntry(new SessionEntry { Role = MessageRole.Notification, Content = "an earlier note" });
+        (await harness.SessionStore.SaveAsync(session, fence)).ShouldBe(SessionSaveOutcome.Persisted);
+        harness.Saves.Crashed.ShouldBeFalse("a save that does not match must not crash the store");
+
+        session.AddEntry(new SessionEntry { Role = MessageRole.Notification, Content = "marker-before-the-crash" });
+        (await harness.SessionStore.SaveAsync(session, fence)).ShouldBe(SessionSaveOutcome.Persisted);
+        harness.Saves.Crashed.ShouldBeTrue("the matching save is the last one that persists");
+
+        await Should.ThrowAsync<IOException>(() => harness.SessionStore.SaveAsync(session, fence));
+        await Should.ThrowAsync<IOException>(() => harness.SessionStore.SaveAsync(session));
+        await Should.ThrowAsync<IOException>(() => harness.SessionStore.PatchMetadataAsync(
+            receipt.SessionId, new Dictionary<string, object?> { ["key"] = "value" }, CancellationToken.None));
+
+        harness.Saves.RefusedWrites
+            .Select(write => $"{write.Operation}{(write.Fenced ? "/fenced" : string.Empty)}")
+            .ToList()
+            .ShouldBe(
+                [$"{nameof(ISessionStore.SaveAsync)}/fenced", nameof(ISessionStore.SaveAsync), nameof(ISessionStore.PatchMetadataAsync)],
+                "each refused write is recorded, in the order it was attempted");
+        harness.Saves.FencedSaves.Count(save => save.Persisted).ShouldBeGreaterThanOrEqualTo(2, "a refused write is not a completed save");
+        var read = await harness.SessionStore.GetAsync(receipt.SessionId);
+        read.ShouldNotBeNull().GetHistorySnapshot().ShouldContain(
+            entry => entry.Content == "marker-before-the-crash", "the save that triggered the crash stays durable and reads keep working");
+    }
+
+    // Proves: the crash can also be armed on an unfenced save, the write-ahead kind the host makes before a run, and it behaves the same way afterwards.
+    [Fact]
+    public async Task RecordingSessionStore_CanCrashAfterAnUnfencedSaveToo()
+    {
+        await using var harness = await RecoveryIngressHarness.StartAsync(new RecoveryIngressOptions(
+        [
+            ScriptStep.Text("The thread is open.")
+        ]));
+        var conversation = await harness.CreateConversationAsync();
+        var receipt = await harness.PostViaControllerAsync(conversation.ConversationId, "Open the thread.");
+        await harness.AwaitTurnsAsync(1);
+        var session = await harness.ReadSessionAsync(receipt.SessionId);
+        harness.Saves.CrashAfterSaveThat(history => history.Any(entry => entry.Content == "marker-before-the-crash"));
+
+        session.AddEntry(new SessionEntry { Role = MessageRole.Notification, Content = "marker-before-the-crash" });
+        await harness.SessionStore.SaveAsync(session);
+
+        harness.Saves.Crashed.ShouldBeTrue("the matching unfenced save is the last write that persists");
+        await Should.ThrowAsync<IOException>(() => harness.SessionStore.SaveAsync(session));
+        harness.Saves.RefusedWrites.ShouldHaveSingleItem().Fenced.ShouldBeFalse();
+    }
+
+    // Proves: a second graph over the same durable disk finds the conversation, the session and the effects marker the first made durable, which is what a restarted process finds.
+    [Fact]
+    public async Task DurableDisk_LetsASecondGraphSeeWhatTheFirstMadeDurable()
+    {
+        using var disk = new DurableTestDisk();
+        IngressReceipt receipt;
+        await using (var first = await RecoveryIngressHarness.StartAsync(new RecoveryIngressOptions(
+        [
+            ScriptStep.ToolCall(SideEffectToolContributor.ToolName, "call-effect-1"),
+            ScriptStep.Text("The scheduled change is applied.")
+        ])
+        { Durable = disk }))
+        {
+            var conversation = await first.CreateConversationAsync();
+            receipt = await first.PostViaControllerAsync(conversation.ConversationId, "Apply the scheduled change.");
+            await first.AwaitTurnsAsync(1);
+            first.Effects.EffectCount.ShouldBe(1, await first.DescribeAsync());
+        }
+
+        await using var second = await RecoveryIngressHarness.StartAsync(new RecoveryIngressOptions([]) { Durable = disk });
+
+        var diagnostics = await second.DescribeAsync();
+        (await second.ConversationStore.GetAsync(receipt.ConversationId))
+            .ShouldNotBeNull($"the conversation must be durable, not just the session{Environment.NewLine}{diagnostics}");
+        var history = (await second.ReadSessionAsync(receipt.SessionId)).GetHistorySnapshot();
+        history.ShouldContain(
+            entry => entry.Role.Equals(MessageRole.Assistant) && entry.Content.Mentions("applied"),
+            $"the finished turn must be in the new graph's transcript{Environment.NewLine}{diagnostics}");
+        second.Effects.EffectCount.ShouldBe(1, $"the effects marker is shared by every graph over the disk{Environment.NewLine}{diagnostics}");
+        second.Provider.CallCount.ShouldBe(0, "reading what is durable must not reach the model");
     }
 }

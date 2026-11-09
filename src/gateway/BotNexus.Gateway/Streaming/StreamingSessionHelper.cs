@@ -85,6 +85,9 @@ public static class StreamingSessionHelper
         AgentResponseUsage? runUsage = null;
         var turnCount = 0;
         AgentRunId? agentRunId = null;
+        // The latest error the run reported, in the same words its error row carries, so the run's lease
+        // records the failure the transcript shows rather than a second account of it.
+        string? terminalError = null;
 
         // Apply stall watchdog if configured — wraps the stream with inactivity timeout.
         var effectiveStream = options.StallWatchdog is not null
@@ -94,6 +97,8 @@ public static class StreamingSessionHelper
         await foreach (var evt in effectiveStream.WithCancellation(cancellationToken))
         {
             agentRunId = evt.AgentRunId ?? agentRunId;
+            if (evt.Type == AgentStreamEventType.Error && !string.IsNullOrWhiteSpace(evt.ErrorMessage))
+                terminalError = evt.ErrorMessage;
             switch (evt.Type)
             {
                 case AgentStreamEventType.ContentDelta when evt.ContentDelta is not null:
@@ -449,10 +454,29 @@ public static class StreamingSessionHelper
 
         // A failed terminal completion is recoverable work, not a clean lease release. Keep the
         // sentinel through the authoritative save so the live recovery subscriber (or startup scan
-        // after a crash) has the same durable marker to accept-before-consume (#4406).
+        // after a crash) has the same durable marker to accept-before-consume (#4406). The run's own
+        // lease on that sentinel is recorded as failed in this same save, so the error row, the
+        // completion and the failed lease become durable together or not at all.
         var terminalFailure = TerminalRunOutcome.IsFailure(runCompletion);
-        if (!terminalFailure)
+        if (terminalFailure)
+        {
+            if (!TerminalRunOutcome.MarkLeaseFailed(
+                    session, options.RunLeaseId, TerminalRunOutcome.ResolveDetail(terminalError, runCompletion), agentRunId)
+                && options.RunLeaseId is not null)
+            {
+                options.Logger?.LogWarning(
+                    "The failed run's lease was not found on session {SessionId}; recovery will treat the sentinel as unleased.",
+                    session.SessionId.Value);
+            }
+        }
+        else
+        {
+            // Clean completion sweeps every sentinel except a pending reservation, as the blocking branch
+            // does and always has. It is not narrowed to this run's own lease; the reason is given where the
+            // blocking branch applies the same sweep (GatewayHost, "Remove crash sentinel on clean turn
+            // completion").
             session.RemoveCrashSentinels();
+        }
 
         // #1518: the final write is the authoritative post-run finalizer save. When a fence was
         // supplied, honour it so a delete/reset that landed mid-stream cannot be undone here. On
@@ -469,7 +493,8 @@ public static class StreamingSessionHelper
                 ? SessionLifecycleEventType.TerminalFailure
                 : SessionLifecycleEventType.Closed,
             finalOutcome,
-            cancellationToken);
+            cancellationToken,
+            terminalFailure ? options.RunLeaseId : null);
 
         // #2613: materialise the tool timeline through the single shared policy, so the streaming
         // boundary hands back exactly the record shape the blocking boundary produces.
@@ -596,6 +621,11 @@ public static class StreamingSessionHelper
 /// <c>session_history</c> nor gets re-sent to the model on the next turn. <c>0</c> (the default)
 /// disables the cap. See issue #1598.
 /// </param>
+/// <param name="RunLeaseId">
+/// The run lease the host wrote on the crash sentinel before the run. When the run settles as failed,
+/// that lease, and only that lease, is recorded as failed in the same final save as the error row.
+/// Null for callers that start a stream without writing a lease.
+/// </param>
 public sealed record StreamingSessionOptions(
     bool IncludeErrorsInHistory = false,
     Func<AgentStreamEvent, CancellationToken, ValueTask>? OnEventAsync = null,
@@ -604,7 +634,8 @@ public sealed record StreamingSessionOptions(
     MessageKind? AssistantMessageKind = null,
     IToolAuditSink? ToolAuditSink = null,
     ILogger? Logger = null,
-    Sessions.IContextExhaustionNotifier? ContextExhaustionNotifier = null);
+    Sessions.IContextExhaustionNotifier? ContextExhaustionNotifier = null,
+    RunLeaseId? RunLeaseId = null);
 
 /// <summary>
 /// Represents the accumulated results of stream processing.

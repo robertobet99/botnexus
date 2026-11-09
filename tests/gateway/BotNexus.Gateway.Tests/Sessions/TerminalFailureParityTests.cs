@@ -399,6 +399,27 @@ public sealed class TerminalFailureParityTests
         durableSave.RunCompletionAtSave.ShouldNotBeNull(diagnostics).Status.Equals("Failed", StringComparison.OrdinalIgnoreCase)
             .ShouldBeTrue($"the persisted completion must be Failed{Environment.NewLine}{diagnostics}");
 
+        // The run's lease on that sentinel records the failure in the very save that persisted the error row,
+        // and still names the input the run was admitted for.
+        var lease = history.SentinelLeases().ShouldHaveSingleItem(
+            $"the failed run's lease must stay on its sentinel{Environment.NewLine}{diagnostics}");
+        lease.State.ShouldBe(RunLeaseState.Failed, diagnostics);
+        lease.Attempt.ShouldBe(0, diagnostics);
+        lease.Origin.ShouldBe(lease.Input, $"an original run's origin is its own input{Environment.NewLine}{diagnostics}");
+        lease.FailedRunId.ShouldBe(errorRows[0].AgentRunId, $"the lease must name the run that failed{Environment.NewLine}{diagnostics}");
+        lease.FailedAt.ShouldNotBeNull(diagnostics);
+        var detail = lease.FailureDetail.ShouldNotBeNull($"the lease must record why the run failed{Environment.NewLine}{diagnostics}");
+        detail.Mentions(DetailNeedle(shape)).ShouldBeTrue($"the lease detail must match the error row's{Environment.NewLine}{diagnostics}");
+        detail.Length.ShouldBeLessThanOrEqualTo(RunLease.MaxFailureDetailLength, diagnostics);
+        var input = lease.Input.Resolve(history);
+        input.Match.ShouldBe(InputRefMatch.Single, $"the lease must resolve to exactly one stored input{Environment.NewLine}{diagnostics}");
+        input.Entry.ShouldNotBeNull(diagnostics).Content.Mentions(Instruction)
+            .ShouldBeTrue($"the lease must name the message the run was admitted for{Environment.NewLine}{diagnostics}");
+        durableSave.HistoryAtSave.SentinelLeases().ShouldHaveSingleItem(
+            $"the persisted transcript must carry the failed lease with the error row{Environment.NewLine}{diagnostics}").ShouldBe(lease, diagnostics);
+        failures[0].HistoryAtPublish.SentinelLeases().ShouldHaveSingleItem(
+            $"the published session must carry the failed lease{Environment.NewLine}{diagnostics}").LeaseId.ShouldBe(lease.LeaseId, diagnostics);
+
         history.HasCrashSentinel().ShouldBeTrue(
             $"the sentinel is recovery's durable marker and must survive the host's finalization{Environment.NewLine}{diagnostics}");
     }

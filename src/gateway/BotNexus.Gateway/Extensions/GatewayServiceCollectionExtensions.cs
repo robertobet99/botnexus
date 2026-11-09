@@ -521,7 +521,8 @@ public static class GatewayServiceCollectionExtensions
             sp.GetService<IOptions<GatewayOptions>>(),
             sp.GetService<IConversationStore>(),
             sp.GetService<SessionLifecycleEvents>(),
-            sp.GetService<Diagnostics.CleanShutdownMarker>()));
+            sp.GetService<Diagnostics.CleanShutdownMarker>(),
+            sp.GetService<Sessions.ISessionTurnTracker>()));
         services.AddHostedService<SessionCleanupService>();
         // Session/conversation consistency monitor + safe auto-heal path (#2046).
         services.TryAddSingleton<Sessions.SessionConsistencyChecker>();

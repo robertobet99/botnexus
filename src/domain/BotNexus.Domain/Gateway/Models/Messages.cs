@@ -169,6 +169,13 @@ public sealed record InboundMessage
     public MessageKind? Kind { get; init; }
 
     /// <summary>
+    /// Present only on a replacement the gateway's recovery service queued for an interrupted run. It names
+    /// the reservation the replacement takes over and what the interrupted work is known to have done. The
+    /// host validates it against the session before trusting it; no channel or request can supply it.
+    /// </summary>
+    public RecoveryContext? Recovery { get; init; }
+
+    /// <summary>
     /// Resolves the effective <see cref="MessageKind"/> for this message, mapping the unset
     /// <see cref="Kind"/> to <see cref="MessageKind.Message"/> so every consumer reads a concrete,
     /// non-null kind and legacy/unstamped messages default safely.

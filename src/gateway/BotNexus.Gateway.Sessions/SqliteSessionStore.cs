@@ -1934,7 +1934,11 @@ public sealed partial class SqliteSessionStore : SessionStoreBase, IConversation
                      ("persistence_key", "TEXT"),
                      ("tool_invocation_id", "INTEGER"),
                      ("agent_run_id", "TEXT"),
-                     ("tool_is_incomplete", "INTEGER NOT NULL DEFAULT 0")
+                     ("tool_is_incomplete", "INTEGER NOT NULL DEFAULT 0"),
+                     // The run lease the gateway writes on a crash sentinel when it admits a run, as one
+                     // JSON document. Idempotent ALTER; NULL for every other row and for every sentinel
+                     // written before leases existed, which read back as lease-less.
+                     ("run_lease_json", "TEXT")
                  })
         {
             await using var cmd = connection.CreateCommand();
@@ -2431,7 +2435,8 @@ public sealed partial class SqliteSessionStore : SessionStoreBase, IConversation
                         WHEN h.message_kind='tool-start' OR h.tool_args_from_invocation=1
                         THEN i.arguments_json END AS tool_args,
                    h.tool_is_error, h.is_crash_sentinel, h.is_history, h.trigger_type, h.thinking_content,
-                   h.message_kind, h.sender_id, h.is_replay_banner, h.agent_run_id, h.tool_is_incomplete
+                   h.message_kind, h.sender_id, h.is_replay_banner, h.agent_run_id, h.tool_is_incomplete,
+                   h.run_lease_json
             FROM session_history h
             LEFT JOIN tool_invocations i ON i.id=h.tool_invocation_id AND i.session_id=h.session_id
             WHERE h.session_id = $sessionId
@@ -2827,6 +2832,7 @@ public sealed partial class SqliteSessionStore : SessionStoreBase, IConversation
                 persistence_key = $persistenceKey,
                 agent_run_id = $agentRunId,
                 tool_is_incomplete = $toolIsIncomplete,
+                run_lease_json = $runLeaseJson,
                 tool_invocation_id = NULL,
                 tool_args_from_invocation = 0,
                 tool_content_from_invocation = 0
@@ -2852,11 +2858,13 @@ public sealed partial class SqliteSessionStore : SessionStoreBase, IConversation
                   is_replay_banner IS NOT $isReplayBanner OR
                   persistence_key IS NOT $persistenceKey OR
                   agent_run_id IS NOT $agentRunId OR
-                  tool_is_incomplete IS NOT $toolIsIncomplete
+                  tool_is_incomplete IS NOT $toolIsIncomplete OR
+                  run_lease_json IS NOT $runLeaseJson
               )
             """;
         command.Parameters.AddWithValue("$agentRunId", (object?)entry.AgentRunId?.Value ?? DBNull.Value);
         command.Parameters.AddWithValue("$toolIsIncomplete", entry.ToolIsIncomplete ? 1 : 0);
+        command.Parameters.AddWithValue("$runLeaseJson", (object?)SqliteRunLeaseJson.Serialize(entry.RunLease) ?? DBNull.Value);
         command.Parameters.AddWithValue("$id", entry.PersistenceId!.Value);
         command.Parameters.AddWithValue("$sessionId", sessionId.Value);
         command.Parameters.AddWithValue("$role", entry.Role.Value);
@@ -2960,8 +2968,8 @@ public sealed partial class SqliteSessionStore : SessionStoreBase, IConversation
         await using var insertCommand = connection.CreateCommand();
         insertCommand.Transaction = transaction;
         insertCommand.CommandText = """
-            INSERT INTO session_history (session_id, role, content, timestamp, tool_name, tool_call_id, is_compaction_summary, tool_args, tool_is_error, is_crash_sentinel, is_history, trigger_type, thinking_content, message_kind, sender_id, is_replay_banner, persistence_key, agent_run_id, tool_is_incomplete, tool_args_from_invocation)
-            VALUES ($sessionId, $role, $content, $timestamp, $toolName, $toolCallId, $isCompactionSummary, $toolArgs, $toolIsError, $isCrashSentinel, $isHistory, $triggerType, $thinkingContent, $messageKind, $senderId, $isReplayBanner, $persistenceKey, $agentRunId, $toolIsIncomplete, $toolArgsFromInvocation)
+            INSERT INTO session_history (session_id, role, content, timestamp, tool_name, tool_call_id, is_compaction_summary, tool_args, tool_is_error, is_crash_sentinel, is_history, trigger_type, thinking_content, message_kind, sender_id, is_replay_banner, persistence_key, agent_run_id, tool_is_incomplete, tool_args_from_invocation, run_lease_json)
+            VALUES ($sessionId, $role, $content, $timestamp, $toolName, $toolCallId, $isCompactionSummary, $toolArgs, $toolIsError, $isCrashSentinel, $isHistory, $triggerType, $thinkingContent, $messageKind, $senderId, $isReplayBanner, $persistenceKey, $agentRunId, $toolIsIncomplete, $toolArgsFromInvocation, $runLeaseJson)
             ON CONFLICT(session_id, persistence_key) WHERE persistence_key IS NOT NULL DO NOTHING
             RETURNING id
             """;
@@ -2990,6 +2998,8 @@ public sealed partial class SqliteSessionStore : SessionStoreBase, IConversation
         var pAgentRunId = insertCommand.Parameters.AddWithValue("$agentRunId", DBNull.Value);
         var pIncomplete = insertCommand.Parameters.AddWithValue("$toolIsIncomplete", 0);
         var pArgsFromInvocation = insertCommand.Parameters.AddWithValue("$toolArgsFromInvocation", 0);
+        // NULL for every row except a crash sentinel that carries a run lease.
+        var pRunLease = insertCommand.Parameters.AddWithValue("$runLeaseJson", DBNull.Value);
 
         await using var existingIdCommand = connection.CreateCommand();
         existingIdCommand.Transaction = transaction;
@@ -3030,6 +3040,7 @@ public sealed partial class SqliteSessionStore : SessionStoreBase, IConversation
             pAgentRunId.Value = (object?)entry.AgentRunId?.Value ?? DBNull.Value;
             pIncomplete.Value = entry.ToolIsIncomplete ? 1 : 0;
             pArgsFromInvocation.Value = entry.Kind == MessageKind.ToolResult && entry.ToolCallId is not null && entry.ToolArgs is not null ? 1 : 0;
+            pRunLease.Value = (object?)SqliteRunLeaseJson.Serialize(entry.RunLease) ?? DBNull.Value;
             var insertedId = await insertCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
             long durableId;
             if (insertedId is long newId)

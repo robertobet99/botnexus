@@ -217,6 +217,66 @@ public sealed class PrepareBulkInsertSessionTests : IDisposable
         rows.ShouldNotContain(r => r.Content == "first-c");
     }
 
+    [Fact]
+    public async Task ReplaceHistory_RunLeasePerRow_DoesNotBleedAcrossRows()
+    {
+        var store = CreateStore();
+        var session = await store.GetOrCreateAsync(SessionId.From("s-lease-rows"), AgentId.From("agent-a"));
+        var leaseA = RunLease.Admit(InputRef.For(new SessionEntry { Role = MessageRole.User, Content = "first request" }));
+        var leaseB = RunLease.Admit(InputRef.For(new SessionEntry { Role = MessageRole.User, Content = "second request" }))
+            .MarkFailed(DateTimeOffset.UtcNow, "backend error", AgentRunId.From("run-b"));
+
+        // A row with a lease sits between rows without one, so a lease parameter that was not reset for the
+        // next row would show up on a neighbour.
+        session.AddEntries(
+        [
+            new SessionEntry { Role = MessageRole.User, Content = "first request" },
+            new SessionEntry { Role = MessageRole.System, Content = "sentinel-a", IsCrashSentinel = true, RunLease = leaseA },
+            new SessionEntry { Role = MessageRole.Assistant, Content = "answer" },
+            new SessionEntry { Role = MessageRole.System, Content = "sentinel-b", IsCrashSentinel = true, RunLease = leaseB },
+            new SessionEntry { Role = MessageRole.User, Content = "second request" },
+        ]);
+        await store.SaveAsync(session);
+
+        var rows = (await CreateStore().GetAsync(SessionId.From("s-lease-rows"))).ShouldNotBeNull().GetHistorySnapshot().ToList();
+
+        rows.Count.ShouldBe(5);
+        rows[0].RunLease.ShouldBeNull();
+        rows[1].RunLease.ShouldBe(leaseA);
+        rows[2].RunLease.ShouldBeNull("the lease of the row before must not bleed into this one");
+        rows[3].RunLease.ShouldBe(leaseB);
+        rows[4].RunLease.ShouldBeNull("the lease of the row before must not bleed into this one");
+    }
+
+    [Fact]
+    public async Task ReplaceHistory_OnReSave_UpdatesAChangedLeaseInPlaceAndNothingElse()
+    {
+        var firstStore = CreateStore();
+        var session = await firstStore.GetOrCreateAsync(SessionId.From("s-lease-update"), AgentId.From("agent-a"));
+        var lease = RunLease.Admit(InputRef.For(new SessionEntry { Role = MessageRole.User, Content = "request" }));
+        session.AddEntries(
+        [
+            new SessionEntry { Role = MessageRole.User, Content = "request" },
+            new SessionEntry { Role = MessageRole.Assistant, Content = "unrelated answer" },
+            new SessionEntry { Role = MessageRole.System, Content = "sentinel", IsCrashSentinel = true, RunLease = lease },
+        ]);
+        await firstStore.SaveAsync(session);
+
+        var secondStore = CreateStore();
+        var reloaded = (await secondStore.GetAsync(SessionId.From("s-lease-update"))).ShouldNotBeNull();
+        reloaded.TryUpdateRunLease(lease.LeaseId, current => current.MarkFailed(DateTimeOffset.UtcNow, "backend error", null)).ShouldBeTrue();
+        await secondStore.SaveAsync(reloaded);
+
+        // Only the sentinel row changed, so a diff predicate that ignored the lease would update nothing.
+        secondStore.LastHistoryWriteReconciled.ShouldBeTrue();
+        secondStore.LastHistoryRowsMutated.ShouldBe(1);
+        var rows = (await CreateStore().GetAsync(SessionId.From("s-lease-update"))).ShouldNotBeNull().GetHistorySnapshot().ToList();
+        rows.Count.ShouldBe(3);
+        rows[2].RunLease.ShouldNotBeNull().State.ShouldBe(RunLeaseState.Failed);
+        rows[0].RunLease.ShouldBeNull();
+        rows[1].RunLease.ShouldBeNull();
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directoryPath))
