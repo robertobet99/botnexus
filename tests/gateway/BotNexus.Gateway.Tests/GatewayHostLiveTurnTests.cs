@@ -125,19 +125,17 @@ public sealed class GatewayHostLiveTurnTests
 
         public void Release() => _gate.TrySetResult();
 
-        /// <summary>Polls the store, with a bounded wait, until the in-flight tool start has been saved.</summary>
+        /// <summary>Waits, with a bounded poll, until the in-flight tool start has been saved, then forgets earlier supervisor calls.</summary>
         public async Task WaitForToolStartRowAsync()
         {
-            var deadline = DateTime.UtcNow + WaitLimit;
-            while (DateTime.UtcNow < deadline)
-            {
-                var history = await ReadStoredHistoryAsync();
-                if (history.Any(e => e.ToolCallId == "call-1" && e.IsToolStartRow()))
-                    return;
-                await Task.Delay(25);
-            }
+            await TestAwait.EventuallyAsync(
+                async () => (await ReadStoredHistoryAsync()).Any(e => e.ToolCallId == "call-1" && e.IsToolStartRow()),
+                "the in-flight tool-start row to be stored while the first turn is running",
+                timeout: WaitLimit);
 
-            throw new TimeoutException("The tool-start row was not stored while the first turn was running.");
+            // The host stops the handle once for a session with empty history (fresh system prompt).
+            // That call belongs to the first turn, so only calls after this point are under test.
+            Supervisor.Invocations.Clear();
         }
 
         public async Task<IReadOnlyList<SessionEntry>> ReadStoredHistoryAsync()
