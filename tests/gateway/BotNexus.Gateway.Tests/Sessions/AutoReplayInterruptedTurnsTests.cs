@@ -3,11 +3,16 @@ using BotNexus.Domain.World;
 using BotNexus.Gateway.Abstractions.Activity;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Channels;
+using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Configuration;
 using BotNexus.Gateway.Dispatching;
+using BotNexus.Gateway.Diagnostics;
+using System.IO.Abstractions.TestingHelpers;
 using BotNexus.Gateway.Sessions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -26,11 +31,14 @@ public sealed class AutoReplayInterruptedTurnsTests
         ChannelKey? channelType = null,
         SessionType? sessionType = null,
         string? lastUserContent = null,
-        int existingReplayCount = 0)
+        int existingReplayCount = 0,
+        MessageRole? initiatingRole = null,
+        string? initiatingSenderId = null)
     {
         var session = new GatewaySession
         {
             SessionId = SessionId.From(sessionId),
+            ConversationId = ConversationId.From($"conv-{sessionId}"),
             AgentId = AgentId.From(agentId),
             Status = SessionStatus.Active,
             UpdatedAt = DateTimeOffset.UtcNow,
@@ -43,8 +51,9 @@ public sealed class AutoReplayInterruptedTurnsTests
         {
             session.AddEntry(new SessionEntry
             {
-                Role = MessageRole.User,
+                Role = initiatingRole ?? MessageRole.User,
                 Content = lastUserContent,
+                SenderId = initiatingSenderId,
                 Timestamp = DateTimeOffset.UtcNow.AddMinutes(-1)
             });
         }
@@ -82,11 +91,24 @@ public sealed class AutoReplayInterruptedTurnsTests
     private static Mock<ISessionStore> CreateStore(params GatewaySession[] sessions)
     {
         var store = new Mock<ISessionStore>();
-        store.Setup(s => s.ListAsync(It.IsAny<AgentId?>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((AgentId? agentId, CancellationToken _) =>
-                sessions.Where(s => !agentId.HasValue || s.AgentId == agentId.Value).ToList());
-        store.Setup(s => s.SaveAsync(It.IsAny<GatewaySession>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+        store.Setup(s => s.ListUnresolvedCrashSentinelsAsync(
+                It.IsAny<int>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((int limit, string? cursor, CancellationToken _) =>
+            {
+                var page = sessions
+                    .Where(session => session.History.Any(entry => entry.IsCrashSentinel))
+                    .OrderBy(session => session.SessionId.Value, StringComparer.Ordinal)
+                    .Where(session => cursor is null || string.CompareOrdinal(session.SessionId.Value, cursor) > 0)
+                    .Take(limit)
+                    .ToList();
+                return new UnresolvedCrashSentinelPage(page.Select(session => new UnresolvedCrashSentinelRow(session.SessionId, session.AgentId)).ToList(), null);
+            });
+        store.Setup(s => s.GetAsync(It.IsAny<SessionId>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((SessionId id, CancellationToken _) =>
+                sessions.SingleOrDefault(session => session.SessionId == id));
+        store.Setup(s => s.SaveAsync(
+                It.IsAny<GatewaySession>(), It.IsAny<SessionWriteFence>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SessionSaveOutcome.Persisted);
         return store;
     }
 
@@ -97,27 +119,310 @@ public sealed class AutoReplayInterruptedTurnsTests
         return orch;
     }
 
+    private static Mock<IConversationStore> CreateConversationStore(GatewaySession session, bool hasHuman)
+    {
+        var conversation = new Conversation
+        {
+            ConversationId = session.ConversationId,
+            AgentId = session.AgentId,
+            Participants = hasHuman
+                ? [new SessionParticipant { CitizenId = CitizenId.Of(UserId.From("user-a")) }]
+                : [new SessionParticipant { CitizenId = CitizenId.Of(session.AgentId) }]
+        };
+        var store = new Mock<IConversationStore>();
+        store.Setup(s => s.GetAsync(session.ConversationId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(conversation);
+        return store;
+    }
+
     private static InterruptedTurnNotificationService CreateService(
         ISessionStore store,
         IAgentRegistry registry,
         GatewayOptions? options = null,
         IInboundMessageOrchestrator? orchestrator = null,
         IActivityBroadcaster? broadcaster = null,
-        IChannelManager? channelManager = null)
+        IConversationEventPublisher? eventPublisher = null,
+        IConversationStore? conversationStore = null,
+        SessionLifecycleEvents? lifecycleEvents = null,
+        CleanShutdownMarker? shutdownMarker = null,
+        ILogger<InterruptedTurnNotificationService>? logger = null)
     {
         broadcaster ??= Mock.Of<IActivityBroadcaster>();
-        channelManager ??= Mock.Of<IChannelManager>();
+        eventPublisher ??= Mock.Of<IConversationEventPublisher>();
         return new InterruptedTurnNotificationService(
             store,
             registry,
             broadcaster,
-            channelManager,
-            NullLogger<InterruptedTurnNotificationService>.Instance,
+            eventPublisher,
+            logger ?? NullLogger<InterruptedTurnNotificationService>.Instance,
             orchestrator,
-            options is not null ? Options.Create(options) : null);
+            options is not null ? Options.Create(options) : null,
+            conversationStore,
+            lifecycleEvents,
+            shutdownMarker);
     }
 
     // ── Tests ──────────────────────────────────────────────────────────────
+
+    private static Mock<ISessionStore> CreatePagedStore(
+        GatewaySession first, GatewaySession samePage, GatewaySession nextPage)
+    {
+        var store = CreateStore(first, samePage, nextPage);
+        store.Setup(s => s.ListUnresolvedCrashSentinelsAsync(
+                256, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new UnresolvedCrashSentinelPage(
+                [new(first.SessionId, first.AgentId), new(samePage.SessionId, samePage.AgentId)],
+                samePage.SessionId.Value));
+        store.Setup(s => s.ListUnresolvedCrashSentinelsAsync(
+                256, samePage.SessionId.Value, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new UnresolvedCrashSentinelPage(
+                [new(nextPage.SessionId, nextPage.AgentId)], null));
+        return store;
+    }
+
+    [Theory]
+    [InlineData("read")]
+    [InlineData("post")]
+    [InlineData("broadcast")]
+    public async Task StartedAsync_CandidateFails_RecoversLaterRowsAndPages(string failurePoint)
+    {
+        var first = CreateSession("scan-1", "agent-scan", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "first request");
+        var samePage = CreateSession("scan-2", "agent-scan", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "same page request");
+        var nextPage = CreateSession("scan-3", "agent-scan", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "next page request");
+        var store = CreatePagedStore(first, samePage, nextPage);
+        var orchestrator = CreateOrchestrator();
+        var broadcaster = new Mock<IActivityBroadcaster>();
+        var logger = new Mock<ILogger<InterruptedTurnNotificationService>>();
+        var failure = new InvalidOperationException($"{failurePoint} failed");
+        if (failurePoint == "read")
+            store.Setup(s => s.GetAsync(first.SessionId, It.IsAny<CancellationToken>())).ThrowsAsync(failure);
+        else if (failurePoint == "post")
+            orchestrator.Setup(o => o.Post(It.Is<InboundMessage>(m => m.Content == "first request")))
+                .Throws(failure);
+        else
+            broadcaster.Setup(b => b.PublishAsync(
+                    It.Is<GatewayActivity>(a => a.SessionId == first.SessionId.Value), It.IsAny<CancellationToken>()))
+                .Throws(failure);
+        var service = CreateService(store.Object, CreateRegistry("agent-scan"),
+            new GatewayOptions { AutoReplayInterruptedTurns = true }, orchestrator.Object,
+            broadcaster.Object, logger: logger.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        foreach (var session in new[] { samePage, nextPage })
+        {
+            store.Verify(s => s.GetAsync(session.SessionId, It.IsAny<CancellationToken>()), Times.Once);
+            store.Verify(s => s.SaveAsync(session, It.IsAny<SessionWriteFence>(), It.IsAny<CancellationToken>()), Times.Once);
+            orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m =>
+                m.RoutingHints != null && m.RoutingHints.RequestedSessionId == session.SessionId)), Times.Once);
+            session.History.ShouldNotContain(e => e.IsCrashSentinel);
+            session.History.Count(e => e.IsReplayBanner).ShouldBe(1);
+            session.History.Count(e => e.Role == MessageRole.Notification).ShouldBe(1);
+            session.Metadata[InterruptedTurnNotificationService.MetadataKeyReplayCount].ShouldBe(1);
+        }
+        store.Verify(s => s.ListUnresolvedCrashSentinelsAsync(
+            256, samePage.SessionId.Value, It.IsAny<CancellationToken>()), Times.Once);
+        var warning = logger.Invocations.Single(invocation => invocation.Method.Name == "Log"
+            && Equals(invocation.Arguments[0], LogLevel.Warning)
+            && ReferenceEquals(invocation.Arguments[3], failure));
+        var message = warning.Arguments[2].ToString() ?? throw new InvalidOperationException("Missing warning text.");
+        message.ShouldContain(first.SessionId.Value);
+    }
+
+    [Theory]
+    [InlineData("read")]
+    [InlineData("post")]
+    [InlineData("page")]
+    [InlineData("read-noncancellation")]
+    public async Task StartedAsync_CancellationDuringScan_PropagatesAndStopsLaterCandidates(string failurePoint)
+    {
+        using var cancellation = new CancellationTokenSource();
+        var first = CreateSession("cancel-1", "agent-cancel", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "first request");
+        var samePage = CreateSession("cancel-2", "agent-cancel", withSentinel: true);
+        var nextPage = CreateSession("cancel-3", "agent-cancel", withSentinel: true);
+        var store = CreatePagedStore(first, samePage, nextPage);
+        var orchestrator = CreateOrchestrator();
+        Exception failure = failurePoint == "read-noncancellation"
+            ? new InvalidOperationException("failure concurrent with cancellation")
+            : new OperationCanceledException(cancellation.Token);
+        if (failurePoint == "page")
+            store.Setup(s => s.ListUnresolvedCrashSentinelsAsync(256, null, cancellation.Token))
+                .Callback(() => cancellation.Cancel()).ThrowsAsync(failure);
+        else if (failurePoint == "post")
+            orchestrator.Setup(o => o.Post(It.IsAny<InboundMessage>()))
+                .Callback(() => cancellation.Cancel()).Throws(failure);
+        else
+            store.Setup(s => s.GetAsync(first.SessionId, cancellation.Token))
+                .Callback(() => cancellation.Cancel()).ThrowsAsync(failure);
+        var service = CreateService(store.Object, CreateRegistry("agent-cancel"),
+            new GatewayOptions { AutoReplayInterruptedTurns = true }, orchestrator.Object);
+
+        var caught = await Record.ExceptionAsync(() => service.StartedAsync(cancellation.Token));
+
+        caught.ShouldBeSameAs(failure);
+        store.Verify(s => s.GetAsync(samePage.SessionId, It.IsAny<CancellationToken>()), Times.Never);
+        store.Verify(s => s.GetAsync(nextPage.SessionId, It.IsAny<CancellationToken>()), Times.Never);
+        store.Verify(s => s.ListUnresolvedCrashSentinelsAsync(
+            256, samePage.SessionId.Value, It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task StartedAsync_SaveFailsAfterScanCancellation_PropagatesAndStopsLaterCandidates(bool cancellationException)
+    {
+        using var cancellation = new CancellationTokenSource();
+        var first = CreateSession("save-cancel-1", "agent-save", withSentinel: true);
+        var samePage = CreateSession("save-cancel-2", "agent-save", withSentinel: true);
+        var nextPage = CreateSession("save-cancel-3", "agent-save", withSentinel: true);
+        var store = CreatePagedStore(first, samePage, nextPage);
+        Exception failure = cancellationException
+            ? new OperationCanceledException(cancellation.Token)
+            : new IOException("save failed concurrently with scan cancellation");
+        store.Setup(s => s.SaveAsync(first, It.IsAny<SessionWriteFence>(), cancellation.Token))
+            .Callback(() => cancellation.Cancel()).ThrowsAsync(failure);
+        var broadcaster = new Mock<IActivityBroadcaster>();
+        var publisher = new Mock<IConversationEventPublisher>();
+        var service = CreateService(store.Object, CreateRegistry("agent-save"),
+            broadcaster: broadcaster.Object, eventPublisher: publisher.Object);
+
+        var caught = await Record.ExceptionAsync(() => service.StartedAsync(cancellation.Token));
+
+        caught.ShouldBeSameAs(failure);
+        store.Verify(s => s.SaveAsync(first, It.IsAny<SessionWriteFence>(), cancellation.Token), Times.Once);
+        store.Verify(s => s.GetAsync(samePage.SessionId, It.IsAny<CancellationToken>()), Times.Never);
+        store.Verify(s => s.GetAsync(nextPage.SessionId, It.IsAny<CancellationToken>()), Times.Never);
+        store.Verify(s => s.ListUnresolvedCrashSentinelsAsync(
+            256, samePage.SessionId.Value, It.IsAny<CancellationToken>()), Times.Never);
+        publisher.Verify(p => p.PublishAsync(It.IsAny<ConversationSessionItemPersistedEvent>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+        broadcaster.Verify(b => b.PublishAsync(It.IsAny<GatewayActivity>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task StartedAsync_SaveFailsWithoutScanCancellation_ContainsFailureAndRecoversLaterRowsAndPages(bool cancellationException)
+    {
+        using var unrelatedCancellation = new CancellationTokenSource();
+        unrelatedCancellation.Cancel();
+        var first = CreateSession("save-fail-1", "agent-save", withSentinel: true);
+        var samePage = CreateSession("save-fail-2", "agent-save", withSentinel: true);
+        var nextPage = CreateSession("save-fail-3", "agent-save", withSentinel: true);
+        var store = CreatePagedStore(first, samePage, nextPage);
+        Exception failure = cancellationException
+            ? new OperationCanceledException(unrelatedCancellation.Token)
+            : new IOException("save failed without scan cancellation");
+        store.Setup(s => s.SaveAsync(first, It.IsAny<SessionWriteFence>(), CancellationToken.None))
+            .ThrowsAsync(failure);
+        var logger = new Mock<ILogger<InterruptedTurnNotificationService>>();
+        var broadcaster = new Mock<IActivityBroadcaster>();
+        var publisher = new Mock<IConversationEventPublisher>();
+        var service = CreateService(store.Object, CreateRegistry("agent-save"),
+            broadcaster: broadcaster.Object, eventPublisher: publisher.Object, logger: logger.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        foreach (var session in new[] { samePage, nextPage })
+        {
+            store.Verify(s => s.GetAsync(session.SessionId, CancellationToken.None), Times.Once);
+            store.Verify(s => s.SaveAsync(session, It.IsAny<SessionWriteFence>(), CancellationToken.None), Times.Once);
+            publisher.Verify(p => p.PublishAsync(It.Is<ConversationSessionItemPersistedEvent>(e =>
+                e.SessionId == session.SessionId), CancellationToken.None), Times.Once);
+            broadcaster.Verify(b => b.PublishAsync(It.Is<GatewayActivity>(a =>
+                a.SessionId == session.SessionId.Value), CancellationToken.None), Times.Once);
+        }
+        store.Verify(s => s.ListUnresolvedCrashSentinelsAsync(
+            256, samePage.SessionId.Value, CancellationToken.None), Times.Once);
+        publisher.Verify(p => p.PublishAsync(It.Is<ConversationSessionItemPersistedEvent>(e =>
+            e.SessionId == first.SessionId), It.IsAny<CancellationToken>()), Times.Never);
+        broadcaster.Verify(b => b.PublishAsync(It.Is<GatewayActivity>(a =>
+            a.SessionId == first.SessionId.Value), It.IsAny<CancellationToken>()), Times.Never);
+        var warning = logger.Invocations.Single(invocation => invocation.Method.Name == "Log"
+            && Equals(invocation.Arguments[0], LogLevel.Warning)
+            && ReferenceEquals(invocation.Arguments[3], failure));
+        (warning.Arguments[2].ToString() ?? string.Empty).ShouldContain(first.SessionId.Value);
+    }
+
+    [Fact]
+    public async Task StartedAsync_PageFetchFails_LogsAndStopsBoundedScan()
+    {
+        var first = CreateSession("page-1", "agent-page", withSentinel: true);
+        var samePage = CreateSession("page-2", "agent-page", withSentinel: true);
+        var nextPage = CreateSession("page-3", "agent-page", withSentinel: true);
+        var store = CreatePagedStore(first, samePage, nextPage);
+        var failure = new IOException("page fetch failed");
+        store.Setup(s => s.ListUnresolvedCrashSentinelsAsync(
+                256, samePage.SessionId.Value, It.IsAny<CancellationToken>())).ThrowsAsync(failure);
+        var logger = new Mock<ILogger<InterruptedTurnNotificationService>>();
+        var service = CreateService(store.Object, CreateRegistry("agent-page"), logger: logger.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        store.Verify(s => s.SaveAsync(first, It.IsAny<SessionWriteFence>(), It.IsAny<CancellationToken>()), Times.Once);
+        store.Verify(s => s.SaveAsync(samePage, It.IsAny<SessionWriteFence>(), It.IsAny<CancellationToken>()), Times.Once);
+        store.Verify(s => s.GetAsync(nextPage.SessionId, It.IsAny<CancellationToken>()), Times.Never);
+        var warning = logger.Invocations.Single(invocation => invocation.Method.Name == "Log"
+            && Equals(invocation.Arguments[0], LogLevel.Warning)
+            && ReferenceEquals(invocation.Arguments[3], failure));
+        var message = warning.Arguments[2].ToString() ?? throw new InvalidOperationException("Missing warning text.");
+        message.ShouldContain("bounded interrupted-turn scan");
+    }
+
+    [Fact]
+    public async Task Recovery_WhenFencedSaveConflicts_DoesNotPublishOrReplay()
+    {
+        var session = CreateSession("fenced-conflict", "agent-a", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "hello agent");
+        var store = CreateStore(session);
+        store.Setup(sessionStore => sessionStore.SaveAsync(
+                It.IsAny<GatewaySession>(), It.IsAny<SessionWriteFence>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SessionSaveOutcome.Rebound);
+        var orchestrator = CreateOrchestrator();
+        var broadcaster = new Mock<IActivityBroadcaster>();
+        var eventPublisher = new Mock<IConversationEventPublisher>();
+        var service = CreateService(store.Object, CreateRegistry("agent-a"),
+            new GatewayOptions { AutoReplayInterruptedTurns = false }, orchestrator.Object,
+            broadcaster.Object, eventPublisher.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        eventPublisher.Verify(publisher => publisher.PublishAsync(
+            It.IsAny<ConversationSessionItemPersistedEvent>(), It.IsAny<CancellationToken>()), Times.Never);
+        broadcaster.Verify(publisher => publisher.PublishAsync(
+            It.IsAny<GatewayActivity>(), It.IsAny<CancellationToken>()), Times.Never);
+        orchestrator.Verify(orchestration => orchestration.Post(It.IsAny<InboundMessage>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task PlannedRestart_ReplaysHumanTurnWithoutInstallationOptIn()
+    {
+        var session = CreateSession("planned-human", "agent-a", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "continue after restart");
+        var fs = new MockFileSystem();
+        var marker = new CleanShutdownMarker(fs, "/data");
+        var requested = new DateTimeOffset(2026, 10, 7, 5, 0, 0, TimeSpan.Zero);
+        marker.TryMarkPlannedShutdown(requested).ShouldBeTrue();
+        marker.MarkCleanShutdown(requested.AddSeconds(1));
+        marker.WasPreviousShutdownPlanned().ShouldBeTrue();
+        marker.MarkRunning();
+
+        var store = CreateStore(session);
+        var orchestrator = CreateOrchestrator();
+        var service = CreateService(store.Object, CreateRegistry("agent-a"),
+            new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 },
+            orchestrator.Object, shutdownMarker: marker);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m =>
+            m.Content == "continue after restart" && (bool)m.Metadata["isReplay"]!)), Times.Once);
+    }
 
     [Fact]
     public async Task AutoReplay_WhenEnabled_PostsLastUserMessage()
@@ -146,6 +451,251 @@ public sealed class AutoReplayInterruptedTurnsTests
         var options = new GatewayOptions { AutoReplayInterruptedTurns = false };
 
         var service = CreateService(store.Object, CreateRegistry("agent-b"), options, orchestrator.Object);
+        await service.StartedAsync(CancellationToken.None);
+
+        orchestrator.Verify(o => o.Post(It.IsAny<InboundMessage>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AutoReplay_WhenDisabled_AndConversationHasNoHuman_PostsLastUserMessage()
+    {
+        var session = CreateSession("sess-agent-only", "agent-only", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "continue the work");
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: false);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+
+        var service = CreateService(store.Object, CreateRegistry("agent-only"), options,
+            orchestrator.Object, conversationStore: conversations.Object);
+        await service.StartedAsync(CancellationToken.None);
+
+        orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m => m.Content == "continue the work")), Times.Once);
+        session.History.Single(e => e.Role == MessageRole.Notification).Content
+            .Contains("please resend", StringComparison.OrdinalIgnoreCase).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task AutoReplay_WhenDisabled_AndAgentOnlyApiKickoffIsAssistantOrigin_ReplaysWithProvenance()
+    {
+        var session = CreateSession("sess-agent-api", "agent-api", withSentinel: true,
+            callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
+            lastUserContent: "execute issue 4370", initiatingRole: MessageRole.Assistant,
+            initiatingSenderId: "api:issue-delivery-pump");
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: false);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+
+        var service = CreateService(store.Object, CreateRegistry("agent-api"), options,
+            orchestrator.Object, conversationStore: conversations.Object);
+        await service.StartedAsync(CancellationToken.None);
+
+        orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m =>
+            m.Content == "execute issue 4370" &&
+            m.ChannelType == ChannelKey.From("api") &&
+            m.SenderId == "api:issue-delivery-pump" &&
+            m.SpeakAs == MessageRole.Assistant &&
+            m.RoutingHints!.RequestedAgentId == session.AgentId &&
+            m.RoutingHints.RequestedSessionId == session.SessionId &&
+            m.RoutingHints.RequestedConversationId == session.ConversationId)), Times.Once);
+    }
+
+    [Fact]
+    public async Task AutoReplay_WhenAdmissionRejected_PreservesCrashSentinelAndDoesNotConsumeAttempt()
+    {
+        var session = CreateSession("sess-rejected", "agent-rejected", withSentinel: true,
+            callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
+            lastUserContent: "execute issue 4370", initiatingRole: MessageRole.Assistant,
+            initiatingSenderId: "api:issue-delivery-pump");
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: false);
+        var orchestrator = CreateOrchestrator(postAccepted: false);
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+
+        var service = CreateService(store.Object, CreateRegistry("agent-rejected"), options,
+            orchestrator.Object, conversationStore: conversations.Object);
+        await service.StartedAsync(CancellationToken.None);
+
+        session.History.ShouldContain(e => e.IsCrashSentinel);
+        session.History.ShouldNotContain(e => e.IsReplayBanner);
+        session.Metadata.ContainsKey(InterruptedTurnNotificationService.MetadataKeyReplayCount).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task LiveTerminalFailure_AgentOnlyApiTurn_ReusesBoundedReplayWithoutRestart()
+    {
+        var session = CreateSession("sess-live", "agent-live", withSentinel: true,
+            callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
+            lastUserContent: "execute issue 4406", initiatingRole: MessageRole.Assistant,
+            initiatingSenderId: "api:issue-delivery-pump");
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: false);
+        var orchestrator = CreateOrchestrator();
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+        var service = CreateService(store.Object, CreateRegistry("agent-live"), options,
+            orchestrator.Object, conversationStore: conversations.Object, lifecycleEvents: lifecycle);
+        await service.StartAsync(CancellationToken.None);
+
+        await lifecycle.PublishAsync(new SessionLifecycleEvent(
+            session.SessionId.Value, session.AgentId.Value,
+            SessionLifecycleEventType.TerminalFailure, session));
+
+        orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m =>
+            m.Content == "execute issue 4406" && m.SpeakAs == MessageRole.Assistant)), Times.Once);
+        session.History.Count(e => e.IsReplayBanner).ShouldBe(1);
+        session.History.ShouldNotContain(e => e.IsCrashSentinel);
+        session.Metadata[InterruptedTurnNotificationService.MetadataKeyReplayCount].ShouldBe(1);
+
+        await lifecycle.PublishAsync(new SessionLifecycleEvent(
+            session.SessionId.Value, session.AgentId.Value,
+            SessionLifecycleEventType.TerminalFailure, session));
+
+        orchestrator.Verify(o => o.Post(It.IsAny<InboundMessage>()), Times.Once,
+            "the accepted replacement consumes the marker, making duplicate failure signals no-ops");
+        session.History.Count(e => e.IsReplayBanner).ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task LiveTerminalFailure_WhenAdmissionRejected_PreservesMarkerAndAttemptBudget()
+    {
+        var session = CreateSession("sess-live-rejected", "agent-live", withSentinel: true,
+            callerId: "api:pump", channelType: ChannelKey.From("api"),
+            lastUserContent: "continue", initiatingRole: MessageRole.Assistant,
+            initiatingSenderId: "api:pump");
+        var store = CreateStore(session);
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var service = CreateService(store.Object, CreateRegistry("agent-live"),
+            new GatewayOptions { MaxAutoReplayAttempts = 2 }, CreateOrchestrator(false).Object,
+            conversationStore: CreateConversationStore(session, hasHuman: false).Object,
+            lifecycleEvents: lifecycle);
+        await service.StartAsync(CancellationToken.None);
+
+        await lifecycle.PublishAsync(new SessionLifecycleEvent(
+            session.SessionId.Value, session.AgentId.Value,
+            SessionLifecycleEventType.TerminalFailure, session));
+
+        session.History.ShouldContain(e => e.IsCrashSentinel);
+        session.History.ShouldNotContain(e => e.IsReplayBanner);
+        session.Metadata.ShouldNotContainKey(InterruptedTurnNotificationService.MetadataKeyReplayCount);
+    }
+
+    [Fact]
+    public async Task AutoReplay_CarriesIncompleteToolCallIdsForVerification()
+    {
+        var session = CreateSession("sess-tools", "agent-tools", withSentinel: false,
+            callerId: "api:issue-delivery-pump", channelType: ChannelKey.From("api"),
+            lastUserContent: "execute issue 4370", initiatingRole: MessageRole.Assistant,
+            initiatingSenderId: "api:issue-delivery-pump");
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.Tool,
+            Content = "",
+            ToolName = "github_issue_update",
+            ToolCallId = "call-unknown",
+            ToolArgs = "{}",
+            Kind = MessageKind.ToolStart
+        });
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.System,
+            Content = "[agent turn in progress — gateway restarted if visible]",
+            IsCrashSentinel = true
+        });
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.Tool,
+            Content = "Tool 'github_issue_update' did not complete — result synthesized for transcript consistency.",
+            ToolName = "github_issue_update",
+            ToolCallId = "call-unknown",
+            ToolIsError = true,
+            ToolArgs = "{}",
+            Kind = MessageKind.ToolResult
+        });
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.Tool,
+            Content = "",
+            ToolName = "github_issue_get",
+            ToolCallId = "call-complete",
+            ToolArgs = "{}",
+            Kind = MessageKind.ToolStart
+        });
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.Tool,
+            Content = "issue loaded",
+            ToolName = "github_issue_get",
+            ToolCallId = "call-complete",
+            ToolArgs = "{}",
+            Kind = MessageKind.ToolResult
+        });
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: false);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+
+        var service = CreateService(store.Object, CreateRegistry("agent-tools"), options,
+            orchestrator.Object, conversationStore: conversations.Object);
+        await service.StartedAsync(CancellationToken.None);
+
+        var replay = orchestrator.Invocations.Single().Arguments.Single().ShouldBeOfType<InboundMessage>();
+        var outcomeUnknown = replay.Metadata["outcomeUnknownToolCallIds"].ShouldBeOfType<string[]>();
+        outcomeUnknown.ShouldBe(new[] { "call-unknown" });
+        session.History.Single(e => e.IsReplayBanner).Content.ShouldContain("call-unknown");
+    }
+
+    [Fact]
+    public async Task AutoReplay_WhenDisabled_AndConversationHasHuman_RemainsNotifyOnly()
+    {
+        var session = CreateSession("sess-human", "agent-human", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "human request");
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: true);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+
+        var service = CreateService(store.Object, CreateRegistry("agent-human"), options,
+            orchestrator.Object, conversationStore: conversations.Object);
+        await service.StartedAsync(CancellationToken.None);
+
+        orchestrator.Verify(o => o.Post(It.IsAny<InboundMessage>()), Times.Never);
+        session.History.Single(e => e.Role == MessageRole.Notification).Content
+            .Contains("please resend", StringComparison.OrdinalIgnoreCase).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task AutoReplay_WhenDisabled_AndAgentOnlyAtMax_FallsBackWithoutHumanInstruction()
+    {
+        var session = CreateSession("sess-agent-max", "agent-max", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "retry this", existingReplayCount: 2);
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: false);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+
+        var service = CreateService(store.Object, CreateRegistry("agent-max"), options,
+            orchestrator.Object, conversationStore: conversations.Object);
+        await service.StartedAsync(CancellationToken.None);
+
+        orchestrator.Verify(o => o.Post(It.IsAny<InboundMessage>()), Times.Never);
+        session.History.Single(e => e.Role == MessageRole.Notification).Content
+            .Contains("please resend", StringComparison.OrdinalIgnoreCase).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task AutoReplay_WhenDisabled_AndAgentOnlyCron_RemainsExcluded()
+    {
+        var session = CreateSession("sess-agent-cron", "agent-cron", withSentinel: true,
+            channelType: ChannelKey.From("cron"), lastUserContent: "scheduled work");
+        var store = CreateStore(session);
+        var conversations = CreateConversationStore(session, hasHuman: false);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false, MaxAutoReplayAttempts = 2 };
+
+        var service = CreateService(store.Object, CreateRegistry("agent-cron"), options,
+            orchestrator.Object, conversationStore: conversations.Object);
         await service.StartedAsync(CancellationToken.None);
 
         orchestrator.Verify(o => o.Post(It.IsAny<InboundMessage>()), Times.Never);
@@ -217,5 +767,109 @@ public sealed class AutoReplayInterruptedTurnsTests
         await service.StartedAsync(CancellationToken.None);
 
         orchestrator.Verify(o => o.Post(It.IsAny<InboundMessage>()), Times.Never);
+    }
+
+    // ── #3046: restart-replay banner ───────────────────────────────────────
+
+    /// <summary>
+    /// #3046 clause 5. The replayed message alone is indistinguishable from the user simply repeating
+    /// themselves, so the gateway must append its own System entry - flagged IsReplayBanner so the
+    /// projector admits it on cold resume - naming the restart, refusing to assert the prior work's
+    /// completion state, requiring verification first, and carrying the original message.
+    /// </summary>
+    [Fact]
+    public async Task AutoReplay_AppendsReplayBanner_AsFlaggedSystemEntry()
+    {
+        var session = CreateSession("sess-7", "agent-g", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "revert the token argument only");
+        var store = CreateStore(session);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = true, MaxAutoReplayAttempts = 2 };
+        var service = CreateService(store.Object, CreateRegistry("agent-g"), options, orchestrator.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        var banner = session.History.SingleOrDefault(e => e.IsReplayBanner);
+        banner.ShouldNotBeNull("auto-replay must append exactly one gateway-authored restart banner");
+        banner.Role.ShouldBe(MessageRole.System,
+            "the banner is gateway-authored; attributing it to the user would forge provenance");
+
+        // The banner must actually reach the model, which is the entire point of the flag.
+        SessionContextProjector.IsVisibleOnResume(banner).ShouldBeTrue();
+
+        banner.Content.ShouldContain("PLATFORM RESTART");
+        banner.Content.Contains("unknown point", StringComparison.Ordinal).ShouldBeTrue(
+            "the banner must state the completion state is unknown rather than claiming the work failed");
+        banner.Content.Contains("verify", StringComparison.Ordinal).ShouldBeTrue(
+            "the banner must instruct verification before acting, or a side-effecting step can be re-run");
+        banner.Content.Contains("revert the token argument only", StringComparison.Ordinal).ShouldBeTrue(
+            "the banner must reproduce the original message that started the interrupted loop");
+        banner.Content.Contains("1 of 2", StringComparison.Ordinal).ShouldBeTrue(
+            "the banner must surface the replay attempt budget");
+    }
+
+    /// <summary>
+    /// #3046 clauses 6 and 7. The banner is additive: the user's own entry and the replayed payload
+    /// both stay byte-for-byte verbatim. Prefixing the banner onto either would produce a transcript in
+    /// which the user's turn contains words the user never wrote.
+    /// </summary>
+    [Fact]
+    public async Task AutoReplay_LeavesUserEntryAndReplayedContentVerbatim()
+    {
+        const string original = "revert the token argument only";
+        var session = CreateSession("sess-8", "agent-h", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: original);
+        var store = CreateStore(session);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = true, MaxAutoReplayAttempts = 2 };
+        var service = CreateService(store.Object, CreateRegistry("agent-h"), options, orchestrator.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        var userEntry = session.History.Single(e => e.Role == MessageRole.User && !e.IsCrashSentinel);
+        userEntry.Content.ShouldBe(original, "the user's own entry must never be rewritten in place");
+        userEntry.IsReplayBanner.ShouldBeFalse();
+
+        orchestrator.Verify(o => o.Post(It.Is<InboundMessage>(m => m.Content == original)), Times.Once);
+    }
+
+    /// <summary>
+    /// #3046 clause 8. The notification-only path is unchanged: with the toggle off, no banner is
+    /// written at all, so a disabled feature leaves no trace in the transcript.
+    /// </summary>
+    [Fact]
+    public async Task AutoReplay_WhenDisabled_WritesNoBanner()
+    {
+        var session = CreateSession("sess-9", "agent-i", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "hello");
+        var store = CreateStore(session);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = false };
+        var service = CreateService(store.Object, CreateRegistry("agent-i"), options, orchestrator.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        session.History.ShouldNotContain(e => e.IsReplayBanner);
+        session.History.ShouldContain(e => e.Role == MessageRole.Notification);
+    }
+
+    /// <summary>
+    /// #3046: at the attempt ceiling there is no replay, so there must be no banner either - a banner
+    /// with no accompanying replay would tell the agent to continue work nothing is going to re-dispatch.
+    /// </summary>
+    [Fact]
+    public async Task AutoReplay_WhenMaxAttemptsReached_WritesNoBanner()
+    {
+        var session = CreateSession("sess-10", "agent-j", withSentinel: true,
+            channelType: ChannelKey.From("signalr"), lastUserContent: "retry this",
+            existingReplayCount: 2);
+        var store = CreateStore(session);
+        var orchestrator = CreateOrchestrator();
+        var options = new GatewayOptions { AutoReplayInterruptedTurns = true, MaxAutoReplayAttempts = 2 };
+        var service = CreateService(store.Object, CreateRegistry("agent-j"), options, orchestrator.Object);
+
+        await service.StartedAsync(CancellationToken.None);
+
+        session.History.ShouldNotContain(e => e.IsReplayBanner);
     }
 }

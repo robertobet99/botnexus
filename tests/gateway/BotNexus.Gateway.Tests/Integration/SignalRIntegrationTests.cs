@@ -431,6 +431,13 @@ public sealed class SignalRIntegrationTests : IAsyncDisposable
         const string conversationId = "conv-42";
 
         // Pre-create the session so GetOrCreateAsync can resolve it
+        var conversations = factory.Services.GetRequiredService<IConversationStore>();
+        await conversations.CreateAsync(new Conversation
+        {
+            ConversationId = ConversationId.From("conv-42"),
+            AgentId = AgentId.From(TestAgentId),
+            Visibility = ConversationVisibility.UserFacing
+        }, cts.Token);
         var sessions = factory.Services.GetRequiredService<ISessionStore>();
         await sessions.GetOrCreateAsync(SessionId.From(sessionId), AgentId.From(TestAgentId), cts.Token);
 
@@ -636,11 +643,12 @@ public sealed class SignalRIntegrationTests : IAsyncDisposable
                 AgentStreamEventType.TurnInterrupted => "TurnInterrupted",
                 AgentStreamEventType.TurnEnd => null, // internal persistence signal -- not forwarded to Hub clients
                 AgentStreamEventType.ClaimAudit => null, // internal anti-fabrication diagnostic signal -- not forwarded to Hub clients (#1600)
+                AgentStreamEventType.ProviderRecovery => null, // internal bounded provider-recovery lifecycle signal
                 AgentStreamEventType.RunEnded => "RunEnded",
                 _ => throw new ArgumentOutOfRangeException()
             };
 
-            if (method is null) continue; // TurnEnd/ClaimAudit are internal-only, not forwarded to Hub clients
+            if (method is null) continue; // Internal persistence/diagnostic signals are not forwarded to Hub clients.
             var payload = await handlers[method].Task.WaitAsync(cts.Token);
             payload.Type.ShouldBe(expected);
         }
@@ -718,10 +726,10 @@ public sealed class SignalRIntegrationTests : IAsyncDisposable
             .Build();
     }
 
-    private static async Task<HubConnection> CreateStartedConnection(WebApplicationFactory<Program> factory, CancellationToken cancellationToken)
+    private static async Task<HubConnection> CreateStartedConnection(WebApplicationFactory<Program> factory, CancellationToken cancellationToken, [System.Runtime.CompilerServices.CallerMemberName] string testName = "")
     {
         var connection = CreateHubConnection(factory);
-        await connection.StartAsync(CancellationToken.None);
+        await HubFixtureGuard.StartGuardedAsync(connection, "SignalRIntegrationTests", cancellationToken, testName: testName);
         return connection;
     }
 
@@ -826,7 +834,7 @@ public sealed class SignalRIntegrationTests : IAsyncDisposable
         public Task<AgentResponse> PromptAsync(string message, CancellationToken cancellationToken = default)
             => Task.FromResult(new AgentResponse { Content = string.Empty });
 
-        public Task<AgentResponse> PromptAsync(UserMessage message, CancellationToken cancellationToken = default)
+        public Task<AgentResponse> PromptAsync(BotNexus.Gateway.Abstractions.Models.AgentUserMessage message, CancellationToken cancellationToken = default)
             => PromptAsync(message.Content, cancellationToken);
 
         public async IAsyncEnumerable<AgentStreamEvent> StreamAsync(string message, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -835,7 +843,7 @@ public sealed class SignalRIntegrationTests : IAsyncDisposable
             yield break;
         }
 
-        public IAsyncEnumerable<AgentStreamEvent> StreamAsync(UserMessage message, CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<AgentStreamEvent> StreamAsync(BotNexus.Gateway.Abstractions.Models.AgentUserMessage message, CancellationToken cancellationToken = default)
             => StreamAsync(message.Content, cancellationToken);
 
         public Task AbortAsync(CancellationToken cancellationToken = default)
@@ -847,7 +855,7 @@ public sealed class SignalRIntegrationTests : IAsyncDisposable
         public Task InterruptAndSteerAsync(string message, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task SteerAsync(string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task FollowUpAsync(string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
-        public Task FollowUpAsync(AgentMessage message, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task FollowUpAsync(AgentTranscriptMessage message, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

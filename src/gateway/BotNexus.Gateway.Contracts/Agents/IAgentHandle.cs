@@ -1,7 +1,5 @@
 using BotNexus.Gateway.Abstractions.Models;
-using BotNexus.Agent.Core.Types;
 using BotNexus.Domain.Primitives;
-using AgentUserMessage = BotNexus.Agent.Core.Types.UserMessage;
 
 namespace BotNexus.Gateway.Abstractions.Agents;
 
@@ -19,6 +17,16 @@ namespace BotNexus.Gateway.Abstractions.Agents;
 /// For in-process isolation, this wraps a <c>BotNexus.Agent.Core.Agent</c> directly.
 /// For container or remote isolation, this would be a gRPC/HTTP proxy.
 /// </para>
+/// <para>
+/// Blocking prompt methods report cancellation or timeout through
+/// <see cref="AgentPromptInterruptedException"/>. Its partial response contains only the interrupted
+/// run's tool timeline and provider measurements; unmeasured usage remains null, and runtime-generated
+/// abort markers do not count as model turns. Calls cancelled before admission contain no run evidence.
+/// The exception carries the caller token when cancelled, otherwise the signalled run token. Internal
+/// abort does not cancel the caller's source. In-flight audited tools are closed as incomplete before
+/// interruption propagates. Streaming retains event-based completion and ordinary enumeration
+/// cancellation; it does not throw the blocking partial-response exception.
+/// </para>
 /// </remarks>
 public interface IAgentHandle : IAsyncDisposable
 {
@@ -27,6 +35,13 @@ public interface IAgentHandle : IAsyncDisposable
 
     /// <summary>The session ID this handle is bound to.</summary>
     SessionId SessionId { get; }
+
+    /// <summary>
+    /// Reserves idle run admission for external transcript maintenance. Null means busy, stopped,
+    /// or unsupported. All prompt/continue/stream paths must honor the reservation until disposed.
+    /// Implementations without atomic lifecycle authority fail closed.
+    /// </summary>
+    IDisposable? TryReserveMaintenance() => null;
 
     /// <summary>Whether the agent is currently processing a request.</summary>
     bool IsRunning { get; }
@@ -41,6 +56,20 @@ public interface IAgentHandle : IAsyncDisposable
     Task<AgentResponse> PromptAsync(string message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Runs one text-only finalization turn without exposing tools to the model.
+    /// </summary>
+    /// <param name="message">The instruction to synthesize a final response from existing context.</param>
+    /// <param name="cancellationToken">The original run deadline token.</param>
+    /// <returns>The final text response.</returns>
+    /// <remarks>
+    /// The default fails closed because silently falling back to <see cref="PromptAsync(string,CancellationToken)"/>
+    /// would expose tools during a call whose contract explicitly forbids them. Implementations must also
+    /// suppress completion continuations so this remains exactly one model turn.
+    /// </remarks>
+    Task<AgentResponse> PromptWithoutToolsAsync(string message, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support tool-free finalization.");
+
+    /// <summary>
     /// Sends a multimodal user message (text + optional images) and waits for the complete response.
     /// Use the string overload when no images are present.
     /// </summary>
@@ -48,6 +77,22 @@ public interface IAgentHandle : IAsyncDisposable
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The complete agent response.</returns>
     Task<AgentResponse> PromptAsync(AgentUserMessage message, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Waits for the agent's run slot, reports when this message actually owns it, then executes the
+    /// prompt with producer-owned cancellation.
+    /// </summary>
+    /// <remarks>
+    /// Handles that cannot provide an atomic wait/start boundary fail closed. Falling back to
+    /// <see cref="PromptAsync(AgentUserMessage, CancellationToken)"/> would either reject a busy
+    /// agent or falsely report a queued message as running.
+    /// </remarks>
+    Task<AgentResponse> PromptWhenAvailableAsync(
+        AgentUserMessage message,
+        Func<Task> onStartedAsync,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support producer-owned queued execution.");
 
     /// <summary>
     /// Sends a message to the agent and streams back events in real time.
@@ -68,6 +113,35 @@ public interface IAgentHandle : IAsyncDisposable
     IAsyncEnumerable<AgentStreamEvent> StreamAsync(AgentUserMessage message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Subscribes to per-turn completion notifications for runs executed through this handle, so a
+    /// blocking caller can observe and bound the number of turns a run consumes (#2656).
+    /// </summary>
+    /// <param name="onTurnCompleted">
+    /// Invoked once each time the agent loop finishes a turn (one model call plus its tool cycle).
+    /// Called on the agent's event-dispatch path, so it must be fast and must not throw.
+    /// </param>
+    /// <returns>
+    /// A subscription to dispose when the caller no longer wants notifications, or <c>null</c> when
+    /// this handle has no per-turn visibility.
+    /// </returns>
+    /// <remarks>
+    /// The default implementation returns <c>null</c>: a handle with no insight into its own loop
+    /// must report that honestly rather than fabricate turn boundaries. Callers that enforce a turn
+    /// budget must treat <c>null</c> as "budget not enforceable on this handle" instead of assuming
+    /// zero turns were used. Handles that own a real agent loop MUST override this.
+    /// </remarks>
+    IDisposable? ObserveTurns(Action onTurnCompleted) => null;
+
+    /// <summary>
+    /// Observes authoritative completed-tool and turn-boundary activity for no-progress policy.
+    /// Producers must derive fixed-size identities from normalized tool/result evidence internally,
+    /// never from model narration, and must not expose arguments or result payloads. Observations
+    /// are ordered; completed tools precede their turn boundary. Callbacks must be fast and not throw.
+    /// </summary>
+    /// <returns>A disposable subscription, or null when authoritative activity is unavailable.</returns>
+    IDisposable? ObserveActivity(Action<AgentActivityObservation> onActivity) => null;
+
+    /// <summary>
     /// Aborts the current agent execution, if any.
     /// </summary>
     Task AbortAsync(CancellationToken cancellationToken = default);
@@ -81,6 +155,24 @@ public interface IAgentHandle : IAsyncDisposable
     /// <returns>A task that completes when the message is queued.</returns>
     /// <remarks>Only effective while the agent is actively running (processing a prompt).</remarks>
     Task SteerAsync(string message, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Steers the running agent with a fully-composed multimodal user message, so a steer issued
+    /// from a composer that had draft attachments delivers those attachments rather than text only
+    /// (#2484).
+    /// </summary>
+    /// <param name="message">The composed steering message, optionally carrying image content.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A task that completes when the message is queued.</returns>
+    /// <remarks>
+    /// The default implementation preserves the composed text (which already carries inlined
+    /// non-image attachments from <c>AgentUserMessageComposer</c>) but not the vision payload;
+    /// handles that own a real steering queue MUST override it to inject the typed message intact.
+    /// </remarks>
+    Task SteerAsync(AgentUserMessage message, CancellationToken cancellationToken = default)
+        => SteerAsync(
+            AgentHandleImageDropGuard.DegradeToText(this, message, AgentHandleImageDropGuard.SteerSite),
+            cancellationToken);
 
     /// <summary>
     /// Steers the running agent with a system-injected side turn (#1845) that must only be
@@ -109,7 +201,60 @@ public interface IAgentHandle : IAsyncDisposable
     /// <param name="message">The follow-up message to queue.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A task that completes when the message is queued.</returns>
-    Task FollowUpAsync(AgentMessage message, CancellationToken cancellationToken = default);
+    /// <remarks>
+    /// Takes the gateway's own <see cref="AgentTranscriptMessage"/> rather than an agent-core
+    /// message type (#3251); the isolation strategy - the layer entitled to know about core - maps
+    /// it at the boundary.
+    /// </remarks>
+    Task FollowUpAsync(AgentTranscriptMessage message, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Queues <paramref name="message"/> as a follow-up <em>only</em> if a run is currently in
+    /// flight, and reports whether it was queued.
+    /// </summary>
+    /// <param name="message">The follow-up text to queue.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>
+    /// <c>true</c> when a run was in flight and the message is queued for delivery after it
+    /// settles; <c>false</c> when the agent was idle (or became idle before the queued message
+    /// could be claimed), in which case the message has NOT been queued and the caller must
+    /// deliver it as an ordinary inbound message instead.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// This is the primitive that makes hub-level follow-up correct (#2438). Doing the same thing
+    /// as <c>if (handle.IsRunning) FollowUpAsync(...) else Send(...)</c> at the call site is racy:
+    /// the run can settle between the check and the enqueue, leaving the message stranded in an
+    /// idle agent's follow-up queue which is never drained again. Implementations must close that
+    /// window - enqueue first, then re-verify the run is still live, and take the message back if
+    /// it is not.
+    /// </para>
+    /// <para>
+    /// Overflow of the bounded follow-up queue surfaces as an exception, never as a silent drop.
+    /// </para>
+    /// <para>
+    /// The default implementation is the best a handle with no visibility into its own run
+    /// lifecycle can do: it reports "not queued" so the caller falls back to a normal send. Any
+    /// handle that really owns a follow-up queue MUST override this with the atomic
+    /// enqueue-then-reverify form.
+    /// </para>
+    /// </remarks>
+    Task<bool> TryFollowUpWhileRunningAsync(string message, CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
+    /// <summary>
+    /// Typed counterpart of <see cref="TryFollowUpWhileRunningAsync(string, CancellationToken)"/>
+    /// that carries a fully-composed multimodal user message so a follow-up issued with draft
+    /// attachments survives the queue round-trip (#2484).
+    /// </summary>
+    /// <param name="message">The composed follow-up message, optionally carrying image content.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>
+    /// <c>true</c> when a run was in flight and the message is queued; <c>false</c> when the agent
+    /// was idle and the caller must deliver it as an ordinary inbound message instead.
+    /// </returns>
+    Task<bool> TryFollowUpWhileRunningAsync(AgentUserMessage message, CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
 
     /// <summary>
     /// Atomically aborts the current agent run (if any) and injects a new steering direction.
@@ -124,4 +269,17 @@ public interface IAgentHandle : IAsyncDisposable
     /// Implementation is wired in Issue #800.
     /// </remarks>
     Task InterruptAndSteerAsync(string message, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Typed counterpart of <see cref="InterruptAndSteerAsync(string, CancellationToken)"/> that
+    /// carries a fully-composed multimodal user message so a redirect issued with draft attachments
+    /// delivers them rather than dropping them (#2484).
+    /// </summary>
+    /// <param name="message">The composed redirect message, optionally carrying image content.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A task that completes when the abort is issued and the steer is queued.</returns>
+    Task InterruptAndSteerAsync(AgentUserMessage message, CancellationToken cancellationToken = default)
+        => InterruptAndSteerAsync(
+            AgentHandleImageDropGuard.DegradeToText(this, message, AgentHandleImageDropGuard.RedirectSite),
+            cancellationToken);
 }

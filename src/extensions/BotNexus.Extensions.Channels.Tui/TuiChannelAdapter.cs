@@ -1,5 +1,6 @@
 using BotNexus.Gateway.Channels;
 using BotNexus.Gateway.Abstractions.Channels;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Domain.Primitives;
 using BotNexus.Domain.World;
@@ -11,12 +12,33 @@ namespace BotNexus.Extensions.Channels.Tui;
 /// <summary>
 /// Terminal UI channel adapter for local console I/O.
 /// </summary>
-public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
-    : ChannelAdapterBase(logger), IStreamEventChannelAdapter
+public sealed class TuiChannelAdapter
+    : ChannelAdapterBase, IStreamEventChannelAdapter, IConversationEventSink
 {
-    private readonly ILogger<TuiChannelAdapter> _logger = logger;
+    private readonly ILogger<TuiChannelAdapter> _logger;
+    private readonly TextReader _input;
+    private readonly TextWriter _output;
     private CancellationTokenSource? _inputLoopCancellation;
     private Task? _inputLoopTask;
+
+    /// <summary>
+    /// Initializes a terminal adapter over the process console.
+    /// </summary>
+    public TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
+        : this(logger, Console.In, Console.Out)
+    {
+    }
+
+    internal TuiChannelAdapter(
+        ILogger<TuiChannelAdapter> logger,
+        TextReader input,
+        TextWriter output)
+        : base(logger)
+    {
+        _logger = logger;
+        _input = input;
+        _output = output;
+    }
 
     /// <summary>
     /// Gets the channel type identifier.
@@ -44,6 +66,12 @@ public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
 
     /// <inheritdoc />
     public override bool SupportsToolDisplay => true;
+
+    /// <summary>
+    /// The terminal UI renders directly to the operator's console - a user-visible surface - so
+    /// the delimited internal runtime-context envelope is redacted before write (#1430).
+    /// </summary>
+    protected override bool StripsRuntimeContext => true;
 
     /// <inheritdoc />
     protected override Task OnStartAsync(CancellationToken cancellationToken)
@@ -92,7 +120,7 @@ public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
             _logger.LogDebug("{DisplayName} send requested while adapter is not running", DisplayName);
         }
 
-        return Console.Out.WriteLineAsync($"[{DisplayName}:{message.ChannelAddress.Value}] {message.Content}");
+        return _output.WriteLineAsync($"[{DisplayName}:{message.ChannelAddress.Value}] {ProjectOutboundText(message.Content)}");
     }
 
     /// <summary>
@@ -111,7 +139,7 @@ public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
             _logger.LogDebug("{DisplayName} stream delta requested while adapter is not running", DisplayName);
         }
 
-        return Console.Out.WriteAsync(delta);
+        return _output.WriteAsync(delta);
     }
 
     /// <summary>
@@ -134,13 +162,13 @@ public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
             AgentStreamEventType.ContentDelta when streamEvent.ContentDelta is not null
                 => SendStreamDeltaAsync(target, streamEvent.ContentDelta, cancellationToken),
             AgentStreamEventType.ThinkingDelta when streamEvent.ThinkingContent is not null
-                => Console.Out.WriteAsync($"\n💭 {streamEvent.ThinkingContent}"),
+                => _output.WriteAsync($"\n💭 {streamEvent.ThinkingContent}"),
             AgentStreamEventType.ToolStart when streamEvent.ToolName is not null
-                => Console.Out.WriteLineAsync($"\n{ToolGlyphs.ForTool(streamEvent.ToolName)} [{DisplayName}:{label}] Tool start: {streamEvent.ToolName}"),
+                => _output.WriteLineAsync($"\n{ToolGlyphs.ForTool(streamEvent.ToolName)} [{DisplayName}:{label}] Tool start: {streamEvent.ToolName}"),
             AgentStreamEventType.ToolEnd
-                => Console.Out.WriteLineAsync($"\n{(streamEvent.ToolIsError == true ? "\u26A0\uFE0F" : ToolGlyphs.ForTool(streamEvent.ToolName))} [{DisplayName}:{label}] Tool complete: {streamEvent.ToolName ?? streamEvent.ToolCallId ?? "unknown"}"),
+                => _output.WriteLineAsync($"\n{(streamEvent.ToolIsError == true ? "\u26A0\uFE0F" : ToolGlyphs.ForTool(streamEvent.ToolName))} [{DisplayName}:{label}] Tool complete: {streamEvent.ToolName ?? streamEvent.ToolCallId ?? "unknown"}"),
             AgentStreamEventType.Error when streamEvent.ErrorMessage is not null
-                => Console.Out.WriteLineAsync($"\n❌ [{DisplayName}:{label}] {streamEvent.ErrorMessage}"),
+                => _output.WriteLineAsync($"\n❌ [{DisplayName}:{label}] {streamEvent.ErrorMessage}"),
             _ => Task.CompletedTask
         };
     }
@@ -152,7 +180,7 @@ public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
             string? line;
             try
             {
-                line = await Console.In.ReadLineAsync(cancellationToken);
+                line = await _input.ReadLineAsync(cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -187,25 +215,26 @@ public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
 
                 if (string.IsNullOrWhiteSpace(steerContent))
                 {
-                    await Console.Out.WriteLineAsync("↪ Usage: /steer <message>");
+                    await _output.WriteLineAsync("↪ Usage: /steer <message>");
                     continue;
                 }
 
-                await Console.Out.WriteLineAsync($"↪ [{DisplayName}:console] Steering queued.");
+                await _output.WriteLineAsync($"↪ [{DisplayName}:console] Steering submitted.");
                 await DispatchInboundAsync(new InboundMessage
                 {
                     ChannelType = ChannelType,
                     SenderId = Environment.UserName,
                     Sender = CitizenId.Of(UserId.From(Environment.UserName)),
                     ChannelAddress = ChannelAddress.From("console"),
-                    // PR2 of W-5 (#691): no RoutingHints — the conversation router
-                    // resolves the (tui, console) binding to the active conversation
-                    // and reuses or opens a session through the normal P9 path.
+                    // The conversation router resolves the (tui, console) binding to the active
+                    // conversation and session. TUI declares delivery intent without selecting a
+                    // second GatewayHost control path or fabricating a routing identity.
                     Content = steerContent,
-                    Metadata = new Dictionary<string, object?>
-                    {
-                        ["control"] = "steer"
-                    }
+                    RoutingHints = InboundMessageRoutingHints.LiftFromStrings(
+                        targetAgentId: null,
+                        sessionId: null,
+                        conversationId: null,
+                        deliveryMode: InboundDeliveryMode.Steer)
                 }, cancellationToken);
                 continue;
             }
@@ -221,4 +250,23 @@ public sealed class TuiChannelAdapter(ILogger<TuiChannelAdapter> logger)
             }, cancellationToken);
         }
     }
+    /// <inheritdoc />
+    public async Task OnConversationEventAsync(
+        ConversationEvent conversationEvent,
+        CancellationToken cancellationToken = default)
+    {
+        if (conversationEvent is not ConversationAgentEvent agentEvent)
+            return;
+
+        foreach (var target in ConversationEventStreamRouting.GetTargets(
+                     conversationEvent, ChannelType, ((IChannelAdapter)this).AdapterId))
+        {
+            if (((IStreamEventChannelAdapter)this).CanSendStreamEvent(target))
+            {
+                await SendStreamEventAsync(target, agentEvent.StreamEvent, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+    }
+
 }

@@ -3,19 +3,9 @@
 @implements IDisposable
 
 <div class="agent-panel" data-testid="agent-panel">
-    <header class="agent-panel-header">
-        <div class="agent-panel-avatar" aria-hidden="true">@AvatarGlyph</div>
-        <div class="agent-panel-meta" title="@AgentId">
-            <h2 class="agent-panel-title">@DisplayName</h2>
-            @if (!string.IsNullOrWhiteSpace(Description))
-            {
-                <span class="agent-panel-description">@Description</span>
-            }
-            <span class="agent-panel-id">@AgentId</span>
-        </div>
-        <span class="agent-panel-status @StatusCssClass" role="status" aria-live="polite">@StatusLabel</span>
-    </header>
-
+    @* #2441: the agent identity row moved into the portal top bar (see AgentIdentity.razor),
+       reclaiming a full row for the conversation. The run-state badge is small enough to ride
+       along on the tab strip, so the panel now starts directly with the tabs. *@
     <nav class="agent-tab-bar agent-panel-tab-strip" role="tablist" aria-label="Agent sections">
         @foreach (var tab in VisibleTabs)
         {
@@ -25,11 +15,13 @@
                     role="tab"
                     aria-selected="@IsActiveTab(tab.Key)"
                     aria-controls="@GetPanelId(tab.Key)"
+                    title="@tab.Hint"
                     @onclick="() => SelectTab(tab.Key)">
-                <span class="agent-tab-icon" aria-hidden="true">@tab.Icon</span>
+                <span class="agent-tab-icon"><Icon Name="@tab.Icon" Size="16" /></span>
                 <span class="agent-tab-label">@tab.Label</span>
             </button>
         }
+        <span class="agent-panel-status @StatusCssClass" role="status" aria-live="polite">@StatusLabel</span>
     </nav>
 
     <div class="agent-tab-content">
@@ -37,7 +29,7 @@
                  data-testid="agent-panel-conversation"
                  class="agent-tab-pane @(IsActiveTab(AgentPanelTab.Conversation) ? "active" : "")"
                  role="tabpanel">
-            <ChatPanel AgentId="@AgentId" />
+            <ChatPanel AgentId="@AgentId" ConversationId="@EffectiveConversationId" />
         </section>
 
         @if (!IsSubAgent)
@@ -62,14 +54,14 @@
                  data-testid="agent-panel-canvas"
                  class="agent-tab-pane @(IsActiveTab(AgentPanelTab.Canvas) ? "active" : "")"
                  role="tabpanel">
-            <CanvasPanel AgentId="@AgentId" ConversationId="@Agent?.ActiveConversationId" />
+            <CanvasPanel AgentId="@AgentId" ConversationId="@EffectiveConversationId" />
         </section>
 
         <section id="@GetPanelId(AgentPanelTab.Todo)"
                  data-testid="agent-panel-todo"
                  class="agent-tab-pane @(IsActiveTab(AgentPanelTab.Todo) ? "active" : "")"
                  role="tabpanel">
-            <TodoPanel AgentId="@AgentId" ConversationId="@Agent?.ActiveConversationId" />
+            <TodoPanel AgentId="@AgentId" ConversationId="@EffectiveConversationId" />
         </section>
     </div>
 </div>
@@ -78,33 +70,62 @@
     [Parameter, EditorRequired]
     public string AgentId { get; set; } = default!;
 
+    /// <summary>
+    /// #2976: the conversation named by the ROUTE, when the URL carries a conversation segment.
+    /// The canvas pane must show the routed conversation's canvas, because a deep link is exactly
+    /// the case where the agent's active conversation has since moved on and a silent wrong-canvas
+    /// render is worse than no canvas. Null when the route is agent-only
+    /// (<c>/agent/{AgentId}</c>), in which case the pre-#2976 active-conversation behaviour and the
+    /// agent-level legacy fallback below it are preserved unchanged.
+    /// </summary>
+    [Parameter]
+    public string? RoutedConversationId { get; set; }
+
+    /// <summary>
+    /// Resolves which conversation the per-conversation panes bind to. Home canonicalizes
+    /// conversation-less routes before rendering this panel, so the route-owned parameter is the
+    /// only conversation authority here. A routed id is honoured only when it belongs to this agent;
+    /// otherwise no conversation renders rather than silently substituting ambient selected state.
+    /// </summary>
+    private string? EffectiveConversationId
+    {
+        get
+        {
+            if (RoutedConversationId is { Length: > 0 } routed &&
+                Agent?.Conversations.ContainsKey(routed) == true)
+            {
+                return routed;
+            }
+
+            return null;
+        }
+    }
+
     private AgentPanelTab _activeTab = AgentPanelTab.Conversation;
     // Track whether the agent was a sub-agent last time we checked, so we can
     // re-apply tab suppression when agent data arrives after the URL tab was set.
     private bool? _lastIsSubAgent;
 
     private AgentState? Agent => Store.GetAgent(AgentId);
-    private string DisplayName => Agent?.DisplayName ?? AgentId;
-    // Prefer the agent's configured emoji; fall back to the default robot glyph
-    // when none is set. Mirrors the sidebar card (AgentDashboard.razor) so the
-    // header and list stay visually consistent.
-    private string AvatarGlyph => string.IsNullOrWhiteSpace(Agent?.Emoji) ? "\U0001F916" : Agent!.Emoji!;
-    private string? Description => Agent?.Description;
     private string StatusLabel => Agent?.IsConnected != true ? "Offline" : Agent?.IsStreaming == true ? "Running" : "Idle";
     private string StatusCssClass => Agent?.IsConnected != true ? "offline" : Agent?.IsStreaming == true ? "running" : "idle";
 
-    private static readonly (AgentPanelTab Key, string Label, string Icon)[] s_tabs =
+    private static readonly (AgentPanelTab Key, string Label, string Icon, string Hint)[] s_tabs =
     [
-        (AgentPanelTab.Conversation, "Conversation", "💬"),
-        (AgentPanelTab.Workspace, "Workspace", "📁"),
-        (AgentPanelTab.Reports, "Reports", "📊"),
-        (AgentPanelTab.Canvas, "Canvas", "🎨"),
-        (AgentPanelTab.Todo, "Todo", "✅")
+        (AgentPanelTab.Conversation, "Conversation", "conversation", "Chat with this agent"),
+        (AgentPanelTab.Workspace, "Workspace", "folder", "Files this agent can read and write"),
+        (AgentPanelTab.Reports, "Reports", "reports", "Reports this agent has produced"),
+        (AgentPanelTab.Canvas, "Canvas", "canvas", "Shared canvas for this conversation"),
+        (AgentPanelTab.Todo, "Todo", "todo", "This agent's task list")
     ];
 
     private AgentState? CurrentAgent => Store.GetAgent(AgentId);
-    private bool IsSubAgent => CurrentAgent?.IsReadOnly == true && CurrentAgent?.SessionType == "agent-subagent";
-    private IEnumerable<(AgentPanelTab Key, string Label, string Icon)> VisibleTabs =>
+    // #2248: sub-agent classification keys on the IMMUTABLE IsObserverAgent kind, NOT the mutable
+    // SessionType. A real user agent whose SessionType was stamped "agent-subagent" by an inbound
+    // session event must NOT have its Workspace/Reports tabs suppressed — only genuine sub-agent
+    // observer entries are.
+    private bool IsSubAgent => CurrentAgent?.IsObserverAgent == true;
+    private IEnumerable<(AgentPanelTab Key, string Label, string Icon, string Hint)> VisibleTabs =>
         IsSubAgent ? s_tabs.Where(t => t.Key != AgentPanelTab.Workspace && t.Key != AgentPanelTab.Reports) : s_tabs;
 
     protected override void OnInitialized()
@@ -140,8 +161,14 @@
     private void HandleStoreChanged()
     {
         var currentIsSubAgent = CurrentAgent is not null ? IsSubAgent : (bool?)null;
+        // #3084: this early-out lost its `return;` in a reformat, so the `if` bound to the
+        // assignment below and control fell through on every store notification. The braces are
+        // deliberate: an empty-bodied `if` is legal C# and neither the compiler nor review can see
+        // the difference.
         if (currentIsSubAgent == _lastIsSubAgent)
-    
+        {
+            return;
+        }
 
         _lastIsSubAgent = currentIsSubAgent;
 

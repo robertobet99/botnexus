@@ -117,14 +117,26 @@ public sealed class DefaultConversationRouter : IConversationRouter
             // any sub-address (e.g. forum topic) into the channel address themselves.
             // There is no special "default" conversation for addressless channels -- an empty
             // address is a valid stable identity (e.g. a future channel with no external ID).
-            conversation = new Conversation
-            {
-                ConversationId = ConversationId.Create(),
-                AgentId = agentId,
-                Title = $"{channelType}:{channelAddress}",
-                IsDefault = false,
-                Initiator = initiator?.IsValid == true ? initiator : null
-            };
+            // Channel/router path: a citizen sent an inbound message on a channel binding.
+            // Minted through the single creation seam (#2310) so provenance cannot be omitted.
+            //
+            // #2488: if this agent has no default conversation yet, THIS one becomes it. The
+            // default is minted lazily rather than at agent registration so an agent that is
+            // never used does not accrue an empty row, and so no registration hook is required -
+            // a default exists exactly when there is something to show in it.
+            var newConversationId = ConversationId.Create();
+            var title = $"{channelType}:{channelAddress}";
+            conversation = await AgentHasDefaultConversationAsync(agentId, ct)
+                ? ConversationFactory.CreateForChannel(
+                    newConversationId,
+                    agentId,
+                    title: title,
+                    initiator: initiator?.IsValid == true ? initiator : null)
+                : ConversationFactory.CreateDefaultForAgent(
+                    newConversationId,
+                    agentId,
+                    title: title,
+                    initiator: initiator?.IsValid == true ? initiator : null);
             if (ShouldPersistBinding(agentId, channelType, channelAddress) &&
                 !conversation.ChannelBindings.Any(b =>
                     b.ChannelType == channelType && b.ChannelAddress == channelAddress))
@@ -139,8 +151,16 @@ public sealed class DefaultConversationRouter : IConversationRouter
                 addedBinding = true;
             }
             _logger.LogDebug(
-                "Creating new conversation for agent={AgentId} channel={ChannelType} address={ChannelAddress}",
-                agentId, channelType, channelAddress);
+                "Creating new conversation for agent={AgentId} channel={ChannelType} address={ChannelAddress} isDefault={IsDefault}",
+                agentId, channelType, channelAddress, conversation.IsDefault);
+
+            // A freshly minted default must be persisted even when nothing else changed, or the
+            // uniqueness check above would mint a second one on the next inbound and the portal
+            // auto-select would still find nothing.
+            if (conversation.IsDefault)
+            {
+                addedBinding = true;
+            }
         }
 
         // 3. Resolve or create the active session
@@ -291,6 +311,22 @@ public sealed class DefaultConversationRouter : IConversationRouter
         _logger.LogWarning("ReattachBinding: binding {BindingId} not found in any conversation for agent {AgentId}", bindingId, target.AgentId);
     }
 
+    /// <summary>
+    /// Returns true when <paramref name="agentId"/> already owns a conversation flagged
+    /// <see cref="Conversation.IsDefault"/>, in any status.
+    /// </summary>
+    /// <remarks>
+    /// This is the enforcement point for the "at most one <c>is_default = 1</c> per agent"
+    /// invariant (#2488). It deliberately counts <b>archived</b> defaults too: an archived default
+    /// is still the agent's default and is reopened on next use, so skipping it would produce two
+    /// rows with the flag set the moment the first came back.
+    /// </remarks>
+    private async Task<bool> AgentHasDefaultConversationAsync(AgentId agentId, CancellationToken ct)
+    {
+        var existing = await _conversationStore.ListAsync(agentId, ct);
+        return existing.Any(c => c.IsDefault);
+    }
+
     // Resolves or creates an active session for the given conversation.
     // Stamps session.ConversationId and conversation.ActiveSessionId when changed.
     // Returns the sessionId, whether it is new, and whether the conversation was mutated.
@@ -383,11 +419,39 @@ public sealed class DefaultConversationRouter : IConversationRouter
     // internal channel whose ChannelAddress equals the conversation AgentId. That
     // artifact must never be persisted as a binding: an internal binding addressed by
     // an agent name accumulates duplicates and poisons multi-bot routing (#1681).
-    private const string KickoffChannelType = "internal";
+    // #2530 generalised this: the same rule now applies to every channel type that is
+    // not on the allow-list below.
 
-    private static bool ShouldPersistBinding(AgentId agentId, ChannelKey channelType, ChannelAddress channelAddress) =>
-        !(string.Equals(channelType.Value, KickoffChannelType, StringComparison.OrdinalIgnoreCase) &&
-          string.Equals(channelAddress.Value, agentId.Value, StringComparison.OrdinalIgnoreCase));
+    // Channel types for which an agent-id-shaped ChannelAddress is a LEGITIMATE, stable
+    // routing key rather than a junk artifact.
+    //
+    // "signalr" is the portal's conversation-first routing key: GatewayHub deliberately
+    // mints ChannelAddress.From(agentId.Value) so every browser connection for an agent
+    // converges on the same portal conversation regardless of connection id. Delivery is
+    // by SignalR group (conversationId), never by the address, so the binding is
+    // deliverable and must keep persisting -- suppressing it would break reconnect
+    // resolution via ResolveByBindingAsync.
+    //
+    // Every other channel type is an EXTERNAL transport whose adapter resolves a real
+    // remote destination from the address (Teams thread, Telegram chat id, Service Bus
+    // conversation reference). An agent id there can never be delivered: the relay logs
+    // "No conversation reference found for <agentId>" and drops the reply (#2530).
+    private static readonly HashSet<string> AgentIdAddressableChannelTypes =
+        new(StringComparer.OrdinalIgnoreCase) { "signalr" };
+
+    /// <summary>
+    /// Decides whether a (channelType, channelAddress) pair may be persisted as a durable
+    /// <see cref="ChannelBinding"/>. An address equal to the agent id is rejected for every
+    /// channel type except the explicitly allow-listed ones that use it as a real routing key.
+    /// </summary>
+    private static bool ShouldPersistBinding(AgentId agentId, ChannelKey channelType, ChannelAddress channelAddress)
+    {
+        if (!string.Equals(channelAddress.Value, agentId.Value, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Address == agent id. Only the allow-listed channel types may keep it.
+        return AgentIdAddressableChannelTypes.Contains(channelType.Value);
+    }
 
     private async Task<Conversation?> TryReopenArchivedConversationAsync(
         AgentId agentId,

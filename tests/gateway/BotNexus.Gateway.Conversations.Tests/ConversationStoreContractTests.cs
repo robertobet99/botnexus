@@ -1,4 +1,5 @@
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Domain.World;
 using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
@@ -16,6 +17,17 @@ public abstract class ConversationStoreContractTests
     /// <summary>Creates a fresh store instance for a single test.</summary>
     protected abstract IConversationStore CreateStore();
 
+    /// <summary>
+    /// Creates a store whose internal entity cache (if the implementation has one) is capped
+    /// at <paramref name="capacity"/> entries — smaller than the datasets used by the
+    /// capacity-stress contract test. Implementations backed by a bounded cache MUST override
+    /// this so the parity suite exercises list materialisation under eviction pressure; the
+    /// default returns <c>null</c> for cache-free implementations, and the test falls back to
+    /// <see cref="CreateStore"/>. This is the generalised guard for #2226: list completeness
+    /// must never depend on cache survival.
+    /// </summary>
+    protected virtual IConversationStore? CreateCapacityConstrainedStore(int capacity) => null;
+
     /// <summary>Disposes any resources used by the store fixture (e.g. temp DB).</summary>
     protected virtual void DisposeStore() { }
 
@@ -30,7 +42,95 @@ public abstract class ConversationStoreContractTests
             Title = title ?? "Test conversation"
         };
 
+    [Fact]
+    public async Task Activity_cutoff_is_inclusive_and_preserves_visibility_and_unbounded_callers()
+    {
+        var store = CreateStore();
+        var cutoff = new DateTimeOffset(2026, 10, 27, 12, 0, 0, TimeSpan.Zero);
+        foreach (var (id, updated, parent, status, visibility) in new[]
+        {
+            ("old", cutoff.AddTicks(-1), false, ConversationStatus.Active, ConversationVisibility.UserFacing),
+            ("boundary", cutoff, false, ConversationStatus.Active, ConversationVisibility.UserFacing),
+            ("offset", cutoff.ToOffset(TimeSpan.FromHours(-7)), false, ConversationStatus.Active, ConversationVisibility.UserFacing),
+            ("readonly", cutoff, false, ConversationStatus.Active, ConversationVisibility.InspectableReadOnly),
+            ("nested", cutoff, true, ConversationStatus.Active, ConversationVisibility.UserFacing),
+            ("archived", cutoff, false, ConversationStatus.Archived, ConversationVisibility.UserFacing)
+        })
+            await store.CreateAsync(new Conversation
+            {
+                ConversationId = ConversationId.From(id), AgentId = Agent(), Title = id,
+                CreatedAt = cutoff.AddDays(-2), UpdatedAt = updated, Status = status, Visibility = visibility,
+                ParentConversationId = parent ? ConversationId.From("parent") : null
+            });
+        var summaries = await store.GetSummariesAsync(cutoff);
+        summaries.Select(s => s.ConversationId).Order().ShouldBe(new[] { "boundary", "offset", "readonly" });
+        summaries.Single(s => s.ConversationId == "readonly").Visibility.ShouldBe("InspectableReadOnly");
+        (await store.GetSummariesAsync()).ShouldContain(s => s.ConversationId == "old");
+    }
+    [Theory]
+    [InlineData("created")]
+    [InlineData("updated")]
+    [InlineData("inbound")]
+    [InlineData("outbound")]
+    public async Task Activity_cutoff_uses_latest_creation_update_or_binding_activity(string signal)
+    {
+        var store = CreateStore();
+        var cutoff = DateTimeOffset.UtcNow.AddDays(1);
+        var latest = cutoff.AddMinutes(2);
+        var conversation = MakeConversation() with
+        {
+            CreatedAt = signal == "created" ? latest : cutoff.AddDays(-2),
+            UpdatedAt = signal == "updated" ? latest : cutoff.AddDays(-2)
+        };
+        conversation.ChannelBindings.Add(new ChannelBinding
+        {
+            BindingId = BindingId.Create(), ChannelType = ChannelKey.From("signalr"),
+            ChannelAddress = ChannelAddress.From("test"),
+            LastInboundAt = signal == "inbound" ? latest : null,
+            LastOutboundAt = signal == "outbound" ? latest : null
+        });
+        await store.CreateAsync(conversation);
+        var summary = (await store.GetSummariesAsync(cutoff)).ShouldHaveSingleItem();
+        summary.UpdatedAt.ShouldBe(cutoff.AddMinutes(2));
+        (await store.GetSummariesAsync((DateTimeOffset?)null)).ShouldHaveSingleItem()
+            .UpdatedAt.ShouldBe(latest);
+        (await store.GetSummariesAsync(cutoff)).ShouldHaveSingleItem()
+            .UpdatedAt.ShouldBe(latest);
+        (await store.GetSummariesAsync()).ShouldHaveSingleItem()
+            .UpdatedAt.ShouldBe(conversation.UpdatedAt);
+    }
     // ── GetAsync ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// #2883 (acceptance criterion 3): a title truncated on a grapheme boundary must survive the
+    /// full persistence round-trip with no replacement characters. This runs against every store
+    /// implementation because the corruption is unrepairable once written - the other half of the
+    /// surrogate pair no longer exists to reconstruct from.
+    /// </summary>
+    [Fact]
+    public async Task CreateAsync_PersistsTruncatedEmojiTitle_WithoutReplacementCharacters()
+    {
+        const string Grinning = "\U0001F600";
+        var sixtyEmoji = string.Concat(Enumerable.Repeat(Grinning, 60));
+
+        // 40 code units lands on a pair boundary here, but the helper is what guarantees that;
+        // the point of the test is that whatever it produces survives storage intact.
+        var truncated = TextTruncation.SafeTruncate(sixtyEmoji, 40)!;
+        truncated.ShouldNotContain('\uFFFD');
+
+        var store = CreateStore();
+        var conv = MakeConversation(title: truncated);
+
+        await store.CreateAsync(conv);
+        var loaded = await store.GetAsync(conv.ConversationId);
+
+        loaded.ShouldNotBeNull();
+        loaded!.Title.ShouldBe(truncated);
+        loaded.Title.ShouldNotContain('\uFFFD');
+        loaded.Title!.Any(char.IsSurrogate).ShouldBeTrue(
+            "non-vacuity: the round-tripped title must still contain astral characters, " +
+            "otherwise the store silently stripped them and the assertion proves nothing");
+    }
 
     [Fact]
     public async Task GetAsync_ReturnsNull_WhenNotFound()
@@ -38,6 +138,104 @@ public abstract class ConversationStoreContractTests
         var store = CreateStore();
         var result = await store.GetAsync(NewId());
         result.ShouldBeNull();
+    }
+
+    // ── GetPendingAskUserCheckpointsAsync (#3660) ──────────────────────────────
+
+    /// <summary>
+    /// #3660 acceptance criterion 4: seed many conversations of which exactly one carries a
+    /// pending checkpoint, and assert the store surfaces exactly that one. This is the parity
+    /// expression of "conversations without a checkpoint are never materialised" — the
+    /// SQLite-specific proof that the filter runs in SQL lives in
+    /// <c>SqliteConversationStorePendingAskUserQueryTests</c>.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAskUserCheckpointsAsync_ReturnsOnlyConversationsWithACheckpoint()
+    {
+        var store = CreateStore();
+        const int NoiseCount = 25;
+        for (var i = 0; i < NoiseCount; i++)
+            await store.CreateAsync(MakeConversation(title: $"noise-{i}"));
+
+        var withCheckpoint = MakeConversation(title: "pending");
+        withCheckpoint.PendingAskUserJson = """{"requestId":"req-1"}""";
+        await store.CreateAsync(withCheckpoint);
+
+        // Non-vacuity: the noise rows really are in the store, so returning one result is a
+        // filter working rather than an empty store.
+        (await store.ListAsync()).Count.ShouldBe(NoiseCount + 1);
+
+        var checkpoints = await store.GetPendingAskUserCheckpointsAsync();
+
+        checkpoints.Count.ShouldBe(1);
+        checkpoints[0].ConversationId.ShouldBe(withCheckpoint.ConversationId);
+        checkpoints[0].PendingAskUserJson.ShouldBe("""{"requestId":"req-1"}""");
+    }
+
+    /// <summary>
+    /// #3660 acceptance criterion 2: the projection omits <c>NULL</c> and empty payloads, so the
+    /// caller never has to re-check emptiness. An empty-string checkpoint is the case the old
+    /// in-memory <c>string.IsNullOrEmpty</c> guard covered; the filter must cover it now.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAskUserCheckpointsAsync_OmitsNullAndEmptyPayloads()
+    {
+        var store = CreateStore();
+
+        var nullPayload = MakeConversation(title: "null-payload");
+        await store.CreateAsync(nullPayload);
+
+        var emptyPayload = MakeConversation(title: "empty-payload");
+        emptyPayload.PendingAskUserJson = string.Empty;
+        await store.CreateAsync(emptyPayload);
+
+        var checkpoints = await store.GetPendingAskUserCheckpointsAsync();
+
+        checkpoints.ShouldBeEmpty();
+    }
+
+    /// <summary>
+    /// #3660 acceptance criterion 6: multiple pending checkpoints are all surfaced, so the #2047
+    /// waiter map is rebuilt completely rather than for whichever row happened to sort first.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAskUserCheckpointsAsync_ReturnsEveryPendingCheckpoint()
+    {
+        var store = CreateStore();
+        var expected = new List<ConversationId>();
+        for (var i = 0; i < 3; i++)
+        {
+            var conv = MakeConversation(title: $"pending-{i}");
+            conv.PendingAskUserJson = $$"""{"requestId":"req-{{i}}"}""";
+            await store.CreateAsync(conv);
+            expected.Add(conv.ConversationId);
+        }
+
+        await store.CreateAsync(MakeConversation(title: "clean"));
+
+        var checkpoints = await store.GetPendingAskUserCheckpointsAsync();
+
+        checkpoints.Count.ShouldBe(3);
+        checkpoints.Select(c => c.ConversationId).ShouldBe(expected, ignoreOrder: true);
+    }
+
+    /// <summary>
+    /// #3660 acceptance criterion 6: cancellation propagates rather than being swallowed into an
+    /// empty result, which would silently skip rehydration and reintroduce the #2047 mis-dispatch.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAskUserCheckpointsAsync_PropagatesCancellation()
+    {
+        var store = CreateStore();
+        var conv = MakeConversation(title: "pending");
+        conv.PendingAskUserJson = """{"requestId":"req-1"}""";
+        await store.CreateAsync(conv);
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Should.ThrowAsync<OperationCanceledException>(
+            () => store.GetPendingAskUserCheckpointsAsync(cts.Token));
     }
 
     [Fact]
@@ -128,6 +326,34 @@ public abstract class ConversationStoreContractTests
 
         var result = await store.ListAsync();
         result.Count.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task ListAsync_ReturnsEveryRow_WhenCountFarExceedsCacheCapacity()
+    {
+        // Generalised parity guard for #2226: no store implementation may gate the membership
+        // of a list result on a bounded read-through cache surviving materialisation. With far
+        // more conversations than the cache capacity, warming id N can evict an earlier id; a
+        // materialiser that rebuilds the result by re-reading from the cache then silently drops
+        // the evicted rows (the flicker bug). For cache-free stores this asserts plain
+        // completeness. Runs against every IConversationStore implementation.
+        const int capacity = 8;
+        const int total = 50;
+        var store = CreateCapacityConstrainedStore(capacity) ?? CreateStore();
+
+        var expected = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < total; i++)
+        {
+            var conv = MakeConversation(title: $"conv-{i:D3}");
+            await store.CreateAsync(conv);
+            expected.Add(conv.ConversationId.Value);
+        }
+
+        var list = await store.ListAsync();
+
+        list.Count.ShouldBe(total);
+        var returnedIds = list.Select(c => c.ConversationId.Value).ToHashSet(StringComparer.Ordinal);
+        returnedIds.SetEquals(expected).ShouldBeTrue();
     }
 
     [Fact]
@@ -327,5 +553,174 @@ public abstract class ConversationStoreContractTests
         var loaded = await store.GetAsync(conv.ConversationId);
         loaded.ShouldNotBeNull();
         loaded!.PendingAskUserJson.ShouldBeNull();
+    }
+
+    // ── Transactional binding + narrow patch operations (issue #2139) ──────────
+
+    private static ChannelBinding MakeBinding(string address)
+        => new()
+        {
+            BindingId = BindingId.Create(),
+            ChannelType = ChannelKey.From("signal"),
+            ChannelAddress = ChannelAddress.From(address),
+            BoundAt = DateTimeOffset.UtcNow
+        };
+
+    [Fact]
+    public async Task AddBindingAsync_AppendsSingleBinding()
+    {
+        var store = CreateStore();
+        var conv = MakeConversation();
+        await store.CreateAsync(conv);
+
+        var added = await store.AddBindingAsync(conv.ConversationId, MakeBinding("addr-1"));
+
+        added.ShouldBeTrue();
+        var loaded = await store.GetAsync(conv.ConversationId);
+        loaded!.ChannelBindings.Select(b => b.ChannelAddress.Value).ShouldBe(["addr-1"]);
+    }
+
+    [Fact]
+    public async Task AddBindingAsync_ReturnsFalse_WhenConversationMissing()
+    {
+        var store = CreateStore();
+        (await store.AddBindingAsync(NewId(), MakeBinding("x"))).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task AddBindingAsync_DoesNotDropExistingBindings()
+    {
+        var store = CreateStore();
+        var conv = MakeConversation();
+        await store.CreateAsync(conv);
+
+        await store.AddBindingAsync(conv.ConversationId, MakeBinding("addr-1"));
+        await store.AddBindingAsync(conv.ConversationId, MakeBinding("addr-2"));
+
+        var loaded = await store.GetAsync(conv.ConversationId);
+        loaded!.ChannelBindings.Select(b => b.ChannelAddress.Value).OrderBy(x => x, StringComparer.Ordinal)
+            .ShouldBe(["addr-1", "addr-2"]);
+    }
+
+    [Fact]
+    public async Task RemoveBindingAsync_RemovesOnlyRequested()
+    {
+        var store = CreateStore();
+        var keep = MakeBinding("keep");
+        var drop = MakeBinding("drop");
+        var conv = MakeConversation();
+        conv.ChannelBindings.Add(keep);
+        conv.ChannelBindings.Add(drop);
+        await store.CreateAsync(conv);
+
+        var removed = await store.RemoveBindingAsync(conv.ConversationId, drop.BindingId);
+
+        removed.ShouldBeTrue();
+        var loaded = await store.GetAsync(conv.ConversationId);
+        loaded!.ChannelBindings.Select(b => b.ChannelAddress.Value).ShouldBe(["keep"]);
+    }
+
+    [Fact]
+    public async Task RemoveBindingAsync_ReturnsFalse_WhenBindingMissing()
+    {
+        var store = CreateStore();
+        var conv = MakeConversation();
+        await store.CreateAsync(conv);
+
+        (await store.RemoveBindingAsync(conv.ConversationId, BindingId.Create())).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task MoveBindingAsync_ReparentsBinding()
+    {
+        var store = CreateStore();
+        var binding = MakeBinding("mobile");
+        var source = MakeConversation();
+        source.ChannelBindings.Add(binding);
+        var target = MakeConversation();
+        await store.CreateAsync(source);
+        await store.CreateAsync(target);
+
+        var moved = await store.MoveBindingAsync(source.ConversationId, target.ConversationId, binding.BindingId);
+
+        moved.ShouldBeTrue();
+        (await store.GetAsync(source.ConversationId))!.ChannelBindings.ShouldBeEmpty();
+        (await store.GetAsync(target.ConversationId))!.ChannelBindings.Select(b => b.ChannelAddress.Value).ShouldBe(["mobile"]);
+    }
+
+    [Fact]
+    public async Task MoveBindingAsync_ReturnsFalse_WhenSourceBindingMissing()
+    {
+        var store = CreateStore();
+        var source = MakeConversation();
+        var target = MakeConversation();
+        await store.CreateAsync(source);
+        await store.CreateAsync(target);
+
+        (await store.MoveBindingAsync(source.ConversationId, target.ConversationId, BindingId.Create())).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task PatchMetadataAsync_WritesOnlySetFields_AndPreservesOverrides()
+    {
+        var store = CreateStore();
+        var conv = MakeConversation() with { Purpose = "orig-purpose", Instructions = "orig-instr", ModelOverride = "opus" };
+        await store.CreateAsync(conv);
+
+        var updated = await store.PatchMetadataAsync(
+            conv.ConversationId,
+            new ConversationMetadataPatch { Title = FieldUpdate<string>.Set("new-title") });
+
+        updated.ShouldNotBeNull();
+        updated!.Title.ShouldBe("new-title");
+        updated.Purpose.ShouldBe("orig-purpose");
+        updated.Instructions.ShouldBe("orig-instr");
+        updated.ModelOverride.ShouldBe("opus");
+    }
+
+    [Fact]
+    public async Task PatchMetadataAsync_ReturnsNull_WhenMissing()
+    {
+        var store = CreateStore();
+        (await store.PatchMetadataAsync(NewId(), new ConversationMetadataPatch { Title = FieldUpdate<string>.Set("x") })).ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task PatchOverrideAsync_WritesOnlySetFields_AndPreservesMetadata()
+    {
+        var store = CreateStore();
+        var conv = MakeConversation(Agent("agent-x"), "keep-title") with { ThinkingOverride = "high" };
+        await store.CreateAsync(conv);
+
+        var updated = await store.PatchOverrideAsync(
+            conv.ConversationId,
+            new ConversationOverridePatch { Model = FieldUpdate<string?>.Set("sonnet") });
+
+        updated.ShouldNotBeNull();
+        updated!.ModelOverride.ShouldBe("sonnet");
+        updated.ThinkingOverride.ShouldBe("high");
+        updated.Title.ShouldBe("keep-title");
+    }
+
+    [Fact]
+    public async Task PatchOverrideAsync_ClearsField_WhenSetToNull()
+    {
+        var store = CreateStore();
+        var conv = MakeConversation() with { ModelOverride = "opus", ThinkingOverride = "max", ContextWindowOverride = 200_000 };
+        await store.CreateAsync(conv);
+
+        var updated = await store.PatchOverrideAsync(
+            conv.ConversationId,
+            new ConversationOverridePatch
+            {
+                Model = FieldUpdate<string?>.Set(null),
+                Thinking = FieldUpdate<string?>.Set(null),
+                ContextWindow = FieldUpdate<int?>.Set(null)
+            });
+
+        updated.ShouldNotBeNull();
+        updated!.ModelOverride.ShouldBeNull();
+        updated.ThinkingOverride.ShouldBeNull();
+        updated.ContextWindowOverride.ShouldBeNull();
     }
 }

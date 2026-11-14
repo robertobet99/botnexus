@@ -15,6 +15,14 @@
   <ItemGroup>
     <Using Include="Xunit" />
     <Using Include="Bunit" />    <Using Include="NSubstitute" />
+    <!-- #2305 (epic #2300): the conversation-origin enums have a SINGLE canonical declaration in
+         BotNexus.Gateway.Abstractions.Models; the client no longer re-declares them. Imported as
+         type ALIASES rather than a whole-namespace using so unrelated same-named types in that
+         namespace (e.g. SubAgentInfo) do not collide with the client's own models. -->
+    <Using Include="BotNexus.Gateway.Abstractions.Models.ConversationSource" Alias="ConversationSource" />
+    <Using Include="BotNexus.Gateway.Abstractions.Models.ConversationKind" Alias="ConversationKind" />
+    <Using Include="BotNexus.Gateway.Abstractions.Models.ConversationVisibility" Alias="ConversationVisibility" />
+    <Using Include="BotNexus.Gateway.Abstractions.Models.InboundDeliveryMode" Alias="InboundDeliveryMode" />
   </ItemGroup>
 
   <ItemGroup>
@@ -26,11 +34,42 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Copy app.css to output for CSS content tests (#935) -->
+    <!-- Copy app.css and source icon metadata to output for generated-contract tests (#935, #3950) -->
     <None Include="..\..\..\src\extensions\BotNexus.Extensions.Channels.SignalR.BlazorClient\wwwroot\css\app.css">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>wwwroot\css\app.css</Link>
     </None>
+    <None Include="..\..\..\assets\icons\svg\*.svg">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>assets\icons\svg\%(Filename)%(Extension)</Link>
+    </None>
+    <None Include="..\..\..\src\extensions\BotNexus.Extensions.Channels.SignalR.BlazorClient\wwwroot\js\chat.js">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>wwwroot\js\chat.js</Link>
+    </None>
+    <None Include="prompt-template-composer.test.mjs">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>wwwroot\js\prompt-template-composer.test.mjs</Link>
+    </None>
+    <None Include="..\..\..\src\extensions\BotNexus.Extensions.Channels.SignalR.BlazorClient\wwwroot\js\splitter.js">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>wwwroot\js\splitter.js</Link>
+    </None>
+    <None Include="splitter.resize.test.mjs">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>wwwroot\js\splitter.resize.test.mjs</Link>
+    </None>
+    <None Include="..\..\..\assets\icons\README.md">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>assets\icons\README.md</Link>
+    </None>
   </ItemGroup>
+
+  <Target Name="CopyAttachmentListCssForTests" AfterTargets="Build">
+    <MakeDir Directories="$(OutDir)wwwroot/css" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../../../src/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient.Core/Components/AttachmentList.razor.css"
+          DestinationFiles="$(OutDir)wwwroot/css/AttachmentList.razor.css"
+          SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

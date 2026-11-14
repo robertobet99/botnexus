@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
 using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Models;
@@ -29,7 +31,7 @@ internal static class OpenAIResponsesRequestBuilder
             input.Insert(0, new JsonObject
             {
                 ["role"] = model.Reasoning ? "developer" : "system",
-                ["content"] = UnicodeSanitizer.SanitizeSurrogates(systemPrompt)
+                ["content"] = systemPrompt.SanitizeSurrogates()
             });
         }
 
@@ -51,7 +53,11 @@ internal static class OpenAIResponsesRequestBuilder
             payload["service_tier"] = responsesOptions.ServiceTier;
 
         if (options?.CacheRetention != CacheRetention.None && !string.IsNullOrWhiteSpace(options?.SessionId))
-            payload["prompt_cache_key"] = options.SessionId;
+            // Responses cache keys are limited to 64 characters. Hash the entire long ID so
+            // sibling sub-agents sharing a prefix still receive distinct, stable cache keys.
+            payload["prompt_cache_key"] = options.SessionId.Length <= 64
+                ? options.SessionId
+                : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(options.SessionId)));
         var promptCacheRetention = GetPromptCacheRetention(model.BaseUrl, options?.CacheRetention ?? CacheRetention.Short);
         if (!string.IsNullOrWhiteSpace(promptCacheRetention))
             payload["prompt_cache_retention"] = promptCacheRetention;
@@ -72,13 +78,12 @@ internal static class OpenAIResponsesRequestBuilder
                 };
                 payload["include"] = new JsonArray { "reasoning.encrypted_content" };
             }
-            else if (!string.Equals(model.Provider, "github-copilot", StringComparison.OrdinalIgnoreCase))
-            {
-                payload["reasoning"] = new JsonObject
-                {
-                    ["effort"] = "none"
-                };
-            }
+        }
+
+        if (options?.ToolChoiceMode == BotNexus.Agent.Providers.Core.ToolChoice.None)
+        {
+            payload.Remove("tools");
+            payload["tool_choice"] = "none";
         }
 
         return payload;

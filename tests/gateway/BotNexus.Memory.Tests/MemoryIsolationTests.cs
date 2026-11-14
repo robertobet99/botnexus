@@ -1,3 +1,4 @@
+using BotNexus.Domain.Primitives;
 using BotNexus.Memory;
 using BotNexus.Memory.Tests.TestInfrastructure;
 using Microsoft.Data.Sqlite;
@@ -14,8 +15,8 @@ public sealed class MemoryIsolationTests
 
         try
         {
-            var storeA = factory.Create("agent-a");
-            var storeB = factory.Create("agent-b");
+            var storeA = factory.Create(AgentId.From("agent-a"));
+            var storeB = factory.Create(AgentId.From("agent-b"));
             await storeA.InitializeAsync();
             await storeB.InitializeAsync();
 
@@ -30,7 +31,8 @@ public sealed class MemoryIsolationTests
         }
         finally
         {
-            SqliteConnection.ClearAllPools();
+            foreach (var agent in new[] { "agent-a", "agent-b" })
+                SqlitePoolCleanup.ClearPoolFor(Path.Combine(tempRoot, agent, "memory.db"));
             if (Directory.Exists(tempRoot))
             {
                 for (var attempt = 0; attempt < 5; attempt++)

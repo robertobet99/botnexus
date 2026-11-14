@@ -65,6 +65,56 @@ public sealed class FileConversationStore : IConversationStore
         _fileSystem.Directory.CreateDirectory(rootPath);
     }
 
+    private static readonly HashSet<string> OwnershipFields = new(StringComparer.Ordinal) { "conversationId", "agentId" };
+
+    /// <inheritdoc />
+    public async Task<ConversationOwnership?> GetOwnershipAsync(ConversationId conversationId, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            foreach (var dir in _fileSystem.Directory.EnumerateDirectories(_rootPath))
+            {
+                ct.ThrowIfCancellationRequested();
+                var path = Path.Combine(dir, $"{conversationId.Value}.json");
+                if (!_fileSystem.File.Exists(path)) continue;
+                var ownership = await ReadOwnershipAsync(path, ct).ConfigureAwait(false);
+                if (ownership?.ConversationId == conversationId) return ownership;
+            }
+            return null;
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationOwnership>> ListOwnershipAsync(AgentId? agentId = null, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var result = new List<ConversationOwnership>();
+            foreach (var dir in _fileSystem.Directory.EnumerateDirectories(_rootPath))
+            foreach (var path in _fileSystem.Directory.EnumerateFiles(dir, "*.json"))
+            {
+                ct.ThrowIfCancellationRequested();
+                var ownership = await ReadOwnershipAsync(path, ct).ConfigureAwait(false);
+                if (ownership is not null && (agentId is null || ownership.AgentId == agentId.Value)) result.Add(ownership);
+            }
+            return result;
+        }
+        finally { _lock.Release(); }
+    }
+
+    private async Task<ConversationOwnership?> ReadOwnershipAsync(string path, CancellationToken ct)
+    {
+        try
+        {
+            await using var stream = _fileSystem.FileStream.New(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            return await BoundedJsonProjection.ReadAsync<ConversationOwnership>(stream, JsonOptions, OwnershipFields, ct).ConfigureAwait(false);
+        }
+        catch (FileNotFoundException) { return null; }
+    }
+
     /// <inheritdoc />
     public async Task<Conversation?> GetAsync(ConversationId conversationId, CancellationToken ct = default)
     {
@@ -107,6 +157,8 @@ public sealed class FileConversationStore : IConversationStore
 
     public async Task<Conversation> CreateAsync(Conversation conversation, CancellationToken ct = default)
     {
+        if (conversation.CompactionTokenCeiling is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(conversation), "CompactionTokenCeiling must be positive or null.");
         StampWorldId(conversation);
 
         await _lock.WaitAsync(ct).ConfigureAwait(false);
@@ -124,6 +176,10 @@ public sealed class FileConversationStore : IConversationStore
     /// <inheritdoc />
     public async Task SaveAsync(Conversation conversation, CancellationToken ct = default)
     {
+        if (conversation.CompactionTokenCeiling is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(conversation), "CompactionTokenCeiling must be positive or null.");
+        if (conversation.Status == ConversationStatus.Archived && conversation.ActiveSessionId is not null)
+            throw new InvalidOperationException($"Conversation '{conversation.ConversationId}' cannot be archived while an active session is assigned.");
         StampWorldId(conversation);
         conversation = conversation with { UpdatedAt = DateTimeOffset.UtcNow };
         await _lock.WaitAsync(ct).ConfigureAwait(false);
@@ -133,16 +189,39 @@ public sealed class FileConversationStore : IConversationStore
 
     /// <inheritdoc />
     public async Task ArchiveAsync(ConversationId conversationId, CancellationToken ct = default)
+        => _ = await TryArchiveCoreAsync(conversationId, ct).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public Task<bool> TryArchiveAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(actor);
+        return TryArchiveCoreAsync(conversationId, ct);
+    }
+
+    private async Task<bool> TryArchiveCoreAsync(ConversationId conversationId, CancellationToken ct)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var conversation = await FindByConversationIdAsync(conversationId, ct).ConfigureAwait(false);
-            if (conversation is null)
-                return;
+            if (conversation?.Status != ConversationStatus.Active)
+                return false;
             await WriteFileAsync(
-                conversation with { Status = ConversationStatus.Archived, ActiveSessionId = null, UpdatedAt = DateTimeOffset.UtcNow },
+                conversation with
+                {
+                    Status = ConversationStatus.Archived,
+                    ActiveSessionId = null,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                    Version = conversation.Version + 1
+                },
                 ct).ConfigureAwait(false);
+            return true;
         }
         finally { _lock.Release(); }
     }
@@ -226,6 +305,124 @@ public sealed class FileConversationStore : IConversationStore
     }
 
     /// <inheritdoc />
+    public async Task<bool> AddBindingAsync(ConversationId conversationId, ChannelBinding binding, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(binding);
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var conversation = await FindByConversationIdAsync(conversationId, ct).ConfigureAwait(false);
+            if (conversation is null)
+                return false;
+            conversation.ChannelBindings.Add(binding);
+            conversation.UpdatedAt = DateTimeOffset.UtcNow;
+            await WriteFileAsync(conversation, ct).ConfigureAwait(false);
+            return true;
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RemoveBindingAsync(ConversationId conversationId, BindingId bindingId, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var conversation = await FindByConversationIdAsync(conversationId, ct).ConfigureAwait(false);
+            if (conversation is null)
+                return false;
+            var target = conversation.ChannelBindings.FirstOrDefault(b => b.BindingId == bindingId);
+            if (target is null)
+                return false;
+            conversation.ChannelBindings.Remove(target);
+            conversation.UpdatedAt = DateTimeOffset.UtcNow;
+            await WriteFileAsync(conversation, ct).ConfigureAwait(false);
+            return true;
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> MoveBindingAsync(ConversationId fromConversationId, ConversationId toConversationId, BindingId bindingId, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var source = await FindByConversationIdAsync(fromConversationId, ct).ConfigureAwait(false);
+            if (source is null)
+                return false;
+            var destination = await FindByConversationIdAsync(toConversationId, ct).ConfigureAwait(false);
+            if (destination is null)
+                return false;
+            var target = source.ChannelBindings.FirstOrDefault(b => b.BindingId == bindingId);
+            if (target is null)
+                return false;
+
+            var now = DateTimeOffset.UtcNow;
+            source.ChannelBindings.Remove(target);
+            source.UpdatedAt = now;
+            destination.ChannelBindings.Add(target);
+            destination.UpdatedAt = now;
+            await WriteFileAsync(source, ct).ConfigureAwait(false);
+            await WriteFileAsync(destination, ct).ConfigureAwait(false);
+            return true;
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<Conversation?> PatchMetadataAsync(ConversationId conversationId, ConversationMetadataPatch patch, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(patch);
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var conversation = await FindByConversationIdAsync(conversationId, ct).ConfigureAwait(false);
+            if (conversation is null)
+                return null;
+            if (patch.Title.IsSet)
+                conversation.Title = patch.Title.Value;
+            if (patch.Purpose.IsSet)
+                conversation.Purpose = patch.Purpose.Value;
+            if (patch.Instructions.IsSet)
+                conversation.Instructions = patch.Instructions.Value;
+            conversation.UpdatedAt = DateTimeOffset.UtcNow;
+            await WriteFileAsync(conversation, ct).ConfigureAwait(false);
+            return BackfillWorldId(conversation);
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<Conversation?> PatchOverrideAsync(ConversationId conversationId, ConversationOverridePatch patch, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(patch);
+        if (patch.CompactionTokenCeiling.IsSet && patch.CompactionTokenCeiling.Value is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(patch), "CompactionTokenCeiling must be positive or null.");
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var conversation = await FindByConversationIdAsync(conversationId, ct).ConfigureAwait(false);
+            if (conversation is null)
+                return null;
+            if (patch.Model.IsSet)
+                conversation.ModelOverride = patch.Model.Value;
+            if (patch.Thinking.IsSet)
+                conversation.ThinkingOverride = patch.Thinking.Value;
+            if (patch.ContextWindow.IsSet)
+                conversation.ContextWindowOverride = patch.ContextWindow.Value;
+            if (patch.CompactionTokenCeiling.IsSet)
+                conversation.CompactionTokenCeiling = patch.CompactionTokenCeiling.Value;
+            if (patch.ToolOverrideJson.IsSet)
+                conversation.ToolOverrideJson = patch.ToolOverrideJson.Value;
+            conversation.UpdatedAt = DateTimeOffset.UtcNow;
+            await WriteFileAsync(conversation, ct).ConfigureAwait(false);
+            return BackfillWorldId(conversation);
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
     public async Task<Conversation?> ResolveByBindingAsync(
         AgentId agentId,
         ChannelKey channelType,
@@ -251,11 +448,64 @@ public sealed class FileConversationStore : IConversationStore
         var all = await ListAsync(null, ct).ConfigureAwait(false);
         return [.. all
             .Where(c => c.Status != ConversationStatus.Archived)
+            // #2338: nested sub-agent runs are reachable only through their parent's spawning tool
+            // call, so they never appear as top-level summaries.
+            .Where(c => c.ParentConversationId is null)
             .OrderByDescending(c => c.IsPinned)
             .ThenByDescending(c => c.PinnedAt)
             .ThenByDescending(c => c.UpdatedAt)
             .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal)
             .Select(ToSummary)];
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(
+        DateTimeOffset? activitySince, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var all = await ListAsync(ct: ct).ConfigureAwait(false);
+        return [.. all
+            .Where(c => c.Status == ConversationStatus.Active && c.ParentConversationId is null)
+            .Select(c => (Conversation: c, Activity: ConversationStoreShared.EffectiveActivity(c)))
+            .Where(x => activitySince is null || x.Activity >= activitySince.Value)
+            .OrderByDescending(x => x.Conversation.IsPinned)
+            .ThenByDescending(x => x.Conversation.PinnedAt)
+            .ThenByDescending(x => x.Activity)
+            .ThenBy(x => x.Conversation.ConversationId.Value, StringComparer.Ordinal)
+            .Select(x => ToSummary(x.Conversation) with { UpdatedAt = x.Activity })];
+    }
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationRetentionCandidate>> GetRetentionCandidatesAsync(
+        ConversationSource? source = null,
+        CancellationToken ct = default)
+    {
+        var all = await ListAsync(null, ct).ConfigureAwait(false);
+        return [.. all
+            .Where(c => c.Status == ConversationStatus.Active && (!source.HasValue || c.Source == source.Value))
+            .OrderBy(c => c.UpdatedAt)
+            .Select(c => new ConversationRetentionCandidate(
+                c.ConversationId,
+                c.AgentId,
+                c.UpdatedAt,
+                c.IsPinned,
+                c.Source,
+                c.SourceId))];
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default)
+    {
+        // #3660 (criterion 6): cancellation must surface rather than resolve to an empty list.
+        ct.ThrowIfCancellationRequested();
+        // #3660: the file store has no queryable index, so the enumeration cost is inherent to the
+        // backing format rather than to this call. The observable contract still matches SQLite:
+        // only non-empty checkpoints are surfaced, projected to id + payload.
+        var all = await ListAsync(null, ct).ConfigureAwait(false);
+        return [.. all
+            .Where(c => !string.IsNullOrEmpty(c.PendingAskUserJson))
+            .OrderByDescending(c => c.UpdatedAt)
+            .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal)
+            .Select(c => new PendingAskUserCheckpoint(c.ConversationId, c.PendingAskUserJson!))];
     }
 
     private async Task<IReadOnlyList<Conversation>> EnumerateAsync(AgentId? agentId, CancellationToken ct)
@@ -372,6 +622,8 @@ public sealed class FileConversationStore : IConversationStore
             c.UpdatedAt,
             c.Purpose,
             c.Kind.ToString(),
+            c.Source.ToString(),
+            c.Visibility.ToString(),
             c.IsPinned,
             c.PinnedAt,
             // #1427: populate the participant roster (avatar-chip list the portal renders)
@@ -380,7 +632,9 @@ public sealed class FileConversationStore : IConversationStore
             c.Participants.Select(p => new ParticipantSummary(
                 p.CitizenId.Kind.ToString(),
                 p.CitizenId.Value,
-                p.Role)).ToList());
+                p.Role)).ToList(),
+            // #2121: SourceId travels with Source everywhere Source is projected.
+            c.SourceId);
 
     // ── Canvas State ───────────────────────────────────────────────────────
     // The file store persists canvas state in the CanvasState property of the Conversation

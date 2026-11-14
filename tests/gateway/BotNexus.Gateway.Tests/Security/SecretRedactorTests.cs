@@ -1,3 +1,5 @@
+using BotNexus.Agent.Core.Loop;
+using BotNexus.Agent.Core.Types;
 using BotNexus.Gateway.Security;
 
 namespace BotNexus.Gateway.Tests.Security;
@@ -34,6 +36,28 @@ public sealed class SecretRedactorTests
         var input = $"key={key}";
         _sut.Redact(input).ShouldNotContain(key);
         _sut.Redact(input).ShouldContain("[REDACTED]");
+    }
+
+    [Fact]
+    public void ToolResultSanitizer_UsesSharedVocabularyAcrossAdjacentTextBlocks()
+    {
+        const string token = "github_pat_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789_ABCDEF123456789012345678";
+        var splitAt = token.Length / 2;
+        var result = new AgentToolResult(
+        [
+            new AgentToolContent(AgentToolContentType.Text, $"prefix {token[..splitAt]}"),
+            new AgentToolContent(AgentToolContentType.Text, $"{token[splitAt..]} suffix"),
+            new AgentToolContent(AgentToolContentType.Image, "data:image/png;base64,AAAA")
+        ]);
+
+        var sanitized = ToolResultSanitizer.Apply(result, _sut.Redact);
+
+        var text = string.Concat(sanitized.Content
+            .Where(block => block.Type == AgentToolContentType.Text)
+            .Select(block => block.Value));
+        text.ShouldBe("prefix [REDACTED] suffix");
+        sanitized.Content.ShouldContain(block =>
+            block.Type == AgentToolContentType.Image && block.Value == "data:image/png;base64,AAAA");
     }
 
     [Theory]
@@ -117,6 +141,90 @@ public sealed class SecretRedactorTests
     }
 
     [Fact]
+    public void Redact_AuthorizationBasicHeader_IsRedacted()
+    {
+        // Basic auth base64-encodes user:password; the full credential must not survive.
+        const string cred = "dXNlcm5hbWU6c3VwZXJzZWNyZXRwYXNzd29yZA==";
+        var input = $"Authorization: Basic {cred}";
+        var result = _sut.Redact(input);
+        result.ShouldNotContain(cred);
+        result.ShouldContain("[REDACTED]");
+    }
+
+    [Fact]
+    public void Redact_AuthorizationBotHeader_IsRedacted()
+    {
+        // Discord-style bot token.
+        const string token = "MTIzNDU2Nzg5MDEyMzQ1Njc4.AbCdEf.GhIjKlMnOpQrStUvWxYz012345";
+        var input = $"Authorization: Bot {token}";
+        var result = _sut.Redact(input);
+        result.ShouldNotContain(token);
+        result.ShouldContain("[REDACTED]");
+    }
+
+    [Fact]
+    public void Redact_ProxyAuthorizationHeader_IsRedacted()
+    {
+        const string cred = "aGVsbG86d29ybGRzZWNyZXR2YWx1ZQ==";
+        var input = $"Proxy-Authorization: Basic {cred}";
+        var result = _sut.Redact(input);
+        result.ShouldNotContain(cred);
+        result.ShouldContain("[REDACTED]");
+    }
+
+    [Theory]
+    [InlineData("X-Api-Key")]
+    [InlineData("X-Auth-Token")]
+    [InlineData("X-OpenClaw-Token")]
+    public void Redact_ApiKeyStyleHeader_IsRedacted(string header)
+    {
+        const string secret = "aBcDeFgHiJkLmNoPqRsT1234";
+        var input = $"{header}: {secret}";
+        var result = _sut.Redact(input);
+        result.ShouldNotContain(secret);
+        result.ShouldContain("[REDACTED]");
+    }
+
+    [Fact]
+    public void Redact_StandaloneBearerToken_IsRedacted()
+    {
+        // A raw diagnostic / exception line that prints "Bearer <token>" with no
+        // Authorization: header name in front still leaks the token.
+        const string token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwR";
+        var input = $"HttpRequestException: sent header Bearer {token}";
+        var result = _sut.Redact(input);
+        result.ShouldNotContain(token);
+        result.ShouldContain("[REDACTED]");
+    }
+
+    [Fact]
+    public void Redact_QuotedAuthorizationHeader_IsRedacted()
+    {
+        // JSON-embedded / serialized header form: "Authorization": "Bearer <token>".
+        const string token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwR";
+        var input = $"{{\"Authorization\": \"Bearer {token}\"}}";
+        var result = _sut.Redact(input);
+        result.ShouldNotContain(token);
+        result.ShouldContain("[REDACTED]");
+    }
+
+    [Fact]
+    public void Redact_WordBearerInProse_IsNotOverRedacted()
+    {
+        // The word "Bearer" in ordinary prose (no long token following) must survive.
+        const string safe = "The bearer of this message is a friend.";
+        _sut.Redact(safe).ShouldBe(safe);
+    }
+
+    [Fact]
+    public void Redact_ShortApiKeyHeaderValue_IsNotRedacted()
+    {
+        // Values shorter than the minimum length must pass through.
+        const string safe = "X-Api-Key: abc";
+        _sut.Redact(safe).ShouldBe(safe);
+    }
+
+    [Fact]
     public void Redact_ApiKeyInQueryString_IsRedacted()
     {
         const string key = "AbCdEfGhIjKlMnOpQrStUvWxYz12345678901234";
@@ -160,5 +268,73 @@ public sealed class SecretRedactorTests
         var firstPass = _sut.Redact(key);
         var secondPass = _sut.Redact(firstPass);
         secondPass.ShouldBe(firstPass);
+    }
+    [Theory]
+    // JSON form: aws_secret_access_key: "<40-char value>"
+    [InlineData("{\"aws_secret_access_key\": \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"}")]
+    // key=value form with the compact SecretAccessKey field name
+    [InlineData("SecretAccessKey=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")]
+    // env-assignment form: AWS_SECRET_ACCESS_KEY=<40-char value>
+    [InlineData("AWS_SECRET_ACCESS_KEY=abcdefghij0123456789ABCDEFGHIJ0123456789")]
+    // hyphenated field name variant
+    [InlineData("aws-secret-access-key: 'abcdefghij0123456789ABCDEFGHIJ0123456789'")]
+    public void Redact_AwsSecretAccessKey_IsRedacted(string input)
+    {
+        var result = _sut.Redact(input);
+        result.ShouldNotContain("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        result.ShouldNotContain("abcdefghij0123456789ABCDEFGHIJ0123456789");
+        result.ShouldContain("[REDACTED]");
+    }
+
+    [Fact]
+    public void Redact_BareFortyCharString_IsNotRedactedAsAwsSecret()
+    {
+        // A 40-char alphanumeric string with no aws-secret field name in front must
+        // survive: the field-name form is the required minimum, and the bare
+        // value-shape pattern was deliberately NOT added (false-positive risk, #2286).
+        const string safe = "commit abcdefghij0123456789ABCDEFGHIJ0123456789 landed";
+        _sut.Redact(safe).ShouldBe(safe);
+    }
+
+    // GitLab token prefixes (#2285)
+
+    [Theory]
+    // Personal access token: glpat- + 20 chars
+    [InlineData("glpat-AbCdEfGhIjKlMnOpQrSt")]
+    // Routable token family: gl(dt|cbt|ptt|ft|imt|agent|wt|soat|ffct|rt|rtr)- + 20 chars
+    [InlineData("gldt-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glcbt-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glptt-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glft-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glimt-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glagent-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glwt-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glsoat-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glffct-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glrt-AbCdEfGhIjKlMnOpQrSt")]
+    [InlineData("glrtr-AbCdEfGhIjKlMnOpQrSt")]
+    // Runner registration token: GR1348941 + 20 chars
+    [InlineData("GR1348941AbCdEfGhIjKlMnOpQrSt")]
+    // Session cookie: _gitlab_session= + 20 chars
+    [InlineData("_gitlab_session=AbCdEfGh12._-%34567890")]
+    public void Redact_GitLabToken_IsRedacted(string token)
+    {
+        var input = $"token: {token}";
+        _sut.Redact(input).ShouldNotContain(token);
+        _sut.Redact(input).ShouldContain("[REDACTED]");
+    }
+
+    [Theory]
+    // Too short (only 19 chars after prefix) - must not match.
+    [InlineData("glpat-AbCdEfGhIjKlMnOpQrS")]
+    // Unknown gl-prefix that is not in the routable family.
+    [InlineData("glxyz-AbCdEfGhIjKlMnOpQrSt")]
+    // Runner-token prefix with too-short suffix.
+    [InlineData("GR1348941AbCdEfGhIjKlMnOpQr")]
+    // Session cookie name without a long-enough value.
+    [InlineData("_gitlab_session=short")]
+    public void Redact_GitLabTokenLikeButInvalid_IsNotRedacted(string safe)
+    {
+        _sut.Redact(safe).ShouldBe(safe);
     }
 }

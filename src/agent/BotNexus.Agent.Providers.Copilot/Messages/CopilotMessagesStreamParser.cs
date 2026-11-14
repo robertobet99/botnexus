@@ -2,17 +2,20 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using BotNexus.Agent.Providers.Copilot.Telemetry;
+using BotNexus.Agent.Providers.Core;
+using BotNexus.Agent.Providers.Core.Diagnostics;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Streaming;
 using BotNexus.Agent.Providers.Core.Utilities;
+using BotNexus.Gateway.Abstractions.Security;
+using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Agent.Providers.Copilot.Messages;
 
 /// <summary>
 /// Parses GitHub Copilot Anthropic-Messages SSE streams into content blocks and
-/// streaming events. Owned by the Copilot provider; behaviour is byte-identical
-/// to the Anthropic parser for the Copilot transport (which never used the
-/// claude-cli OAuth tool-name reverse-lookup).
+/// streaming events. Completion requires an explicit message_stop; transport EOF
+/// alone leaves the message incomplete.
 /// </summary>
 internal static class CopilotMessagesStreamParser
 {
@@ -26,7 +29,20 @@ internal static class CopilotMessagesStreamParser
     // before it could approach the total cap.
     private const long MaxFrameBytes = 64L * 1024;
 
-    internal static async Task<(Usage Usage, string? ResponseId, StopReason StopReason)> ProcessStreamAsync(
+    /// <summary>
+    /// Logger category for the stream-assembly diagnostic. This parser is an <c>internal static</c>
+    /// helper with no injected logger, so it takes the ambient factory the composition root sets
+    /// on <see cref="ProviderDiagnostics"/> - the same seam #2485 introduced for the static
+    /// converters. Passing <c>null</c> here instead is what made the checksum unreportable (#3443):
+    /// <c>Reconcile</c> guards its whole diagnostic behind <c>logger?.</c>, so a null argument does
+    /// not degrade the warning, it deletes it.
+    /// </summary>
+    private const string LoggerCategory = "CopilotMessagesStreamParser";
+
+    internal readonly record struct StreamResult(
+        Usage Usage, string? ResponseId, StopReason StopReason, bool MessageStopped);
+
+    internal static async Task<StreamResult> ProcessStreamAsync(
         Stream responseStream,
         LlmModel model,
         LlmStream stream,
@@ -35,24 +51,40 @@ internal static class CopilotMessagesStreamParser
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage,
         Func<string?, StopReason> mapStopReason,
         CancellationToken ct,
-        Action? onFirstToken = null)
+        Action? onFirstToken = null,
+        TimeSpan? idleTimeout = null,
+        ISecretRedactor? secretRedactor = null)
     {
         // Bound the untrusted SSE body before a single byte reaches the line loop below. Every byte
         // the StreamReader consumes flows through the ByteCountingStream, so an unbounded body or a
         // single never-terminating data: line trips the cap regardless of how the reader buffers
         // internally (#1668). Leave the inner stream open -- the caller owns its lifetime.
         using var boundedStream = new ByteCountingStream(
-            responseStream, MaxResponseBytes, MaxFrameBytes, leaveOpen: true);
+            responseStream,
+            MaxResponseBytes,
+            MaxFrameBytes,
+            leaveOpen: true,
+            idleTimeout: idleTimeout);
         using var reader = new StreamReader(boundedStream, Encoding.UTF8);
 
+        var logger = ProviderDiagnostics.CreateLogger(LoggerCategory);
         var usage = initialUsage;
         var blockTypes = new Dictionary<int, string>();
+        var finalizedBlocks = new Dictionary<int, ContentBlock>();
         var textAccumulators = new Dictionary<int, StringBuilder>();
+        // Text deltas that actually contributed to each block, so the mismatch diagnostic reports
+        // the real fragment count instead of a constant 0 (#3443). Counted at the point of append
+        // so it can never drift from what was accumulated.
+        var textDeltaCounts = new Dictionary<int, int>();
         var signatureAccumulators = new Dictionary<int, StringBuilder>();
         var toolCallIds = new Dictionary<int, string>();
         var toolCallNames = new Dictionary<int, string>();
+        // One budget per streamed tool call, bounding the cumulative UTF-8 byte cost of its
+        // input_json_delta fragments (#2902). Created on content_block_start for tool_use blocks.
+        var argumentBudgets = new Dictionary<int, StreamToolArgumentBudget>();
         string? responseId = null;
         var stopReason = StopReason.Stop;
+        var messageStopped = false;
         string? currentEvent = null;
         var firstTokenFired = false;
 
@@ -96,23 +128,47 @@ internal static class CopilotMessagesStreamParser
                     model,
                     stream,
                     contentBlocks,
+                    finalizedBlocks,
                     blockTypes,
                     textAccumulators,
+                    textDeltaCounts,
                     signatureAccumulators,
                     toolCallIds,
                     toolCallNames,
+                    argumentBudgets,
                     usage,
+                    logger,
                     buildMessage,
                     mapStopReason,
+                    secretRedactor,
                     ref responseId,
                     ref stopReason,
+                    ref messageStopped,
                     out usage);
             }
 
             currentEvent = null;
         }
 
-        return (usage, responseId, stopReason);
+        ct.ThrowIfCancellationRequested();
+
+        if (!messageStopped)
+        {
+            // Retain text already delivered to the caller without claiming that an open block
+            // completed. Tool arguments remain unfinished and must not become executable calls.
+            foreach (var (index, blockType) in blockTypes)
+            {
+                if (blockType == "text" && textAccumulators.TryGetValue(index, out var text) && text.Length > 0)
+                    finalizedBlocks.TryAdd(index, new TextContent(text.ToString()));
+            }
+
+            // Closed blocks may have arrived after an earlier block that remains open. Merge
+            // by wire index rather than appending salvaged text in block-completion order.
+            contentBlocks.Clear();
+            contentBlocks.AddRange(finalizedBlocks.OrderBy(pair => pair.Key).Select(pair => pair.Value));
+        }
+
+        return new StreamResult(usage, responseId, stopReason, messageStopped);
     }
 
     private static void ProcessSseEvent(
@@ -121,16 +177,22 @@ internal static class CopilotMessagesStreamParser
         LlmModel model,
         LlmStream stream,
         List<ContentBlock> contentBlocks,
+        Dictionary<int, ContentBlock> finalizedBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
         Dictionary<int, string> toolCallIds,
         Dictionary<int, string> toolCallNames,
+        Dictionary<int, StreamToolArgumentBudget> argumentBudgets,
         Usage usage,
+        ILogger logger,
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage,
         Func<string?, StopReason> mapStopReason,
+        ISecretRedactor? secretRedactor,
         ref string? responseId,
         ref StopReason stopReason,
+        ref bool messageStopped,
         out Usage updatedUsage)
     {
         updatedUsage = usage;
@@ -154,18 +216,20 @@ internal static class CopilotMessagesStreamParser
 
             case "content_block_start":
                 HandleContentBlockStart(data, model, stream, contentBlocks, blockTypes,
-                    textAccumulators, signatureAccumulators, toolCallIds, toolCallNames, usage, responseId,
+                    textAccumulators, textDeltaCounts, signatureAccumulators, toolCallIds, toolCallNames, argumentBudgets, usage, responseId,
                     buildMessage);
                 break;
 
             case "content_block_delta":
                 HandleContentBlockDelta(data, model, stream, contentBlocks, blockTypes,
-                    textAccumulators, signatureAccumulators, usage, responseId, buildMessage);
+                    textAccumulators, textDeltaCounts, signatureAccumulators, argumentBudgets,
+                    toolCallIds, toolCallNames, usage, responseId, buildMessage);
                 break;
 
             case "content_block_stop":
-                HandleContentBlockStop(data, model, stream, contentBlocks, blockTypes,
-                    textAccumulators, signatureAccumulators, toolCallIds, toolCallNames, usage, responseId, buildMessage);
+                HandleContentBlockStop(data, model, stream, contentBlocks, finalizedBlocks, blockTypes,
+                    textAccumulators, textDeltaCounts, signatureAccumulators, toolCallIds, toolCallNames, usage, logger, responseId, buildMessage);
+                blockTypes.Remove(data.GetProperty("index").GetInt32());
                 break;
 
             case "message_delta":
@@ -179,13 +243,15 @@ internal static class CopilotMessagesStreamParser
                 break;
 
             case "message_stop":
+                messageStopped = true;
                 break;
 
             case "error":
                 var errorMsg = data.TryGetProperty("error", out var err)
                     ? err.TryGetProperty("message", out var m) ? m.GetString() : "Unknown error"
                     : "Unknown error";
-                throw new InvalidOperationException($"Copilot streaming error: {errorMsg}");
+                var diagnostic = ProviderHttpErrorHelper.RedactDiagnosticText(errorMsg, secretRedactor);
+                throw new InvalidOperationException($"Copilot streaming error: {diagnostic}");
         }
     }
 
@@ -196,9 +262,11 @@ internal static class CopilotMessagesStreamParser
         List<ContentBlock> contentBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
         Dictionary<int, string> toolCallIds,
         Dictionary<int, string> toolCallNames,
+        Dictionary<int, StreamToolArgumentBudget> argumentBudgets,
         Usage usage,
         string? responseId,
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage)
@@ -209,6 +277,7 @@ internal static class CopilotMessagesStreamParser
         var blockType = block.GetProperty("type").GetString() ?? "text";
         blockTypes[index] = blockType;
         textAccumulators[index] = new StringBuilder();
+        textDeltaCounts[index] = 0;
         signatureAccumulators[index] = new StringBuilder();
 
         var partial = buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId);
@@ -232,7 +301,16 @@ internal static class CopilotMessagesStreamParser
                     toolCallIds[index] = tcId.GetString() ?? "";
                 if (block.TryGetProperty("name", out var tcName))
                     toolCallNames[index] = tcName.GetString() ?? "";
-                stream.Push(new ToolCallStartEvent(index, partial));
+                // Bound this tool call's argument accumulation before the first fragment arrives
+                // (#2902): a hostile stream must not be able to grow the buffer without limit.
+                argumentBudgets[index] = StreamToolArgumentBudget.ForToolCall(
+                    model.Provider, model.Id,
+                    $"tool '{toolCallNames.GetValueOrDefault(index, "")}' (block {index})");
+                stream.Push(new ToolCallStartEvent(
+                    index,
+                    partial,
+                    toolCallIds.GetValueOrDefault(index),
+                    toolCallNames.GetValueOrDefault(index)));
                 break;
         }
     }
@@ -244,7 +322,11 @@ internal static class CopilotMessagesStreamParser
         List<ContentBlock> contentBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
+        Dictionary<int, StreamToolArgumentBudget> argumentBudgets,
+        Dictionary<int, string> toolCallIds,
+        Dictionary<int, string> toolCallNames,
         Usage usage,
         string? responseId,
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage)
@@ -258,8 +340,14 @@ internal static class CopilotMessagesStreamParser
         switch (deltaType)
         {
             case "text_delta":
+                // Byte-identical accumulation (#3442). The CRLF strip that used to run here was
+                // removed once mitm captures showed Copilot sends no CR on the wire; the artifact
+                // came from our own separator injection (#3425/#3428).
                 var text = delta.GetProperty("text").GetString() ?? "";
+                if (text.Length == 0)
+                    break;
                 textAccumulators[index].Append(text);
+                textDeltaCounts[index] = textDeltaCounts.GetValueOrDefault(index) + 1;
                 stream.Push(new TextDeltaEvent(index, text, partial));
                 break;
             case "thinking_delta":
@@ -269,8 +357,19 @@ internal static class CopilotMessagesStreamParser
                 break;
             case "input_json_delta":
                 var jsonFrag = delta.GetProperty("partial_json").GetString() ?? "";
-                textAccumulators[index].Append(jsonFrag);
-                stream.Push(new ToolCallDeltaEvent(index, jsonFrag, partial));
+                // Budgeted append: throws StreamToolArgumentsTooLargeException on overflow, which the
+                // provider's stream task turns into a terminal error event rather than emitting a
+                // truncated-and-therefore-invalid argument blob (#2902).
+                if (argumentBudgets.TryGetValue(index, out var budget))
+                    budget.Append(textAccumulators[index], jsonFrag);
+                else
+                    textAccumulators[index].Append(jsonFrag);
+                stream.Push(new ToolCallDeltaEvent(
+                    index,
+                    jsonFrag,
+                    partial,
+                    toolCallIds.GetValueOrDefault(index),
+                    toolCallNames.GetValueOrDefault(index)));
                 break;
             case "signature_delta":
                 var sig = delta.GetProperty("signature").GetString() ?? "";
@@ -284,12 +383,15 @@ internal static class CopilotMessagesStreamParser
         LlmModel model,
         LlmStream stream,
         List<ContentBlock> contentBlocks,
+        Dictionary<int, ContentBlock> finalizedBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
         Dictionary<int, string> toolCallIds,
         Dictionary<int, string> toolCallNames,
         Usage usage,
+        ILogger logger,
         string? responseId,
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage)
     {
@@ -303,19 +405,35 @@ internal static class CopilotMessagesStreamParser
         switch (blockType)
         {
             case "text":
-                contentBlocks.Add(new TextContent(accumulated, signature));
+                // The provider's own authoritative text for the block, when the stop frame carries
+                // one. Reconciling against it is the free per-block checksum #2443 introduced and
+                // #3336 found wired into only ONE of the three parsers, which is why the CRLF
+                // family survived into a fourth recurrence on the relay paths. Fail-open: a stop
+                // frame with no final value yields null and the assembled text stands.
+                accumulated = StreamAssemblyConformance.Reconcile(
+                    accumulated,
+                    data.TryRead(),
+                    model.Provider,
+                    model.Id,
+                    "github-copilot-messages",
+                    "sse",
+                    textDeltaCounts.GetValueOrDefault(index),
+                    logger,
+                    stream,
+                    () => buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId));
+                contentBlocks.Add(finalizedBlocks[index] = new TextContent(accumulated, signature));
                 var textPartial = buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId);
                 stream.Push(new TextEndEvent(index, accumulated, textPartial));
                 break;
 
             case "thinking":
-                contentBlocks.Add(new ThinkingContent(accumulated, signature));
+                contentBlocks.Add(finalizedBlocks[index] = new ThinkingContent(accumulated, signature));
                 var thinkPartial = buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId);
                 stream.Push(new ThinkingEndEvent(index, accumulated, thinkPartial));
                 break;
 
             case "redacted_thinking":
-                contentBlocks.Add(new ThinkingContent(accumulated, signature, Redacted: true));
+                contentBlocks.Add(finalizedBlocks[index] = new ThinkingContent(accumulated, signature, Redacted: true));
                 var redactPartial = buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId);
                 stream.Push(new ThinkingEndEvent(index, accumulated, redactPartial));
                 break;
@@ -325,7 +443,7 @@ internal static class CopilotMessagesStreamParser
                 var toolName = toolCallNames.GetValueOrDefault(index, "");
                 var args = StreamingJsonParser.Parse(accumulated);
                 var toolCall = new ToolCallContent(toolId, toolName, args, signature);
-                contentBlocks.Add(toolCall);
+                contentBlocks.Add(finalizedBlocks[index] = toolCall);
                 var toolPartial = buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId);
                 stream.Push(new ToolCallEndEvent(index, toolCall, toolPartial));
                 break;

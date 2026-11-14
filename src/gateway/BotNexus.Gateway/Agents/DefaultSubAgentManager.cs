@@ -1,18 +1,20 @@
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Abstractions.Concurrency;
 using System.Collections.Concurrent;
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Activity;
 using BotNexus.Gateway.Abstractions.Channels;
+using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Security;
+using BotNexus.Gateway.Audit;
 using BotNexus.Gateway.Configuration;
 using BotNexus.Gateway.Diagnostics;
 using BotNexus.Gateway.Security;
 using BotNexus.Agent.Core.Types;
+using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Providers.Core.Resolution;
+using BotNexus.Cron;
 using BotNexus.Domain.Primitives;
 using BotNexus.Domain.World;
 using Microsoft.Extensions.Logging;
@@ -23,18 +25,35 @@ namespace BotNexus.Gateway.Agents;
 /// <summary>
 /// Default in-memory orchestrator for background sub-agent sessions.
 /// </summary>
-public sealed class DefaultSubAgentManager : ISubAgentManager
+public sealed partial class DefaultSubAgentManager : ISubAgentManager
 {
+    private static readonly StripedAsyncLock SpawnAdmissionLocks = new();
     private readonly IAgentSupervisor _supervisor;
     private readonly IAgentRegistry _registry;
     private readonly IActivityBroadcaster _activity;
-    private readonly IChannelDispatcher _dispatcher;
     private readonly IAgentWorkspaceManager? _workspaceManager;
     private readonly IOptionsMonitor<GatewayOptions> _options;
+    private readonly IOptions<AgentExchangeOptions> _exchangeOptions;
     private readonly ILogger<DefaultSubAgentManager> _logger;
     private readonly DefaultToolPolicyProvider? _policyProvider;
     private readonly TimeProvider _timeProvider;
     private readonly ISessionStore? _sessionStore;
+    private readonly ISecretRedactor _secretRedactor;
+    private readonly ISubAgentWorktreeSnapshotService? _worktreeSnapshotService;
+
+    /// <summary>
+    /// The single execution-layer tool-audit sink (#2614 AC4).
+    /// </summary>
+    private readonly IToolAuditSink _toolAudit;
+    // #2338: the child run mints its own conversation through ConversationFactory and persists it
+    // here. Optional so hosts/tests without a conversation store behave exactly as before apart
+    // from the row not being written - the id is still minted so the child never shares the
+    // parent's SignalR group.
+    private readonly IConversationStore? _conversationStore;
+    // #2647: model registry used to preflight a requested model/provider override BEFORE any child
+    // session, descriptor or record exists. Optional: a host without a populated registry classifies
+    // as RegistryUnavailable and the spawn proceeds exactly as before (never a false rejection).
+    private readonly ModelRegistry? _modelRegistry;
     // Trusted-only security-event sink (#1647). Optional: null behaves exactly as before (no
     // emission). Spawn and kill each emit one SecurityEvent so the sandbox boundary is recorded
     // to the trusted sink and never the public activity/diagnostic stream.
@@ -69,58 +88,220 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         DefaultToolPolicyProvider? policyProvider = null,
         ISessionStore? sessionStore = null,
         TimeProvider? timeProvider = null,
-        ISecurityEventSink? securityEvents = null)
+        ISecurityEventSink? securityEvents = null,
+        IConversationStore? conversationStore = null,
+        ModelRegistry? modelRegistry = null,
+        IToolAuditSink? toolAudit = null,
+        ISubAgentWorktreeSnapshotService? worktreeSnapshotService = null,
+        IOptions<AgentExchangeOptions>? exchangeOptions = null,
+        ISecretRedactor? secretRedactor = null)
     {
         _supervisor = supervisor;
         _registry = registry;
         _activity = activity;
-        _dispatcher = dispatcher;
+        _ = dispatcher; // Kept for constructor compatibility; child completion never dispatches inbound turns.
         _workspaceManager = workspaceManager;
         _options = options;
+        _exchangeOptions = exchangeOptions ?? Options.Create(new AgentExchangeOptions());
         _logger = logger;
         _policyProvider = policyProvider;
         _sessionStore = sessionStore;
+        _secretRedactor = secretRedactor ?? new SecretRedactor();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _securityEvents = securityEvents;
+        _conversationStore = conversationStore;
+        _modelRegistry = modelRegistry;
+        _toolAudit = toolAudit ?? DefaultToolAuditSink.Instance;
+        _worktreeSnapshotService = worktreeSnapshotService;
     }
 
     /// <summary>
-    /// Eagerly pins the freshly-created child session to the parent's conversation BEFORE
-    /// <see cref="SpawnAsync"/> returns, so concurrent lookups
+    /// Persists the sub-agent run's tool timeline onto its own child session (#2614 AC4).
+    /// </summary>
+    /// <remarks>
+    /// Best-effort by design, matching every other persistence side-effect on this path: a failed
+    /// audit write must not change the run's terminal disposition, because doing so would let an
+    /// unrelated store fault turn a successful delegated run into a failure. A no-op when no
+    /// session store is configured or the run executed no tools.
+    /// </remarks>
+    /// <param name="response">The completed blocking run.</param>
+    /// <param name="record">The run record carrying the child session to write to.</param>
+    private async Task PersistToolAuditAsync(AgentResponse response, SubAgentRecord record)
+    {
+        if (_sessionStore is null || response.ToolCalls.Count == 0)
+            return;
+
+        try
+        {
+            var childSessionId = record.Info.ChildSessionId;
+            var childSession = await _sessionStore.GetAsync(childSessionId, CancellationToken.None).ConfigureAwait(false);
+            if (childSession is null)
+                return;
+
+            foreach (var toolEntry in _toolAudit.ProjectBlockingRun(_toolAudit.CaptureBlockingRun(response)))
+                childSession.AddEntry(toolEntry);
+
+            await _sessionStore.SaveAsync(childSession, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed persisting the tool-audit timeline for sub-agent '{SubAgentId}' on child session '{ChildSessionId}'.",
+                record.Info.SubAgentId,
+                record.Info.ChildSessionId);
+        }
+    }
+
+    /// <summary>
+    /// Persists the sub-agent run's own final assistant text onto its child session (#3256).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Before #3256 the sub-agent path wrote <see cref="MessageRole.Tool"/> rows and nothing else,
+    /// so all 533 sub-agent sessions in the store held exactly one role. Every other blocking
+    /// <c>PromptAsync</c> boundary (REST chat, agent exchange, the trigger projector) appends the
+    /// assistant row immediately after the tool timeline; the sub-agent path simply never did, and
+    /// its summary survived only as a transient completion event delivered to the parent. The
+    /// result was a <c>UserFacing</c> conversation that rendered as tool spam with no model output.
+    /// </para>
+    /// <para>
+    /// Ordering is load-bearing and mirrors <c>ChatController</c>: tool rows are written by
+    /// <see cref="PersistToolAuditAsync"/> on the run path, and this row lands afterwards from the
+    /// terminal completion path, so the transcript reads tools-then-summary rather than the
+    /// reverse. Best-effort by design like every other persistence side-effect here: a store fault
+    /// must not change the run's terminal disposition. Blank summaries are not persisted, so an
+    /// empty row is never manufactured for a run that genuinely said nothing.
+    /// </para>
+    /// </remarks>
+    /// <param name="childSessionId">The child session the run owns.</param>
+    /// <param name="summary">The normalized terminal summary, already the record's winning text.</param>
+    private async Task PersistAssistantSummaryAsync(SessionId childSessionId, string? summary)
+    {
+        if (_sessionStore is null || string.IsNullOrWhiteSpace(summary))
+            return;
+
+        try
+        {
+            var childSession = await _sessionStore.GetAsync(childSessionId, CancellationToken.None).ConfigureAwait(false);
+            if (childSession is null)
+                return;
+
+            childSession.AddEntry(new SessionEntry
+            {
+                Role = MessageRole.Assistant,
+                Content = summary,
+                // The row is tagged as the sub-agent's own response so a renderer can tell a
+                // delegated run's summary apart from an ordinary assistant turn without inferring
+                // it from the session id shape.
+                Kind = MessageKind.SubAgentResponse
+            });
+
+            await _sessionStore.SaveAsync(childSession, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed persisting the assistant summary for child session '{ChildSessionId}'.",
+                childSessionId);
+        }
+    }
+
+    /// <summary>
+    /// Eagerly mints the child run's <b>own</b> conversation and binds the freshly-created child
+    /// session to it BEFORE <see cref="SpawnAsync"/> returns, so concurrent lookups
     /// (<see cref="ISessionStore.ListByConversationAsync"/>, /api/conversations/{id}/history,
-    /// canvas resolvers) never observe the child as an orphan. Prior to this the pin ran inside the
+    /// canvas resolvers) never observe the child as an orphan. Prior to this the bind ran inside the
     /// fire-and-forget <c>Task.Run</c> at the end of <c>SpawnAsync</c>, opening an orphan window
     /// between the method returning and the background task being scheduled (Phase 4 / F-6).
     /// </summary>
     /// <remarks>
-    /// No-op when no <see cref="ISessionStore"/> is wired. If the child row does not exist yet,
-    /// this method creates and persists it before handle creation can start background execution.
-    /// Extracted from <see cref="SpawnAsync"/> so the eager-pin step is a
-    /// named, awaited unit on the orchestration path (#1630); the eager (not lazy) ordering is
-    /// guarded by the architecture/behaviour tests. Declared BEFORE <c>SpawnAsync</c> so the
+    /// <para>
+    /// <b>#2338.</b> The child no longer inherits the parent's <see cref="ConversationId"/>. It gets
+    /// its own, linked back to the supervisor through <c>Conversation.ParentConversationId</c> (and,
+    /// when known, <c>Conversation.SpawningToolCallId</c>). Sharing the id made
+    /// <c>SignalRChannelAdapter</c> - which routes purely by conversation id - broadcast every child
+    /// tool call, thinking delta and content delta into the <em>parent's</em> group, interleaving the
+    /// sub-agent's internals with the parent's own turn. Distinct ids make that structurally
+    /// impossible; the parent edge is what keeps the run reachable and keeps it out of top-level
+    /// listings.
+    /// </para>
+    /// <para>
+    /// The child conversation row is only persisted when an <see cref="IConversationStore"/> is
+    /// wired; the id is minted either way so the child session is never bound to the parent's
+    /// conversation. Session materialisation is a no-op when no <see cref="ISessionStore"/> is
+    /// wired. Extracted from <see cref="SpawnAsync"/> so the eager step is a named, awaited unit on
+    /// the orchestration path (#1630); the eager (not lazy) ordering is guarded by the
+    /// architecture/behaviour tests. Declared BEFORE <c>SpawnAsync</c> so the
     /// <c>.ConversationId =</c> mutation lexically precedes the fire-and-forget <c>Task.Run</c> in
     /// the orchestrator -- the F-6 architecture fence
     /// (SubAgentEagerPinArchitectureTests.NoConversationIdMutation_InsideTaskRun) is a source-position
-    /// check, so the eager-pin helper must sit above the queue point even though it is awaited first.
+    /// check, so this helper must sit above the queue point even though it is awaited first.
+    /// </para>
     /// </remarks>
-    /// <param name="request">The spawn request carrying the inherited conversation id.</param>
-    /// <param name="childSessionId">The minted child session to bind to the parent conversation.</param>
+    /// <param name="request">The spawn request carrying the parent conversation edge.</param>
+    /// <param name="childSessionId">The minted child session to bind to the child conversation.</param>
     /// <param name="childAgentId">The ephemeral child agent that owns the new session.</param>
+    /// <param name="name">Resolved display name for the run, used as the conversation title.</param>
     /// <param name="ct">Cancellation token for the store reads/writes.</param>
-    private async Task PinChildConversationAsync(
+    /// <returns>The child run's own conversation id.</returns>
+    private async Task<ConversationId> MintChildConversationAsync(
         SubAgentSpawnRequest request,
         SessionId childSessionId,
         AgentId childAgentId,
+        string? name,
+        AdmissionResources resources,
         CancellationToken ct)
     {
-        if (_sessionStore is null)
-            return;
+        var childConversationId = ConversationId.Create();
 
-        var childSession = await _sessionStore.GetAsync(childSessionId, ct).ConfigureAwait(false)
-            ?? await _sessionStore.GetOrCreateAsync(childSessionId, childAgentId, ct).ConfigureAwait(false);
-        childSession.ConversationId = request.InheritedConversationId;
-        childSession.SessionType = SessionType.AgentSubAgent;
-        await _sessionStore.SaveAsync(childSession, ct).ConfigureAwait(false);
+        if (_conversationStore is not null)
+        {
+            // ConversationFactory is the single sanctioned creation seam (#2310/#2321): the
+            // sub-agent factory hard-codes Kind = AgentSubAgent / Source = Agent and requires the
+            // parent edge, so a parentless or mislabelled child conversation cannot be constructed.
+            var childConversation = ConversationFactory.CreateForSubAgent(
+                childConversationId,
+                childAgentId,
+                request.InheritedConversationId,
+                request.SpawningToolCallId,
+                title: string.IsNullOrWhiteSpace(name) ? "Sub-agent run" : name,
+                initiator: CitizenId.Of(request.ParentAgentId),
+                purpose: request.Task);
+
+            try
+            {
+                await _conversationStore.CreateAsync(childConversation, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Best-effort, matching the other persistence side-effects on this path: a failed
+                // conversation row must not abort the spawn. The child session is still bound to the
+                // minted id, so the run stays isolated from the parent's group either way.
+                _logger.LogWarning(
+                    ex,
+                    "Failed to persist child conversation '{ChildConversationId}' for sub-agent under parent conversation '{ParentConversationId}'.",
+                    childConversationId,
+                    request.InheritedConversationId);
+            }
+        }
+
+        if (_sessionStore is not null)
+        {
+            var childSession = await _sessionStore.GetAsync(childSessionId, ct).ConfigureAwait(false);
+            if (childSession is null)
+            {
+                childSession = await _sessionStore.GetOrCreateAsync(childSessionId, childAgentId, ct).ConfigureAwait(false);
+                resources.SessionCreated = true;
+            }
+
+            childSession.ConversationId = childConversationId;
+            childSession.SessionType = SessionType.AgentSubAgent;
+            await _sessionStore.SaveAsync(childSession, ct).ConfigureAwait(false);
+        }
+
+        return childConversationId;
     }
 
     /// <inheritdoc />
@@ -132,11 +313,26 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         // deserialization quirks) would otherwise reach the default arm and
         // hit a NullReferenceException dereferencing request.Mode.GetType().
         ArgumentNullException.ThrowIfNull(request.Mode);
+        // Serialize only admission, never the run/join. Retries from recreated managers share this
+        // bounded lock and re-read the existing durable spawn identity before creating a child.
+        using var admissionLock = await SpawnAdmissionLocks.AcquireAsync(request.ParentSessionId, ct).ConfigureAwait(false);
 
         var parentDescriptor = _registry.Get(request.ParentAgentId)
             ?? throw new KeyNotFoundException($"Parent agent '{request.ParentAgentId}' is not registered.");
 
-        EnforceSpawnLimits(request);
+        if (request.SpawningToolCallId is { } spawnCall)
+        {
+            var liveRetry = _records.Values.Select(r => r.Info).FirstOrDefault(i =>
+                i.ParentSessionId == request.ParentSessionId && i.SpawningToolCallId == spawnCall);
+            if (liveRetry is not null) return liveRetry;
+            var coldRetry = _sessionStore is null ? null : await _sessionStore.FindSubAgentSpawnAsync(request.ParentSessionId, spawnCall, ct).ConfigureAwait(false);
+            if (coldRetry is not null) return FromRetained(coldRetry);
+        }
+        if (request.SpawningToolCallId is not null && _sessionStore is null)
+            throw new InvalidOperationException("Durable sub-agent storage is required for tool-origin admission.");
+
+        var budgetPolicy = ResolveBudgetPolicy(request);
+        EnforceSpawnLimits(request, budgetPolicy);
 
         var uniqueId = Guid.NewGuid().ToString("N");
         var subAgentId = uniqueId;
@@ -145,6 +341,13 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         // Resolve the Embody | Mirror discriminated union into a side-effect-free plan
         // (descriptor + minted child id + customisation overrides). See ResolveSpawnPlan.
         var plan = ResolveSpawnPlan(request, parentDescriptor, uniqueId);
+        // Mirror selects another registered identity. Enforce the same peer grants as converse
+        // against that resolved target before acquiring any child resources; Embody stays local.
+        if (request.Mode is Mirror mirror
+            && !PeerAccessPolicy.IsAllowed(_exchangeOptions.Value, parentDescriptor, mirror.TargetAgentId, plan.BaseDescriptor))
+            throw new UnauthorizedAccessException(
+                $"Agent '{request.ParentAgentId}' is not allowed to mirror '{mirror.TargetAgentId}'.");
+
         var archetype = plan.Archetype;
         var baseDescriptor = plan.BaseDescriptor;
         var childAgentId = plan.ChildAgentId;
@@ -157,103 +360,295 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         // resolved from Mode, not a deleted top-level request field. See ValidateToolGrants.
         ValidateToolGrants(request, toolIds);
 
+        // #2650: fail fast on a write-capable child that was handed read-only granted paths.
+        WarnOnUnwritableGrantedPaths(request, toolIds);
+
+        // A relative deny is workspace-relative to whichever agent owns the policy, so re-anchor it
+        // before the policy crosses onto the child. See RebaseInheritedDenies.
+        var baseFileAccess = RebaseInheritedDenies(baseDescriptor.FileAccess, baseDescriptor.AgentId);
+
+        // #3562: the symmetric contradiction - a write grant handed to a toolset that cannot write.
+        // Rejects rather than warns; see ValidateWriteGrantIsUsable.
+        ValidateWriteGrantIsUsable(request, toolIds, archetype);
+
         // Build file access policy for workspace isolation. Null means "fully isolated" -
         // the child falls back to the base descriptor's FileAccess below. See
         // BuildChildFileAccessPolicy.
-        var childFileAccess = BuildChildFileAccessPolicy(request);
+        var childFileAccess = BuildChildFileAccessPolicy(request, baseFileAccess);
 
-        if (!_registry.Contains(childAgentId))
-        {
-            _registry.Register(baseDescriptor with
-            {
-                AgentId = childAgentId,
-                DisplayName = $"{baseDescriptor.DisplayName} ({archetype.Value})",
-                Kind = AgentKind.SubAgent,
-                FileAccess = childFileAccess ?? baseDescriptor.FileAccess
-            });
-        }
-
-        // Materialize and persist the child session before handle creation. Handle creation can
-        // reach the model immediately, so this is the last safe point to guarantee that every
-        // later tool write-ahead has a durable parent row (#2113).
-        await PinChildConversationAsync(request, childSessionId, childAgentId, ct).ConfigureAwait(false);
-
-        var handle = await _supervisor.GetOrCreateAsync(childAgentId, childSessionId, ct);
-
+        // #2647: ONE resolution, consumed by both the descriptor the child actually runs on and the
+        // SubAgentInfo reporting record below. Computing it twice is exactly how "what runs" and
+        // "what is reported" drifted: the record was populated from a resolution that nothing ever
+        // wrote through to the descriptor, so list_subagents corroborated a model the child never used.
+        //
+        // The agent layer (the configured sub-agent DefaultModel) is deliberately gated on Embody.
+        // Mirror is strict pass-through of the TARGET descriptor (#562 / #1565) - letting the
+        // platform-wide sub-agent default apply there would silently re-point a mirrored agent at a
+        // different model than the one it is registered with.
         var configuredDefaultModel = string.IsNullOrWhiteSpace(_options.CurrentValue.SubAgents.DefaultModel)
             ? null
             : _options.CurrentValue.SubAgents.DefaultModel;
+        var agentLayerModel = request.Mode is Embody ? configuredDefaultModel : null;
 
-        var info = new SubAgentInfo
+        var effectiveModel = ModelOverrideResolver.Resolve(
+            modelDefaults: new ModelOverrideLayer(Model: baseDescriptor.ModelId),
+            agent: new ModelOverrideLayer(Model: agentLayerModel),
+            conversation: new ModelOverrideLayer(Model: modelOverride)).Model;
+        var effectiveProvider = plan.ApiProviderOverride ?? baseDescriptor.ApiProvider;
+
+        // Preflight the REQUESTED pair before anything is created. Only runs when the caller actually
+        // asked for an override - the parent's own already-running model is not ours to second-guess.
+        if (!string.IsNullOrWhiteSpace(plan.ModelOverride) || !string.IsNullOrWhiteSpace(plan.ApiProviderOverride))
         {
-            SubAgentId = subAgentId,
-            ParentSessionId = request.ParentSessionId,
-            ChildSessionId = childSessionId,
-            Name = name,
-            ParentAgentId = request.ParentAgentId.Value,
-            ChildAgentId = childAgentId.Value,
-            Task = request.Task,
-            Model = ModelOverrideResolver.Resolve(
-                modelDefaults: new ModelOverrideLayer(Model: baseDescriptor.ModelId),
-                agent: new ModelOverrideLayer(Model: configuredDefaultModel),
-                conversation: new ModelOverrideLayer(Model: modelOverride)).Model,
-            Archetype = archetype,
-            Status = SubAgentStatus.Running,
-            StartedAt = DateTimeOffset.UtcNow,
-            TurnsUsed = 0
-        };
+            var requested = string.IsNullOrWhiteSpace(plan.ApiProviderOverride)
+                ? effectiveModel
+                : $"{plan.ApiProviderOverride}/{effectiveModel}";
 
-        var record = new SubAgentRecord(info, request.ParentAgentId, childAgentId);
-        if (!_records.TryAdd(subAgentId, record))
-            throw new InvalidOperationException($"Sub-agent '{subAgentId}' already exists.");
-
-        // Persist the sub-agent session row to sessions.db (best-effort; non-SQLite stores no-op).
-        if (_sessionStore is not null)
-        {
-            try { await _sessionStore.SaveSubAgentSessionAsync(info, ct).ConfigureAwait(false); }
-            catch (Exception ex)
+            var preflight = CronModelPreflight.Resolve(_modelRegistry, requested);
+            if (preflight.IsRejection)
             {
-                _logger.LogWarning(ex, "Failed to persist sub-agent session row for '{SubAgentId}'.", subAgentId);
+                // Fail loudly naming the requested value. Silent substitution of a different model is
+                // never acceptable: it fabricates the results of every model comparison run through
+                // spawn_subagent. Thrown here, so no session, descriptor or record is created.
+                throw new InvalidOperationException(
+                    $"Sub-agent spawn requested model '{requested}' which cannot be resolved. {preflight.Reason}");
+            }
+
+            if (preflight.Kind == CronModelPreflightKind.Resolved)
+            {
+                effectiveModel = preflight.ModelId;
+                effectiveProvider = preflight.Provider ?? effectiveProvider;
             }
         }
 
+        var resources = new AdmissionResources();
+        IAgentHandle? handle = null;
+        ConversationId? childConversationId = null;
+        var timeoutSeconds = 0;
+        var maxTurns = 0;
+        SubAgentBudgetClamp? budgetClamp = null;
+        SubAgentBudgetAdvisory? budgetAdvisory = null;
+        SubAgentInfo? info = null;
+        SubAgentRecord? record = null;
+
+        try
+        {
+            if (!_registry.Contains(childAgentId))
+            {
+                _registry.Register(baseDescriptor with
+                {
+                    AgentId = childAgentId,
+                    DisplayName = $"{baseDescriptor.DisplayName} ({archetype.Value})",
+                    Kind = AgentKind.SubAgent,
+                    // #2136: apply the archetype/customisation tool restriction and any system-prompt
+                    // override onto the parent clone. A null toolIds means "inherit the parent's tools".
+                    ToolIds = toolIds is { Count: > 0 } ? toolIds : baseDescriptor.ToolIds,
+                    SystemPrompt = string.IsNullOrWhiteSpace(plan.SystemPromptOverride)
+                        ? baseDescriptor.SystemPrompt
+                        : plan.SystemPromptOverride,
+                    // #2647: the authoritative state the child dispatches against. Sourced from the single
+                    // resolution above - the same values the SubAgentInfo record reports.
+                    ModelId = effectiveModel ?? baseDescriptor.ModelId,
+                    ApiProvider = effectiveProvider,
+                    FileAccess = childFileAccess ?? baseFileAccess
+                });
+                resources.DescriptorRegistered = true;
+            }
+
+            // Register first: the existing registry liveness probe must own the directory as soon as
+            // it exists. Provision once here, before any handle/tool exposure; path resolution and
+            // tool retries must never resurrect a terminal workspace. Custom workspace managers keep
+            // their existing lifecycle; this is the file-backed production manager's admission seam.
+            if (_workspaceManager is FileAgentWorkspaceManager fileWorkspaces)
+            {
+                var workspaceExisted = Directory.Exists(fileWorkspaces.GetWorkspacePath(childAgentId.Value));
+                fileWorkspaces.ProvisionSubAgentWorkspace(childAgentId.Value);
+                resources.WorkspaceProvisioned = !workspaceExisted;
+            }
+
+            // Materialize and persist the child conversation + session before handle creation. Handle
+            // creation can reach the model immediately, so this is the last safe point to guarantee that
+            // every later tool write-ahead has a durable parent row (#2113). Since #2338 the child owns
+            // its own conversation rather than inheriting the parent's.
+            childConversationId = await MintChildConversationAsync(
+                request,
+                childSessionId,
+                childAgentId,
+                name,
+                resources,
+                ct).ConfigureAwait(false);
+
+            // #2847: install the inherited deny-list BEFORE the handle exists. This used to sit 67
+            // lines lower, after record construction and an awaited SaveSubAgentSessionAsync - so the
+            // child agent had a live runtime handle, and the comment directly above says handle
+            // creation "can reach the model immediately", while carrying no inherited restrictions at
+            // all. The gap was bounded by disk I/O rather than instruction count, making it schedulable
+            // rather than theoretical, and a sub-agent spawned by a restricted parent could invoke a
+            // parent-denied tool inside it. Tool restriction is the control that stops a restricted
+            // agent escalating by spawning an unrestricted child, so it must be bound to the execution
+            // identity at creation, not applied afterwards.
+            //
+            // Registration is UNCONDITIONAL, including for an empty list. The previous
+            // `if (count > 0)` guard left the child's policy slot absent rather than explicitly empty,
+            // which is a different state from "deliberately unrestricted" and was asymmetric with
+            // RemoveDynamicDenyList, which always removes. Always writing the slot means the child's
+            // authority is a decision that was recorded, not an absence that happens to read the same.
+            // ParentAgentId is a required non-nullable AgentId on the request, so it needs no guard;
+            // only the optional policy provider does. (.Value here is AgentId's underlying string, not
+            // a Nullable unwrap - the same accessor the original registration used.)
+            if (_policyProvider is not null && resources.DescriptorRegistered)
+            {
+                _policyProvider.SetDynamicDenyList(
+                    childAgentId,
+                    _policyProvider.GetEffectiveDenyList(request.ParentAgentId.Value));
+                resources.PolicyRegistered = true;
+            }
+
+            handle = await _supervisor.GetOrCreateAsync(childAgentId, childSessionId, ct);
+            resources.HandleCreated = true;
+
+            // Clamp the agent-supplied timeout to the configured ceiling. Depth and concurrency are
+            // already bounded above; without this the timeout (the only budget wired to a real
+            // cancellation token) could be set arbitrarily high, letting a background sub-agent run
+            // effectively forever. Mirrors the runaway-cost guard the agent_converse tool applies.
+            timeoutSeconds = budgetPolicy.ResolveTimeoutSeconds(request.TimeoutSeconds);
+
+            // Clamp the requested turn budget too, then enforce it: the resolved value is threaded
+            // into the run alongside timeoutSeconds and bounds the live per-turn counter, so a run
+            // that exceeds it terminates as BudgetExhausted (#2656). The ceiling here remains the
+            // request-shape guard it has always been (#1344).
+            maxTurns = budgetPolicy.ResolveMaxTurns(request.MaxTurns);
+
+            // #2789: when either budget was actually reduced, surface the reduction on the record the
+            // caller reads. Resolved BEFORE the SubAgentInfo is built and reusing the very locals that
+            // are threaded into RunSubAgentAsync below, so the disclosed effective values cannot drift
+            // from the budget the run is given. Null when nothing was clamped - the disclosure has to
+            // be a signal, not a field that is always there and therefore always ignored.
+            budgetClamp = request.TimeoutSeconds > timeoutSeconds || request.MaxTurns > maxTurns
+                ? new SubAgentBudgetClamp(
+                    budgetPolicy.Tier,
+                    request.MaxTurns,
+                    maxTurns,
+                    request.TimeoutSeconds,
+                    timeoutSeconds)
+                : null;
+
+            // #3341: advisory thresholds are evaluated only after hard policy has produced the
+            // effective budgets. They add guidance but never clamp, reject, or replace those values.
+            budgetAdvisory = budgetPolicy.CreateAdvisory(maxTurns, timeoutSeconds);
+
+            info = new SubAgentInfo
+            {
+                SubAgentId = subAgentId,
+                SpawningToolCallId = request.SpawningToolCallId,
+                ParentSessionId = request.ParentSessionId,
+                ChildSessionId = childSessionId,
+                ChildConversationId = childConversationId.Value,
+                ParentConversationId = request.InheritedConversationId,
+                Name = name,
+                ParentAgentId = request.ParentAgentId.Value,
+                ChildAgentId = childAgentId.Value,
+                Task = request.Task,
+                // #2647: reported value is the SAME single resolution written onto the descriptor above.
+                Model = effectiveModel,
+                Archetype = archetype,
+                Status = SubAgentStatus.Running,
+                StartedAt = DateTimeOffset.UtcNow,
+                TurnsUsed = 0,
+                EffectiveMaxTurns = maxTurns,
+                EffectiveTimeoutSeconds = timeoutSeconds,
+                // #2789: null unless a ceiling actually reduced the request.
+                BudgetClamp = budgetClamp,
+                // #3341: null unless an effective budget is above an enabled advisory threshold.
+                BudgetAdvisory = budgetAdvisory
+            };
+
+            // A tool-origin admission must retain its retry identity before starting the run or
+            // returning a background admission. Keep persistence inside the resource rollback seam.
+            if (_sessionStore is not null)
+            {
+                try { await _sessionStore.SaveSubAgentSessionAsync(info, ct).ConfigureAwait(false); }
+                catch (Exception ex) when (request.SpawningToolCallId is null && ex is not OperationCanceledException)
+                {
+                    // Direct manager callers retain the historical optional tracking behavior.
+                    _logger.LogWarning(ex, "Failed to persist sub-agent session row for '{SubAgentId}'.", subAgentId);
+                }
+            }
+
+            var admissionRecord = new SubAgentRecord(
+                info,
+                request.ParentAgentId,
+                childAgentId,
+                request.GrantedWritePaths is { Count: > 0 } ? [.. request.GrantedWritePaths] : []);
+            if (!_records.TryAdd(subAgentId, admissionRecord))
+                throw new InvalidOperationException($"Sub-agent '{subAgentId}' already exists.");
+
+            record = admissionRecord;
+        }
+        catch
+        {
+            await RollbackAdmissionAsync(
+                childAgentId,
+                childSessionId,
+                resources).ConfigureAwait(false);
+            throw;
+        }
+
+        var admittedHandle = handle
+            ?? throw new InvalidOperationException($"Sub-agent '{subAgentId}' was admitted without a runtime handle.");
+        var admittedRecord = record
+            ?? throw new InvalidOperationException($"Sub-agent '{subAgentId}' was admitted without a management record.");
+        var admittedInfo = info
+            ?? throw new InvalidOperationException($"Sub-agent '{subAgentId}' was admitted without run metadata.");
+
         _parentChildren.GetOrAdd(request.ParentSessionId, _ => []).Add(subAgentId);
 
-        // Register inherited deny-list so the child agent can't invoke parent-denied tools
-        if (_policyProvider is not null)
-        {
-            var effectiveDenyList = _policyProvider.GetEffectiveDenyList(request.ParentAgentId.Value);
-            if (effectiveDenyList.Count > 0)
-                _policyProvider.SetDynamicDenyList(childAgentId, effectiveDenyList);
-        }
-
-        var subAgentOptions = _options.CurrentValue.SubAgents;
-
-        // Clamp the agent-supplied timeout to the configured ceiling. Depth and concurrency are
-        // already bounded above; without this the timeout (the only budget wired to a real
-        // cancellation token) could be set arbitrarily high, letting a background sub-agent run
-        // effectively forever. Mirrors the runaway-cost guard the agent_converse tool applies.
-        var timeoutSeconds = subAgentOptions.ResolveTimeoutSeconds(request.TimeoutSeconds);
-
-        // Clamp the requested turn budget too. It is not yet wired to a live per-turn counter, but
-        // bounding it here keeps the request shape honest and prevents a latent runaway when it is.
-        var maxTurns = subAgentOptions.ResolveMaxTurns(request.MaxTurns);
-        if (request.TimeoutSeconds > timeoutSeconds || request.MaxTurns > maxTurns)
+        if (budgetClamp is not null)
         {
             _logger.LogWarning(
-                "Sub-agent '{SubAgentId}' spawn budget clamped: timeoutSeconds {RequestedTimeout}->{ClampedTimeout}, maxTurns {RequestedMaxTurns}->{ClampedMaxTurns}.",
+                "Sub-agent '{SubAgentId}' spawn budget clamped: ParentAgentId={ParentAgentId}, PolicyTier={PolicyTier}, timeoutSeconds {RequestedTimeout}->{ClampedTimeout}, maxTurns {RequestedMaxTurns}->{ClampedMaxTurns}.",
                 subAgentId,
-                request.TimeoutSeconds,
-                timeoutSeconds,
-                request.MaxTurns,
-                maxTurns);
+                request.ParentAgentId.Value,
+                budgetClamp.PolicyTier,
+                budgetClamp.RequestedTimeoutSeconds,
+                budgetClamp.EffectiveTimeoutSeconds,
+                budgetClamp.RequestedMaxTurns,
+                budgetClamp.EffectiveMaxTurns);
         }
 
-        var timeoutCts = new CancellationTokenSource();
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
-        record.TimeoutCts = timeoutCts;
+        if (budgetAdvisory is not null)
+        {
+            _logger.LogWarning(
+                "Sub-agent '{SubAgentId}' effective budget is above the staging advisory: timeoutSeconds {EffectiveTimeout} (threshold {TimeoutThreshold}), maxTurns {EffectiveMaxTurns} (threshold {MaxTurnsThreshold}). Delegate one coherent stage; this advisory did not change the effective budget.",
+                subAgentId,
+                budgetAdvisory.EffectiveTimeoutSeconds,
+                budgetAdvisory.TimeoutSecondsThreshold,
+                budgetAdvisory.EffectiveMaxTurns,
+                budgetAdvisory.MaxTurnsThreshold);
+        }
 
-        _ = Task.Run(() => RunSubAgentAsync(subAgentId, handle, request.Task, timeoutSeconds), CancellationToken.None);
+        // The deadline is scheduled through the injected TimeProvider rather than the ambient
+        // CancelAfter timer so the run's clock is the SAME clock the rest of this class already
+        // uses (retention stamps, descendant polling). Under TimeProvider.System this is
+        // byte-for-byte the previous behaviour; under a test provider the deadline becomes
+        // virtual, which is what removes the wall-clock race that made the non-timeout
+        // classification tests flaky on a loaded CI runner (#2979). A test asserting "empty
+        // response before the deadline" must not have to WIN A RACE against a real 1s timer.
+        var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds), _timeProvider);
+        admittedRecord.TimeoutCts = timeoutCts;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RunSubAgentAsync(subAgentId, admittedHandle, request.Task, timeoutSeconds, maxTurns)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                admittedRecord.MarkRunCompleted();
+            }
+        }, CancellationToken.None);
 
         _logger.LogInformation(
             "Spawned sub-agent '{SubAgentId}' for parent session '{ParentSessionId}' in child session '{ChildSessionId}'.",
@@ -264,7 +659,7 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         await PublishLifecycleActivityAsync(
             GatewayActivityType.SubAgentSpawned,
             "subagent_spawned",
-            info,
+            admittedInfo,
             request.ParentAgentId.Value,
             $"Sub-agent '{subAgentId}' spawned.");
 
@@ -275,8 +670,96 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         // Opportunistically age out finished records so the registry stays bounded without a timer.
         ReapCompletedRecords();
 
-        return info;
+        return admittedInfo;
     }
+
+    private async Task RollbackAdmissionAsync(
+        AgentId childAgentId,
+        SessionId childSessionId,
+        AdmissionResources resources)
+    {
+        if (resources.HandleCreated)
+        {
+            try
+            {
+                await _supervisor.StopAsync(childAgentId, childSessionId, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed stopping child agent '{ChildAgentId}' while rolling back sub-agent admission.", childAgentId);
+            }
+        }
+
+        if (resources.PolicyRegistered)
+        {
+            try
+            {
+                _policyProvider?.RemoveDynamicDenyList(childAgentId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed removing the dynamic policy for child agent '{ChildAgentId}' while rolling back sub-agent admission.", childAgentId);
+            }
+        }
+
+        if (resources.SessionCreated && _sessionStore is not null)
+        {
+            try
+            {
+                await _sessionStore.DeleteAsync(childSessionId, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed deleting child session '{ChildSessionId}' while rolling back sub-agent admission.", childSessionId);
+            }
+        }
+
+        if (resources.WorkspaceProvisioned && _workspaceManager is not null)
+        {
+            try
+            {
+                _workspaceManager.TryCleanupWorkspace(childAgentId.Value);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed cleaning child workspace for agent '{ChildAgentId}' while rolling back sub-agent admission.", childAgentId);
+            }
+        }
+
+        if (resources.DescriptorRegistered)
+        {
+            try
+            {
+                _registry.Unregister(childAgentId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed unregistering child agent '{ChildAgentId}' while rolling back sub-agent admission.", childAgentId);
+            }
+        }
+    }
+
+    private sealed class AdmissionResources
+    {
+        public bool DescriptorRegistered { get; set; }
+        public bool WorkspaceProvisioned { get; set; }
+        public bool SessionCreated { get; set; }
+        public bool PolicyRegistered { get; set; }
+        public bool HandleCreated { get; set; }
+    }
+
+    /// <inheritdoc />
+    public int ResolveSpawnTimeoutSeconds(AgentId parentAgentId, int requestedTimeoutSeconds)
+        => _options.CurrentValue.SubAgents.ResolveBudgetPolicy(parentAgentId)
+            .ResolveTimeoutSeconds(requestedTimeoutSeconds);
+
+    /// <summary>
+    /// Selects a fresh policy snapshot from the current options using only the trusted parent ID.
+    /// Reading <see cref="IOptionsMonitor{TOptions}.CurrentValue"/> per spawn makes configuration
+    /// reloads effective without mutating policies already assigned to running children.
+    /// </summary>
+    internal SubAgentBudgetPolicy ResolveBudgetPolicy(SubAgentSpawnRequest request)
+        => _options.CurrentValue.SubAgents.ResolveBudgetPolicy(request.ParentAgentId);
 
     /// <summary>
     /// Enforces the configured spawn depth and per-session concurrency ceilings for
@@ -291,6 +774,9 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
     /// maximum number of running sub-agents.
     /// </exception>
     internal void EnforceSpawnLimits(SubAgentSpawnRequest request)
+        => EnforceSpawnLimits(request, ResolveBudgetPolicy(request));
+
+    private void EnforceSpawnLimits(SubAgentSpawnRequest request, SubAgentBudgetPolicy budgetPolicy)
     {
         var maxDepth = _options.CurrentValue.SubAgents.MaxDepth;
         if (maxDepth > 0)
@@ -301,7 +787,7 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
                     $"Cannot spawn sub-agent: parent session depth {depth} has reached the maximum depth of {maxDepth}.");
         }
 
-        var maxConcurrent = _options.CurrentValue.SubAgents.MaxConcurrentPerSession;
+        var maxConcurrent = budgetPolicy.MaxConcurrentPerSession;
         if (maxConcurrent > 0)
         {
             var activeCount = _records.Values.Count(record =>
@@ -341,6 +827,14 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         switch (request.Mode)
         {
             case Embody embody:
+                // #2136: worker archetypes are resolved from the built-in catalog rather than a
+                // registered named agent. When the caller supplies no explicit tool allowlist, apply
+                // the archetype's tool restriction so the role's tool boundary is preserved; the
+                // model/provider/system prompt are still inherited from the parent descriptor.
+                var archetypeProfile = BuiltInArchetypes.GetProfile(embody.Role);
+                var resolvedToolIds = embody.Customizations.ToolIds is { Count: > 0 }
+                    ? embody.Customizations.ToolIds
+                    : archetypeProfile?.ToolIds;
                 return new SubAgentSpawnPlan(
                     Archetype: embody.Role,
                     BaseDescriptor: parentDescriptor,
@@ -348,7 +842,7 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
                     Name: embody.Customizations.Name,
                     ModelOverride: embody.Customizations.ModelOverride,
                     ApiProviderOverride: embody.Customizations.ApiProviderOverride,
-                    ToolIds: embody.Customizations.ToolIds,
+                    ToolIds: resolvedToolIds,
                     SystemPromptOverride: embody.Customizations.SystemPromptOverride);
 
             case Mirror mirror:
@@ -361,7 +855,9 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
                     Archetype: SubAgentArchetype.General,
                     BaseDescriptor: targetDescriptor,
                     ChildAgentId: AgentId.From($"{request.ParentAgentId}--subagent--{mirror.TargetAgentId.Value}--{uniqueId}"),
-                    Name: null,
+                    // #3570: the run label, NOT a descriptor customisation. Everything below stays
+                    // null because Mirror remains strict pass-through of the target's descriptor.
+                    Name: string.IsNullOrWhiteSpace(mirror.RunName) ? null : mirror.RunName,
                     ModelOverride: null,
                     ApiProviderOverride: null,
                     ToolIds: null,
@@ -411,12 +907,141 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
     }
 
     /// <summary>
+    /// Emits a spawn-time diagnostic when a write-capable child is handed granted paths but no
+    /// writable location (#2650). Reuses the pre-flight seam alongside
+    /// <see cref="ValidateToolGrants"/> so the caller learns before the child burns budget and
+    /// discovers the refusal at its first <c>write</c>/<c>edit</c>.
+    /// </summary>
+    /// <remarks>
+    /// Warns (does not throw): a read-only delegation to a write-capable archetype is a legitimate
+    /// request, it is only the silent mid-run failure that is the defect. A child is treated as
+    /// write-capable when its resolved toolset contains <c>write</c> or <c>edit</c>, or when no
+    /// toolset restriction was resolved at all (the child then inherits the parent's tools, which
+    /// normally include writing). Nothing is emitted when the spawn already has a writable
+    /// location - <see cref="SubAgentSpawnRequest.ShareWorkspace"/> or
+    /// <see cref="SubAgentSpawnRequest.GrantedWritePaths"/>.
+    /// </remarks>
+    /// <param name="request">The spawn request carrying granted paths and the share-workspace flag.</param>
+    /// <param name="toolIds">The resolved tools the child would be granted, or <c>null</c>/empty.</param>
+    internal void WarnOnUnwritableGrantedPaths(SubAgentSpawnRequest request, IReadOnlyList<string>? toolIds)
+    {
+        if (request.GrantedPaths is not { Count: > 0 })
+            return;
+
+        if (request.ShareWorkspace || request.GrantedWritePaths is { Count: > 0 })
+            return;
+
+        var writeCapable = toolIds is not { Count: > 0 }
+            || toolIds.Any(t =>
+                string.Equals(t, "write", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(t, "edit", StringComparison.OrdinalIgnoreCase));
+        if (!writeCapable)
+            return;
+
+        _logger.LogWarning(
+            "Sub-agent spawn for parent '{ParentAgentId}' grants write-capable tools with grantedPaths "
+            + "[{GrantedPaths}] but no writable location: grantedPaths are read-only. Use "
+            + "grantedWritePaths for a specific writable directory, or shareWorkspace for the parent "
+            + "workspace, otherwise every write/edit outside the child workspace will be refused.",
+            request.ParentAgentId.Value,
+            string.Join(", ", request.GrantedPaths));
+    }
+
+    /// <summary>
+    /// Re-anchors a base descriptor's relative deny paths onto the workspace of the agent that owns
+    /// them, before that policy is composed into a child policy or copied onto the child wholesale.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DefaultPathValidator"/> reads a relative deny as "&lt;my workspace&gt;/x", so an
+    /// entry carried across verbatim silently re-points at the CHILD's workspace and stops guarding
+    /// the directory the operator named - which the child can then reach through whatever it was
+    /// granted. No-op without an <see cref="IAgentWorkspaceManager"/>: there is no workspace to
+    /// anchor to, and dropping the entries instead would un-deny them.
+    /// <para>
+    /// Denies only, deliberately. A drifting deny stops guarding what the operator named, while a
+    /// drifting allow moves a grant without un-protecting anything; rebasing the allow-lists is a
+    /// wider change raised separately.
+    /// </para>
+    /// </remarks>
+    /// <param name="policy">The base descriptor's policy.</param>
+    /// <param name="ownerAgentId">The agent whose workspace the relative denies are written against.</param>
+    /// <returns>The policy with its denies re-anchored, or the input unchanged.</returns>
+    internal FileAccessPolicy? RebaseInheritedDenies(FileAccessPolicy? policy, AgentId ownerAgentId)
+    {
+        if (policy is null || policy.DeniedPaths.Count == 0 || _workspaceManager is null)
+            return policy;
+
+        return policy with
+        {
+            DeniedPaths = DefaultPathValidator.RebaseRelativePaths(
+                policy.DeniedPaths,
+                _workspaceManager.GetWorkspacePath(ownerAgentId.Value))
+        };
+    }
+
+    /// <summary>
+    /// Rejects a spawn that grants the child a writable location it has no tool to write with
+    /// (#3562). <c>grantedWritePaths</c>/<c>shareWorkspace</c> and the archetype tool allowlist are
+    /// resolved on independent code paths, so <c>spawn_subagent(archetype: "researcher",
+    /// grantedWritePaths: [...])</c> was accepted and produced a worker holding a writable directory
+    /// and no <c>write</c>, <c>edit</c> or <c>exec</c> tool.
+    /// </summary>
+    /// <remarks>
+    /// Throws rather than warning, per the issue: the failure otherwise surfaces at the END of the
+    /// child's run when it tries to produce its deliverable, after its whole token and wall-clock
+    /// budget is spent, and a parent-side log warning is never seen by the worker. The message names
+    /// both the archetype and the missing tools so the caller can correct the call without reading
+    /// gateway source. A <c>null</c>/empty <paramref name="toolIds"/> means "inherit the parent's
+    /// tools" and is never rejected - no restriction was resolved, so nothing contradicts the grant.
+    /// This is the mirror image of <see cref="WarnOnUnwritableGrantedPaths"/>, which is deliberately
+    /// left untouched: it covers write-capable tools with read-only <c>grantedPaths</c>.
+    /// </remarks>
+    /// <param name="request">The spawn request carrying the write grant.</param>
+    /// <param name="toolIds">The resolved tools the child would be granted, or <c>null</c>/empty.</param>
+    /// <param name="archetype">The resolved archetype, named in the rejection message.</param>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when a write grant is present and the resolved toolset contains no write-capable tool.
+    /// </exception>
+    internal void ValidateWriteGrantIsUsable(
+        SubAgentSpawnRequest request,
+        IReadOnlyList<string>? toolIds,
+        SubAgentArchetype archetype)
+    {
+        // AC3: shareWorkspace is the same contradiction expressed differently, so both grant shapes
+        // enter the same check.
+        var hasWriteGrant = request.ShareWorkspace || request.GrantedWritePaths is { Count: > 0 };
+        if (!hasWriteGrant)
+            return;
+
+        // No resolved restriction => the child inherits the parent's tools, which normally write.
+        if (toolIds is not { Count: > 0 })
+            return;
+
+        if (toolIds.Any(BuiltInArchetypes.WriteCapableToolIds.Contains))
+            return;
+
+        var grantDescription = request.ShareWorkspace && request.GrantedWritePaths is { Count: > 0 }
+            ? "shareWorkspace and grantedWritePaths"
+            : request.ShareWorkspace ? "shareWorkspace" : "grantedWritePaths";
+
+        throw new InvalidOperationException(
+            $"Sub-agent spawn requests {grantDescription} but archetype '{archetype.Value}' resolves a "
+            + $"toolset with no write-capable tool (has: {string.Join(", ", toolIds)}). The write grant "
+            + $"would be unusable and the child would lose its output at the end of its run. Supply one "
+            + $"of [{string.Join(", ", BuiltInArchetypes.WriteCapableToolIds.Order(StringComparer.Ordinal))}] "
+            + "via the 'tools' override, choose a write-capable archetype (for example 'coder' or "
+            + "'writer'), or drop the write grant and use grantedPaths for read-only access.");
+    }
+
+    /// <summary>
     /// Composes the child's <see cref="FileAccessPolicy"/> for workspace isolation, or returns
     /// <c>null</c> when the child should stay fully isolated (the caller then falls back to the
     /// base descriptor's <see cref="AgentDescriptor.FileAccess"/>). By default a sub-agent can only
     /// reach its own temporary workspace; <see cref="SubAgentSpawnRequest.ShareWorkspace"/> adds
-    /// read+write access to the parent's workspace, and <see cref="SubAgentSpawnRequest.GrantedPaths"/>
-    /// adds read-only access to specific directories.
+    /// read+write access to the parent's workspace, <see cref="SubAgentSpawnRequest.GrantedPaths"/>
+    /// adds read-only access to specific directories, and
+    /// <see cref="SubAgentSpawnRequest.GrantedWritePaths"/> adds read+write access to specific
+    /// directories (#2650).
     /// </summary>
     /// <remarks>
     /// Returns <c>null</c> (not an empty policy) when neither <c>ShareWorkspace</c> nor any granted
@@ -426,12 +1051,29 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
     /// kept path is resolved via <see cref="Path.GetFullPath(string)"/>. Extracted from
     /// <see cref="SpawnAsync"/> so the policy composition (read/write split, blank filtering, the
     /// isolated -> null contract) is independently unit-testable (#1630).
+    /// <para>
+    /// A composed policy REPLACES the base one on the child descriptor, so
+    /// <see cref="FileAccessPolicy.DeniedPaths"/> is inherited from <paramref name="basePolicy"/>:
+    /// asking for a grant must never erase the denies the operator configured. The allow-lists
+    /// are deliberately NOT inherited - starting the child from only what it was granted narrows it,
+    /// which is the intended isolation posture.
+    /// </para>
     /// </remarks>
     /// <param name="request">The spawn request carrying the share-workspace flag and granted paths.</param>
+    /// <param name="basePolicy">
+    /// The base descriptor's policy, source of the inherited denies, already re-anchored by
+    /// <see cref="RebaseInheritedDenies"/>. Required rather than optional-with-default so that
+    /// omitting it is a compile error: a caller that silently passed nothing is precisely how the
+    /// denies came to be dropped.
+    /// </param>
     /// <returns>The composed policy, or <c>null</c> when the child stays fully isolated.</returns>
-    internal FileAccessPolicy? BuildChildFileAccessPolicy(SubAgentSpawnRequest request)
+    internal FileAccessPolicy? BuildChildFileAccessPolicy(
+        SubAgentSpawnRequest request,
+        FileAccessPolicy? basePolicy)
     {
-        if (!request.ShareWorkspace && request.GrantedPaths is not { Count: > 0 })
+        if (!request.ShareWorkspace
+            && request.GrantedPaths is not { Count: > 0 }
+            && request.GrantedWritePaths is not { Count: > 0 })
             return null;
 
         var allowedRead = new List<string>();
@@ -453,22 +1095,41 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
             }
         }
 
-        return new FileAccessPolicy
+        // #2650: granted WRITE paths are the explicit write grant - they appear in both lists so a
+        // sub-agent can produce files in a specific directory without ShareWorkspace handing it the
+        // whole parent workspace. Plain GrantedPaths remain read-only.
+        if (request.GrantedWritePaths is { Count: > 0 })
+        {
+            foreach (var grantedWritePath in request.GrantedWritePaths)
+            {
+                if (string.IsNullOrWhiteSpace(grantedWritePath))
+                    continue;
+
+                var resolved = Path.GetFullPath(grantedWritePath);
+                allowedRead.Add(resolved);
+                allowedWrite.Add(resolved);
+            }
+        }
+
+        // Derived FROM the base rather than built fresh, so a field added to FileAccessPolicy later
+        // carries the operator's configuration forward instead of silently resetting to its default.
+        return (basePolicy ?? new FileAccessPolicy()) with
         {
             AllowedReadPaths = allowedRead,
-            AllowedWritePaths = allowedWrite
+            AllowedWritePaths = allowedWrite,
+            // Denies are the only policy field that subtracts access, and this policy replaces the
+            // base one wholesale, so not carrying them forward silently un-denies the child.
+            DeniedPaths = basePolicy?.DeniedPaths ?? []
         };
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<SubAgentInfo>> ListAsync(SessionId parentSessionId, CancellationToken ct = default)
+    public async Task<IReadOnlyList<SubAgentInfo>> ListAsync(SessionId parentSessionId, CancellationToken ct = default)
     {
         // Reap on read too, so list_subagents never surfaces (or retains) an unbounded backlog.
         ReapCompletedRecords();
 
-        if (!_parentChildren.TryGetValue(parentSessionId, out var subAgentIds))
-            return Task.FromResult<IReadOnlyList<SubAgentInfo>>([]);
-
+        var subAgentIds = _parentChildren.TryGetValue(parentSessionId, out var children) ? children : [];
         var results = subAgentIds
             .Select(id => _records.TryGetValue(id, out var record) ? record.Info : null)
             .Where(info => info is not null)
@@ -476,15 +1137,100 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
             .OrderBy(info => info.StartedAt)
             .ToArray();
 
-        return Task.FromResult<IReadOnlyList<SubAgentInfo>>(results);
+        if (_sessionStore is null) return results;
+        var retained = await _sessionStore.ListSubAgentSessionsAsync(parentSessionId, ct).ConfigureAwait(false);
+        var liveIds = results.Select(i => i.SubAgentId).ToHashSet(StringComparer.Ordinal);
+        return results.Concat(retained.Where(d => !liveIds.Contains(d.SubAgentId)).Select(FromRetained))
+            .OrderBy(i => i.StartedAt).ToArray();
     }
 
     /// <inheritdoc />
-    public Task<SubAgentInfo?> GetAsync(string subAgentId, CancellationToken ct = default)
+    public async Task<SubAgentInfo?> GetAsync(string subAgentId, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subAgentId);
         ReapCompletedRecords();
-        return Task.FromResult(_records.TryGetValue(subAgentId, out var record) ? record.Info : null);
+        if (_records.TryGetValue(subAgentId, out var record)) return record.Info;
+        var detail = _sessionStore is null ? null : await _sessionStore.GetSubAgentSessionAsync(subAgentId, ct).ConfigureAwait(false);
+        if (detail is null || _sessionStore is null) return null;
+        var fullSummary = await _sessionStore.GetSubAgentResultSummaryAsync(subAgentId, ct).ConfigureAwait(false);
+        return FromRetained(fullSummary is null ? detail : detail with { ResultSummary = fullSummary })
+            with { RetainedResultFullCopyUnavailable = fullSummary is null };
+    }
+
+    private static SubAgentInfo FromRetained(SubAgentRunDetail detail)
+    {
+        var interrupted = !SubAgentStatusPolicy.IsTerminal(detail.Status);
+        return new SubAgentInfo
+        {
+            SubAgentId = detail.SubAgentId, SpawningToolCallId = detail.SpawningToolCallId,
+            ParentSessionId = SessionId.From(detail.ParentSessionId ?? throw new InvalidOperationException("Run has no parent.")),
+            ChildSessionId = SessionId.From(detail.ChildSessionId ?? detail.SubAgentId),
+            ParentConversationId = detail.ParentConversationId is { } parent ? ConversationId.From(parent) : null,
+            ChildConversationId = detail.ChildConversationId is { } child ? ConversationId.From(child) : null,
+            ParentAgentId = detail.ParentAgentId, ChildAgentId = detail.ChildAgentId,
+            Name = detail.Name, Task = detail.Task ?? "", Model = detail.Model,
+            Archetype = string.IsNullOrWhiteSpace(detail.Archetype) ? SubAgentArchetype.General : SubAgentArchetype.FromString(detail.Archetype),
+            CompletionDelivery = detail.CompletionDelivery ?? SubAgentCompletionDelivery.Pending,
+            CompletionDeliveryError = detail.CompletionDeliveryError,
+            WorktreeSnapshot = detail.WorktreeSnapshot is { } snapshot ? new SubAgentWorktreeSnapshot(
+                snapshot.Outcome, null, snapshot.ArtifactReference, snapshot.PatchBytes ?? 0, snapshot.ChangedFiles, snapshot.PathsTruncated) : null,
+            StartedAt = detail.StartedAt ?? default, CompletedAt = interrupted ? DateTimeOffset.UtcNow : detail.CompletedAt,
+            Status = interrupted ? SubAgentStatus.Failed : detail.Status,
+            ResultSummary = interrupted ? "Sub-agent interrupted by host restart; no live run can be joined. " + detail.ResultSummary : detail.ResultSummary,
+            RetainedResultFullCopyUnavailable = true,
+            RetainedResultOriginalLength = detail.OriginalLength, RetainedResultSummaryTruncated = detail.SummaryTruncated,
+            TurnsUsed = detail.TurnsUsed ?? 0, EffectiveMaxTurns = detail.EffectiveMaxTurns, EffectiveTimeoutSeconds = detail.EffectiveTimeoutSeconds,
+            PartialResult = detail.Result is { } result ? new SubAgentPartialResult
+            {
+                Completion = result.Completion, StopReason = result.StopReason, Summary = result.Summary,
+                TurnsUsed = result.TurnsUsed ?? 0, Usage = result.Usage, UnresolvedWork = result.UnresolvedWork,
+                RetainedVerifiedTools = SubAgentRunResult.BoundVerifiedTools(result.VerifiedTools)
+            } : null
+        };
+    }
+
+    /// <inheritdoc />
+    public async Task<SubAgentInfo> WaitAsync(string subAgentId, SessionId parentSessionId, CancellationToken ct = default)
+    {
+        var info = await GetAsync(subAgentId, ct).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Sub-agent '{subAgentId}' was not found.");
+        if (info.ParentSessionId != parentSessionId) throw new UnauthorizedAccessException("Sub-agent does not belong to the current session.");
+        if (_records.TryGetValue(subAgentId, out var record))
+        {
+            // StartedAt is a wall-clock admission timestamp, not an injected scheduler instant.
+            // Mixing those clock domains can manufacture a years-long, invalid timer duration.
+            var budget = TimeSpan.FromSeconds(info.EffectiveTimeoutSeconds ?? 600);
+            var remaining = info.StartedAt + budget - DateTimeOffset.UtcNow;
+            var bounded = TimeSpan.FromTicks(Math.Clamp(remaining.Ticks, 0, budget.Ticks));
+            var wait = bounded + TimeSpan.FromSeconds(10);
+            var maximumTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+            if (wait > maximumTimer) wait = maximumTimer;
+            await record.TerminalReady.WaitAsync(wait, ct).ConfigureAwait(false);
+            return record.Info;
+        }
+        return info;
+    }
+
+    /// <inheritdoc />
+    public async Task<string> ConsumeResultAsync(SubAgentInfo info, string toolCallId, string toolName,
+        string argumentsJson, string payload, CancellationToken ct = default, BotNexus.Domain.Primitives.AgentRunId? agentRunId = null)
+    {
+        if (!SubAgentStatusPolicy.IsTerminal(info.Status)) return payload;
+        if (_sessionStore is null) throw new InvalidOperationException("Durable parent result storage is required.");
+        // Terminal persistence on completion is best-effort. A consuming call is not: fail closed
+        // if the retained classification cannot be written, rather than commit a receipt whose
+        // cold read would still look Running (or be misclassified as restart interruption).
+        await _sessionStore.UpdateSubAgentSessionAsync(info, ct).ConfigureAwait(false);
+        var entry = DefaultToolAuditSink.Instance.ProjectResult(toolCallId, toolName, payload,
+            isError: false, maxPersistedBytes: 0, serializedArguments: argumentsJson) with { AgentRunId = agentRunId };
+        // The store derives the same run-qualified identity used by streamed/aggregate results.
+        var accepted = await _sessionStore.ConsumeSubAgentResultAsync(info.SubAgentId, info.ParentSessionId,
+            info.ParentConversationId, entry, ct).ConfigureAwait(false);
+        return accepted ?? System.Text.Json.JsonSerializer.Serialize(new
+        {
+            subAgentId = info.SubAgentId, sessionId = info.ChildSessionId.Value,
+            conversationId = info.ChildConversationId?.Value, status = info.Status.ToString(), alreadyConsumed = true
+        });
     }
 
     /// <summary>
@@ -493,8 +1239,8 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
     /// <para>
     /// The retention eviction is driven by <c>RetiredAt</c>, which is stamped in the completion
     /// <c>finally</c> (via <see cref="CleanupChildAgentAsync"/>) AFTER the record's status has
-    /// already flipped to <see cref="SubAgentStatus.Completed"/> and after two awaited dispatch
-    /// steps. A test that advances a virtual <see cref="TimeProvider"/> the moment it observes
+    /// already flipped to <see cref="SubAgentStatus.Completed"/> and after awaited persistence
+    /// and cleanup steps. A test that advances a virtual <see cref="TimeProvider"/> the moment it observes
     /// <c>Completed</c> can therefore race the retirement stamp: the record is retired at the
     /// (already-advanced) virtual instant, so its window never elapses relative to the assertion
     /// and the eviction silently no-ops. Tests poll this to await the real retirement before
@@ -505,6 +1251,15 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
     /// </summary>
     internal bool IsRetiredForTest(string subAgentId)
         => _records.TryGetValue(subAgentId, out var record) && record.RetiredAt is not null;
+
+    /// <summary>
+    /// Returns a diagnostic boundary that completes only after the run-loop frame has exited and
+    /// disposed its method-scoped resources. It does not alter runtime lifecycle semantics.
+    /// </summary>
+    internal Task WaitForRunCompletionForTestAsync(string subAgentId)
+        => _records.TryGetValue(subAgentId, out var record)
+            ? record.RunCompletion
+            : Task.CompletedTask;
 
     /// <inheritdoc />
     public async Task<bool> KillAsync(string subAgentId, SessionId requestingSessionId, CancellationToken ct = default)
@@ -519,24 +1274,29 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         if (info.ParentSessionId != requestingSessionId)
             return false;
 
-        if (info.Status is SubAgentStatus.Completed or SubAgentStatus.Failed or SubAgentStatus.Killed or SubAgentStatus.TimedOut)
+        // Claim the terminal winner before cancellation can run callbacks or wake the timeout path.
+        // A stale read followed by an unconditional update lets kill overwrite a completed run, or
+        // lets cancellation audit a timeout for a successful kill.
+        if (!record.TryClaimSnapshotTerminal(SubAgentStatus.Killed)
+            || !record.TryMarkKilled(out var updatedInfo))
             return false;
 
-        record.CancelTimeout();
-
-        await CleanupChildAgentAsync(subAgentId, info.ChildSessionId, ct);
-
-        if (!TryUpdateSubAgent(
-            subAgentId,
-            current => current with
-            {
-                Status = SubAgentStatus.Killed,
-                CompletedAt = DateTimeOffset.UtcNow,
-                ResultSummary = "Sub-agent was killed by parent session."
-            },
-            out var updatedInfo))
+        try
         {
-            return false;
+            record.CancelTimeout();
+        }
+        catch (AggregateException ex)
+        {
+            // Cancellation invokes third-party callbacks. The kill already owns the terminal
+            // disposition; a callback failure must be visible but cannot strand owned resources.
+            _logger.LogWarning(ex,
+                "Sub-agent '{SubAgentId}' cancellation callback failed; the kill remains authoritative and cleanup will be attempted.",
+                subAgentId);
+        }
+        finally
+        {
+            // Teardown is owned by the winning kill, not by the caller's cancellation lifetime.
+            await CleanupChildAgentAsync(subAgentId, info.ChildSessionId, SubAgentStatus.Killed, CancellationToken.None);
         }
 
         _logger.LogInformation(
@@ -550,9 +1310,7 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
             try
             {
                 await _sessionStore.UpdateSubAgentSessionAsync(
-                    subAgentId,
-                    updatedInfo.CompletedAt.Value,
-                    SubAgentStatus.Killed.ToString(),
+                    updatedInfo,
                     ct).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -572,11 +1330,16 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         // wrong-requester and already-terminal guards above early-return false before this point.
         EmitSubAgentEvent("subagent.killed", info.ParentSessionId, subAgentId);
 
+        record.MarkTerminalReady();
         return true;
     }
 
     /// <inheritdoc />
-    public async Task OnCompletedAsync(string subAgentId, string resultSummary, CancellationToken ct = default)
+    public async Task OnCompletedAsync(
+        string subAgentId,
+        string resultSummary,
+        SubAgentRunOutcome? outcome = null,
+        CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subAgentId);
 
@@ -592,14 +1355,43 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         const string emptyResponseDiagnostic = "Sub-agent failed because it returned an empty final response.";
         var hasFinalResponse = !string.IsNullOrWhiteSpace(resultSummary);
 
+        // #3565: text alone no longer decides success. A run that produced prose while every tool
+        // it invoked errored - or whose terminal assistant message carried a provider error - is a
+        // FAILURE, and must present as one to the parent. `outcome` is null only when the caller
+        // could not observe the run's timeline at all, in which case the historical text-only
+        // behaviour is preserved exactly.
+        var runFailed = outcome?.HasFailure == true;
+
+        // Normalize pathological token-per-line whitespace at the earliest point so
+        // the record, session persistence, LLM parent context, and every channel all
+        // observe the same clean content (#2150). Done before the record is updated
+        // rather than only at dispatch time to avoid a divergent persisted summary.
+        var normalizedResultSummary = SubAgentSummaryNormalizer.Normalize(resultSummary);
+
+        // AC3: the text delivered to the parent names the sub-agent and the underlying tool error,
+        // so the parent can act without opening the child transcript. The run's own words are kept
+        // BELOW the diagnostic rather than discarded - they are often the only description of what
+        // was attempted - but they can no longer stand alone as an unqualified success.
+        var terminalSummary = runFailed
+            ? DescribeFailedRun(subAgentId, outcome!, hasFinalResponse ? normalizedResultSummary : null)
+            : hasFinalResponse
+                ? outcome?.HasRecoveredErrors == true
+                    ? DescribeRecoveredRun(outcome, normalizedResultSummary ?? resultSummary)
+                    : normalizedResultSummary
+                : emptyResponseDiagnostic;
+
+        var terminalStatus = hasFinalResponse && !runFailed
+            ? SubAgentStatus.Completed
+            : SubAgentStatus.Failed;
+
         if (!TryUpdateSubAgent(
                 subAgentId,
                 current => current.Status == SubAgentStatus.Running
                     ? current with
                     {
-                        Status = hasFinalResponse ? SubAgentStatus.Completed : SubAgentStatus.Failed,
+                        Status = terminalStatus,
                         CompletedAt = DateTimeOffset.UtcNow,
-                        ResultSummary = hasFinalResponse ? resultSummary : emptyResponseDiagnostic
+                        ResultSummary = terminalSummary
                     }
                     : current,
                 out var updated) || updated.Status == SubAgentStatus.Killed)
@@ -608,8 +1400,13 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         }
 
         // A timeout/failure may set the terminal record before entering the shared completion path.
-        // Always publish and dispatch the record's winning terminal reason, never a late prompt result.
+        // Always publish the record's winning terminal reason, never a late prompt result.
         var normalizedSummary = updated.ResultSummary ?? emptyResponseDiagnostic;
+
+        // #3256: the run's own words become durable here, on the child session, before the summary
+        // is returned through the parent tool result. Every terminal disposition
+        // routes through this method, so a timed-out or failed run records its diagnostic too.
+        await PersistAssistantSummaryAsync(updated.ChildSessionId, normalizedSummary).ConfigureAwait(false);
 
         // Update the sub-agent session row with the final status (best-effort).
         if (_sessionStore is not null && updated.CompletedAt.HasValue)
@@ -617,9 +1414,7 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
             try
             {
                 await _sessionStore.UpdateSubAgentSessionAsync(
-                    subAgentId,
-                    updated.CompletedAt.Value,
-                    updated.Status.ToString(),
+                    updated,
                     ct).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -628,171 +1423,560 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
             }
         }
 
-        var parentAgentId = record.ParentAgentId;
-        // Producer-side species: this wake-up is FROM the child sub-agent TO the parent.
-        // Sender must carry the child's AgentId, not the parent's, so participant
-        // tracking and downstream conversation attribution see the correct originator.
-        // (Fix #526 / sub-agent misclassification.) The child AgentId now lives on the
-        // record alongside the rest of the sub-agent state, so it can never drift out of
-        // sync with the live entry the way the old separate _childAgentIds map could —
-        // the synthetic-fallback workaround that drift required is no longer needed (#1385).
-        var childAgentId = record.ChildAgentId;
-        if (updated.Status == SubAgentStatus.Completed)
+        try
+        {
+            await CleanupChildAgentAsync(subAgentId, updated.ChildSessionId, updated.Status, CancellationToken.None).ConfigureAwait(false);
+            await PublishTerminalLifecycleActivityAsync(subAgentId, updated, record.ParentAgentId.Value).ConfigureAwait(false);
+        }
+        finally
+        {
+            record.MarkTerminalReady();
+        }
+    }
+
+    /// <summary>
+    /// Publishes the single lifecycle activity that describes how a terminal sub-agent run ended,
+    /// taking BOTH the run's own status and the completion-delivery verdict into account (#3703).
+    /// <para>
+    /// A delivery failure is reported as <see cref="GatewayActivityType.SubAgentFailed"/> even when
+    /// the child's own work succeeded: from the supervisor's point of view a result it was never
+    /// handed is indistinguishable from a result that was never produced, and the one thing it must
+    /// not receive is a clean <see cref="GatewayActivityType.SubAgentCompleted"/>.
+    /// </para>
+    /// </summary>
+    private async Task PublishTerminalLifecycleActivityAsync(
+        string subAgentId,
+        SubAgentInfo updated,
+        string? parentAgentId)
+    {
+        if (updated.CompletionDelivery == SubAgentCompletionDelivery.Failed)
+        {
+            await PublishLifecycleActivityAsync(
+                GatewayActivityType.SubAgentFailed,
+                "subagent_delivery_failed",
+                updated,
+                parentAgentId,
+                $"Sub-agent '{subAgentId}' finished but its completion could not be delivered to the parent session.");
+            return;
+        }
+
+        // #2725: HandedOff is a success disposition, so it publishes the completed activity
+        // alongside Completed rather than falling through to no lifecycle event at all.
+        if (updated.Status is SubAgentStatus.Completed or SubAgentStatus.HandedOff)
         {
             await PublishLifecycleActivityAsync(
                 GatewayActivityType.SubAgentCompleted,
                 "subagent_completed",
                 updated,
-                parentAgentId.Value,
+                parentAgentId,
                 $"Sub-agent '{subAgentId}' completed.");
         }
-        else if (updated.Status is SubAgentStatus.Failed or SubAgentStatus.TimedOut)
+        else if (SubAgentStatusPolicy.IsUnsuccessfulTermination(updated.Status))
         {
             await PublishLifecycleActivityAsync(
                 GatewayActivityType.SubAgentFailed,
                 "subagent_failed",
                 updated,
-                parentAgentId.Value,
+                parentAgentId,
                 $"Sub-agent '{subAgentId}' failed.");
         }
-
-        if (string.IsNullOrWhiteSpace(parentAgentId.Value))
-            return;
-
-        try
-        {
-            // Dispatch half: deliver the completion follow-up to the parent session.
-            await DispatchCompletionFollowUpAsync(subAgentId, normalizedSummary, updated, parentAgentId, childAgentId, ct);
-        }
-        finally
-        {
-            // Teardown half: always release the child agent/session, even if dispatch threw.
-            await CleanupChildAgentAsync(subAgentId, updated.ChildSessionId, CancellationToken.None);
-        }
     }
 
-    /// <summary>
-    /// Dispatch half of completion handling: builds the completion follow-up message and delivers
-    /// it to the parent session via <see cref="_dispatcher"/>, recording wake telemetry. Delivery
-    /// failures are logged and swallowed (the record-teardown in <see cref="OnCompletedAsync"/>
-    /// still runs). Separated from the record-teardown so the two concerns are independently
-    /// readable (#1565).
-    /// </summary>
-    /// <param name="subAgentId">The completing sub-agent's id.</param>
-    /// <param name="normalizedSummary">The normalized result summary.</param>
-    /// <param name="updated">The updated sub-agent info (final status/timestamps).</param>
-    /// <param name="parentAgentId">The parent agent to wake (already non-empty).</param>
-    /// <param name="childAgentId">The child agent id used as the wake sender (#526).</param>
-    /// <param name="ct">Cancellation token for the dispatch.</param>
-    private async Task DispatchCompletionFollowUpAsync(
-        string subAgentId,
-        string normalizedSummary,
-        SubAgentInfo updated,
-        AgentId parentAgentId,
-        AgentId childAgentId,
-        CancellationToken ct)
-    {
-        var completionMessage = new SubAgentCompletionMessage
-        {
-            SubAgentId = subAgentId,
-            Status = DescribeStatus(updated.Status),
-            Summary = normalizedSummary,
-            CompletedAt = updated.CompletedAt ?? DateTimeOffset.UtcNow
-        };
-
-        var followUp = completionMessage.Content;
-
-        try
-        {
-            _logger.LogInformation(
-                "Dispatching sub-agent completion for parent agent '{ParentAgentId}' session '{ParentSessionId}' from sub-agent '{SubAgentId}'.",
-                parentAgentId,
-                updated.ParentSessionId,
-                subAgentId);
-
-            GatewayTelemetry.SubAgentParentWakeups.Add(1,
-                new KeyValuePair<string, object?>("botnexus.parent.agent.id", parentAgentId),
-                new KeyValuePair<string, object?>("botnexus.parent.session.id", updated.ParentSessionId),
-                new KeyValuePair<string, object?>("botnexus.subagent.id", subAgentId));
-            GatewayTelemetry.SubAgentWakeDispatched.Add(1,
-                new KeyValuePair<string, object?>("botnexus.parent.agent.id", parentAgentId),
-                new KeyValuePair<string, object?>("botnexus.parent.session.id", updated.ParentSessionId),
-                new KeyValuePair<string, object?>("botnexus.subagent.id", subAgentId));
-
-            await _dispatcher.DispatchAsync(new InboundMessage
-            {
-                ChannelType = ChannelKey.From("internal"),
-                SenderId = $"subagent:{subAgentId}",
-                Sender = CitizenId.Of(childAgentId),
-                ChannelAddress = ChannelAddress.From(updated.ParentSessionId.Value),
-                RoutingHints = new InboundMessageRoutingHints(
-                    RequestedAgentId: parentAgentId,
-                    RequestedSessionId: updated.ParentSessionId,
-                    RequestedConversationId: null),
-                Content = followUp,
-                Metadata = new Dictionary<string, object?>
-                {
-                    ["messageType"] = "subagent-completion",
-                    ["subAgentId"] = subAgentId
-                }
-            }, ct);
-        }
-        catch (Exception ex)
-        {
-            GatewayTelemetry.SubAgentWakeDeliveryFailed.Add(1,
-                new KeyValuePair<string, object?>("botnexus.parent.agent.id", parentAgentId),
-                new KeyValuePair<string, object?>("botnexus.parent.session.id", updated.ParentSessionId),
-                new KeyValuePair<string, object?>("botnexus.subagent.id", subAgentId));
-            _logger.LogWarning(
-                ex,
-                "Failed delivering completion follow-up for sub-agent '{SubAgentId}' to parent session '{ParentSessionId}'.",
-                subAgentId,
-                updated.ParentSessionId);
-        }
-    }
-
-    private async Task RunSubAgentAsync(string subAgentId, IAgentHandle handle, string task, int timeoutSeconds)
+    private async Task RunSubAgentAsync(
+        string subAgentId, IAgentHandle handle, string task, int timeoutSeconds, int maxTurns)
     {
         if (!_records.TryGetValue(subAgentId, out var record) || record.TimeoutCts is not { } timeoutCts)
             return;
 
+        var exploratoryTurns = Math.Max(0, maxTurns - 1);
+        using var explorationCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
+        using var reserveCts = exploratoryTurns > 0
+            ? new CancellationTokenSource(ResolveExplorationDuration(timeoutSeconds), _timeProvider)
+            : null;
+        using var reserveRegistration = reserveCts?.Token.Register(() =>
+        {
+            if (record.TryRequestFinalization())
+                explorationCts.Cancel();
+        });
+
+        AgentResponse? exploration = null;
+        IDisposable? turnSubscription = null;
+        IDisposable? activitySubscription = null;
+        SubAgentNoProgressDecision? noProgress = null;
+        var activityGate = new object();
+        var activityTurns = 0;
+        var noProgressOptions = _options.CurrentValue.SubAgents;
+        var detector = noProgressOptions.NoProgressEnabled
+            ? new SubAgentNoProgressDetector(noProgressOptions.NoProgressTurnWindow,
+                noProgressOptions.NoProgressRepeatedFailureThreshold)
+            : null;
+        if (exploratoryTurns > 0)
+        {
+            turnSubscription = handle.ObserveTurns(() =>
+            {
+                if (!record.TryIncrementTurns(exploratoryTurns, out var used))
+                    return;
+
+                TryUpdateSubAgent(subAgentId, current => current with { TurnsUsed = used });
+                if (used >= exploratoryTurns)
+                {
+                    record.LatchTurnLimitReached();
+                    if (record.TryRequestFinalization())
+                        explorationCts.Cancel();
+                }
+            });
+        }
+        else
+        {
+            record.TryRequestFinalization();
+        }
+
         try
         {
-            var response = await handle.PromptAsync(task, timeoutCts.Token);
+            if (exploratoryTurns > 0 && detector is not null)
+            {
+                activitySubscription = handle.ObserveActivity(observation =>
+                {
+                    lock (activityGate)
+                    {
+                        if (record.FinalizationRequested || timeoutCts.IsCancellationRequested
+                            || record.Info.Status != SubAgentStatus.Running)
+                            return;
+                        if (observation.Kind == AgentActivityKind.TurnCompleted)
+                            activityTurns++;
+                        var decision = detector.Observe(observation);
+                        // The hard exploratory-turn cutoff owns its boundary regardless of which
+                        // of the independent turn/activity observers receives TurnEnd first.
+                        if (decision is null || activityTurns >= exploratoryTurns)
+                            return;
+                        if (record.TryRequestFinalization())
+                        {
+                            noProgress = decision;
+                            explorationCts.Cancel();
+                        }
+                    }
+                });
+            }
+
+            if (exploratoryTurns > 0)
+            {
+                try
+                {
+                    exploration = await handle.PromptAsync(task, explorationCts.Token).ConfigureAwait(false);
+                    await PersistToolAuditAsync(exploration, record).ConfigureAwait(false);
+                    if (!record.FinalizationRequested)
+                    {
+                        await CompleteOrdinaryResponseAsync(
+                            subAgentId, record, exploration, timeoutCts, timeoutSeconds).ConfigureAwait(false);
+                        return;
+                    }
+                }
+                catch (AgentPromptInterruptedException interrupted) when (record.FinalizationRequested)
+                {
+                    exploration = interrupted.PartialResponse;
+                    await PersistToolAuditAsync(exploration, record).ConfigureAwait(false);
+                }
+                catch (Exception) when (record.FinalizationRequested && !timeoutCts.IsCancellationRequested)
+                {
+                    // Some handles cannot project interruption evidence. The conversation history is
+                    // still available to the one-shot finalizer, but no outcome is invented here.
+                }
+            }
+
+            lock (activityGate)
+            {
+                activitySubscription?.Dispose();
+                activitySubscription = null;
+            }
+            turnSubscription?.Dispose();
+            turnSubscription = null;
             if (timeoutCts.IsCancellationRequested)
             {
-                await CompleteTimedOutAsync(subAgentId, timeoutSeconds);
+                await CompleteTimeoutAsync(subAgentId, record, exploration, timeoutSeconds).ConfigureAwait(false);
+                return;
             }
-            else if (string.IsNullOrWhiteSpace(response.Content))
+
+            if (!record.TryIncrementTurns(maxTurns, out var finalTurn))
             {
-                await CompleteFailedAsync(
-                    subAgentId,
-                    "Sub-agent failed because it returned an empty final response.");
+                await CompleteTurnLimitAsync(subAgentId, record, exploration, maxTurns).ConfigureAwait(false);
+                return;
             }
-            else
+
+            TryUpdateSubAgent(subAgentId, current => current with { TurnsUsed = finalTurn });
+            AgentResponse? final = null;
+            try
             {
-                await OnCompletedAsync(subAgentId, response.Content);
+                final = await handle.PromptWithoutToolsAsync(FinalizationPrompt, timeoutCts.Token)
+                    .ConfigureAwait(false);
             }
+            catch (Exception) when (record.FinalizationRequested && !timeoutCts.IsCancellationRequested)
+            {
+                // Best effort. The original exploration evidence and stop reason are rendered below.
+            }
+
+            // The absolute deadline is authoritative even when a provider ignores cancellation and
+            // returns usable-looking text after its token fired. Never accept or persist that text.
+            if (timeoutCts.IsCancellationRequested)
+            {
+                await CompleteTimeoutAsync(subAgentId, record, exploration, timeoutSeconds).ConfigureAwait(false);
+                return;
+            }
+
+            if (final is not null)
+                await PersistToolAuditAsync(final, record).ConfigureAwait(false);
+
+            if (noProgress is not null)
+            {
+                var evidence = final is not null && !string.IsNullOrWhiteSpace(final.Content)
+                    ? MergeFinalizationOutcome(exploration, final)
+                    : exploration ?? new AgentResponse { Content = string.Empty };
+                _logger.LogInformation(
+                    "Sub-agent no-progress finalization: {Reason}, {MatchedTurns} matching turns.",
+                    noProgress.Reason, noProgress.MatchedTurns);
+                // Count the reserved final turn without replacing exploration's measured evidence.
+                evidence = evidence with { TurnCount = record.Info.TurnsUsed };
+                await CompleteInterruptedAsync(subAgentId, record, evidence, SubAgentStatus.Failed,
+                    SubAgentStopReason.NoProgress,
+                    $"Sub-agent stopped for no progress: {noProgress.Reason} ({noProgress.MatchedTurns} matching turns; supporting turns: {string.Join(",", noProgress.SupportingTurnIds)}).")
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            if (final is not null && !string.IsNullOrWhiteSpace(final.Content))
+            {
+                var measured = MergeFinalizationOutcome(exploration, final);
+                await OnCompletedAsync(subAgentId, final.Content, SubAgentRunOutcome.From(measured))
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            if (record.TurnLimitReached)
+            {
+                await CompleteTurnLimitAsync(subAgentId, record, exploration, maxTurns).ConfigureAwait(false);
+                return;
+            }
+
+            // The reserve is a scheduling boundary, not a terminal reason. If its best-effort
+            // synthesis produced no answer, keep the run alive until the authoritative absolute
+            // deadline fires; only an observed turn cutoff may report BudgetExhausted.
+            await Task.Delay(Timeout.InfiniteTimeSpan, timeoutCts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        catch (AgentPromptInterruptedException interrupted) when (timeoutCts.IsCancellationRequested)
         {
-            await CompleteTimedOutAsync(subAgentId, timeoutSeconds);
+            await CompleteInterruptedAsync(subAgentId, record, interrupted.PartialResponse,
+                SubAgentStatus.TimedOut, SubAgentStopReason.Timeout, TimeoutDiagnostic(timeoutSeconds))
+                .ConfigureAwait(false);
         }
         catch (Exception) when (timeoutCts.IsCancellationRequested)
         {
-            // Some providers translate cancellation into a different exception. Once the
-            // deadline has fired, timeout remains the authoritative terminal reason.
-            await CompleteTimedOutAsync(subAgentId, timeoutSeconds);
+            await CompleteTimeoutAsync(subAgentId, record, exploration, timeoutSeconds).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            await CompleteFailedAsync(subAgentId, $"Sub-agent failed: {ex.Message}");
+            await CompleteFailedAsync(subAgentId, $"Sub-agent failed: {ex.Message}").ConfigureAwait(false);
         }
         finally
         {
+            lock (activityGate)
+            {
+                activitySubscription?.Dispose();
+                activitySubscription = null;
+            }
+            turnSubscription?.Dispose();
             record.DisposeTimeout();
         }
     }
+
+    private static TimeSpan ResolveExplorationDuration(int timeoutSeconds)
+    {
+        var timeout = TimeSpan.FromSeconds(timeoutSeconds);
+        var reserve = TimeSpan.FromTicks(Math.Clamp(
+            timeout.Ticks / 10,
+            TimeSpan.FromMilliseconds(100).Ticks,
+            TimeSpan.FromSeconds(30).Ticks));
+        if (reserve >= timeout)
+            reserve = TimeSpan.FromTicks(Math.Max(1, timeout.Ticks / 2));
+        return timeout - reserve;
+    }
+
+    private static AgentResponse MergeFinalizationOutcome(AgentResponse? exploration, AgentResponse final)
+    {
+        if (exploration is null)
+            return final;
+
+        return final with
+        {
+            // A merged response has no single admission identity. Attribute missing per-call IDs
+            // within each original response before combining, never to the final response afterward.
+            AgentRunId = exploration.AgentRunId == final.AgentRunId ? final.AgentRunId : null,
+            ToolCalls = [.. exploration.ToolCalls.Select(call => call with { AgentRunId = call.AgentRunId ?? exploration.AgentRunId }),
+                .. final.ToolCalls.Select(call => call with { AgentRunId = call.AgentRunId ?? final.AgentRunId })],
+            TerminalError = exploration.TerminalError ?? final.TerminalError,
+            RunUsage = exploration.RunUsage ?? final.RunUsage
+        };
+    }
+
+    private Task CompleteTimeoutAsync(
+        string subAgentId, SubAgentRecord record, AgentResponse? exploration, int timeoutSeconds)
+        => exploration is null
+            ? CompleteTimedOutAsync(subAgentId, timeoutSeconds)
+            : CompleteInterruptedAsync(subAgentId, record, exploration, SubAgentStatus.TimedOut,
+                SubAgentStopReason.Timeout, TimeoutDiagnostic(timeoutSeconds));
+
+    private Task CompleteTurnLimitAsync(
+        string subAgentId, SubAgentRecord record, AgentResponse? exploration, int maxTurns)
+        => exploration is null
+            ? CompleteBudgetExhaustedAsync(subAgentId, maxTurns)
+            : CompleteInterruptedAsync(subAgentId, record, exploration, SubAgentStatus.BudgetExhausted,
+                SubAgentStopReason.TurnLimit, TurnLimitDiagnostic(maxTurns));
+
+    private async Task CompleteOrdinaryResponseAsync(string subAgentId, SubAgentRecord record,
+        AgentResponse response, CancellationTokenSource timeoutCts, int timeoutSeconds)
+    {
+        if (timeoutCts.IsCancellationRequested)
+        {
+            await CompleteTimedOutAsync(subAgentId, timeoutSeconds);
+            return;
+        }
+
+        var outcome = SubAgentRunOutcome.From(response);
+        // Provider rejection can return no text. Preserve its diagnostic rather than
+        // treating it as a clean silent run or allowing a descendant handoff to hide it.
+        if (outcome.HasFailure || !string.IsNullOrWhiteSpace(response.Content))
+            await OnCompletedAsync(subAgentId, response.Content, outcome);
+        else
+            await CompleteSilentRunAsync(subAgentId, record, timeoutCts.Token);
+    }
+
+    private static string TurnLimitDiagnostic(int maxTurns)
+        => $"Sub-agent exhausted its turn budget after {maxTurns} {(maxTurns == 1 ? "turn" : "turns")}.";
+
+    private static string TimeoutDiagnostic(int timeoutSeconds)
+        => $"Sub-agent timed out after {timeoutSeconds} {(timeoutSeconds == 1 ? "second" : "seconds")}.";
+
+    private const string FinalizationPrompt =
+        "Stop using tools. Synthesize the final answer now from the work and evidence already in this conversation. " +
+        "State the result, validation performed, and any remaining risks concisely. Do not start new work.";
+
+    /// <summary>
+    /// Terminal classification for a run that produced no synthesized text of its own.
+    /// <para>
+    /// The predicate is the <b>spawn-only handoff</b>: the run accepted a session spawn AND
+    /// produced zero delivery payloads AND emitted no text. Only then does the run become
+    /// <see cref="SubAgentStatus.HandedOff"/>, carrying the descendant's result rather than a
+    /// diagnostic. The accepted-spawn signal is read from the existing parent-to-children index
+    /// keyed by the run's own child session - the same structure <c>ListAsync</c> already serves
+    /// from - rather than a second, separately-maintained flag that could drift out of sync with
+    /// the spawns that actually happened.
+    /// </para>
+    /// <para>
+    /// <b>The discrimination is the point.</b> A run with no accepted spawn still records the
+    /// empty-response diagnostic and still fails. A change that classified every silent run as a
+    /// handoff would be a suppression, not a fix: the operator would lose the ability to see a
+    /// genuinely mute agent at all.
+    /// </para>
+    /// <para>
+    /// A handoff whose descendant did not itself succeed is recorded as a FAILURE carrying the
+    /// descendant's own diagnostic. Delegation that ended badly must not be laundered into a
+    /// success merely because the delegation itself was well-formed.
+    /// </para>
+    /// </summary>
+    private async Task CompleteSilentRunAsync(
+        string subAgentId,
+        SubAgentRecord record,
+        CancellationToken ct)
+    {
+        const string emptyResponseDiagnostic =
+            "Sub-agent failed because it returned an empty final response.";
+
+        var descendants = GetAcceptedSpawns(record.Info.ChildSessionId);
+        if (descendants.Count == 0)
+        {
+            await CompleteFailedAsync(subAgentId, emptyResponseDiagnostic);
+            return;
+        }
+
+        var outcome = await AwaitDescendantOutcomeAsync(descendants, ct);
+        if (outcome is null)
+        {
+            // The descendants never settled within the run's own deadline. Nothing was delegated
+            // successfully and nothing can be delivered, so the original diagnostic stands.
+            await CompleteFailedAsync(subAgentId, emptyResponseDiagnostic);
+            return;
+        }
+
+        var summary = string.IsNullOrWhiteSpace(outcome.ResultSummary)
+            ? emptyResponseDiagnostic
+            : outcome.ResultSummary!;
+
+        if (SubAgentStatusPolicy.IsUnsuccessfulTermination(outcome.Status))
+        {
+            await CompleteFailedAsync(subAgentId, summary);
+            return;
+        }
+
+        await CompleteTerminalAsync(subAgentId, SubAgentStatus.HandedOff, summary);
+    }
+
+    /// <summary>
+    /// The accepted-spawn signal: the sub-agents this run spawned from its OWN child session.
+    /// A non-empty result means the run accepted at least one session spawn.
+    /// </summary>
+    private IReadOnlyList<string> GetAcceptedSpawns(SessionId childSessionId)
+        => _parentChildren.TryGetValue(childSessionId, out var ids)
+            ? [.. ids.Distinct(StringComparer.OrdinalIgnoreCase)]
+            : [];
+
+    /// <summary>
+    /// Waits for every descendant to reach a terminal state and returns the one whose disposition
+    /// the parent adopts: the first unsuccessful descendant if any failed, otherwise the last to
+    /// settle. Returns <see langword="null"/> if the wait is cancelled before they all settle,
+    /// which the caller treats as "nothing was delivered".
+    /// </summary>
+    private async Task<SubAgentInfo?> AwaitDescendantOutcomeAsync(
+        IReadOnlyList<string> descendantIds,
+        CancellationToken ct)
+    {
+        var settled = new List<SubAgentInfo>(descendantIds.Count);
+
+        foreach (var descendantId in descendantIds)
+        {
+            while (true)
+            {
+                if (ct.IsCancellationRequested)
+                    return null;
+
+                if (!_records.TryGetValue(descendantId, out var descendant))
+                    break;
+
+                var info = descendant.Info;
+                if (SubAgentStatusPolicy.IsTerminal(info.Status))
+                {
+                    settled.Add(info);
+                    break;
+                }
+
+                try
+                {
+                    await Task.Delay(DescendantPollInterval, _timeProvider, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return null;
+                }
+            }
+        }
+
+        if (settled.Count == 0)
+            return null;
+
+        return settled.FirstOrDefault(info => SubAgentStatusPolicy.IsUnsuccessfulTermination(info.Status))
+            ?? settled[^1];
+    }
+
+    /// <summary>
+    /// Poll cadence while awaiting descendant runs. Short enough that a handoff is not perceptibly
+    /// delayed, long enough not to spin; the wait is always bounded by the parent run's own
+    /// deadline token, so an unsettled descendant can never hang the parent indefinitely.
+    /// </summary>
+    private static readonly TimeSpan DescendantPollInterval = TimeSpan.FromMilliseconds(25);
+
+    private async Task CompleteInterruptedAsync(
+        string subAgentId,
+        SubAgentRecord record,
+        AgentResponse response,
+        SubAgentStatus status,
+        SubAgentStopReason stopReason,
+        string diagnostic)
+    {
+        await PersistToolAuditAsync(response, record).ConfigureAwait(false);
+
+        var summary = SubAgentSummaryNormalizer.Normalize(response.Content);
+        var partial = new SubAgentPartialResult
+        {
+            Completion = SubAgentCompletion.Partial,
+            StopReason = stopReason,
+            Summary = summary,
+            SummaryIsVerified = false,
+            VerifiedEvidence =
+            [
+                .. response.ToolCalls
+                    .Where(call => !call.IsError && !call.IsIncomplete)
+                    .Select(call => new SubAgentVerifiedEvidence(
+                        call.ToolCallId,
+                        call.ToolName,
+                        call.ResultContent))
+            ],
+            UnresolvedWork =
+            [
+                .. response.ToolCalls
+                    .Where(call => call.IsError || call.IsIncomplete)
+                    .Select(call => $"{call.ToolName} ({call.ToolCallId}) did not complete successfully."),
+                .. stopReason == SubAgentStopReason.NoProgress
+                    ? new[] { "Exploration stopped at the no-progress boundary; remaining work and final summary are unverified." }
+                    : Array.Empty<string>()
+            ],
+            ActionsTaken =
+            [
+                .. response.ToolCalls.Select(call => new SubAgentPartialAction(
+                    call.ToolCallId,
+                    call.ToolName,
+                    Completed: !call.IsIncomplete,
+                    Succeeded: !call.IsError && !call.IsIncomplete))
+            ],
+            TurnsUsed = response.TurnCount ?? record.Info.TurnsUsed,
+            Usage = response.RunUsage,
+            CheckpointSessionId = record.Info.ChildSessionId,
+            CheckpointConversationId = record.Info.ChildConversationId
+        };
+
+        var rendered = RenderPartialResult(diagnostic, partial);
+        await CompleteTerminalAsync(subAgentId, status, rendered, partial).ConfigureAwait(false);
+    }
+
+    internal static string RenderPartialResult(string diagnostic, SubAgentPartialResult partial)
+    {
+        var stopReason = partial.StopReason switch
+        {
+            SubAgentStopReason.TurnLimit => "turn_limit",
+            SubAgentStopReason.Timeout => "timeout",
+            SubAgentStopReason.TokenLimit => "token_limit",
+            SubAgentStopReason.NoProgress => "no_progress",
+            SubAgentStopReason.CallerCancelled => "caller_cancelled",
+            _ => throw new ArgumentOutOfRangeException(nameof(partial), partial.StopReason, null)
+        };
+
+        var text = $"[partial:{stopReason}] {diagnostic}";
+        if (!string.IsNullOrWhiteSpace(partial.Summary))
+        {
+            text += Environment.NewLine
+                + Environment.NewLine
+                + "Unverified child summary:"
+                + Environment.NewLine
+                + partial.Summary;
+        }
+
+        if (partial.VerifiedEvidence.Count > 0)
+        {
+            text += Environment.NewLine
+                + Environment.NewLine
+                + "Verified tool evidence:"
+                + Environment.NewLine
+                + string.Join(
+                    Environment.NewLine,
+                    partial.VerifiedEvidence.Select(evidence =>
+                        $"- {evidence.ToolName} ({evidence.ToolCallId})"
+                        + (string.IsNullOrWhiteSpace(evidence.Result) ? string.Empty : $": {evidence.Result}")));
+        }
+
+        return text;
+    }
+
+    private Task CompleteBudgetExhaustedAsync(string subAgentId, int maxTurns)
+        => CompleteTerminalAsync(
+            subAgentId,
+            SubAgentStatus.BudgetExhausted,
+            $"Sub-agent exhausted its turn budget after {maxTurns} {(maxTurns == 1 ? "turn" : "turns")}.");
 
     private Task CompleteTimedOutAsync(string subAgentId, int timeoutSeconds)
         => CompleteTerminalAsync(
@@ -806,33 +1990,122 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
     private async Task CompleteTerminalAsync(
         string subAgentId,
         SubAgentStatus status,
-        string diagnostic)
+        string diagnostic,
+        SubAgentPartialResult? partialResult = null)
     {
-        if (TryUpdateSubAgent(
-                subAgentId,
-                current => current.Status == SubAgentStatus.Running
-                    ? current with
-                    {
-                        Status = status,
-                        CompletedAt = DateTimeOffset.UtcNow,
-                        ResultSummary = diagnostic
-                    }
-                    : current,
-                out var updated) && updated.Status == status)
+        if (!_records.TryGetValue(subAgentId, out var record))
+            return;
+
+        // Claim the timeout/budget disposition before capture starts. A concurrent explicit kill
+        // must not win after recovery capture has already begun, and observers must not see the
+        // terminal status until its snapshot evidence is ready to publish.
+        if ((status is SubAgentStatus.TimedOut or SubAgentStatus.BudgetExhausted)
+            && !record.TryClaimSnapshotTerminal(status))
+            return;
+
+        SubAgentWorktreeSnapshot? snapshot = null;
+        if (status is SubAgentStatus.TimedOut or SubAgentStatus.BudgetExhausted
+            && _worktreeSnapshotService is not null)
         {
-            await OnCompletedAsync(subAgentId, diagnostic);
+            try
+            {
+                snapshot = await _worktreeSnapshotService
+                    .CaptureAsync(subAgentId, record.GrantedWritePaths, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed capturing a recovery snapshot for sub-agent '{SubAgentId}'; terminal status '{Status}' remains authoritative.",
+                    subAgentId,
+                    status);
+                snapshot = new SubAgentWorktreeSnapshot(
+                    SubAgentWorktreeSnapshotOutcome.ProcessFailed, null, null, 0, [], false);
+            }
         }
+
+        // Publish the terminal disposition and its recovery evidence in one compare-and-swap.
+        // The earlier claim prevents a concurrent kill from winning after capture begins; no
+        // observer can see timeout/budget status without the corresponding snapshot result.
+        if (!record.TryPublishTerminal(status, diagnostic, snapshot, partialResult, out _))
+        {
+            if (snapshot?.ArtifactPath is { } orphanedArtifact && _worktreeSnapshotService is not null)
+                await _worktreeSnapshotService.DeleteArtifactAsync(orphanedArtifact, CancellationToken.None).ConfigureAwait(false);
+            return;
+        }
+
+        await OnCompletedAsync(subAgentId, diagnostic);
     }
 
-    private static string DescribeStatus(SubAgentStatus status)
-        => status switch
+    /// <summary>
+    /// Builds the failure text a parent receives when a sub-agent run narrated an answer but its
+    /// tools failed, or its terminal assistant message carried a provider error (#3565, AC3).
+    /// </summary>
+    /// <remarks>
+    /// The sub-agent id and the underlying error are both named so the parent can act without
+    /// opening the child transcript. The run's own words are appended rather than dropped: they are
+    /// frequently the only record of what was attempted, and discarding them would trade one
+    /// information loss for another. Vocabulary deliberately mirrors the existing
+    /// <c>emptyResponseDiagnostic</c> shape ("Sub-agent failed because ...") so the diagnostics on
+    /// this path stay recognisable as one family.
+    /// </remarks>
+    /// <param name="subAgentId">The run whose failure is being described.</param>
+    /// <param name="outcome">The measured tool/provider outcome of the run.</param>
+    /// <param name="narratedSummary">The run's own final text, or null when it produced none.</param>
+    internal static string DescribeFailedRun(
+        string subAgentId,
+        SubAgentRunOutcome outcome,
+        string? narratedSummary)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+
+        var reason = outcome.FailedToolCount > 0
+            ? $"{outcome.FailedToolCount} tool invocation{(outcome.FailedToolCount == 1 ? string.Empty : "s")} failed"
+            : "the provider ended its final turn with an error";
+
+        var detail = outcome.FailedToolCount > 0
+            ? outcome.LastToolError
+            : outcome.TerminalError;
+
+        var text = $"Sub-agent '{subAgentId}' failed because {reason}.";
+
+        if (!string.IsNullOrWhiteSpace(detail))
+            text += $" Last error: {detail}";
+
+        if (!string.IsNullOrWhiteSpace(narratedSummary))
         {
-            SubAgentStatus.Completed => "completed",
-            SubAgentStatus.Failed => "failed",
-            SubAgentStatus.TimedOut => "timed out",
-            SubAgentStatus.Killed => "was killed",
-            _ => "updated"
-        };
+            text += Environment.NewLine
+                + Environment.NewLine
+                + "The sub-agent nevertheless reported the following, which must NOT be treated as a "
+                + "confirmed result:"
+                + Environment.NewLine
+                + narratedSummary;
+        }
+
+        return text;
+    }
+
+    /// <summary>
+    /// Builds the bounded recovery evidence delivered with a successful run that contained
+    /// superseded tool failures. The full failed and successful records remain in child history;
+    /// this summary carries only counts, tool names, and correlation ids.
+    /// </summary>
+    internal static string DescribeRecoveredRun(SubAgentRunOutcome outcome, string narratedSummary)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+
+        var recoveries = string.Join(
+            ", ",
+            outcome.RecoveredToolFailures.Select(recovery =>
+                $"{recovery.ToolName} {recovery.FailedToolCallId}->{recovery.RecoveryToolCallId}"));
+
+        return "[completed-with-recovered-errors] "
+            + $"{outcome.RecoveredToolFailureCount} failed tool invocation"
+            + (outcome.RecoveredToolFailureCount == 1 ? " was" : "s were")
+            + $" recovered by an adjacent same-tool retry ({recoveries})."
+            + Environment.NewLine
+            + narratedSummary;
+    }
 
     private bool TryUpdateSubAgent(string subAgentId, Func<SubAgentInfo, SubAgentInfo> updateFactory)
         => TryUpdateSubAgent(subAgentId, updateFactory, out _);
@@ -881,7 +2154,11 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         }
     }
 
-    private async Task CleanupChildAgentAsync(string subAgentId, SessionId childSessionId, CancellationToken ct)
+    private async Task CleanupChildAgentAsync(
+        string subAgentId,
+        SessionId childSessionId,
+        SubAgentStatus terminalStatus,
+        CancellationToken ct)
     {
         // The cleanup body must run at most once per sub-agent: it stops the child agent,
         // removes the dynamic deny-list, unregisters the descriptor and reclaims the
@@ -891,54 +2168,71 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         if (!_records.TryGetValue(subAgentId, out var record) || !record.TryBeginCleanup())
             return;
 
-        // Start the record's retention clock and release the timeout source now that the sub-agent
-        // has finished. The record itself stays in _records (for list_subagents / status queries)
-        // until ReapCompletedRecords ages it out, but its CancellationTokenSource is an IDisposable
-        // that must not be held for the process lifetime. DisposeTimeout is idempotent and a no-op
-        // when an explicit kill already disposed it via CancelTimeout.
-        record.MarkRetired(_timeProvider.GetUtcNow());
-        record.DisposeTimeout();
-
-        var childAgentId = record.ChildAgentId;
-
-        // Remove the dynamic deny-list registered for this ephemeral sub-agent
-        _policyProvider?.RemoveDynamicDenyList(childAgentId);
-
         try
         {
-            await _supervisor.StopAsync(childAgentId, childSessionId, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(
-                ex,
-                "Failed stopping child agent '{ChildAgentId}' for sub-agent '{SubAgentId}'.",
-                childAgentId,
-                subAgentId);
-        }
-        finally
-        {
-            _registry.Unregister(childAgentId);
-        }
+            // Release the timeout source promptly once cleanup is owned. Disposal is idempotent
+            // and a no-op when an explicit kill already disposed it via CancelTimeout.
+            record.DisposeTimeout();
 
-        if (_workspaceManager is null)
-            return;
+            var childAgentId = record.ChildAgentId;
 
-        try
-        {
-            if (_workspaceManager.TryCleanupWorkspace(childAgentId.Value))
+            // Remove the dynamic deny-list registered for this ephemeral sub-agent
+            _policyProvider?.RemoveDynamicDenyList(childAgentId);
+
+            try
             {
-                _logger.LogDebug(
-                    "Cleaned up temporary workspace for child agent '{ChildAgentId}'.",
+                await _supervisor.StopAsync(childAgentId, childSessionId, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed stopping child agent '{ChildAgentId}' for sub-agent '{SubAgentId}'.",
+                    childAgentId,
+                    subAgentId);
+            }
+            finally
+            {
+                _registry.Unregister(childAgentId);
+            }
+
+            if (_workspaceManager is null)
+                return;
+
+            try
+            {
+                if (_workspaceManager.TryCleanupWorkspace(childAgentId.Value))
+                {
+                    // #3670 AC4: the lifecycle route is an audit event, not a debug breadcrumb. It is
+                    // logged at Information using the vocabulary the backstop sweep also emits, so one
+                    // operator query returns every reclamation from either route and the suffix says
+                    // which mechanism acted. Previously this was a Debug line with unrelated wording:
+                    // invisible in production and unjoinable with the sweeper's trail.
+                    //
+                    // It is emitted only when TryCleanupWorkspace actually removed something. A line
+                    // logged unconditionally would report phantom reclamations for an already-absent
+                    // directory. Sharing adds access to the parent; the child still owns an isolated
+                    // cwd, and cleanup must never remove the parent's workspace.
+                    _logger.LogInformation(
+                        SubAgentWorkspaceReclamationAudit.LifecycleTemplate,
+                        childAgentId.Value,
+                        terminalStatus);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed cleaning temporary workspace for child agent '{ChildAgentId}'.",
                     childAgentId);
             }
         }
-        catch (Exception ex)
+        finally
         {
-            _logger.LogWarning(
-                ex,
-                "Failed cleaning temporary workspace for child agent '{ChildAgentId}'.",
-                childAgentId);
+            // #4537: retirement is the cleanup-completion boundary, not its ownership claim.
+            // Start retention only after teardown returns or unwinds, including best-effort failures
+            // and the optional-workspace-manager path. Reaping must never evict in-flight cleanup.
+            record.MarkRetired(_timeProvider.GetUtcNow());
         }
     }
 
@@ -1028,7 +2322,7 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
                 action,
                 SecurityEventOutcome.Success,
                 SecurityEventSeverity.Info,
-                Actor: new SecurityEventActor(SecurityActorKind.Agent, HashActor(parentSessionId.Value)),
+                Actor: new SecurityEventActor(SecurityActorKind.Agent, ActorPseudonym.For(parentSessionId.Value)),
                 Target: new SecurityEventTarget(SecurityTargetKind.Tool, subAgentId),
                 Control: SecurityControlFamily.Sandbox);
             _securityEvents.Record(evt);
@@ -1040,19 +2334,6 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         }
     }
 
-    /// <summary>
-    /// Hashes a session/agent id to a short, opaque hex token so security events carry a stable
-    /// pseudonym instead of the raw id. SHA-256 with a fixed prefix is sufficient for correlation;
-    /// it is not reversible and never stores the plaintext.
-    /// </summary>
-    private static string HashActor(string id)
-    {
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(id ?? string.Empty));
-        var sb = new StringBuilder(16);
-        for (var i = 0; i < 8; i++)
-            sb.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
-        return sb.ToString();
-    }
 
     /// <summary>
     /// Counts the sub-agent nesting depth encoded in a session ID.
@@ -1081,7 +2362,11 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
     /// the maps can no longer drift apart — the drift between <c>_childAgentIds</c> and the live
     /// entry is exactly what forced the old synthetic-child-id fallback in <c>OnCompletedAsync</c>.
     /// </summary>
-    private sealed class SubAgentRecord(SubAgentInfo info, AgentId parentAgentId, AgentId childAgentId)
+    private sealed class SubAgentRecord(
+        SubAgentInfo info,
+        AgentId parentAgentId,
+        AgentId childAgentId,
+        IReadOnlyList<string> grantedWritePaths)
     {
         // Process-wide monotonic spawn counter. Assigned once per record at construction so every
         // record carries a strictly-increasing "spawn age" that is independent of wall-clock
@@ -1092,9 +2377,14 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         private static long _spawnSequenceCounter;
 
         private SubAgentInfo _info = info;
+        private int _snapshotTerminalClaim;
         private int _completionProcessed;
         private int _cleanupStarted;
         private long _retiredAtTicks;
+        private readonly TaskCompletionSource _terminalReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task TerminalReady => _terminalReady.Task;
+        public void MarkTerminalReady() => _terminalReady.TrySetResult();
+        private readonly TaskCompletionSource _runCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         /// <summary>
         /// Strictly-increasing spawn-order sequence, assigned once at construction. Provides a total,
@@ -1110,6 +2400,9 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         /// <summary>Child agent id captured at spawn. Immutable for the record's lifetime.</summary>
         public AgentId ChildAgentId { get; } = childAgentId;
 
+        /// <summary>Caller-granted writable paths captured immutably at spawn.</summary>
+        public IReadOnlyList<string> GrantedWritePaths { get; } = grantedWritePaths;
+
         /// <summary>
         /// The timeout cancellation source. Set once after the spawn budget is resolved and the
         /// record is already registered, so the background run loop can read it. Cleared (set to
@@ -1123,6 +2416,12 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
 
         /// <summary>The current immutable runtime snapshot. Swapped atomically via <see cref="TryUpdateInfo"/>.</summary>
         public SubAgentInfo Info => Volatile.Read(ref _info);
+
+        /// <summary>Completes after the outer run-loop frame has returned and disposed its locals.</summary>
+        public Task RunCompletion => _runCompletion.Task;
+
+        /// <summary>Signals the post-disposal run-loop boundary exactly once.</summary>
+        public void MarkRunCompleted() => _runCompletion.TrySetResult();
 
         /// <summary>
         /// Atomically applies <paramref name="updateFactory"/> to the current snapshot using a
@@ -1143,7 +2442,81 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
             }
         }
 
+        /// <summary>
+        /// Claims whether kill or timeout/budget owns the terminal transition before cancellation
+        /// callbacks or recovery capture can run.
+        /// </summary>
+        public bool TryClaimSnapshotTerminal(SubAgentStatus status)
+        {
+            var claim = status switch
+            {
+                SubAgentStatus.Killed => 1,
+                SubAgentStatus.TimedOut => 2,
+                SubAgentStatus.BudgetExhausted => 3,
+                _ => throw new ArgumentOutOfRangeException(nameof(status), status, null)
+            };
+            return Interlocked.CompareExchange(ref _snapshotTerminalClaim, claim, 0) == 0;
+        }
+
+        public bool TryMarkKilled(out SubAgentInfo updatedInfo)
+        {
+            while (true)
+            {
+                var current = Info;
+                if (SubAgentStatusPolicy.IsTerminal(current.Status))
+                {
+                    updatedInfo = current;
+                    return false;
+                }
+
+                var killed = current with
+                {
+                    Status = SubAgentStatus.Killed,
+                    CompletedAt = DateTimeOffset.UtcNow,
+                    ResultSummary = "Sub-agent was killed by parent session."
+                };
+                if (ReferenceEquals(Interlocked.CompareExchange(ref _info, killed, current), current))
+                {
+                    updatedInfo = killed;
+                    return true;
+                }
+            }
+        }
+
         /// <summary>Returns true exactly once — the first caller wins the completion gate.</summary>
+        /// <summary>Atomically publishes a terminal disposition together with its recovery evidence.</summary>
+        public bool TryPublishTerminal(
+            SubAgentStatus status,
+            string diagnostic,
+            SubAgentWorktreeSnapshot? snapshot,
+            SubAgentPartialResult? partialResult,
+            out SubAgentInfo updatedInfo)
+        {
+            while (true)
+            {
+                var current = Info;
+                if (current.Status != SubAgentStatus.Running)
+                {
+                    updatedInfo = current;
+                    return false;
+                }
+
+                var terminal = current with
+                {
+                    Status = status,
+                    CompletedAt = DateTimeOffset.UtcNow,
+                    ResultSummary = diagnostic,
+                    PartialResult = partialResult,
+                    WorktreeSnapshot = snapshot
+                };
+                if (ReferenceEquals(Interlocked.CompareExchange(ref _info, terminal, current), current))
+                {
+                    updatedInfo = terminal;
+                    return true;
+                }
+            }
+        }
+
         public bool TryBeginCompletion() => Interlocked.CompareExchange(ref _completionProcessed, 1, 0) == 0;
 
         /// <summary>Returns true exactly once — the first caller wins the child-cleanup gate.</summary>
@@ -1179,8 +2552,16 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
             var cts = Interlocked.Exchange(ref _timeoutCts, null);
             if (cts is null)
                 return;
-            cts.Cancel();
-            cts.Dispose();
+            try
+            {
+                cts.Cancel();
+            }
+            finally
+            {
+                // The field has already been exchanged to null, so no other path can dispose
+                // this source if a registered cancellation callback throws.
+                cts.Dispose();
+            }
         }
 
         /// <summary>Disposes the timeout source without cancelling (used by the run loop's finally). Idempotent.</summary>
@@ -1188,6 +2569,51 @@ public sealed class DefaultSubAgentManager : ISubAgentManager
         {
             Interlocked.Exchange(ref _timeoutCts, null)?.Dispose();
         }
+
+        /// <summary>
+        /// The authoritative turn counter for this sub-agent (#2656). Incremented once per
+        /// completed agent-loop turn; both the reported <see cref="SubAgentInfo.TurnsUsed"/> and
+        /// the enforced turn budget read this one value, so they cannot drift apart.
+        /// </summary>
+        public int TurnsUsed => Volatile.Read(ref _turnsUsed);
+
+        /// <summary>
+        /// Increments the single counter only while doing so remains inside the configured ceiling.
+        /// Late observer callbacks after cancellation therefore cannot over-report the run budget.
+        /// </summary>
+        public bool TryIncrementTurns(int ceiling, out int turnsUsed)
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _turnsUsed);
+                if (current >= ceiling)
+                {
+                    turnsUsed = current;
+                    return false;
+                }
+
+                turnsUsed = current + 1;
+                if (Interlocked.CompareExchange(ref _turnsUsed, turnsUsed, current) == current)
+                    return true;
+            }
+        }
+
+        /// <summary>True after the observed exploratory-turn ceiling requested finalization.</summary>
+        public bool TurnLimitReached => Volatile.Read(ref _turnLimitReached) == 1;
+
+        /// <summary>Latches the turn cutoff independently from the pre-deadline reserve.</summary>
+        public void LatchTurnLimitReached() => Interlocked.Exchange(ref _turnLimitReached, 1);
+
+        /// <summary>True after exploration claims the single reserved finalization turn.</summary>
+        public bool FinalizationRequested => Volatile.Read(ref _finalizationRequested) == 1;
+
+        /// <summary>Claims finalization exactly once, preventing recursive or duplicate entry.</summary>
+        public bool TryRequestFinalization()
+            => Interlocked.CompareExchange(ref _finalizationRequested, 1, 0) == 0;
+
+        private int _turnsUsed;
+        private int _turnLimitReached;
+        private int _finalizationRequested;
 
         // Backing field for TimeoutCts so set / read / Cancel / Dispose all touch one field and
         // Cancel/Dispose can clear it atomically, avoiding a double-dispose race between an

@@ -15,15 +15,34 @@ public sealed record ConversationSummaryDto(
     [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt,
     [property: JsonPropertyName("updatedAt")] DateTimeOffset UpdatedAt,
     [property: JsonPropertyName("kind")] string Kind = "HumanAgent",
+    [property: JsonPropertyName("source")] string Source = "Channel",
+    [property: JsonPropertyName("visibility")] string Visibility = "UserFacing",
     [property: JsonPropertyName("isPinned")] bool IsPinned = false,
     [property: JsonPropertyName("pinnedAt")] DateTimeOffset? PinnedAt = null,
-    [property: JsonPropertyName("participants")] IReadOnlyList<ParticipantDto>? Participants = null);
+    [property: JsonPropertyName("participants")] IReadOnlyList<ParticipantDto>? Participants = null,
+    [property: JsonPropertyName("sourceId")] string? SourceId = null,
+    [property: JsonPropertyName("purpose")] string? Purpose = null);
 
 public sealed record ParticipantDto(
     [property: JsonPropertyName("kind")] string Kind,
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("role")] string? Role = null);
 
+/// <summary>
+/// Wire shape of one row from <c>GET /api/conversations/costs</c> (#2898).
+/// </summary>
+/// <remarks>
+/// The nullable count fields are nullable on the wire too: <c>null</c> means the server did not
+/// measure the signal, and it must never be deserialised into or rendered as a measured <c>0</c>
+/// (#2554). A legacy server that omits the property entirely lands on the same <c>null</c>, which
+/// is the correct reading - it did not measure it either.
+/// </remarks>
+public sealed record ConversationCostDto(
+    [property: JsonPropertyName("conversationId")] string ConversationId,
+    [property: JsonPropertyName("sessionCount")] int SessionCount,
+    [property: JsonPropertyName("messageCount")] int MessageCount,
+    [property: JsonPropertyName("compactionSummaryCount")] int? CompactionSummaryCount = null,
+    [property: JsonPropertyName("totalTokens")] long? TotalTokens = null);
 public sealed record CreateConversationRequestDto(
     [property: JsonPropertyName("agentId")] string AgentId,
     [property: JsonPropertyName("title")] string? Title);
@@ -43,12 +62,18 @@ public sealed record ConversationResponseDto(
     [property: JsonPropertyName("updatedAt")] DateTimeOffset UpdatedAt,
     [property: JsonPropertyName("modelOverride")] string? ModelOverride = null,
     [property: JsonPropertyName("thinkingOverride")] string? ThinkingOverride = null,
-    [property: JsonPropertyName("contextWindowOverride")] int? ContextWindowOverride = null);
+    [property: JsonPropertyName("contextWindowOverride")] int? ContextWindowOverride = null,
+    [property: JsonPropertyName("toolOverrideJson")] string? ToolOverrideJson = null,
+    [property: JsonPropertyName("kind")] string Kind = "HumanAgent",
+    [property: JsonPropertyName("source")] string Source = "Channel",
+    [property: JsonPropertyName("visibility")] string Visibility = "UserFacing");
 
 public sealed record SetConversationOverrideRequestDto(
     [property: JsonPropertyName("model")] string? Model = null,
     [property: JsonPropertyName("thinking")] string? Thinking = null,
-    [property: JsonPropertyName("contextWindow")] int? ContextWindow = null);
+    [property: JsonPropertyName("contextWindow")] int? ContextWindow = null,
+    [property: JsonPropertyName("toolOverrideJson")] string? ToolOverrideJson = null,
+    [property: JsonPropertyName("applyToolOverride")] bool ApplyToolOverride = false);
 
 public sealed record ConversationBindingDto(
     [property: JsonPropertyName("bindingId")] string BindingId,
@@ -59,6 +84,18 @@ public sealed record ConversationBindingDto(
     [property: JsonPropertyName("displayPrefix")] string? DisplayPrefix,
     [property: JsonPropertyName("boundAt")] DateTimeOffset BoundAt);
 
+public sealed record AddConversationBindingRequestDto(
+    [property: JsonPropertyName("channelType")] string ChannelType,
+    [property: JsonPropertyName("channelAddress")] string ChannelAddress,
+    [property: JsonPropertyName("mode")] string Mode = "Interactive",
+    [property: JsonPropertyName("threadingMode")] string ThreadingMode = "Single",
+    [property: JsonPropertyName("displayPrefix")] string? DisplayPrefix = null);
+
+public sealed record MoveConversationBindingRequestDto(
+    [property: JsonPropertyName("targetConversationId")] string TargetConversationId);
+
+public sealed record ConversationBindingTargetDto(string ConversationId, string Title);
+
 public sealed record ConversationHistoryResponseDto(
     [property: JsonPropertyName("conversationId")] string ConversationId,
     [property: JsonPropertyName("totalCount")] int TotalCount,
@@ -68,8 +105,15 @@ public sealed record ConversationHistoryResponseDto(
 
 public sealed class ConversationHistoryEntryDto
 {
+    /// <summary>Run identity retained for terminal-notice reconciliation.</summary>
+    [JsonPropertyName("agentRunId")]
+    public string? AgentRunId { get; init; }
+
     [JsonPropertyName("kind")]
     public required string Kind { get; init; }
+
+    [JsonPropertyName("entryId")]
+    public string? EntryId { get; init; }
 
     [JsonPropertyName("sessionId")]
     public required string SessionId { get; init; }
@@ -86,6 +130,9 @@ public sealed class ConversationHistoryEntryDto
     [JsonPropertyName("content")]
     public string? Content { get; init; }
 
+    [JsonPropertyName("attachments")]
+    public IReadOnlyList<HistoryAttachmentDto>? Attachments { get; init; }
+
     [JsonPropertyName("toolName")]
     public string? ToolName { get; init; }
 
@@ -101,9 +148,32 @@ public sealed class ConversationHistoryEntryDto
     [JsonPropertyName("reason")]
     public string? Reason { get; init; }
 
+    /// <summary>
+    /// True when the entry was folded into a later compaction summary server-side (#2936). Such
+    /// entries are still returned so pre-compaction history is reachable, but the portal renders
+    /// them collapsed beneath the compaction boundary rather than as ordinary turns. Absent from a
+    /// legacy server, which deserialises to <c>false</c> - i.e. the pre-#2936 rendering.
+    /// </summary>
+    [JsonPropertyName("isFolded")]
+    public bool IsFolded { get; init; }
+
     [JsonPropertyName("thinkingContent")]
     public string? ThinkingContent { get; init; }
+
+    /// <summary>
+    /// Orthogonal typed presentation kind of the entry (issue #2149): <c>message</c>,
+    /// <c>subagent-completion</c>, or <c>subagent-response</c>. Null/absent from a legacy server
+    /// is treated as <c>message</c> by the client.
+    /// </summary>
+    [JsonPropertyName("messageKind")]
+    public string? MessageKind { get; init; }
 }
+
+public sealed record HistoryAttachmentDto(
+    [property: JsonPropertyName("fileName")] string FileName,
+    [property: JsonPropertyName("mimeType")] string MimeType,
+    [property: JsonPropertyName("size")] long? Size,
+    [property: JsonPropertyName("base64Data")] string Base64Data);
 
 public sealed record SessionHistoryResponseDto(
     [property: JsonPropertyName("offset")] int Offset,
@@ -113,6 +183,14 @@ public sealed record SessionHistoryResponseDto(
 
 public sealed class SessionHistoryEntryDto
 {
+    /// <summary>Raw session entries serialize their presentation kind as kind, not messageKind.</summary>
+    [JsonPropertyName("kind")]
+    public string? Kind { get; init; }
+
+    /// <summary>Run identity retained for terminal-notice reconciliation.</summary>
+    [JsonPropertyName("agentRunId")]
+    public string? AgentRunId { get; init; }
+
     [JsonPropertyName("role")]
     public string? Role { get; init; }
 
@@ -136,4 +214,12 @@ public sealed class SessionHistoryEntryDto
 
     [JsonPropertyName("thinkingContent")]
     public string? ThinkingContent { get; init; }
+
+    /// <summary>
+    /// Orthogonal typed presentation kind of the entry (issue #2149): <c>message</c>,
+    /// <c>subagent-completion</c>, or <c>subagent-response</c>. Null/absent is treated as
+    /// <c>message</c> by the client.
+    /// </summary>
+    [JsonPropertyName("messageKind")]
+    public string? MessageKind { get; init; }
 }

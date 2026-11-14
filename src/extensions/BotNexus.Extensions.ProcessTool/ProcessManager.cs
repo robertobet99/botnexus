@@ -1,115 +1,63 @@
-using System.Collections.Concurrent;
+using BotNexus.Agent.Core.Tools;
+using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Extensions.ProcessTool;
 
-/// <summary>
-/// Static shared registry for tracked background processes.
-/// Any tool or extension can register processes here for lifecycle management.
-/// </summary>
-/// <remarks>
-/// The registry bounds the number of *exited* processes it retains so that a long-running
-/// gateway that launches many short-lived background processes does not leak <see cref="ManagedProcess"/>
-/// instances (each of which pins an OS process handle plus a captured output buffer) indefinitely.
-/// Running processes are never evicted — only completed ones beyond the retention cap, oldest first.
-/// </remarks>
+/// <summary>Compatibility facade; the host-shared core registry owns every child and its output.</summary>
 public sealed class ProcessManager
 {
-    /// <summary>
-    /// Maximum number of *exited* processes kept in the registry. When the count of exited
-    /// processes exceeds this cap, the oldest exited entries are evicted and disposed.
-    /// Running processes do not count against this cap and are never evicted.
-    /// </summary>
     internal const int DefaultMaxExitedRetained = 100;
+    /// <summary>Standalone tool context; contributed tools use their immutable agent owner key.</summary>
+    public static ProcessManager Instance { get; } = new(BackgroundProcessRegistry.Instance, string.Empty);
+    private readonly BackgroundProcessRegistry _registry;
+    private readonly string _owner;
+    private readonly ILogger? _logger;
 
-    /// <summary>Global singleton instance shared across extensions.</summary>
-    public static ProcessManager Instance { get; } = new();
-
-    private readonly ConcurrentDictionary<int, ManagedProcess> _processes = new();
-    private readonly int _maxExitedRetained;
-
-    /// <summary>Creates a registry with the default exited-process retention cap.</summary>
-    public ProcessManager() : this(DefaultMaxExitedRetained) { }
-
-    /// <summary>Creates a registry with an explicit exited-process retention cap (primarily for tests).</summary>
-    /// <param name="maxExitedRetained">Maximum number of exited processes to retain; must be &gt;= 0.</param>
-    internal ProcessManager(int maxExitedRetained)
+    /// <summary>Creates an isolated registry for an independent host.</summary>
+    public ProcessManager() : this(DefaultMaxExitedRetained, null) { }
+    internal ProcessManager(int maxExitedRetained) : this(maxExitedRetained, null) { }
+    internal ProcessManager(int maxExitedRetained, ILogger? logger)
+        : this(new BackgroundProcessRegistry(maxExitedRetained), string.Empty) => _logger = logger;
+    internal ProcessManager(BackgroundProcessRegistry registry, string owner)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(maxExitedRetained);
-        _maxExitedRetained = maxExitedRetained;
+        _registry = registry;
+        _owner = owner;
     }
-
+    /// <summary>Registers only a wrapper whose actual PID matches the supplied handle identity.</summary>
     public void Register(int pid, ManagedProcess process)
     {
         ArgumentNullException.ThrowIfNull(process);
-        _processes[pid] = process;
-
-        // Opportunistically reap completed processes so the registry stays bounded.
-        Reap();
+        if (pid != process.Pid) throw new ArgumentException("PID must match the owned process.", nameof(pid));
+        _registry.Register(_owner, process);
     }
-
-    public ManagedProcess? Get(int pid)
-        => _processes.TryGetValue(pid, out var p) ? p : null;
-
-    public IReadOnlyList<ManagedProcessInfo> List()
-    {
-        // Reap on read too, so `process list` never surfaces an unbounded backlog of exited entries.
-        Reap();
-
-        return _processes.Values
-            .Select(p => new ManagedProcessInfo(p.Pid, p.Command, p.IsRunning, p.StartedAt, p.ExitCode))
-            .ToList();
-    }
-
+    /// <summary>Looks up this owner's child without attaching to arbitrary host processes.</summary>
+    public BackgroundProcess? Get(int pid) => _registry.Get(_owner, pid);
+    /// <summary>Lists this owner's retained processes after bounded completed-entry cleanup.</summary>
+    public IReadOnlyList<ManagedProcessInfo> List() => _registry.List(_owner)
+        .Select(p => new ManagedProcessInfo(p.Pid, p.Command, p.IsRunning, p.StartedAt, p.ExitCode,
+            p.OutputCaptureIncomplete, p.KillUnconfirmed, p.Status)).ToArray();
+    /// <summary>Returns true only for confirmed termination; false includes unknown PIDs and unresolved outcomes.</summary>
     public bool Kill(int pid)
     {
-        if (!_processes.TryGetValue(pid, out var process))
-            return false;
-
-        process.Kill();
-        return true;
+        var process = Get(pid);
+        if (process is null) return false;
+        var confirmed = process.Kill();
+        if (!confirmed)
+            _logger?.LogWarning("Tree kill of process {Pid} ({ProcessName}) was not confirmed; status: {Status}.", process.Pid, process.ProcessName, process.Status);
+        return confirmed;
     }
-
-    /// <summary>
-    /// Evicts exited processes beyond the retention cap, oldest first (by start time), and disposes
-    /// each evicted instance so its OS process handle and event subscriptions are released.
-    /// Running processes are never evicted. Safe to call concurrently.
-    /// </summary>
-    internal void Reap()
-    {
-        // Snapshot the exited entries. ConcurrentDictionary enumeration is safe under concurrent mutation.
-        var exited = _processes.Values
-            .Where(p => !p.IsRunning)
-            .OrderBy(p => p.StartedAt)
-            .ToList();
-
-        var evictCount = exited.Count - _maxExitedRetained;
-        if (evictCount <= 0)
-            return;
-
-        for (var i = 0; i < evictCount; i++)
-        {
-            var process = exited[i];
-            if (_processes.TryRemove(process.Pid, out var removed))
-                removed.Dispose();
-        }
-    }
-
-    /// <summary>Removes all tracked processes. Intended for testing only.</summary>
-    internal void Clear()
-    {
-        foreach (var kvp in _processes)
-            kvp.Value.Dispose();
-
-        _processes.Clear();
-    }
-
-    internal bool Remove(int pid) => _processes.TryRemove(pid, out _);
+    internal void Reap() => _registry.Reap();
+    internal void Clear() => _registry.Clear(_owner);
+    internal bool Remove(int pid) => _registry.Remove(_owner, pid);
 }
 
-/// <summary>Snapshot of a managed process for list results.</summary>
+/// <summary>Immutable status projection without granting access to process handles.</summary>
 public sealed record ManagedProcessInfo(
     int Pid,
     string Command,
     bool IsRunning,
     DateTimeOffset StartedAt,
-    int? ExitCode);
+    int? ExitCode,
+    bool OutputCaptureIncomplete = false,
+    bool KillUnconfirmed = false,
+    string Status = "");

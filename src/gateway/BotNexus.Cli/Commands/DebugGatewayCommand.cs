@@ -1,6 +1,8 @@
 using System.CommandLine;
 using System.Net.Http.Json;
 using System.Text.Json;
+using BotNexus.Cli.Diagnostics;
+using BotNexus.Cli.Services;
 using Spectre.Console;
 
 namespace BotNexus.Cli.Commands;
@@ -21,17 +23,20 @@ internal sealed class DebugGatewayCommand
     {
         var command = new Command("gateway", "Inspect live gateway state via REST API (requires running gateway).");
         var formatOption = new Option<string>("--format", () => "table", "Output format: table or json.");
-        var urlOption = new Option<string>("--url", () => "http://localhost:5005", "Gateway base URL.");
+        var urlOption = new Option<string>("--url", () => GatewayClientFactory.DefaultUrl, "Gateway base URL.");
+        var tokenOption = new Option<string?>("--token", "Gateway API credential. Required when --url is not the local gateway.");
         command.AddOption(formatOption);
         command.AddOption(urlOption);
+        command.AddOption(tokenOption);
 
         // ── status ──
         var statusCommand = new Command("status", "Show gateway uptime, version, and session count.");
         statusCommand.SetHandler(async context =>
         {
             var format = context.ParseResult.GetValueForOption(formatOption) ?? "table";
-            var url = context.ParseResult.GetValueForOption(urlOption) ?? "http://localhost:5005";
-            context.ExitCode = await ExecuteStatusAsync(url, format, context.GetCancellationToken());
+            var url = context.ParseResult.GetValueForOption(urlOption) ?? GatewayClientFactory.DefaultUrl;
+            var token = context.ParseResult.GetValueForOption(tokenOption);
+            context.ExitCode = await ExecuteStatusAsync(url, format, context.GetCancellationToken(), token);
         });
 
         // ── sessions ──
@@ -44,10 +49,11 @@ internal sealed class DebugGatewayCommand
         sessionsCommand.SetHandler(async context =>
         {
             var format = context.ParseResult.GetValueForOption(formatOption) ?? "table";
-            var url = context.ParseResult.GetValueForOption(urlOption) ?? "http://localhost:5005";
+            var url = context.ParseResult.GetValueForOption(urlOption) ?? GatewayClientFactory.DefaultUrl;
+            var token = context.ParseResult.GetValueForOption(tokenOption);
             var agent = context.ParseResult.GetValueForOption(agentOption);
             var limit = context.ParseResult.GetValueForOption(limitOption);
-            context.ExitCode = await ExecuteSessionsAsync(url, agent, limit, format, context.GetCancellationToken());
+            context.ExitCode = await ExecuteSessionsAsync(url, agent, limit, format, context.GetCancellationToken(), token);
         });
 
         // ── providers ──
@@ -55,8 +61,9 @@ internal sealed class DebugGatewayCommand
         providersCommand.SetHandler(async context =>
         {
             var format = context.ParseResult.GetValueForOption(formatOption) ?? "table";
-            var url = context.ParseResult.GetValueForOption(urlOption) ?? "http://localhost:5005";
-            context.ExitCode = await ExecuteProvidersAsync(url, format, context.GetCancellationToken());
+            var url = context.ParseResult.GetValueForOption(urlOption) ?? GatewayClientFactory.DefaultUrl;
+            var token = context.ParseResult.GetValueForOption(tokenOption);
+            context.ExitCode = await ExecuteProvidersAsync(url, format, context.GetCancellationToken(), token);
         });
 
         // ── config ──
@@ -68,9 +75,10 @@ internal sealed class DebugGatewayCommand
         configCommand.SetHandler(async context =>
         {
             var format = context.ParseResult.GetValueForOption(formatOption) ?? "table";
-            var url = context.ParseResult.GetValueForOption(urlOption) ?? "http://localhost:5005";
+            var url = context.ParseResult.GetValueForOption(urlOption) ?? GatewayClientFactory.DefaultUrl;
+            var token = context.ParseResult.GetValueForOption(tokenOption);
             var section = context.ParseResult.GetValueForOption(sectionOption);
-            context.ExitCode = await ExecuteConfigAsync(url, section, format, context.GetCancellationToken());
+            context.ExitCode = await ExecuteConfigAsync(url, section, format, context.GetCancellationToken(), token);
         });
 
         command.AddCommand(statusCommand);
@@ -81,9 +89,16 @@ internal sealed class DebugGatewayCommand
         return command;
     }
 
-    internal static async Task<int> ExecuteStatusAsync(string baseUrl, string format, CancellationToken ct)
+    internal static async Task<int> ExecuteStatusAsync(string baseUrl, string format, CancellationToken ct, string? token = null)
     {
-        using var client = CreateClient(baseUrl);
+        var resolution = CreateClient(baseUrl, token);
+        if (resolution.Client is null)
+        {
+            AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(resolution.RefusalMessage!));
+            return 1;
+        }
+
+        using var client = resolution.Client;
         try
         {
             var health = await client.GetAsync("/health", ct);
@@ -121,7 +136,7 @@ internal sealed class DebugGatewayCommand
         }
         catch (HttpRequestException ex)
         {
-            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", Markup.Escape(baseUrl), Markup.Escape(ex.Message));
+            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectUrl(baseUrl)), CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectMessage(ex.Message)));
             return 1;
         }
         catch (TaskCanceledException) when (!ct.IsCancellationRequested)
@@ -131,9 +146,16 @@ internal sealed class DebugGatewayCommand
         }
     }
 
-    internal static async Task<int> ExecuteSessionsAsync(string baseUrl, string? agentId, int limit, string format, CancellationToken ct)
+    internal static async Task<int> ExecuteSessionsAsync(string baseUrl, string? agentId, int limit, string format, CancellationToken ct, string? token = null)
     {
-        using var client = CreateClient(baseUrl);
+        var resolution = CreateClient(baseUrl, token);
+        if (resolution.Client is null)
+        {
+            AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(resolution.RefusalMessage!));
+            return 1;
+        }
+
+        using var client = resolution.Client;
         try
         {
             var query = agentId != null ? $"?agentId={Uri.EscapeDataString(agentId)}" : "";
@@ -164,7 +186,7 @@ internal sealed class DebugGatewayCommand
         }
         catch (HttpRequestException ex)
         {
-            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", Markup.Escape(baseUrl), Markup.Escape(ex.Message));
+            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectUrl(baseUrl)), CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectMessage(ex.Message)));
             return 1;
         }
         catch (TaskCanceledException) when (!ct.IsCancellationRequested)
@@ -174,9 +196,16 @@ internal sealed class DebugGatewayCommand
         }
     }
 
-    internal static async Task<int> ExecuteProvidersAsync(string baseUrl, string format, CancellationToken ct)
+    internal static async Task<int> ExecuteProvidersAsync(string baseUrl, string format, CancellationToken ct, string? token = null)
     {
-        using var client = CreateClient(baseUrl);
+        var resolution = CreateClient(baseUrl, token);
+        if (resolution.Client is null)
+        {
+            AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(resolution.RefusalMessage!));
+            return 1;
+        }
+
+        using var client = resolution.Client;
         try
         {
             var providers = await client.GetFromJsonAsync<JsonElement>("/api/providers", ct);
@@ -204,7 +233,7 @@ internal sealed class DebugGatewayCommand
                                 .Count(m => m.TryGetProperty("provider", out var mp) &&
                                             string.Equals(mp.GetString(), name, StringComparison.OrdinalIgnoreCase));
                         }
-                        table.AddRow(Markup.Escape(name), modelCount.ToString());
+                        table.AddRow(CliText.SafeDisplay(name), modelCount.ToString());
                     }
                 }
 
@@ -215,7 +244,7 @@ internal sealed class DebugGatewayCommand
         }
         catch (HttpRequestException ex)
         {
-            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", Markup.Escape(baseUrl), Markup.Escape(ex.Message));
+            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectUrl(baseUrl)), CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectMessage(ex.Message)));
             return 1;
         }
         catch (TaskCanceledException) when (!ct.IsCancellationRequested)
@@ -225,9 +254,16 @@ internal sealed class DebugGatewayCommand
         }
     }
 
-    internal static async Task<int> ExecuteConfigAsync(string baseUrl, string? section, string format, CancellationToken ct)
+    internal static async Task<int> ExecuteConfigAsync(string baseUrl, string? section, string format, CancellationToken ct, string? token = null)
     {
-        using var client = CreateClient(baseUrl);
+        var resolution = CreateClient(baseUrl, token);
+        if (resolution.Client is null)
+        {
+            AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(resolution.RefusalMessage!));
+            return 1;
+        }
+
+        using var client = resolution.Client;
         try
         {
             var config = await client.GetFromJsonAsync<JsonElement>("/api/config", ct);
@@ -236,7 +272,7 @@ internal sealed class DebugGatewayCommand
                 config = sectionValue;
             else if (section != null)
             {
-                AnsiConsole.MarkupLine("[yellow]Section '{0}' not found in configuration.[/]", Markup.Escape(section));
+                AnsiConsole.MarkupLine("[yellow]Section '{0}' not found in configuration.[/]", CliText.SafeDisplay(section));
                 return 1;
             }
 
@@ -254,7 +290,7 @@ internal sealed class DebugGatewayCommand
         }
         catch (HttpRequestException ex)
         {
-            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", Markup.Escape(baseUrl), Markup.Escape(ex.Message));
+            AnsiConsole.MarkupLine("[red]Cannot reach gateway at {0}:[/] {1}", CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectUrl(baseUrl)), CliText.SafeDisplay(GatewayDiagnosticsProjection.ProjectMessage(ex.Message)));
             return 1;
         }
         catch (TaskCanceledException) when (!ct.IsCancellationRequested)
@@ -264,12 +300,14 @@ internal sealed class DebugGatewayCommand
         }
     }
 
-    private static HttpClient CreateClient(string baseUrl)
-    {
-        return new HttpClient
-        {
-            BaseAddress = new Uri(baseUrl.TrimEnd('/')),
-            Timeout = TimeSpan.FromSeconds(5)
-        };
-    }
+    // #2747: the credential policy lives in exactly one place. This command family only
+    // chooses its own timeout; whether a credential is attached, and to which hosts, is
+    // GatewayClientFactory's decision so a new gateway command cannot reintroduce the
+    // defect by omission.
+    private static GatewayClientResolution CreateClient(string baseUrl, string? token)
+        => GatewayClientFactory.Resolve(
+            baseUrl,
+            TimeSpan.FromSeconds(5),
+            token,
+            GatewayClientFactory.DefaultCredentialSource());
 }

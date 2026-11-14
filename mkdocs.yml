@@ -53,8 +53,8 @@ plugins:
 exclude_docs: |
   /planning/
   /planning/**
-  /training/
-  /training/**
+  /internals/
+  /internals/**
   /archive/
   /archive/**
   /archived/
@@ -107,8 +107,26 @@ nav:
       - Configuration: configuration.md
       - CLI Reference: cli-reference.md
       - API Reference: api-reference.md
+      - REST API Reference:
+          - Overview: api/README.md
+          - Agents: api/agents.md
+          - Conversations: api/conversations.md
+          - Cron: api/cron.md
+          - Satellites: api/satellites.md
+          - Sessions: api/sessions.md
+          - Webhooks: api/webhooks.md
+          - Tools: api/tools.md
+      - SignalR Hub Reference: api/signalr.md
       - WebSocket Protocol: websocket-protocol.md
   - Architecture:
+      - arc42 Overview: architecture/README.md
+      - C4 Diagrams: architecture/c4-diagrams.md
+      - Runtime View: architecture/runtime-view.md
+      - ADRs: architecture/adr/README.md
+      - ADR-0000 Record Decisions: architecture/adr/0000-record-architecture-decisions.md
+      - ADR-0001 SQLite Persistence: architecture/adr/0001-use-sqlite-for-persistence.md
+      - ADR-0002 Channel-Centric Routing: architecture/adr/0002-channel-centric-routing.md
+      - ADR Template: architecture/adr/adr-template.md
       - Overview: architecture/overview.md
       - Domain Model: architecture/domain-model.md
       - Extension Guide: architecture/extension-guide.md
@@ -118,6 +136,7 @@ nav:
       - Developer Guide: getting-started-dev.md
       - Overview: development/README.md
       - Agent Execution: development/agent-execution.md
+      - Agent Run Completion: development/agent-run-completion.md
       - Message Flow: development/message-flow.md
       - LLM Request Lifecycle: development/llm-request-lifecycle.md
       - Prompt Pipeline: development/prompt-pipeline.md
@@ -126,11 +145,17 @@ nav:
       - DDD Patterns: development/ddd-patterns.md
       - Triggers and Federation: development/triggers-and-federation.md
       - WebUI Connection: development/webui-connection.md
+      - Debugging: development/debugging.md
+      - Code Standards: development/code-standards.md
+      - PR and Commit Conventions: development/pr-and-commit-conventions.md
   - Guides:
       - Audio Recording: guides/audio-recording.md
       - Watchdog Setup: guides/watchdog-setup.md
+      - Offline Install (no nuget.org): guides/offline-install.md
   - Features:
       - Sub-Agent Spawning: features/sub-agent-spawning.md
+      - Session Consistency Monitor: features/session-consistency.md
+      - Hybrid Memory Retrieval: features/hybrid-memory-retrieval.md
   - Extensions:
       - Extension Development: extension-development.md
       - Extension Telemetry: extensions/telemetry.md

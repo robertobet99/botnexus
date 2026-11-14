@@ -1,8 +1,12 @@
 using BotNexus.Agent.Providers.OpenAICompat;
+using System.Net;
 using System.Reflection;
+using System.Text;
 using System.Text.Json.Nodes;
+using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Compatibility;
 using BotNexus.Agent.Providers.Core.Models;
+using BotNexus.Agent.Providers.Core.Streaming;
 
 namespace BotNexus.Agent.Providers.OpenAICompat.Tests;
 
@@ -28,8 +32,7 @@ public class OpenAICompatProviderTests
     [Theory]
     [InlineData("end", StopReason.Stop, null)]
     [InlineData("function_call", StopReason.ToolUse, null)]
-    [InlineData("content_filter", StopReason.Error, "Provider finish_reason: content_filter")]
-    [InlineData("network_error", StopReason.Error, "Provider finish_reason: network_error")]
+    [InlineData("content_filter", StopReason.Sensitive, "Content filtered by provider")]
     public void MapStopReason_MapsExtendedFinishReasons(string finishReason, StopReason expectedReason, string? expectedError)
     {
         var method = typeof(OpenAICompatProvider).GetMethod(
@@ -41,6 +44,143 @@ public class OpenAICompatProviderTests
 
         mapped.StopReason.ShouldBe(expectedReason);
         mapped.ErrorMessage.ShouldBe(expectedError);
+    }
+
+    /// <summary>
+    /// #3567, AC6. Previously an <c>[InlineData]</c> row on the theory above asserting
+    /// <c>(StopReason.Error, "Provider finish_reason: network_error")</c>. Restated, not deleted:
+    /// the mapping now THROWS for this reason so <c>AgentLoopRunner</c>'s exception-only retry lane
+    /// can classify and retry it. <c>content_filter</c> above remains terminal but is a safety outcome.
+    /// </summary>
+    [Fact]
+    public void MapStopReason_NetworkError_ThrowsSoTheRetryLaneCanSeeIt()
+    {
+        var method = typeof(OpenAICompatProvider).GetMethod(
+            "MapStopReason",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        method.ShouldNotBeNull();
+
+        var thrown = Should.Throw<TargetInvocationException>(
+            () => method!.Invoke(null, ["network_error", false]));
+
+        var inner = thrown.InnerException.ShouldBeOfType<ProviderTransientFinishReasonException>();
+        inner.FinishReason.ShouldBe("network_error");
+        inner.Message.ShouldBe("Provider finish_reason: network_error");
+    }
+
+    [Fact]
+    public async Task Stream_ContentFilter_ProducesSensitiveTerminalResultAndDoneEvent()
+    {
+        const string payload = """
+            data: {"id":"resp_1","choices":[{"delta":{"content":"safe prefix"}}]}
+
+            data: {"choices":[{"finish_reason":"content_filter","delta":{}}]}
+
+            data: [DONE]
+
+            """;
+        var handler = new FixedResponseHandler(payload);
+        var provider = new OpenAICompatProvider(new HttpClient(handler));
+        var model = new LlmModel(
+            Id: "compat-model", Name: "Compat", Api: "openai-compat", Provider: "custom",
+            BaseUrl: "https://compat.example/v1", Reasoning: false, Input: ["text"],
+            Cost: new ModelCost(0, 0, 0, 0), ContextWindow: 16384, MaxTokens: 4096);
+        var context = new Context(
+            SystemPrompt: "You are helpful",
+            Messages: [new UserMessage(new UserMessageContent("hello"), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())]);
+
+        var stream = provider.Stream(model, context, new StreamOptions { ApiKey = "test-key" });
+        var events = new List<AssistantMessageEvent>();
+        await foreach (var evt in stream)
+            events.Add(evt);
+        var result = await stream.GetResultAsync().WaitAsync(TimeSpan.FromSeconds(10));
+
+        result.StopReason.ShouldBe(StopReason.Sensitive);
+        result.ErrorMessage.ShouldBe("Content filtered by provider");
+        events.OfType<ErrorEvent>().ShouldBeEmpty();
+        var done = events.OfType<DoneEvent>().ShouldHaveSingleItem();
+        done.Reason.ShouldBe(StopReason.Sensitive);
+        done.Message.ShouldBeSameAs(result);
+        handler.RequestCount.ShouldBe(1);
+    }
+
+    [Theory]
+    [InlineData("mistral-small-latest")]
+    [InlineData("devstral-small-latest")]
+    [InlineData("codestral-latest")]
+    [InlineData("pixtral-large-latest")]
+    [InlineData("open-mixtral-8x22b")]
+    public void BuildRequestBody_MistralFamily_NormalizesMatchingToolCallIds(string modelId)
+    {
+        var method = typeof(OpenAICompatProvider).GetMethod(
+            "BuildRequestBody", BindingFlags.NonPublic | BindingFlags.Static);
+        method.ShouldNotBeNull();
+        var model = new LlmModel(
+            Id: modelId, Name: modelId, Api: "openai-compat", Provider: "custom",
+            BaseUrl: "https://example.test/v1", Reasoning: false, Input: ["text"],
+            Cost: new ModelCost(0, 0, 0, 0), ContextWindow: 32000, MaxTokens: 4096);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        const string originalId = "toolu_01CBhTTz95qkd9LJMdC9sf8t";
+        var context = new Context(null,
+        [
+            new AssistantMessage(
+                [new ToolCallContent(originalId, "read", new Dictionary<string, object?>())],
+                "openai-compat", "custom", modelId, Usage.Empty(), StopReason.ToolUse,
+                null, null, timestamp),
+            new ToolResultMessage(originalId, "read", [new TextContent("ok")], false, timestamp)
+        ], null);
+
+        var body = method!.Invoke(
+            null, [model, context, null, new OpenAICompletionsCompat()]) as JsonObject;
+        var messages = body!["messages"]!.AsArray();
+
+        messages[0]!["tool_calls"]![0]!["id"]!.GetValue<string>().ShouldBe("toolu01CB");
+        messages[1]!["tool_call_id"]!.GetValue<string>().ShouldBe("toolu01CB");
+    }
+
+    [Fact]
+    public void BuildRequestBody_NonMistralModel_PreservesToolCallIds()
+    {
+        var method = typeof(OpenAICompatProvider).GetMethod(
+            "BuildRequestBody", BindingFlags.NonPublic | BindingFlags.Static);
+        method.ShouldNotBeNull();
+        var model = new LlmModel(
+            Id: "qwen-coder", Name: "Qwen", Api: "openai-compat", Provider: "custom",
+            BaseUrl: "https://example.test/v1", Reasoning: false, Input: ["text"],
+            Cost: new ModelCost(0, 0, 0, 0), ContextWindow: 32000, MaxTokens: 4096);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        const string originalId = "call_with-punctuation!";
+        var context = new Context(null,
+        [
+            new AssistantMessage(
+                [new ToolCallContent(originalId, "read", new Dictionary<string, object?>())],
+                "openai-compat", "custom", model.Id, Usage.Empty(), StopReason.ToolUse,
+                null, null, timestamp),
+            new ToolResultMessage(originalId, "read", [new TextContent("ok")], false, timestamp)
+        ], null);
+
+        var body = method!.Invoke(
+            null, [model, context, null, new OpenAICompletionsCompat()]) as JsonObject;
+        var messages = body!["messages"]!.AsArray();
+
+        messages[0]!["tool_calls"]![0]!["id"]!.GetValue<string>().ShouldBe(originalId);
+        messages[1]!["tool_call_id"]!.GetValue<string>().ShouldBe(originalId);
+    }
+
+    private sealed class FixedResponseHandler(string payload) : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "text/event-stream")
+            });
+        }
     }
 
     [Fact]

@@ -12,12 +12,12 @@ else
 {
     <div class="global-error-boundary" data-testid="error-boundary">
         <div class="error-boundary-banner">
-            <span class="error-boundary-icon" aria-hidden="true">&#x26A0;&#xFE0F;</span>
+            <span class="error-boundary-icon" aria-hidden="true"><Icon Name="warning" Size="15" /></span>
             <span class="error-boundary-message">Something went wrong.</span>
             <button class="error-boundary-toggle" @onclick="ToggleDetail" aria-expanded="@_showDetail">
                 @(_showDetail ? "Hide" : "Details")
             </button>
-            <button class="error-boundary-dismiss" @onclick="RecoverFromError" title="Dismiss">&#x2715;</button>
+            <button class="error-boundary-dismiss" @onclick="RecoverFromError" title="Dismiss"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button>
         </div>
 
         @if (_showDetail)
@@ -53,6 +53,10 @@ else
         }
 
         var activeAgent = Store.ActiveAgentId is not null ? Store.GetAgent(Store.ActiveAgentId) : null;
+        var displayedConversationId = (Store as IDisplayedConversation)?.DisplayedConversationIdFor(Store.ActiveAgentId);
+        var displayedSessionId = displayedConversationId is not null
+            ? activeAgent?.Conversations.GetValueOrDefault(displayedConversationId)?.ActiveSessionId
+            : null;
 
         var report = new ChannelErrorReportDto
         {
@@ -66,7 +70,7 @@ else
             AgentId = Store.ActiveAgentId,
             // Prefer the active conversation's session so logged reports carry the
             // session the user was actually in when the error surfaced.
-            SessionId = activeAgent?.ActiveConversationSessionId ?? activeAgent?.SessionId,
+            SessionId = displayedSessionId ?? activeAgent?.SessionId,
             Url = url,
             UserAgent = ua,
         };

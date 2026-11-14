@@ -62,14 +62,31 @@ public class CompletionsStreamEngineTests
     [InlineData("function_call", StopReason.ToolUse, null)]
     [InlineData("tool_calls", StopReason.ToolUse, null)]
     [InlineData("refusal", StopReason.Refusal, null)]
-    [InlineData("content_filter", StopReason.Error, "Content filtered by provider")]
-    [InlineData("network_error", StopReason.Error, "Provider finish_reason: network_error")]
+    [InlineData("content_filter", StopReason.Sensitive, "Content filtered by provider")]
     [InlineData(null, StopReason.Stop, null)]
     public void MapStopReason_MapsKnownReasons(string? reason, StopReason expected, string? expectedMessage)
     {
         var (stopReason, message) = CompletionsStreamEngine.MapStopReason(reason);
         stopReason.ShouldBe(expected);
         message.ShouldBe(expectedMessage);
+    }
+
+    /// <summary>
+    /// #3567, AC6. This case previously lived as an <c>[InlineData]</c> row above asserting
+    /// <c>(StopReason.Error, "Provider finish_reason: network_error")</c>. It is not deleted -- it is
+    /// RESTATED here with its changed expectation: the mapping now throws, because a returned
+    /// terminal message can never reach the loop's exception-only retry lane.
+    /// </summary>
+    [Fact]
+    public void MapStopReason_NetworkError_ThrowsSoTheRetryLaneCanSeeIt()
+    {
+        var ex = Should.Throw<ProviderTransientFinishReasonException>(
+            () => CompletionsStreamEngine.MapStopReason("network_error"));
+
+        ex.FinishReason.ShouldBe("network_error");
+        // The message text is load-bearing: it is what TransientErrorClassifier matches on, and
+        // what names the cause once the attempt budget is exhausted.
+        ex.Message.ShouldBe("Provider finish_reason: network_error");
     }
 
     [Fact]
@@ -101,6 +118,84 @@ public class CompletionsStreamEngineTests
         usage.Input.ShouldBe(70);
         usage.Output.ShouldBe(45);
         usage.TotalTokens.ShouldBe(70 + 45 + 20 + 10);
+
+        // #3297 AC2: reasoning is additionally attributed, while Output keeps its inclusive meaning.
+        usage.Reasoning.ShouldBe(5);
+    }
+
+    /// <summary>
+    /// #3297 AC2/AC4. The distinction is load-bearing: <c>null</c> means the provider never reported
+    /// reasoning tokens, <c>0</c> means it reported zero. Coercing absent to zero would present a
+    /// missing measurement as a measured one and rank a thinking-heavy model as free.
+    /// </summary>
+    [Fact]
+    public void ParseUsage_ReasoningTokens_NullWhenAbsent_ZeroWhenReportedZero()
+    {
+        var absent = CompletionsStreamEngine.ParseUsage(
+            Json("""{ "prompt_tokens": 50, "completion_tokens": 12 }"""),
+            Usage.Empty(),
+            Model());
+
+        absent.Reasoning.ShouldBeNull();
+
+        // completion_tokens_details present but without reasoning_tokens is still "not reported".
+        var detailsWithoutReasoning = CompletionsStreamEngine.ParseUsage(
+            Json("""
+                {
+                  "prompt_tokens": 50,
+                  "completion_tokens": 12,
+                  "completion_tokens_details": { "audio_tokens": 3 }
+                }
+                """),
+            Usage.Empty(),
+            Model());
+
+        detailsWithoutReasoning.Reasoning.ShouldBeNull();
+
+        var reportedZero = CompletionsStreamEngine.ParseUsage(
+            Json("""
+                {
+                  "prompt_tokens": 50,
+                  "completion_tokens": 12,
+                  "completion_tokens_details": { "reasoning_tokens": 0 }
+                }
+                """),
+            Usage.Empty(),
+            Model());
+
+        reportedZero.Reasoning.ShouldBe(0);
+        reportedZero.Reasoning.ShouldNotBeNull();
+    }
+
+    /// <summary>
+    /// #3297 AC5. Reasoning is attribution only: adding the field must not perturb the computed cost
+    /// for any payload, whether reasoning is absent, zero, or non-zero.
+    /// </summary>
+    [Fact]
+    public void ParseUsage_ReasoningAttribution_DoesNotChangeComputedCost()
+    {
+        var withReasoning = CompletionsStreamEngine.ParseUsage(
+            Json("""
+                {
+                  "prompt_tokens": 100,
+                  "completion_tokens": 40,
+                  "completion_tokens_details": { "reasoning_tokens": 5 }
+                }
+                """),
+            Usage.Empty(),
+            Model());
+
+        // The same wire totals expressed without the reasoning breakdown must cost the same,
+        // because Output stays inclusive and CalculateCost is untouched.
+        var equivalent = CompletionsStreamEngine.ParseUsage(
+            Json("""{ "prompt_tokens": 100, "completion_tokens": 45 }"""),
+            Usage.Empty(),
+            Model());
+
+        withReasoning.Output.ShouldBe(equivalent.Output);
+        withReasoning.Cost.ShouldBe(equivalent.Cost);
+        withReasoning.Reasoning.ShouldBe(5);
+        equivalent.Reasoning.ShouldBeNull();
     }
 
     [Fact]

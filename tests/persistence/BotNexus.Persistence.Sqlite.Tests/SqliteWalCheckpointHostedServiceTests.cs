@@ -28,7 +28,8 @@ public sealed class SqliteWalCheckpointHostedServiceTests : IDisposable
         {
             try { h.Dispose(); } catch { /* best effort */ }
         }
-        SqliteConnection.ClearAllPools();
+        foreach (var h in _holders)
+            SqlitePoolCleanup.ClearPoolForConnectionString(h.ConnectionString);
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
     }
 
@@ -134,6 +135,30 @@ public sealed class SqliteWalCheckpointHostedServiceTests : IDisposable
         // TRUNCATE zeroes the -wal file on success.
         Assert.True(File.Exists(walPath));
         Assert.Equal(0, new FileInfo(walPath).Length);
+    }
+
+
+    [Theory]
+    [InlineData(SqliteCheckpointMode.Passive)]
+    [InlineData(SqliteCheckpointMode.Truncate)]
+    public async Task ActiveReader_ReportsIncompleteCheckpoint(SqliteCheckpointMode mode)
+    {
+        var dbPath = await CreateDatabaseWithGrownWalAsync();
+        await using var readerConnection = SqliteConnectionFactory.Create(Cs(dbPath));
+        await readerConnection.OpenAsync();
+        await using var readCommand = readerConnection.CreateCommand();
+        readCommand.CommandText = "SELECT * FROM t;";
+        await using var reader = await readCommand.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+
+        await Exec(_holders[0], "INSERT INTO t(blob) VALUES('blocked-frame');");
+        await using var checkpointConnection = SqliteConnectionFactory.Create(Cs(dbPath));
+        await checkpointConnection.OpenAsync();
+
+        var result = await SqliteWalMaintenance.CheckpointAsync(checkpointConnection, mode);
+
+        Assert.False(result.ReclamationCompleted);
+        Assert.True(result.Busy > 0 || result.CheckpointedFrames < result.LogFrames);
     }
 
     [Fact]

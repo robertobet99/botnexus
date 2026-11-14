@@ -37,10 +37,6 @@ window.chatScroll = {
         }, 100);
     },
 
-    /** Returns true when the viewport matches the mobile breakpoint (≤768px). */
-    isMobileView: function () {
-        return window.innerWidth <= 768;
-    },
 
     /** Auto-resizes a textarea to fit its content, capped at maxRows rows. */
     autoResizeTextarea: function (element, maxRows) {
@@ -57,6 +53,36 @@ window.chatScroll = {
         if (element) { element.style.height = ''; element.style.overflowY = ''; }
     },
 
+    /** Focuses and traps keyboard focus inside the expanded composer dialog. */
+    openComposerDialog: function (dialog, input) {
+        if (!dialog || typeof dialog.addEventListener !== 'function') return;
+        if (!dialog._composerFocusTrapBound) {
+            dialog.addEventListener('keydown', function (event) {
+                if (event.key !== 'Tab') return;
+                var focusable = Array.from(dialog.querySelectorAll(
+                    'button:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                    .filter(function (element) { return element.getClientRects().length > 0; });
+                if (focusable.length === 0) return;
+                var first = focusable[0];
+                var last = focusable[focusable.length - 1];
+                if (event.shiftKey && document.activeElement === first) {
+                    event.preventDefault();
+                    last.focus();
+                } else if (!event.shiftKey && document.activeElement === last) {
+                    event.preventDefault();
+                    first.focus();
+                }
+            });
+            dialog._composerFocusTrapBound = true;
+        }
+        if (input && typeof input.focus === 'function') input.focus();
+    },
+
+    /** Returns focus to the control that opened the expanded composer. */
+    closeComposerDialog: function (trigger) {
+        if (trigger && typeof trigger.focus === 'function') trigger.focus();
+    },
+
     /**
      * Prevents the default Enter key behaviour (newline insertion) on a textarea
      * so that Blazor's onkeydown handler can send the message without a stray newline.
@@ -67,6 +93,21 @@ window.chatScroll = {
         element.addEventListener('keydown', function (e) {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
+                return;
+            }
+            // #2918 prompt-history recall. The caret edge is measured EXACTLY ONCE per keystroke,
+            // here, synchronously, while the DOM selection still reflects the key that was pressed.
+            // The measurement is latched onto the element and handed to C# verbatim by
+            // caretLinePosition below, so the decision that suppressed (or allowed) the native
+            // caret movement is necessarily the same decision the recall logic acts on. Measuring
+            // a second time inside caretLinePosition would re-read the selection after the interop
+            // round trip and could disagree with the preventDefault already applied.
+            if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                var edge = measureCaretEdge(element);
+                element._caretEdgeLatch = edge;
+                if (e.altKey || (e.key === 'ArrowUp' && edge.onFirstLine) || (e.key === 'ArrowDown' && edge.onLastLine)) {
+                    e.preventDefault();
+                }
             }
         });
         element._preventEnterBound = true;
@@ -105,12 +146,67 @@ window.chatScroll = {
         if (added > 0) {
             element.scrollTop = element.scrollTop + added;
         }
+    },
+
+    /**
+     * #2918: hands C# the caret-edge measurement latched by the keydown handler above -- the
+     * SINGLE authority for whether the caret sits on the first/last logical line. The latch is
+     * consumed (cleared) on read so a stale measurement can never serve a later probe. If no
+     * latch exists (no keydown ran, e.g. programmatic invocation) the edge is measured now.
+     * Read-only with respect to the textarea's value and selection.
+     */
+    caretLinePosition: function (element) {
+        if (!element) return { onFirstLine: true, onLastLine: true };
+        var latched = element._caretEdgeLatch;
+        if (latched) {
+            element._caretEdgeLatch = null;
+            return latched;
+        }
+        return measureCaretEdge(element);
+    },
+
+    /**
+     * #2918: places the caret at the end of the textarea and focuses it, so a recalled prompt
+     * leaves the caret somewhere predictable rather than mid-text.
+     */
+    moveCaretToEnd: function (element) {
+        if (!element) return;
+        try {
+            element.focus();
+            var len = (element.value || '').length;
+            element.setSelectionRange(len, len);
+        } catch (e) { /* element detached */ }
     }
 };
 
+/**
+ * #2918: the one and only caret-edge test. Both the keydown suppression decision and the value
+ * reported to C# derive from this function, so they cannot drift apart.
+ */
+function measureCaretEdge(element) {
+    var value = element.value || '';
+    var start = typeof element.selectionStart === 'number' ? element.selectionStart : 0;
+    var end = typeof element.selectionEnd === 'number' ? element.selectionEnd : start;
+    return {
+        onFirstLine: value.lastIndexOf('\n', start - 1) === -1,
+        onLastLine: value.indexOf('\n', end) === -1
+    };
+}
+
 window.portalPrefs = {
     load: function (key) { return localStorage.getItem(key); },
-    save: function (key, value) { localStorage.setItem(key, value); }
+    save: function (key, value) { localStorage.setItem(key, value); },
+
+    // Dark is the default and lives on :root, so it is expressed by the ABSENCE of the attribute
+    // rather than by data-theme="dark". That keeps the default path free of any attribute the
+    // pre-first-paint script would also have to write.
+    applyTheme: function (theme) {
+        if (theme === 'light') {
+            document.documentElement.setAttribute('data-theme', 'light');
+        } else {
+            document.documentElement.removeAttribute('data-theme');
+        }
+    }
 };
 
 window.chatAttachments = {
@@ -135,16 +231,79 @@ window.chatAttachments = {
     bindPaste: function (element, dotNetRef) {
         if (!element || element._attachmentPasteBound) return;
         element.addEventListener('paste', async function (event) {
-            var clipboardFiles = event.clipboardData ? event.clipboardData.files : [];
-            var images = Array.from(clipboardFiles).filter(function (file) {
+            var clipboard = event.clipboardData;
+            var images = clipboard ? Array.from(clipboard.files || []).filter(function (file) {
                 return file.type.startsWith('image/');
-            });
+            }) : [];
+
+            // Some browsers expose pasted images only as DataTransferItems. Ordinary text paste
+            // remains native because the handler returns unless at least one image blob exists.
+            if (!images.length && clipboard && clipboard.items) {
+                images = Array.from(clipboard.items).filter(function (item) {
+                    return item.kind === 'file' && item.type.startsWith('image/');
+                }).map(function (item) {
+                    return item.getAsFile();
+                }).filter(Boolean);
+            }
             if (!images.length) return;
 
             event.preventDefault();
-            var drafts = await window.chatAttachments.readFiles(images);
-            await dotNetRef.invokeMethodAsync('OnAttachmentsPasted', drafts);
+            try {
+                var drafts = await window.chatAttachments.readFiles(images);
+                await dotNetRef.invokeMethodAsync('OnAttachmentsPasted', drafts);
+            } catch (error) {
+                try { await dotNetRef.invokeMethodAsync('OnAttachmentPasteFailed'); } catch (_) { }
+            }
         });
         element._attachmentPasteBound = true;
+    }
+};
+
+
+window.chatComposer = {
+    /** Replaces the current textarea selection as one native undo step, then reports DOM state. */
+    replaceSelection: function (element, text, expectedContext) {
+        if (!element || typeof element.setRangeText !== 'function') {
+            throw new Error('Composer textarea is unavailable.');
+        }
+        if (element.dataset.composerContext !== expectedContext) {
+            throw new Error('Composer context changed.');
+        }
+        element.focus();
+        var start = typeof element.selectionStart === 'number' ? element.selectionStart : element.value.length;
+        var end = typeof element.selectionEnd === 'number' ? element.selectionEnd : start;
+        element.setRangeText(text, start, end, 'end');
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        return {
+            value: element.value,
+            selectionStart: element.selectionStart,
+            selectionEnd: element.selectionEnd
+        };
+    },
+    focusFirst: function (container) {
+        if (!container) return;
+        if (!container._promptTemplateFocusTrap) {
+            container.addEventListener('keydown', function (event) {
+                if (event.key !== 'Tab') return;
+                var focusable = Array.from(container.querySelectorAll('button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+                if (focusable.length === 0) return;
+                var first = focusable[0];
+                var last = focusable[focusable.length - 1];
+                if (event.shiftKey && document.activeElement === first) {
+                    event.preventDefault();
+                    last.focus();
+                } else if (!event.shiftKey && document.activeElement === last) {
+                    event.preventDefault();
+                    first.focus();
+                }
+            });
+            container._promptTemplateFocusTrap = true;
+        }
+        var target = container.querySelector('[data-testid="prompt-template-search"]')
+            || container.querySelector('input, button, [tabindex]:not([tabindex="-1"])');
+        if (target) target.focus();
+    },
+    focusElement: function (element) {
+        if (element && typeof element.focus === 'function') element.focus();
     }
 };

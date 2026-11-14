@@ -21,7 +21,7 @@ effect for the lifetime of the connection:
 Append them to the hub URL, e.g. `…/hub/gateway?client=mobile&clientVersion=1.4.2`. The mobile
 portal sets `client=mobile`; the desktop portal sends no `client` value and is treated as
 `desktop`. Both values are attacker-controlled and are sanitized (CR/LF and control characters
-stripped) before being logged.
+replaced with spaces, then trimmed) before being logged.
 
 ## Hub Methods (Client → Server)
 
@@ -33,17 +33,23 @@ responds directly (most stream their results back as server events instead).
 | Method | Purpose |
 |---|---|
 | `SubscribeAll()` → `SubscribeAllResult` | Subscribe to all agent/session groups. Call after connecting and on every reconnect. |
+| `SubscribeAgents(agentIds)` | Join the per-agent notification groups for the agents this connection renders, so it receives `ConversationChanged` for those agents and no others (#2541). A **separate verb** from `SubscribeAll` on purpose: the conversation groups `SubscribeAll` joins are derived from *existing* sessions, so they can never cover a conversation that has not been created yet - and `created` is one of the change types the event carries. The agent is the smallest scope that can name a not-yet-existing conversation. Idempotent (rejoining a group is a no-op), so the reconnect and rebuild paths may call it on every dial. Blank entries are ignored. |
 | `GetAgents()` → `AgentDescriptor[]` | List the agents registered on this gateway. |
+| `GetAgentStatus(agentId, sessionId)` → `AgentInstance?` | Read the instance for the resolved agent/session, or null when no instance exists. This method returns synchronously and requires read scope. |
 | `SendMessage(agentId, channelType, content, conversationId?)` → `SendMessageResult` | Send a text message to an agent, optionally targeting a specific conversation. |
-| `SendMessageWithMedia(agentId, channelType, content, contentParts)` → `SendMessageResult` | Send a message with attached media (`MediaContentPartDto[]`). |
+| `SendMessageWithMedia(agentId, channelType, content, contentParts, conversationId?)` → `SendMessageResult` | Send a message with attached media (`MediaContentPartDto[]`), optionally targeting a specific conversation. |
+| `SubmitCanvasPrompt(agentId, channelType, content, conversationId)` → `SendMessageResult` | Submit an instruction composed by a canvas (#2449). A **separate verb** from `SendMessage` on purpose: the provenance kind (`MessageKind.CanvasSubmission`) is stamped by the **server** from the transport surface the call arrived on, so it cannot be forged by a caller-supplied field. `conversationId` is **required** — a canvas is attached to one conversation and may target only that conversation. |
 
 ### Steering a running agent
 
 | Method | Purpose |
 |---|---|
-| `Steer(agentId, sessionId, content, conversationId?)` → `SendMessageResult` | Queue a message to be applied at the next turn boundary of the running session. |
+| `Steer(agentId, sessionId, content, conversationId)` → `SendMessageResult` | Queue a message to be applied at the next turn boundary of the running session. The conversation argument position is required, although its value may be null. |
+| `SteerWithMedia(agentId, sessionId, content, contentParts, conversationId)` → `SendMessageResult` | Steer overload carrying draft attachments (#2484). The conversation argument position is required, although its value may be null. |
 | `InterruptAndSteer(agentId, sessionId, message)` → `bool` | Abort the in-flight step and steer immediately (the portal **Redirect** control). |
+| `InterruptAndSteerWithMedia(agentId, sessionId, message, contentParts)` → `bool` | Redirect overload carrying draft attachments (#2484). |
 | `FollowUp(agentId, sessionId, content)` | Queue a message to be delivered after the whole run loop completes. |
+| `FollowUpWithMedia(agentId, sessionId, content, contentParts)` | Follow-up overload carrying draft attachments (#2484). The composed message round-trips through the agent's pending-message queue (#2458) when a run is in flight, and is dispatched as content parts when the agent is idle — so attachments survive both branches. |
 | `Abort(agentId, sessionId)` | Stop the entire run loop immediately (the portal **Stop** control). |
 
 ### Session management
@@ -61,8 +67,22 @@ responds directly (most stream their results back as server events instead).
 > `GET /api/agents/{agentId}/conversations/{conversationId}/pending-ask-user`, which returns the
 > serialized prompt as JSON, `204 No Content` when nothing is pending, or `404` when the
 > conversation is unknown. The portal hydrates this automatically when a conversation is selected
-> (mirroring canvas and todo hydration); the durable copy is cleared once the prompt is answered,
-> times out, or is cancelled.
+> (mirroring canvas and todo hydration); the durable copy is cleared only when the prompt reaches an
+> explicit terminal state -- the user answers, the user cancels, or an optional caller-supplied
+> reminder-style limit elapses.
+
+> **Durable resumable checkpoint (#2047).** A pending `ask_user` prompt is a durable, resumable
+> checkpoint with **no hard timeout by default**. It survives graceful and unclean gateway restarts,
+> page reloads, conversation switches, and newly-opened clients, and stays pending until the user
+> answers or cancels. `RespondToAskUser` resolves through the durable checkpoint even when the
+> original in-memory waiter, provider stream, and `TaskCompletionSource` no longer exist: on the
+> first restart-safe response the gateway atomically claims and clears the persisted checkpoint and
+> dispatches a continuation turn to resume the conversation. Resolution is **idempotent** -- duplicate
+> responses, stale request ids, and competing clients cannot resume the conversation twice; a stale
+> request id (a client that missed a newer prompt) is rejected with a `HubException`, while an
+> already-answered or already-cancelled prompt resolves as a silent no-op. The former mandatory
+> 300-second default timeout has been removed; `timeout_seconds` on the `ask_user` tool is now an
+> optional, non-terminal reminder-style limit rather than an expiry that cancels the prompt.
 
 > `OnConnectedAsync` / `OnDisconnectedAsync` are SignalR lifecycle hooks, not client-callable methods.
 
@@ -75,7 +95,7 @@ Events the server pushes to subscribed clients. Defined by the typed
 
 | Event | Meaning |
 |---|---|
-| `Connected(payload)` | Sent once the connection is established and subscribed. |
+| `Connected(payload)` | Sent during `OnConnectedAsync`; it does not acknowledge the separate `SubscribeAll` subscription. |
 | `SessionReset(payload)` | A session was reset; the client should clear its session context. |
 | `AgentsChanged(payload)` | The set of registered agents changed. |
 | `ConversationChanged(payload)` | A conversation's metadata (title, bindings, archive state) changed. |
@@ -95,7 +115,7 @@ Events the server pushes to subscribed clients. Defined by the typed
 |---|---|
 | `MessageStart(evt)` | The agent began producing a message. |
 | `ThinkingDelta(evt)` | A chunk of reasoning/thinking output (when the provider streams it). |
-| `ContentDelta(evt)` | A chunk of assistant message content. The payload carries an optional `role` field (see note below). |
+| `ContentDelta(evt)` | A chunk of assistant message content. Carries either `ContentDeltaPayload` (optional `role`) or the structured `AgentStreamEvent` form (see note below). |
 | `ToolStart(evt)` | A tool call began. |
 | `ToolEnd(evt)` | A tool call finished. |
 | `MessageEnd(evt)` | The agent finished producing a message. |
@@ -123,14 +143,16 @@ Events the server pushes to subscribed clients. Defined by the typed
 ## Notes
 
 - All gateway-originated messages use `channelType = "signalr"`.
-- The `ContentDelta` payload carries an optional `role` field. It is `null` for ordinary
-  streamed/relayed content — the client then renders the assistant bubble, matching every
-  pre-existing payload — and is only set when an agent-post must render under a specific role
-  (e.g. an on-behalf-of-user kickoff stamped `user`). The field is trailing-optional, so older
-  clients and existing wire messages deserialize unchanged.
+- `ContentDeltaPayload` carries an optional `role` field, set when an agent-post must
+  render under a specific role (e.g. an on-behalf-of-user kickoff stamped `user`). The
+  structured streaming path instead sends `AgentStreamEvent`, which has no `role`
+  property. See [both producer shapes](api/signalr.md#contentdeltapayload); do not require
+  the compact role-bearing record on every content event.
 - Clients should call `SubscribeAll` after connecting and on reconnect.
 - Channel switching is a client-only UI operation. Do not call join/leave methods.
-- Session fan-out uses SignalR groups: `session:{sessionId}`.
+- Stream fan-out uses `conversation:{conversationId}` groups, stable across session
+  compaction. `SubscribeAll` also joins `conversation:{sessionId}` compatibility
+  synonyms; this is not a `session:{sessionId}` subscription contract.
 - `Steer` targets the **session of the conversation being acted on**. Clients must pass the
   displayed conversation's own session id (resolved from that conversation's `activeSessionId`),
   not an agent-global "last session" value — otherwise a steer can land on an unrelated

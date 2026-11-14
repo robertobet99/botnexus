@@ -81,11 +81,11 @@ public class IdentitySection : IPromptSection
 ```csharp
 public interface IPromptContributor
 {
+    PromptSection? Target { get; }  // null = standalone block
     int Priority { get; }
-    string? Target { get; }  // null = top-level, or target section name
-    
+
     bool ShouldInclude(PromptContext context);
-    
+
     PromptContribution GetContribution(PromptContext context);
 }
 
@@ -104,30 +104,10 @@ public record PromptContribution
 - Memory systems injecting agent history
 - MCP servers adding capability descriptions
 
-**Example Contributor:**
-
-```csharp
-public class SkillPromptContributor : IPromptContributor
-{
-    public int Priority => 500;
-    public string? Target => null;  // Top-level
-    
-    public bool ShouldInclude(PromptContext context)
-        => context.Extensions.ContainsKey("skills");
-    
-    public PromptContribution GetContribution(PromptContext context)
-    {
-        var skills = (IReadOnlyList<Skill>)context.Extensions["skills"];
-        
-        return new PromptContribution
-        {
-            SectionHeading = "Available Skills",
-            Lines = skills.Select(s => $"- **{s.Name}**: {s.Description}").ToList(),
-            Order = 600  // After tools section
-        };
-    }
-}
-```
+The repository intentionally has no built-in `IPromptContributor` implementation. The interface is
+the dynamic-extension seam; an extension registers its own implementation in DI. Only standalone
+contributors (`Target == null`) render today. See the source-backed extension example in
+[Extension Prompt Contributions](#extension-prompt-contributions).
 
 ## PromptContext
 
@@ -175,7 +155,7 @@ public sealed class PromptPipeline
 }
 ```
 
-See [PromptPipeline.cs](../../src/prompts/BotNexus.Prompts/PromptPipeline.cs)
+See [PromptPipeline.cs](../../src/gateway/BotNexus.Gateway.Prompts/PromptPipeline.cs)
 
 **Ordering Strategy:**
 
@@ -185,7 +165,7 @@ See [PromptPipeline.cs](../../src/prompts/BotNexus.Prompts/PromptPipeline.cs)
 
 ## SystemPromptBuilder (Gateway)
 
-Gateway-specific prompt builder. In `None` mode returns a minimal identity string. Otherwise, creates a `PromptPipeline` with standard sections (Identity, Workspace, Tools, ContextFiles, Guidelines, Examples), builds a `PromptContext` from `SystemPromptParams`, and returns the assembled prompt.
+Gateway-specific prompt builder. In `None` mode it returns a minimal identity string. Otherwise it creates a `PromptPipeline` from the named `PromptOrder` sections in source, appends DI-resolved contributors, builds a `PromptContext` from `SystemPromptParams`, and returns the assembled prompt. The source order is authoritative; this guide does not restate the full list because new runtime and safety sections are added frequently.
 
 See [SystemPromptBuilder.cs](../../src/gateway/BotNexus.Gateway/Agents/SystemPromptBuilder.cs)
 
@@ -199,7 +179,7 @@ public record SystemPromptParams
     public IReadOnlyList<string>? ToolNames { get; init; }
     public string? UserTimezone { get; init; }
     public IReadOnlyList<ContextFile>? ContextFiles { get; init; }
-    public string? SkillsPrompt { get; init; }
+    public IReadOnlyList<IPromptContributor>? PromptContributors { get; init; }
     public string? HeartbeatPrompt { get; init; }
     public string? DocsPath { get; init; }
     public IReadOnlyList<string>? WorkspaceNotes { get; init; }
@@ -277,7 +257,7 @@ You have access to the following tools:
 
 ## Gateway
 
-- `session`: Manage session history and metadata
+- `sessions`: Manage session history and metadata
 - `agent_converse`: Talk to other registered agents
 
 Use tools when needed. Always validate paths and commands.
@@ -301,7 +281,9 @@ Injects project-specific documentation:
 
 **Context File Discovery:**
 
-Discovers context files from two sources: (1) `.botnexus/context/*.md` directory in workspace, and (2) common root docs (README.md, ARCHITECTURE.md, CONTRIBUTING.md).
+Prompt-file selection normally loads the canonical workspace instruction files in this order: `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `BOOTSTRAP.md`, `IDENTITY.md`, `USER.md`, and `MEMORY.md`.
+
+When `memory.promptInjection` is `none`, `WorkspaceContextBuilder` filters memory prompt files from the selected set, including an explicitly selected `MEMORY.md` or model-specific memory variant. Daily-memory injection follows the same memory setting. Conversation scope independently withholds owner-private files (`USER.md`, `MEMORY.md`, and daily memory notes) from shared conversations.
 
 See [WorkspaceContextBuilder.cs](../../src/gateway/BotNexus.Gateway/Agents/WorkspaceContextBuilder.cs)
 
@@ -494,7 +476,129 @@ The following section IDs cannot be overridden (safety-critical or runtime data)
 | `tool-enforcement` | 32 | Tool calling rules and constraints |
 | `shell-efficiency` | 35 | Shell scripting best practices |
 | `skills-guidance` | 55 | Skills loading and creation guidance (conditional: only when skills tools available) |
-| `model-guidance` | 135 | Per-model-family behavioral defaults (conditional: only for recognized families) |
+| `subagent-scoping` | 57 | Sub-agent dispatch scoping: stage budgets, staged sequencing, snapshot/commit discipline (conditional: only when `spawn_subagent` is available) |
+| `model-guidance` | 135 | Per-model-family behavioral defaults, resolved through the [prompt-variant ladder](#attribute-declared-instruction-variants) |
+
+### Attribute-Declared Instruction Variants
+
+Per-model instruction sets are **declared**, not switched on (#2433). A section annotates static
+members with `[PromptVariant]`, and `PromptVariantRegistry` discovers them by reflection **once**,
+freezing the result into an immutable lookup. Nothing on the prompt-build path reflects - prompt
+assembly runs on every turn of every agent, so a type scan there would be a permanent per-turn cost.
+
+```csharp
+[PromptVariant(ModelGuidanceSection.Id)]                                  // default / agnostic
+[PromptVariant(ModelGuidanceSection.Id, Family = "gpt")]                   // family
+[PromptVariant(ModelGuidanceSection.Id, Family = "gpt", Version = "5")]    // exact 5.0 (unchanged)
+[PromptVariant(ModelGuidanceSection.Id, Family = "gpt", Version = "6", MatchMajorVersion = true)] // all 6.x
+[PromptVariant(ModelGuidanceSection.Id, Family = "gpt", Version = "6-1")]  // exact 6.1
+[PromptVariant(ModelGuidanceSection.Id, Family = "gpt", Replace = true)]   // escape hatch
+```
+
+The annotated member must be a static parameterless method or a static readable property returning
+`IReadOnlyList<PromptRule>`. A `PromptRule` is an instruction line plus a **stable id**.
+
+**Resolution ladder** - least specific first, each rung overlaying the one below it:
+
+```text
+default  ->  family  ->  opted-in family + major version  ->  exact family + version
+```
+
+`MatchMajorVersion = true` opts a declaration into major-version matching. It requires a family
+and a major-only `Version` token, such as `"6"`; missing versions and minor-version spellings such
+as `"6-1"` are rejected. Without the opt-in, `Version = "6"` still means exact 6.0, preserving
+existing declarations. Major and exact declarations can coexist: a GPT-6.1 model receives the
+6.x overlay before an exact 6.1 overlay. Suffixes and version separators are interpreted by the
+existing `ModelFamilyVersion` parser, not by a model-name prefix check. GPT-60 does not match 6.x.
+
+`model_profile` uses the registry's resolved declaration sequence to report the same ladder,
+including `gpt@6.*` for the major overlay and `gpt@6.1` for an exact overlay.
+
+**Overlay is the default.** A variant may reword a rule (same id), add one (new id), or drop one
+(`PromptRule.Remove(id)`), so there is one source of truth for shared intent and a family does not
+re-state - and drift from - rules it agrees with. An overlaid rule keeps its inherited position, so
+overlaying never silently reorders the instructions around it.
+
+**`Replace = true`** discards everything beneath the rung instead, for a family that genuinely needs
+a different rule set. It lives at the declaration site so the choice is visible to whoever reads the
+instruction text.
+
+**The `default` rung is mandatory.** A section that declares any family variant but no default fails
+at freeze time. This is what removes the previous fail-open: `ModelGuidanceSection` used to `switch`
+on the detected family with `_ => []`, so any model the switch had never heard of silently received
+**zero** behavioural guidance. An unrecognised model now gets the conservative default.
+
+**What each rung currently carries.** The rungs are not symmetric, and deliberately so - a family
+rung exists to correct an observed behaviour of that family, not to give every family an equal share
+of the instruction text.
+
+| Rung | Rules |
+|---|---|
+| default (mandatory) | verify with a tool rather than recall; read a file before describing it; state uncertainty; check tool output before assuming success; progress at least every ten tool calls and at phase boundaries |
+| `claude` | prefer targeted edits over whole-file writes; keep edit match windows small; use extended thinking |
+| `gpt` | tool-schema fidelity; retry circuit breaker |
+| `gpt@6.*` | authorized follow-through; material clarification and approval boundaries; skill-conflict transparency; persona-aware writing; bounded delegation; proportionate verification |
+| `gemini` | absolute paths; workspace-root-relative references |
+
+The GPT rung was empty until #3375, on the reasoning that the verification rules it once carried had
+become the shared default. A controlled A/B evaluation of a GPT model against a Claude model - same
+task, same system prompt, equivalent engineering output - showed three operational divergences that
+the default does not address: a parameter transferred from a similar tool's schema, the same edit
+retried three times because a changing match count made each attempt look locally different, and one
+assistant message across 163 tool calls. The GPT-specific rules name the tool-schema and retry
+loopholes directly: a changed match count, whitespace, or anchor is the same strategy retried.
+Subsequent #3668 behavior measurements found 20 tool calls between messages on Default and Claude
+versus 10 on GPT with the same serving model and task. The countable narration boundary therefore
+lives in the shared default (#4579), inherited once by GPT, Claude, Gemini and unknown families;
+"when it helps" cannot bound a run of individually-routine calls.
+
+`Family` and `Version` use the same lowercase token grammar as the override file suffixes
+(alphanumerics, `-` between tokens), and `Version` is parsed by `ModelFamilyVersion` - the one
+sanctioned family/version parser in the tree (#2374). Malformed declarations - a duplicate
+`(section, family, version, match scope)` key, a version with no family, an invalid major-match
+declaration, a duplicate or blank rule id, a removal on the default rung - are rejected while
+freezing, not silently ignored at resolve time.
+
+#### GPT-6 behavioral guidance
+
+The GPT-6 overlay is adapted from [OpenAI's Astra prompting guide](https://github.com/openai/codex/blob/008bbd5884122dc95aaece19ecfe0fc6a59dcf36/codex-rs/skills/src/assets/samples/openai-docs/references/prompting-guide.md).
+It is internal prompt text, not model training or a change to provider request settings. It
+encourages completing authorized work, preparing concrete results before asking blocking questions,
+explaining relevant skill conflicts, following the agent's persona, delegating bounded independent
+work through available tools, and completing required checks without unnecessary repetition.
+Inherited truthfulness, schema discipline, safety requirements, and explicit approval gates remain
+in force. A real blocker must still be reported.
+
+Parsed GPT major version 6 receives this overlay, including Astra and minor/suffix variants. Other
+major versions, unknown models, and other families retain their existing guidance. The effective
+runtime model selects the overlay through normal system-prompt construction; prompt mode `None`
+retains its existing minimal behavior. Selecting a model does not create tools or provider capabilities.
+
+Regression tests establish selection, precedence, inherited-rule preservation, and prompt inclusion.
+They do not establish improved LLM performance. Evaluate representative tasks with unchanged
+reasoning settings before drawing behavioral conclusions; measure task completion, unnecessary
+clarification, tool failures/retries, evidence quality, and approval compliance.
+
+Built-in declarations are frozen at process startup and changes take effect when the operator
+deploys a new build. Existing filesystem prompt-section overrides retain their separate replacement
+semantics; no version-specific filenames are added under `prompts/system/model/` by this change.
+Workspace instruction-file variants still select a single file rather than overlaying stable rule IDs.
+
+The gateway's `SystemPromptBuilder` registers further sections by `PromptOrder` key rather than by
+section ID, including the `<conversations>` capability guidance at order 145 (conditional: only when
+the agent's tool list contains `conversation`) and the `<canvas>` guidance at order 155 (conditional:
+only when the agent's tool list contains `canvas`). The canvas section states when the canvas is the
+right output surface and when a file is — it does not restate the canvas tool's mechanics, which the
+tool description already carries.
+
+The `<conversations>` section states five platform facts an agent otherwise has to rediscover by
+accident: conversations run concurrently and are **not** serialised against each other; the agent can
+create one itself with `conversation new` and start a turn with a `speak_as: user` opening message
+(no cron job or sub-agent required); `conversation list` answers "what am I already doing" across the
+agent's own conversations; conversations are durable across sessions and compaction, unlike the
+session-scoped sub-agent registry; and every conversation is the same agent identity, with
+`spawn_subagent` remaining the separate-worker primitive. It renders immediately before `<messaging>`
+(order 150), which cross-references it when the `conversation` tool is present.
 
 ### LambdaPromptSection
 
@@ -507,73 +611,42 @@ public static LambdaPromptSection Create() =>
 
 ## Model Family Detection
 
-`ModelFamilyDetector.GetModelFamily(modelId)` identifies the model family from a model identifier string. Used by `ModelGuidanceSection` to select per-family prompt defaults.
+`ModelFamilyDetector.GetModelFamily(modelId, providerId)` identifies the model family from a model identifier string, falling back to the provider identity when the id alone does not resolve. Used by `ModelGuidanceSection` to select per-family prompt defaults.
 
 Recognized families: `claude`, `gpt`, `gemini`, `copilot`, `deepseek`, `qwen`, `llama`.
 
-Detection is case-insensitive and matches on common prefixes and substrings. Unrecognized models return `"unknown"` and receive no model-specific guidance.
+Detection is case-insensitive and matches on common prefixes and substrings. The model id is consulted first and always wins when it resolves. When it does not, a provider that serves exactly one family (`anthropic`, `openai`, `azure-openai-responses`, `google`, `deepseek`, `github-copilot` and its transport ids) resolves the family instead — otherwise a model served under a vanity id carrying no family substring would silently lose its guidance. Providers serving several vendors (for example `openrouter` or `huggingface`) prove nothing about the family and are deliberately absent. Unrecognized models return `"unknown"` and receive no model-specific guidance.
+
+`SystemPromptBuilder` passes the model id and provider id through `PromptContext.Extensions` under `ModelGuidanceSection.ModelIdExtensionKey` (`modelId`) and `ModelGuidanceSection.ProviderIdExtensionKey` (`providerId`).
 
 ## Extension Prompt Contributions
 
-Extensions can contribute to prompts via `IPromptContributor`:
+An extension can register an `IPromptContributor` in the host DI container. `WorkspaceContextBuilder`
+receives the complete `IEnumerable<IPromptContributor>`, passes it through
+`SystemPromptParams.PromptContributors`, and `SystemPromptBuilder` calls
+`PromptPipeline.AddContributors`. This production collection path was added in #3667; before it,
+registered contributors were constructed but silently ignored.
 
-**Skills Extension:**
-
-```csharp
-public class SkillsExtension : IExtension, IPromptContributor
-{
-    public int Priority => 500;
-    public string? Target => null;
-    
-    public PromptContribution GetContribution(PromptContext context)
-    {
-        var skillsPrompt = LoadSkills();
-        
-        return new PromptContribution
-        {
-            SectionHeading = "Available Skills",
-            Lines = [skillsPrompt],
-            Order = 350  // After tools, before context files
-        };
-    }
-}
-```
-
-**Memory Extension:**
+Only standalone contributors (`Target == null`) render today. The pipeline calls `ShouldInclude`, obtains
+the `PromptContribution`, and orders the block by `PromptContribution.Order` when supplied or by the
+contributor's `Priority` otherwise. A non-null `Target` is reserved for attaching to a named
+`PromptSection`, but targeted rendering is not implemented yet.
 
 ```csharp
-public class MemoryExtension : IExtension, IPromptContributor
+public sealed class ExtensionPromptContributor : IPromptContributor
 {
-    public PromptContribution GetContribution(PromptContext context)
-    {
-        var memories = FetchRecentMemories(context);
-        
-        return new PromptContribution
-        {
-            SectionHeading = "Recent Memories",
-            Lines = memories.Select(m => $"- {m.Timestamp}: {m.Content}").ToList(),
-            Order = 450  // After skills, before context files
-        };
-    }
-}
-```
+    public PromptSection? Target => null;
+    public int Priority => 350;
 
-**MCP Extension:**
+    public bool ShouldInclude(PromptContext context)
+        => context.AvailableTools.Contains("extension_tool");
 
-```csharp
-public class McpExtension : IExtension, IPromptContributor
-{
     public PromptContribution GetContribution(PromptContext context)
-    {
-        var servers = GetConnectedServers();
-        
-        return new PromptContribution
+        => new()
         {
-            SectionHeading = "MCP Servers",
-            Lines = servers.Select(s => $"- **{s.Name}**: {s.Description} ({s.ToolCount} tools)").ToList(),
-            Order = 310  // Right after tools section
+            SectionHeading = "Extension guidance",
+            Lines = ["Use `extension_tool` for extension-owned operations."]
         };
-    }
 }
 ```
 
@@ -585,27 +658,12 @@ Discovers context files from workspace, builds `SystemPromptParams` with runtime
 
 See [WorkspaceContextBuilder.cs](../../src/gateway/BotNexus.Gateway/Agents/WorkspaceContextBuilder.cs)
 
-## Coding Agent vs. Gateway Agent Prompts
+## Gateway prompt composition
 
-**Coding Agent (BotNexus.CodingAgent):**
-
-- Rich coding-focused prompt
-- Extensive tool documentation
-- Code examples and patterns
-- File operation guidelines
-- Session management instructions
-
-**Gateway Agent (BotNexus.Gateway):**
-
-- More generic prompt structure
-- Extensible via `IPromptContributor`
-- Support for multiple agent archetypes
-- Dynamic context injection
-- Tool registry-based tool docs
-
-**Shared Foundation:**
-
-Both use `BotNexus.Prompts.PromptPipeline` but with different section implementations.
+`WorkspaceContextBuilder` is the production entry point. It discovers workspace context, applies the
+owner-private conversation-scope boundary, resolves DI-registered contributors, and delegates the final
+assembly to `SystemPromptBuilder`. The builder uses `BotNexus.Gateway.Prompts.PromptPipeline`; the retired
+`BotNexus.CodingAgent` project is not a second active prompt implementation.
 
 ## Summary
 
@@ -619,18 +677,15 @@ Both use `BotNexus.Prompts.PromptPipeline` but with different section implementa
 6. **Cache boundaries**: Support for provider-level prompt caching
 7. **Runtime parameterization**: Dynamic values (workspace, tools, timezone) injected at build time
 
-**Performance Characteristics:**
-
-- Prompt build time: <5ms (typical)
-- Context file discovery: <50ms (depends on file count)
-- Cache hit rate: 70-90% (with stable sections)
-- Token reduction: 30-50% (via caching)
+**Performance characteristics:** Prompt construction and context discovery are not assigned fixed latency,
+cache-hit, or token-reduction guarantees. Measure them in the target deployment rather than treating local
+observations as capacity commitments.
 
 **Best Practices:**
 
 1. Use low `Order` values for stable content (cache-friendly)
 2. Use high `Order` values for dynamic content (session-specific)
 3. Keep sections focused and single-purpose
-4. Use `PromptContributor` for extension-based additions
+4. Use `IPromptContributor` for extension-based additions
 5. Leverage `IsMinimal` to reduce token usage for sub-agents
 6. Place cache boundary between stable and dynamic content

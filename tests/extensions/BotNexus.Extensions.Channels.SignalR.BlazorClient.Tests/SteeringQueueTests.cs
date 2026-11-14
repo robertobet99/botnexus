@@ -52,7 +52,7 @@ public sealed class SteeringQueueTests : IDisposable
                 CreatedAt: DateTimeOffset.UtcNow,
                 UpdatedAt: DateTimeOffset.UtcNow)
         });
-        _store.ActiveAgentId = agentId;
+        _store.SelectView(agentId, string.Empty, SelectionSource.UserClick);
         var conv = _store.GetConversation(convId)!;
         return (agent, conv);
     }
@@ -116,7 +116,7 @@ public sealed class SteeringQueueTests : IDisposable
             new ConversationSummaryDto("conv-1", "agent-1", "Conv 1", true, "Active", "session-1", 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow),
             new ConversationSummaryDto("conv-2", "agent-1", "Conv 2", false, "Active", "session-2", 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         });
-        _store.ActiveAgentId = "agent-1";
+        _store.SelectView("agent-1", string.Empty, SelectionSource.UserClick);
 
         // Add entries to different conversations
         _store.AddSteeringEntry("conv-1", new SteeringEntry("e1", "First conv steer", SteeringEntryKind.Steer, SteeringEntryStatus.Pending));
@@ -182,12 +182,14 @@ public sealed class SteeringQueueTests : IDisposable
     {
         var (agent, conv) = SetupAgentWithConversation();
         _store.RegisterSession("agent-1", "session-1");
+        // #3212: visibility is route-derived; state the displayed pane explicitly.
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
         // Add a pending entry
         _store.AddSteeringEntry("conv-1", new SteeringEntry("e1", "Do this instead", SteeringEntryKind.Steer, SteeringEntryStatus.Pending));
 
         // Simulate SteeringFeedback.Injected via the event handler
-        var handler = new GatewayEventHandler(_store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance);
+        var handler = new GatewayEventHandler(_store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance, _store);
 
         handler.HandleSteeringFeedback(new SteeringFeedbackPayload(
             AgentId: "agent-1",
@@ -212,11 +214,13 @@ public sealed class SteeringQueueTests : IDisposable
     {
         var (agent, conv) = SetupAgentWithConversation();
         _store.RegisterSession("agent-1", "session-1");
+        // #3212: visibility is route-derived; state the displayed pane explicitly.
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
         // Add a pending entry
         _store.AddSteeringEntry("conv-1", new SteeringEntry("e1", "Queue this", SteeringEntryKind.Steer, SteeringEntryStatus.Pending));
 
-        var handler = new GatewayEventHandler(_store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance);
+        var handler = new GatewayEventHandler(_store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance, _store);
 
         handler.HandleSteeringFeedback(new SteeringFeedbackPayload(
             AgentId: "agent-1",
@@ -243,7 +247,7 @@ public sealed class SteeringQueueTests : IDisposable
 
         _store.AddSteeringEntry("conv-1", new SteeringEntry("e1", "Steer it", SteeringEntryKind.Steer, SteeringEntryStatus.Pending));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.WaitForAssertion(() =>
         {
@@ -257,8 +261,44 @@ public sealed class SteeringQueueTests : IDisposable
     {
         SetupAgentWithConversation();
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.DoesNotContain("steering-queue-panel", cut.Markup);
+    }
+
+    // ---- #2439: the FOLLOW-UP chip must disappear from the rendered DOM once the run settles ----
+
+    [Fact]
+    public void FollowUp_chip_disappears_from_the_DOM_when_the_run_ends()
+    {
+        SetupAgentWithConversation();
+        _store.RegisterSession("agent-1", "session-1");
+        // #3212: visibility is route-derived; state the displayed pane explicitly.
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<SteeringQueuePanel>(p => p.Add(c => c.ConversationId, "conv-1"));
+
+        _store.AddSteeringEntry("conv-1",
+            new SteeringEntry("f1", "for the portal profiling are you using live LLM models",
+                SteeringEntryKind.FollowUp, SteeringEntryStatus.Pending));
+
+        cut.WaitForAssertion(() =>
+        {
+            Assert.Contains("steering-queue-panel", cut.Markup);
+            Assert.Single(cut.FindAll("[data-testid='steering-queue-item']"));
+            Assert.Contains("Follow-up", cut.Markup);
+        });
+
+        var handler = new GatewayEventHandler(_store, new GatewayHubConnection(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance, _store);
+        handler.HandleRunEnded(new AgentStreamEvent { SessionId = "session-1", ConversationId = "conv-1" });
+
+        cut.WaitForAssertion(() =>
+        {
+            Assert.Empty(cut.FindAll("[data-testid='steering-queue-item']"));
+            Assert.DoesNotContain("steering-queue-panel", cut.Markup);
+        });
+
+        handler.Dispose();
     }
 }

@@ -8,29 +8,24 @@ namespace BotNexus.Extensions.Channels.SignalR.BlazorClient.Mobile.Pages;
 /// Schema-driven mobile platform-settings page (config-parity PBI 6/6 of #1579, issue #1615 -- the
 /// payoff PBI). It consumes the SAME shared <c>SchemaForm</c> renderer the desktop Configuration page
 /// uses, fed by <c>GET /api/config/schema</c>: it fetches the UI schema and the effective config once,
-/// binds them into the form, and persists the sections the user actually edited. There is no
-/// mobile-specific field code, so a config field added to <c>PlatformConfig</c> with annotations
-/// surfaces here automatically. Save behaviour matches the desktop -- edits go through the same
-/// per-section <c>PUT /api/config/{section}</c> endpoints, so hot-reload-without-restart is unchanged.
+/// binds editable platform sections into the form, and persists only the paths the user edited.
+/// The same non-persisted roots as desktop are excluded from rendering, not from the loaded config.
+/// Save behaviour matches desktop: a revision-checked <c>PATCH /api/config</c> preserves unrelated
+/// configuration and reports concurrent changes instead of overwriting them.
 /// The logic mirrors the desktop <c>Configuration</c> code-behind so the two surfaces stay in lockstep.
 /// </summary>
 public partial class Settings : IDisposable
 {
-    private JsonObject? _config;
+    private PlatformConfigFormModel? _form;
+    private PlatformConfigFormModel Form => _form ??= new PlatformConfigFormModel(ConfigService);
+    private JsonObject? _config => Form.Config;
     private JsonObject? _schema;
-    private HashSet<string>? _rawSections;
-    private bool _loading = true;
-    private bool _saving;
-    private bool _dirty;
+    private bool _loading => Form.IsLoading;
+    private bool _saving => Form.IsSaving;
+    private bool _dirty => Form.IsDirty;
     private string? _statusMessage;
     private string _statusClass = "";
     private System.Timers.Timer? _statusTimer;
-
-    // Top-level keys that are never persisted from the settings UI: metadata and the agents tree
-    // (agents are managed through the dedicated agent editor, not the platform config form). Kept in
-    // sync with the desktop Configuration page so both surfaces persist the same sections.
-    private static readonly HashSet<string> NonPersistedSections =
-        new(StringComparer.OrdinalIgnoreCase) { "$schema", "version", "agents" };
 
     protected override async Task OnInitializedAsync()
     {
@@ -39,20 +34,22 @@ public partial class Settings : IDisposable
 
     private async Task LoadConfig()
     {
-        _loading = true;
-        _dirty = false;
         SetStatus("Loading...", "");
         StateHasChanged();
+        await Form.LoadAsync();
 
-        _schema = await ConfigService.LoadSchemaAsync();
-        _config = await ConfigService.LoadAsync();
+        // Mirror desktop's section boundary without pruning the effective config or changing the
+        // shared save workflow. Clone the envelope so the loaded schema remains intact as well.
+        _schema = Form.Schema?.DeepClone().AsObject();
+        if (_schema?["schema"]?["properties"] is JsonObject properties)
+        {
+            foreach (var key in properties.Select(entry => entry.Key).ToArray())
+            {
+                if (PlatformConfigFormModel.NonPersistedSections.Contains(key))
+                    properties.Remove(key);
+            }
+        }
 
-        // Load raw config to know which sections actually exist on disk, so we only persist sections
-        // the user materialised rather than default-injected ones.
-        var raw = await ConfigService.LoadRawAsync();
-        _rawSections = raw?.Select(kv => kv.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        _loading = false;
         if (_config is null || _schema is null)
             SetStatus("Failed to load", "error");
         else
@@ -60,51 +57,39 @@ public partial class Settings : IDisposable
         StateHasChanged();
     }
 
-    // SchemaForm edits _config in place and raises this on every change; flip the dirty flag so the
-    // Save button enables. We re-render because SchemaForm hands back the same instance reference.
     private void OnConfigChanged(JsonObject updated)
     {
-        _config = updated;
-        _dirty = true;
+        Form.MarkConfigChanged(updated);
         StateHasChanged();
     }
 
+    private void OnPathChanged(string path) => Form.MarkPathChanged(path);
+
     private async Task SaveAll()
     {
-        if (_config is null || !_dirty) return;
-        _saving = true;
+        if (!_dirty) return;
         SetStatus("Saving...", "");
         StateHasChanged();
 
-        // Persist every top-level section that exists on disk (raw) and is user-editable. The schema
-        // form mutates the whole tree, so without per-section dirty tracking we save the materialised
-        // sections; default-only sections are skipped to avoid writing injected defaults to disk.
-        var sectionsToSave = _config
-            .Select(kv => kv.Key)
-            .Where(key => !NonPersistedSections.Contains(key))
-            .Where(key => _rawSections is null || _rawSections.Contains(key))
-            .ToList();
-
-        var allOk = true;
-        foreach (var section in sectionsToSave)
+        var outcome = await Form.SaveAsync();
+        if (outcome.Success)
         {
-            var node = _config[section];
-            if (node is null) continue;
-            var (success, error) = await ConfigService.SaveSectionAsync(section, node.DeepClone());
-            if (!success)
-            {
-                SetStatus($"Failed to save {section}: {error}", "error");
-                allOk = false;
-                break;
-            }
-        }
-
-        _saving = false;
-        if (allOk)
-        {
-            _dirty = false;
             SetStatus("Saved successfully", "success", autoHide: true);
+            await LoadConfig();
+            return;
         }
+
+        if (outcome.IsConflict)
+        {
+            SetStatus(
+                "Configuration changed elsewhere since this page loaded. Reload to see the current values, then re-apply your changes.",
+                "error");
+        }
+        else
+        {
+            SetStatus($"Failed to save: {outcome.Error}", "error");
+        }
+
         StateHasChanged();
     }
 

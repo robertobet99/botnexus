@@ -19,6 +19,99 @@ public sealed class LocationsApiIntegrationTests
     private const string ConfigPathKey = "BotNexus__ConfigPath";
     private static readonly SemaphoreSlim EnvLock = new(1, 1);
 
+    /// <summary>
+    /// Builds an absolute filesystem path that is valid on the RUNNING platform.
+    /// </summary>
+    /// <remarks>
+    /// These tests previously embedded Windows literals (<c>Q:\repos\workspace</c>). That is not a
+    /// cosmetic portability wart: since remote containerised validation became the default gate
+    /// (#2158), the suite runs on Linux, where a drive-qualified literal is not an absolute path at
+    /// all - it is a single relative filename whose colon and backslashes are ordinary characters.
+    /// The locations API resolves and stores it, but nothing downstream matches the shape the
+    /// assertions expect, so all four tests failed on every Linux run regardless of the change
+    /// under test (#2830). A gate that is red for reasons unrelated to the diff trains the reader
+    /// to dismiss red, which is how a real regression gets waved through.
+    ///
+    /// Deriving from <see cref="Path.GetTempPath"/> plus <see cref="Path.Combine"/> yields a
+    /// genuinely rooted path with the platform's own separator on both operating systems, so the
+    /// assertions test the API's round-trip behaviour rather than the host's path syntax. The
+    /// directory is deliberately NOT created: these tests exercise configuration persistence, and
+    /// the create/update/delete endpoints do not require the target to exist. Only the health
+    /// projection calls <c>Directory.Exists</c>, and no assertion here depends on it.
+    /// </remarks>
+    /// <param name="segments">Path segments appended beneath the temp root.</param>
+    /// <returns>An absolute, platform-native path.</returns>
+    private static string PlatformPath(params string[] segments)
+        => Path.GetFullPath(Path.Combine([Path.GetTempPath(), "botnexus-locations-values", .. segments]));
+
+    /// <summary>
+    /// Polls <paramref name="read"/> until <paramref name="predicate"/> holds or the budget expires.
+    /// </summary>
+    /// <remarks>
+    /// The locations API persists through <c>PlatformConfigWriter</c>, which writes config.json and
+    /// then RETURNS -- it does not force a reload. The API's read path serves
+    /// <c>IOptionsMonitor&lt;PlatformConfig&gt;.CurrentValue</c>, which only advances once the
+    /// <c>AddJsonFile(reloadOnChange: true)</c> watcher observes the write and the options cache is
+    /// invalidated. That hand-off is ASYNCHRONOUS and its latency is a property of the host
+    /// filesystem, not of the product: a Windows FileSystemWatcher raises the event in single-digit
+    /// milliseconds, so a bare read-after-write appeared deterministic for years, while the same
+    /// code on a container overlay filesystem takes long enough that the read observes the previous
+    /// snapshot and the assertion fails (#2825).
+    ///
+    /// Waiting here does not weaken the assertion. The test still requires the value to arrive; it
+    /// merely stops requiring it to arrive before the watcher has run. Asserting immediately was
+    /// asserting a timing coincidence, not a behaviour -- and a test that only passes because one
+    /// filesystem happens to be fast is vacuous on every filesystem that is not.
+    /// </remarks>
+    private static async Task<T> EventuallyAsync<T>(
+        Func<Task<T>> read,
+        Func<T, bool> predicate,
+        string because,
+        int timeoutMs = 10_000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+
+        // A read taken before the reload lands does not merely return a STALE value -- for a
+        // fetch-by-name it returns 404, and GetFromJsonAsync turns that into an exception. Letting
+        // it escape would abandon the retry loop on the very first attempt and report a transport
+        // failure for what is actually "not visible yet", which is exactly how this surfaced in the
+        // container (#2825). Treat a failed read as an unsatisfied predicate and keep waiting; if
+        // the deadline expires the last exception is rethrown, so a genuinely broken endpoint still
+        // fails loudly rather than being swallowed.
+        Exception? lastFailure = null;
+
+        while (true)
+        {
+            try
+            {
+                var value = await read();
+                if (predicate(value))
+                    return value;
+
+                lastFailure = null;
+
+                if (DateTime.UtcNow >= deadline)
+                {
+                    predicate(value).ShouldBeTrue(
+                        $"{because} (waited up to {timeoutMs}ms for the configuration reload to be observed)");
+                    return value;
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or JsonException)
+            {
+                lastFailure = ex;
+
+                if (DateTime.UtcNow >= deadline)
+                {
+                    throw new InvalidOperationException(
+                        $"{because} (waited up to {timeoutMs}ms; the read never succeeded)", lastFailure);
+                }
+            }
+
+            await Task.Delay(50);
+        }
+    }
+
     [Fact]
     public async Task LocationsApi_AddUpdateDelete_PersistsToConfigFile()
     {
@@ -30,30 +123,38 @@ public sealed class LocationsApiIntegrationTests
             await using var factory = CreateTestFactory();
             using var client = factory.CreateClient();
 
+            var workspacePath = PlatformPath("workspace");
+            var updatedWorkspacePath = PlatformPath("workspace-updated");
+
             var createResponse = await client.PostAsJsonAsync("/api/locations", new
             {
                 name = "workspace",
                 type = "filesystem",
-                value = "Q:\\repos\\workspace",
+                value = workspacePath,
                 description = "Working tree"
             });
 
             createResponse.StatusCode.ShouldBe(HttpStatusCode.Created);
 
-            var listAfterCreate = await client.GetFromJsonAsync<JsonElement>("/api/locations");
+            var listAfterCreate = await EventuallyAsync(
+                () => client.GetFromJsonAsync<JsonElement>("/api/locations"),
+                body => body.ValueKind == JsonValueKind.Array
+                    && body.EnumerateArray().Any(loc => loc.GetProperty("name").GetString() == "workspace"),
+                "the created location should be listed once the configuration reload is observed");
+
             listAfterCreate.ValueKind.ShouldBe(JsonValueKind.Array);
             listAfterCreate.EnumerateArray().Any(loc =>
                 loc.GetProperty("name").GetString() == "workspace").ShouldBeTrue();
 
             var configAfterCreate = fixture.ReadConfigJson();
             configAfterCreate["gateway"]?["locations"]?["workspace"]?["path"]?.GetValue<string>()
-                .ShouldBe("Q:\\repos\\workspace");
+                .ShouldBe(workspacePath);
 
             var updateResponse = await client.PutAsJsonAsync("/api/locations/workspace", new
             {
                 name = "workspace",
                 type = "filesystem",
-                value = "Q:\\repos\\workspace-updated",
+                value = updatedWorkspacePath,
                 description = "Updated"
             });
 
@@ -61,7 +162,7 @@ public sealed class LocationsApiIntegrationTests
 
             var configAfterUpdate = fixture.ReadConfigJson();
             configAfterUpdate["gateway"]?["locations"]?["workspace"]?["path"]?.GetValue<string>()
-                .ShouldBe("Q:\\repos\\workspace-updated");
+                .ShouldBe(updatedWorkspacePath);
             configAfterUpdate["gateway"]?["locations"]?["workspace"]?["description"]?.GetValue<string>()
                 .ShouldBe("Updated");
 
@@ -93,14 +194,26 @@ public sealed class LocationsApiIntegrationTests
             {
                 name = "hot-reload",
                 type = "filesystem",
-                value = "Q:\\repos\\hot-reload"
+                value = PlatformPath("hot-reload")
             });
             createResponse.StatusCode.ShouldBe(HttpStatusCode.Created);
 
-            var getByName = await client.GetFromJsonAsync<JsonElement>("/api/locations/hot-reload");
+            var getByName = await EventuallyAsync(
+                () => client.GetFromJsonAsync<JsonElement>("/api/locations/hot-reload"),
+                body => body.ValueKind == JsonValueKind.Object
+                    && body.TryGetProperty("name", out var n)
+                    && n.GetString() == "hot-reload",
+                "the created location should be fetchable by name once the reload is observed");
+
             getByName.GetProperty("name").GetString().ShouldBe("hot-reload");
 
-            var afterList = await client.GetFromJsonAsync<JsonElement>("/api/locations");
+            var afterList = await EventuallyAsync(
+                () => client.GetFromJsonAsync<JsonElement>("/api/locations"),
+                body => body.ValueKind == JsonValueKind.Array
+                    && body.EnumerateArray().Any(loc =>
+                        string.Equals(loc.GetProperty("name").GetString(), "hot-reload", StringComparison.Ordinal)),
+                "the created location should appear in the list once the reload is observed");
+
             afterList.EnumerateArray()
                 .Any(loc => string.Equals(loc.GetProperty("name").GetString(), "hot-reload", StringComparison.Ordinal))
                 .ShouldBeTrue();
@@ -135,7 +248,7 @@ public sealed class LocationsApiIntegrationTests
             {
                 name = "duplicate",
                 type = "filesystem",
-                value = "Q:\\repos\\dupe"
+                value = PlatformPath("dupe")
             });
             firstCreate.StatusCode.ShouldBe(HttpStatusCode.Created);
 
@@ -143,7 +256,7 @@ public sealed class LocationsApiIntegrationTests
             {
                 name = "duplicate",
                 type = "filesystem",
-                value = "Q:\\repos\\dupe2"
+                value = PlatformPath("dupe2")
             });
 
             duplicateCreate.StatusCode.ShouldBe(HttpStatusCode.Conflict);
@@ -181,12 +294,22 @@ public sealed class LocationsApiIntegrationTests
             createdBody.GetProperty("hasConfiguredSecret").GetBoolean().ShouldBeTrue();
             createdBody.GetRawText().ShouldNotContain(originalSecret);
 
-            var getBody = await client.GetFromJsonAsync<JsonElement>("/api/locations/db-primary");
+            var getBody = await EventuallyAsync(
+                () => client.GetFromJsonAsync<JsonElement>("/api/locations/db-primary"),
+                body => body.ValueKind == JsonValueKind.Object && body.TryGetProperty("pathOrEndpoint", out _),
+                "the created database location should be fetchable once the reload is observed");
+
             getBody.GetProperty("pathOrEndpoint").GetString().ShouldBe("(redacted)");
             getBody.GetProperty("hasConfiguredSecret").GetBoolean().ShouldBeTrue();
             getBody.GetRawText().ShouldNotContain(originalSecret);
 
-            var listBody = await client.GetFromJsonAsync<JsonElement>("/api/locations");
+            var listBody = await EventuallyAsync(
+                () => client.GetFromJsonAsync<JsonElement>("/api/locations"),
+                body => body.ValueKind == JsonValueKind.Array
+                    && body.EnumerateArray().Any(loc =>
+                        string.Equals(loc.GetProperty("name").GetString(), "db-primary", StringComparison.Ordinal)),
+                "the created database location should be listed once the reload is observed");
+
             var listed = listBody.EnumerateArray().Single(loc =>
                 string.Equals(loc.GetProperty("name").GetString(), "db-primary", StringComparison.Ordinal));
             listed.GetProperty("pathOrEndpoint").GetString().ShouldBe("(redacted)");
@@ -255,14 +378,24 @@ public sealed class LocationsApiIntegrationTests
             createdPathOrEndpoint.ShouldNotBeNull();
             createdPathOrEndpoint.ShouldNotContain("SyntheticSecret123!");
 
-            var getBody = await client.GetFromJsonAsync<JsonElement>("/api/locations/db-main");
+            var getBody = await EventuallyAsync(
+                () => client.GetFromJsonAsync<JsonElement>("/api/locations/db-main"),
+                body => body.ValueKind == JsonValueKind.Object && body.TryGetProperty("pathOrEndpoint", out _),
+                "the created database location should be fetchable once the reload is observed");
+
             getBody.GetProperty("pathOrEndpoint").GetString().ShouldBe("(redacted)");
             getBody.GetProperty("hasConfiguredSecret").GetBoolean().ShouldBeTrue();
             var fetchedPathOrEndpoint = getBody.GetProperty("pathOrEndpoint").GetString();
             fetchedPathOrEndpoint.ShouldNotBeNull();
             fetchedPathOrEndpoint.ShouldNotContain("SyntheticSecret123!");
 
-            var listBody = await client.GetFromJsonAsync<JsonElement>("/api/locations");
+            var listBody = await EventuallyAsync(
+                () => client.GetFromJsonAsync<JsonElement>("/api/locations"),
+                body => body.ValueKind == JsonValueKind.Array
+                    && body.EnumerateArray().Any(loc =>
+                        string.Equals(loc.GetProperty("name").GetString(), "db-main", StringComparison.Ordinal)),
+                "the created database location should be listed once the reload is observed");
+
             var listedDb = listBody.EnumerateArray().Single(loc => loc.GetProperty("name").GetString() == "db-main");
             listedDb.GetProperty("pathOrEndpoint").GetString().ShouldBe("(redacted)");
             listedDb.GetProperty("hasConfiguredSecret").GetBoolean().ShouldBeTrue();

@@ -12,6 +12,9 @@ public sealed record SubAgentInfo
     /// </summary>
     public required string SubAgentId { get; init; }
 
+    /// <summary>Original parent spawn call, retained for same-call retries.</summary>
+    public string? SpawningToolCallId { get; init; }
+
     /// <summary>
     /// Gets the parent session identifier that owns this sub-agent.
     /// </summary>
@@ -36,6 +39,18 @@ public sealed record SubAgentInfo
     /// Gets the child agent identifier. Populated at spawn time for session persistence.
     /// </summary>
     public string? ChildAgentId { get; init; }
+
+    /// <summary>
+    /// Gets the conversation this sub-agent run owns. Distinct from the parent's conversation
+    /// (issue #2338): a sub-agent run is a full conversation, so it gets its own id and is linked
+    /// back to its supervisor by <c>Conversation.ParentConversationId</c> rather than by sharing
+    /// the parent's identity. <c>null</c> only when no <c>IConversationStore</c> is wired (tests,
+    /// minimal hosts), in which case there is nothing to mint against.
+    /// </summary>
+    public ConversationId? ChildConversationId { get; init; }
+
+    /// <summary>Gets the supervisor conversation that owns this run.</summary>
+    public ConversationId? ParentConversationId { get; init; }
 
     /// <summary>
     /// Gets the delegated task assigned to the sub-agent.
@@ -72,11 +87,189 @@ public sealed record SubAgentInfo
     /// </summary>
     public int TurnsUsed { get; init; }
 
+    /// <summary>Gets the effective turn ceiling enforced for this run, or null when unknown.</summary>
+    public int? EffectiveMaxTurns { get; init; }
+
+    /// <summary>Gets the effective wall-clock budget in seconds, or null when unknown.</summary>
+    public int? EffectiveTimeoutSeconds { get; init; }
+
     /// <summary>
     /// Gets an optional completion summary produced by the sub-agent.
     /// </summary>
     public string? ResultSummary { get; init; }
+
+    /// <summary>True when cold reconstruction could not recover a full summary copy; never promote the bounded fallback on persistence.</summary>
+    public bool RetainedResultFullCopyUnavailable { get; init; }
+
+    /// <summary>Original retained summary length when this info came from a bounded cold projection.</summary>
+    public int? RetainedResultOriginalLength { get; init; }
+
+    /// <summary>Whether the retained cold projection omitted summary characters.</summary>
+    public bool RetainedResultSummaryTruncated { get; init; }
+
+    /// <summary>
+    /// Gets the structured result retained when a bounded run stops before ordinary completion.
+    /// Narrated summary text is explicitly unverified; tool-backed evidence is projected separately.
+    /// </summary>
+    public SubAgentPartialResult? PartialResult { get; init; }
+
+    /// <summary>
+    /// Gets the budget reduction applied to this spawn, or <c>null</c> when the request fitted
+    /// inside every ceiling (#2789). Deliberately absent rather than always present: an
+    /// unconditional field is boilerplate a calling model learns to skip, so its presence alone
+    /// must mean "your requested budget was reduced and you should re-scope the task".
+    /// </summary>
+    public SubAgentBudgetClamp? BudgetClamp { get; init; }
+
+    /// <summary>
+    /// Gets optional staging guidance when an effective turn or timeout budget exceeds its
+    /// configured advisory threshold. The advisory never changes either effective budget.
+    /// </summary>
+    public SubAgentBudgetAdvisory? BudgetAdvisory { get; init; }
+
+    /// <summary>
+    /// Gets bounded recovery evidence captured from a caller-granted Git worktree when this run
+    /// ended by timeout or turn-budget exhaustion. Null for every other terminal disposition.
+    /// </summary>
+    public SubAgentWorktreeSnapshot? WorktreeSnapshot { get; init; }
+
+    /// <summary>
+    /// Gets the historical completion announcement disposition (#3703).
+    /// Current tool-owned results do not send announcements and leave this field Pending;
+    /// Pending is not evidence that a terminal result is unready or unconsumed. The session
+    /// store's tool-call receipt, not this compatibility field, owns result consumption.
+    /// </summary>
+    public SubAgentCompletionDelivery CompletionDelivery { get; init; } = SubAgentCompletionDelivery.Pending;
+
+    /// <summary>
+    /// Gets the failure detail when <see cref="CompletionDelivery"/> is
+    /// <see cref="SubAgentCompletionDelivery.Failed"/>; otherwise <c>null</c>. Carries the
+    /// historical dispatch exception's message. Current tool-owned results do not update it.
+    /// </summary>
+    public string? CompletionDeliveryError { get; init; }
 }
+
+/// <summary>Structured disposition of a bounded sub-agent result.</summary>
+public enum SubAgentCompletion
+{
+    Complete,
+    Partial,
+    Parked,
+    Failed,
+    Cancelled
+}
+
+/// <summary>Authoritative reason a bounded run stopped.</summary>
+public enum SubAgentStopReason
+{
+    TurnLimit,
+    Timeout,
+    TokenLimit,
+    NoProgress,
+    CallerCancelled
+}
+
+/// <summary>A tool action retained from the interrupted run's authoritative timeline.</summary>
+public sealed record SubAgentPartialAction(
+    string ToolCallId,
+    string ToolName,
+    bool Completed,
+    bool Succeeded);
+
+/// <summary>Successful tool evidence retained separately from unverified child narration.</summary>
+public sealed record SubAgentVerifiedEvidence(
+    string ToolCallId,
+    string ToolName,
+    string? Result);
+
+/// <summary>
+/// Machine-readable result retained when a bounded run is interrupted. Unknown usage remains
+/// <c>null</c>; a missing measurement is never serialized as measured zero.
+/// </summary>
+public sealed record SubAgentPartialResult
+{
+    public required SubAgentCompletion Completion { get; init; }
+    public required SubAgentStopReason StopReason { get; init; }
+    public string? Summary { get; init; }
+    public bool SummaryIsVerified { get; init; }
+    public IReadOnlyList<SubAgentVerifiedEvidence> VerifiedEvidence { get; init; } = [];
+    /// <summary>
+    /// Verified tool names recovered from bounded retained history. These preserve the recorded
+    /// classification only; original call IDs and raw results are unavailable, not reconstructed.
+    /// </summary>
+    public IReadOnlyList<string> RetainedVerifiedTools { get; init; } = [];
+    public IReadOnlyList<string> UnresolvedWork { get; init; } = [];
+    public IReadOnlyList<SubAgentPartialAction> ActionsTaken { get; init; } = [];
+    public IReadOnlyList<string> SideEffects { get; init; } = [];
+    public int TurnsUsed { get; init; }
+    public AgentResponseUsage? Usage { get; init; }
+    public SessionId? CheckpointSessionId { get; init; }
+    public ConversationId? CheckpointConversationId { get; init; }
+}
+
+/// <summary>
+/// Reports whether a terminal sub-agent run's completion follow-up reached the parent session
+/// (#3703). Orthogonal to <see cref="SubAgentStatus"/>: the status is about the child's work, this
+/// is about whether the announcement was delivered.
+/// </summary>
+public enum SubAgentCompletionDelivery
+{
+    /// <summary>
+    /// No delivery has been attempted (or concluded) yet. The state of every still-running record,
+    /// and of a terminal record whose parent agent id was empty so no wake was ever owed.
+    /// </summary>
+    Pending,
+
+    /// <summary>The completion follow-up was dispatched to the parent session without error.</summary>
+    Delivered,
+
+    /// <summary>
+    /// The completion follow-up dispatch threw. The run finished, the child was torn down, and the
+    /// parent was never woken - the result summary on this record is all that survives.
+    /// </summary>
+    Failed
+}
+
+/// <summary>
+/// Reports that a spawn request's budget was reduced by a configured ceiling (#2789).
+/// <para>
+/// The clamp itself is a deliberate runaway-cost guard and is not negotiable; what this record
+/// fixes is that the reduction used to be visible ONLY in the gateway's own Warning log, so the
+/// agent that asked for the budget went on to brief its worker against a budget it did not have.
+/// The effective values carried here are the same values threaded into the run, not a
+/// recomputation of them.
+/// </para>
+/// </summary>
+/// <param name="PolicyTier">The budget policy tier that applied the ceiling.</param>
+/// <param name="RequestedMaxTurns">The turn budget the caller asked for.</param>
+/// <param name="EffectiveMaxTurns">The turn budget the run actually received.</param>
+/// <param name="RequestedTimeoutSeconds">The timeout the caller asked for, in seconds.</param>
+/// <param name="EffectiveTimeoutSeconds">The timeout the run actually received, in seconds.</param>
+public sealed record SubAgentBudgetClamp(
+    string PolicyTier,
+    int RequestedMaxTurns,
+    int EffectiveMaxTurns,
+    int RequestedTimeoutSeconds,
+    int EffectiveTimeoutSeconds)
+{
+    /// <summary>Gets a value indicating whether the turn budget specifically was reduced.</summary>
+    public bool MaxTurnsClamped => RequestedMaxTurns > EffectiveMaxTurns;
+
+    /// <summary>Gets a value indicating whether the timeout specifically was reduced.</summary>
+    public bool TimeoutSecondsClamped => RequestedTimeoutSeconds > EffectiveTimeoutSeconds;
+}
+
+/// <summary>
+/// Advises the caller to split an unusually large permitted budget into one coherent stage. The
+/// effective values are the budgets threaded into the run after hard policy is applied.
+/// </summary>
+public sealed record SubAgentBudgetAdvisory(
+    bool MaxTurnsAboveThreshold,
+    int MaxTurnsThreshold,
+    int EffectiveMaxTurns,
+    bool TimeoutSecondsAboveThreshold,
+    int TimeoutSecondsThreshold,
+    int EffectiveTimeoutSeconds);
 
 /// <summary>
 /// Represents the lifecycle state of a sub-agent run.
@@ -106,5 +299,36 @@ public enum SubAgentStatus
     /// <summary>
     /// The sub-agent timed out before completion.
     /// </summary>
-    TimedOut
+    TimedOut,
+
+    /// <summary>
+    /// The sub-agent exhausted its turn budget (<c>maxTurns</c>) before producing a final
+    /// response. Distinct from <see cref="TimedOut"/>: the run ran out of turns, not wall clock,
+    /// so the remedy is a larger turn budget or a narrower task rather than a longer deadline
+    /// (#2656).
+    /// </summary>
+    BudgetExhausted,
+
+    /// <summary>
+    /// The run accepted a sub-agent spawn, produced zero delivery payloads, and emitted no
+    /// synthesized text of its own - it delegated and correctly stayed silent (#2725).
+    /// <para>
+    /// <b>Why this is its own state rather than <see cref="Completed"/> or <see cref="Failed"/>.</b>
+    /// Delivery classification used to key solely on the run's own final text, so "the run
+    /// produced nothing" and "the run delegated and correctly stayed silent" collapsed onto the
+    /// same empty-response diagnostic. Under a cron trigger that turned every correctly-delegating
+    /// scheduled job red and dropped the descendant's output on the floor. Reusing
+    /// <see cref="Completed"/> would fix the red run but erase the distinction an operator needs
+    /// ("did this job answer, or did it hand off?"), and it would make suppression of the
+    /// empty-response diagnostic indistinguishable from a genuine empty run.
+    /// </para>
+    /// <para>
+    /// A handoff is a SUCCESS state - <c>SubAgentStatusPolicy.IsUnsuccessfulTermination</c>
+    /// returns <c>false</c> - but a distinguishable one. The summary it carries is the
+    /// DESCENDANT's result, not a diagnostic. A run whose descendant itself failed is recorded as
+    /// <see cref="Failed"/>, never as a handoff: the classification must not launder a failed
+    /// delegation into a success.
+    /// </para>
+    /// </summary>
+    HandedOff
 }

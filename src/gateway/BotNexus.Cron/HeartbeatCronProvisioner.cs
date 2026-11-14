@@ -116,11 +116,39 @@ public sealed class HeartbeatCronProvisioner : IHostedService, IHeartbeatProvisi
                 TimeZone = timezone
             };
 
-            await _cronStore.UpdateAsync(updated, cancellationToken).ConfigureAwait(false);
+            // #2133: heartbeat provisioning is a definition write; the scheduler owns
+            // NextRunAt/LastRun* and CAS owns the conversation pin, so use the narrow write.
+            await _cronStore.UpdateDefinitionAsync(updated, expectedOwnership: null, cancellationToken).ConfigureAwait(false);
             _logger.LogInformation(
                 "Updated heartbeat cron job for agent '{AgentId}' with schedule '{Schedule}'.",
                 descriptor.AgentId, cronExpression);
         }
+    }
+
+    /// <inheritdoc/>
+    public async Task DeprovisionAsync(AgentId agentId, CancellationToken cancellationToken)
+    {
+        var jobId = JobId.From($"heartbeat:{agentId.Value}");
+        var existing = await _cronStore.GetAsync(jobId, cancellationToken).ConfigureAwait(false);
+
+        if (existing is null)
+        {
+            // Idempotent: nothing provisioned (or already reclaimed) is success, not an error.
+            return;
+        }
+
+        if (!existing.System)
+        {
+            // Same ownership guard ProvisionAsync applies on the disable branch: the platform only
+            // deletes jobs it minted, never an operator-authored job that shares the id.
+            _logger.LogWarning(
+                "Leaving non-system cron job '{JobId}' in place while deprovisioning agent '{AgentId}'.",
+                jobId, agentId);
+            return;
+        }
+
+        await _cronStore.DeleteAsync(jobId, cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation("Deprovisioned heartbeat cron job for deleted agent '{AgentId}'.", agentId);
     }
 
     /// <summary>

@@ -35,6 +35,10 @@ public sealed class ProbeRound2ComponentTests : IDisposable
         _ctx.Services.AddSingleton(http);
         _ctx.Services.AddSingleton(new ExtensionFeatureService(restClient));
         _ctx.Services.AddSingleton(new CronApiClient(http));
+        _ctx.Services.AddSingleton(new SectionsApiClient(http));
+        _ctx.Services.AddSingleton(sp => new ConversationSectionsState(sp.GetRequiredService<SectionsApiClient>()));
+        _ctx.Services.AddSingleton(new ToolsApiClient(http));
+        _ctx.Services.AddStubNavOrderApiClient();
         _ctx.Services.AddSingleton(Substitute.For<IUpdateStatusService>());
         var _mockPrefs = Substitute.For<IPortalPreferencesService>(); _mockPrefs.Current.Returns(new PortalPreferences()); _ctx.Services.AddSingleton(_mockPrefs);
         _ctx.JSInterop.Mode = JSRuntimeMode.Loose;
@@ -59,9 +63,9 @@ public sealed class ProbeRound2ComponentTests : IDisposable
     {
         SeedConnectedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConv("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Type a message into the textarea
         var textarea = cut.Find(".chat-input");
@@ -71,7 +75,9 @@ public sealed class ProbeRound2ComponentTests : IDisposable
         var sendBtn = cut.Find(".send-btn");
         await cut.InvokeAsync(() => sendBtn.Click());
 
-        await _interaction.Received(1).SendMessageAsync("agent-1", "Hello from test!");
+        await _interaction.Received(1).DeliverMessageAsync(
+            "agent-1", "conv-1", "Hello from test!", InboundDeliveryMode.Auto,
+            Arg.Any<IReadOnlyList<DraftAttachment>>());
     }
 
     // ── ChatPanel: Follow Up button queues via IAgentInteractionService.FollowUpAsync ──
@@ -81,12 +87,12 @@ public sealed class ProbeRound2ComponentTests : IDisposable
     {
         SeedConnectedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConv("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
         // Mark the run active so the run controls (incl. Follow Up) render instead of Send.
         _store.GetStreamState("conv-1").IsRunActive = true;
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var textarea = cut.Find(".chat-input");
         await cut.InvokeAsync(() => textarea.Input("Next, write the tests."));
@@ -95,9 +101,9 @@ public sealed class ProbeRound2ComponentTests : IDisposable
         await cut.InvokeAsync(() => followUpBtn.Click());
 
         // Follow Up must route to FollowUpAsync (queue after loop), NOT SteerAsync or SendMessageAsync.
-        await _interaction.Received(1).FollowUpAsync("agent-1", "Next, write the tests.");
-        await _interaction.DidNotReceive().SteerAsync("agent-1", Arg.Any<string>());
-        await _interaction.DidNotReceive().SendMessageAsync("agent-1", Arg.Any<string>());
+        await _interaction.Received(1).FollowUpAsync("agent-1", Arg.Any<string>(), "Next, write the tests.");
+        await _interaction.DidNotReceive().SteerAsync("agent-1", Arg.Any<string>(), Arg.Any<string>());
+        await _interaction.DidNotReceive().SendMessageAsync("agent-1", Arg.Any<string>(), Arg.Any<string>());
     }
 
     [Fact]
@@ -105,9 +111,9 @@ public sealed class ProbeRound2ComponentTests : IDisposable
     {
         SeedConnectedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConv("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var textarea = cut.Find(".chat-input");
         Assert.Contains("/prompts", textarea.GetAttribute("placeholder"));
@@ -118,15 +124,15 @@ public sealed class ProbeRound2ComponentTests : IDisposable
     {
         SeedConnectedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConv("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         var textarea = cut.Find(".chat-input");
 
         await cut.InvokeAsync(() => textarea.Input("/prompts"));
         await cut.InvokeAsync(() => textarea.TriggerEvent("onkeydown", new KeyboardEventArgs { Key = "Enter" }));
 
-        await _interaction.Received(1).SendMessageAsync("agent-1", "/prompts");
+        await _interaction.Received(1).SendMessageAsync("agent-1", "conv-1", "/prompts");
     }
 
     // ── ChatPanel: New session button click triggers confirmation dialog ───────
@@ -136,7 +142,7 @@ public sealed class ProbeRound2ComponentTests : IDisposable
     {
         SeedConnectedAgent("agent-1");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Confirm dialog should not be visible initially
         Assert.Empty(cut.FindAll(".reset-confirm-overlay"));
@@ -156,8 +162,11 @@ public sealed class ProbeRound2ComponentTests : IDisposable
     public async Task ChatPanel_ConfirmNewSession_CallsResetSessionAsync()
     {
         SeedConnectedAgent("agent-1");
+        // #3211: the reset targets an explicit conversation, so the panel must have one to act on.
+        _store.SeedConversations("agent-1", [MakeConv("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Open confirmation dialog
         cut.Find(".new-chat-btn").Click();
@@ -166,7 +175,7 @@ public sealed class ProbeRound2ComponentTests : IDisposable
         var confirmBtn = cut.Find(".confirm-btn");
         await cut.InvokeAsync(() => confirmBtn.Click());
 
-        await _interaction.Received(1).ResetSessionAsync("agent-1");
+        await _interaction.Received(1).ResetSessionAsync("agent-1", "conv-1");
     }
 
     // ── ChatPanel: Cancelling new session dialog hides dialog without calling service ──
@@ -176,13 +185,13 @@ public sealed class ProbeRound2ComponentTests : IDisposable
     {
         SeedConnectedAgent("agent-1");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".new-chat-btn").Click();
         cut.Find(".cancel-btn").Click();
 
         Assert.Empty(cut.FindAll(".reset-confirm-overlay"));
-        await _interaction.DidNotReceive().ResetSessionAsync(Arg.Any<string>());
+        await _interaction.DidNotReceive().ResetSessionAsync(Arg.Any<string>(), Arg.Any<string>());
     }
 
     // ── MainLayout: Clicking conversation calls IAgentInteractionService.SelectConversationAsync ──
@@ -215,6 +224,10 @@ public sealed class ProbeRound2ComponentTests : IDisposable
         ctx.Services.AddSingleton(http);
         ctx.Services.AddSingleton(new ExtensionFeatureService(restClient));
         ctx.Services.AddSingleton(new CronApiClient(http));
+        ctx.Services.AddSingleton(new SectionsApiClient(http));
+        ctx.Services.AddSingleton(sp => new ConversationSectionsState(sp.GetRequiredService<SectionsApiClient>()));
+        ctx.Services.AddSingleton(new ToolsApiClient(http));
+        ctx.Services.AddStubNavOrderApiClient();
         ctx.Services.AddSingleton(Substitute.For<IUpdateStatusService>());
         var mockPrefs2 = Substitute.For<IPortalPreferencesService>(); mockPrefs2.Current.Returns(new PortalPreferences()); ctx.Services.AddSingleton(mockPrefs2);
         ctx.JSInterop.Mode = JSRuntimeMode.Loose;
@@ -223,7 +236,7 @@ public sealed class ProbeRound2ComponentTests : IDisposable
         store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Click Me", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        store.ActiveAgentId = "a-1";
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = ctx.Render<MainLayout>(p => p
             .Add(c => c.Body, (Microsoft.AspNetCore.Components.RenderFragment)(_ => { })));
@@ -256,10 +269,13 @@ public sealed class ProbeRound2ComponentTests : IDisposable
         _ctx.Services.AddSingleton(gatewayInfo);
         _ctx.Services.AddSingleton(new ExtensionFeatureService(restClient));
         _ctx.Services.AddSingleton(new CronApiClient(http));
+        _ctx.Services.AddSingleton(new SectionsApiClient(http));
+        _ctx.Services.AddSingleton(sp => new ConversationSectionsState(sp.GetRequiredService<SectionsApiClient>()));
+        _ctx.Services.AddSingleton(new ToolsApiClient(http));
 
         _store.SeedAgents([new AgentSummary("a-1", "Agent One")]);
         _store.SeedConversations("a-1", []);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = _ctx.Render<MainLayout>(p => p
             .Add(c => c.Body, (Microsoft.AspNetCore.Components.RenderFragment)(_ => { })));

@@ -12,6 +12,7 @@ using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Domain.World;
 using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Gateway.Sessions;
@@ -34,7 +35,7 @@ namespace BotNexus.Gateway.Sessions;
 /// </list>
 /// <para>Thread-safe via <see cref="SemaphoreSlim"/>. Suitable for single-instance deployments.</para>
 /// </remarks>
-public sealed class FileSessionStore : SessionStoreBase
+public sealed partial class FileSessionStore : SessionStoreBase
 {
     private static readonly ActivitySource ActivitySource = new("BotNexus.Gateway");
     private readonly string _storePath;
@@ -89,14 +90,26 @@ public sealed class FileSessionStore : SessionStoreBase
     /// <see cref="Session.ConversationId"/> defensively at save time.
     /// </param>
     /// <param name="redactor">When provided, secrets in content are redacted before storage.</param>
+    /// <param name="home">
+    /// The already-verified BotNexus home (#2836). When supplied, the store path must live inside it;
+    /// a path outside is refused rather than created. Optional so hosts that have not opted into
+    /// world identity behave exactly as before - the same inert-by-default posture the SQLite guard
+    /// takes.
+    /// </param>
     public FileSessionStore(
         string storePath,
         ILogger<FileSessionStore> logger,
         IFileSystem fileSystem,
         IConversationStore conversationStore,
-        ISecretRedactor? redactor = null)
+        ISecretRedactor? redactor = null,
+        IVerifiedHome? home = null)
         : base(conversationStore)
     {
+        // Ordered deliberately: the containment check runs BEFORE CreateDirectory, so a store path
+        // outside the verified home leaves no directory behind. A guard that throws after scaffolding
+        // has already written into the world it was refusing (#2836 AC5).
+        HomeScope.EnsureWithin(home, storePath);
+
         _storePath = storePath;
         _logger = logger;
         _fileSystem = fileSystem;
@@ -171,11 +184,155 @@ public sealed class FileSessionStore : SessionStoreBase
         await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            _cache[session.SessionId] = session;
-            await WriteToFileAsync(session, cancellationToken).ConfigureAwait(false);
+            await SaveUnderLockAsync(session, cancellationToken).ConfigureAwait(false);
         }
         finally { _lock.Release(); }
     }
+
+    /// <inheritdoc />
+    public override async Task<SessionSaveOutcome> SaveAsync(
+        GatewaySession session,
+        SessionWriteFence fence,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        await EnsureMigratedAsync(cancellationToken).ConfigureAwait(false);
+        // Match ordinary save's resolver ordering; never acquire the conversation resolver
+        // while holding the store lock just to prepare a candidate for persistence.
+        await EnsureConversationIdStampedAsync(session, cancellationToken).ConfigureAwait(false);
+
+        await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Cache state includes a reset that has already sealed its retained aggregate.
+            // On a cold store, read the durable aggregate under this same lock. Neither a
+            // regular save nor delete/archive may slip between this check and the write.
+            var current = _cache.GetValueOrDefault(fence.ExpectedSessionId)
+                ?? await LoadFromFileAsync(fence.ExpectedSessionId, cancellationToken).ConfigureAwait(false);
+            if (!SessionFenceEvaluator.Passes(fence, current))
+                return SessionSaveOutcome.Rebound;
+            if (fence.ExpectedContentFingerprint is { } expected &&
+                (current is null || SessionWriteFence.ContentFingerprint(current) != expected))
+                return SessionSaveOutcome.Conflict;
+
+            await SaveUnderLockAsync(session, cancellationToken).ConfigureAwait(false);
+            return SessionSaveOutcome.Persisted;
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public override async Task<SessionAppendMutationResult> AppendEntriesAsync(SessionId sessionId,
+        IReadOnlyList<SessionEntry> entries, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(entries);
+        await EnsureMigratedAsync(cancellationToken).ConfigureAwait(false);
+        await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var current = _cache.GetValueOrDefault(sessionId)
+                ?? await LoadFromFileAsync(sessionId, cancellationToken).ConfigureAwait(false);
+            if (current is null)
+                return new SessionAppendMutationResult(SessionMutationOutcome.NotFound, 0);
+            if (SessionMutationPolicy.IsTerminal(current.Status))
+                return new SessionAppendMutationResult(SessionMutationOutcome.Conflict, 0);
+            if (entries.Count > 0)
+            {
+                current.AddEntries(entries);
+                current.UpdatedAt = DateTimeOffset.UtcNow;
+                await SaveUnderLockAsync(current, cancellationToken).ConfigureAwait(false);
+            }
+            return new SessionAppendMutationResult(SessionMutationOutcome.Applied, entries.Count);
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public override async Task<SessionMetadataMutationResult> PatchMetadataAsync(SessionId sessionId,
+        IReadOnlyDictionary<string, object?> patch, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(patch);
+        await EnsureMigratedAsync(cancellationToken).ConfigureAwait(false);
+        await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var current = _cache.GetValueOrDefault(sessionId)
+                ?? await LoadFromFileAsync(sessionId, cancellationToken).ConfigureAwait(false);
+            if (current is null)
+                return SessionMetadataMutationResult.NotFound;
+            SessionMutationPolicy.ApplyMetadataPatch(current.Metadata, patch);
+            current.UpdatedAt = DateTimeOffset.UtcNow;
+            await SaveUnderLockAsync(current, cancellationToken).ConfigureAwait(false);
+            return new SessionMetadataMutationResult(SessionMutationOutcome.Applied,
+                new Dictionary<string, object?>(current.Metadata));
+        }
+        finally { _lock.Release(); }
+    }
+
+    // Both aggregate save overloads must hold _lock for the complete persistence operation.
+    private async Task SaveUnderLockAsync(GatewaySession session, CancellationToken cancellationToken)
+    {
+        await PersistSessionAsync(session, cancellationToken).ConfigureAwait(false);
+        _cache[session.SessionId] = session;
+    }
+
+    /// <inheritdoc />
+    public override async Task<SessionMutationOutcome> ExpireIfMatchesAsync(
+        SessionCleanupFence fence,
+        DateTimeOffset expiresAt,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureMigratedAsync(cancellationToken).ConfigureAwait(false);
+        await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var session = _cache.GetValueOrDefault(fence.SessionId)
+                ?? await LoadFromFileAsync(fence.SessionId, cancellationToken).ConfigureAwait(false);
+            if (session is null)
+                return SessionMutationOutcome.NotFound;
+            if (!MatchesCleanupFence(session, fence))
+                return SessionMutationOutcome.Conflict;
+
+            session.Status = SessionStatus.Expired;
+            session.ExpiresAt ??= expiresAt;
+            session.UpdatedAt = expiresAt;
+            _cache[fence.SessionId] = session;
+            await PersistSessionAsync(session, cancellationToken).ConfigureAwait(false);
+            return SessionMutationOutcome.Applied;
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public override async Task<SessionMutationOutcome> DeleteIfMatchesAsync(
+        SessionCleanupFence fence,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureMigratedAsync(cancellationToken).ConfigureAwait(false);
+        await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var session = _cache.GetValueOrDefault(fence.SessionId)
+                ?? await LoadFromFileAsync(fence.SessionId, cancellationToken).ConfigureAwait(false);
+            if (session is null)
+                return SessionMutationOutcome.NotFound;
+            if (!MatchesCleanupFence(session, fence))
+                return SessionMutationOutcome.Conflict;
+
+            _cache.Remove(fence.SessionId);
+            var historyPath = GetHistoryPath(fence.SessionId);
+            var metaPath = GetMetaPath(fence.SessionId);
+            if (_fileSystem.File.Exists(historyPath)) _fileSystem.File.Delete(historyPath);
+            if (_fileSystem.File.Exists(metaPath)) _fileSystem.File.Delete(metaPath);
+            return SessionMutationOutcome.Applied;
+        }
+        finally { _lock.Release(); }
+    }
+
+    private static bool MatchesCleanupFence(GatewaySession session, SessionCleanupFence fence) =>
+        session.ConversationId == fence.ConversationId
+        && session.Status == fence.ExpectedStatus
+        && session.UpdatedAt == fence.ExpectedUpdatedAt;
 
     /// <inheritdoc />
     public override async Task DeleteAsync(SessionId sessionId, CancellationToken cancellationToken = default)
@@ -198,6 +355,11 @@ public sealed class FileSessionStore : SessionStoreBase
     /// <inheritdoc />
     public override async Task ArchiveAsync(SessionId sessionId, CancellationToken cancellationToken = default)
     {
+        // #2903: stop and drain the run bound to this exact session before the files are moved out
+        // of normal lookup. Archiving under an in-flight turn otherwise leaves the run writing to a
+        // path the store no longer reads. Drained outside the store lock so the run can persist.
+        await DrainActiveRunForArchiveAsync(sessionId, cancellationToken).ConfigureAwait(false);
+
         await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -213,6 +375,120 @@ public sealed class FileSessionStore : SessionStoreBase
         }
         finally { _lock.Release(); }
     }
+
+    /// <inheritdoc />
+    public override async Task<SessionSummaryPage> ListSummaryPageAsync(
+        SessionSummaryQuery query, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (query.ConversationIds is { Count: 0 })
+            return SessionSummaryPage.Empty;
+
+        // Keep legacy recovery for ordinary list callers. Eligible search and metadata-only
+        // tool reads must never run migration, hydrate replay, or rewrite orphan sidecars.
+        if (query.ConversationIds is null && !query.MetadataOnly)
+            return await base.ListSummaryPageAsync(query, cancellationToken).ConfigureAwait(false);
+
+        await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var summaries = new List<SessionSummary>();
+            var agents = new Dictionary<ConversationId, AgentId>();
+            foreach (var metaPath in _fileSystem.Directory.GetFiles(_storePath, "*.meta.json"))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                // Deliberately deserialize only summary fields, not transcript or replay data.
+                var meta = query.MetadataOnly
+                    ? await ReadSummaryMetadataAsync(_fileSystem, metaPath, JsonOptions, cancellationToken).ConfigureAwait(false)
+                    : JsonSerializer.Deserialize<SessionSummaryMeta>(
+                        await _fileSystem.File.ReadAllTextAsync(metaPath, cancellationToken).ConfigureAwait(false), JsonOptions);
+                if (meta?.ConversationId is not { } conversationId
+                    || (query.ConversationIds is not null && !query.ConversationIds.Contains(conversationId))
+                    || (query.ConversationIdFilter is not null
+                        && !string.Equals(conversationId.Value, query.ConversationIdFilter, StringComparison.Ordinal))
+                    || meta.UpdatedAt < query.UpdatedAfter
+                    || (!query.IncludeInactive && meta.Status is not (SessionStatus.Active or SessionStatus.Suspended)))
+                    continue;
+
+                // Ownership is canonical on the conversation, never on a legacy sidecar.
+                // Resolve only after eligibility, with no orphan resolver or global list.
+                if (!agents.TryGetValue(conversationId, out var agentId))
+                {
+                    // Existing eligible search callers retain their original store contract.
+                    // Tool metadata-only reads explicitly require the fresh narrow projection.
+                    var owner = query.MetadataOnly
+                        ? (await _conversationStore.GetOwnershipAsync(conversationId, cancellationToken).ConfigureAwait(false))?.AgentId
+                        : (await _conversationStore.GetAsync(conversationId, cancellationToken).ConfigureAwait(false))?.AgentId;
+                    if (owner is null)
+                        continue;
+                    agentId = owner.Value;
+                    agents.Add(conversationId, agentId);
+                }
+                if (query.AgentId is not null && !string.Equals(agentId.Value, query.AgentId, StringComparison.Ordinal))
+                    continue;
+
+                var encodedId = Path.GetFileName(metaPath)[..^".meta.json".Length];
+                var sessionId = SessionId.From(Uri.UnescapeDataString(encodedId));
+                var sessionType = meta.SessionType ?? InferSessionType(sessionId, meta.ChannelType);
+                var interactive = sessionType.Equals(SessionType.UserAgent)
+                    && (!meta.ChannelType.HasValue
+                        || !string.Equals(meta.ChannelType.Value.Value, "cron", StringComparison.OrdinalIgnoreCase));
+                summaries.Add(new SessionSummary(sessionId.Value, agentId.Value, meta.ChannelType,
+                    meta.Status, sessionType, interactive, meta.MessageCount ?? -1, meta.CreatedAt, meta.UpdatedAt, conversationId.Value));
+            }
+
+            // Count matching metadata before windowing. Tool reads use the persisted count
+            // (unknown for legacy sidecars); ordinary eligible search retains exact history counts.
+            var page = SessionSummaryWindow.ApplyQuery(summaries, query);
+            var items = new List<SessionSummary>(page.Items.Count);
+            foreach (var summary in page.Items)
+            {
+                var count = query.MetadataOnly
+                    ? summary.MessageCount
+                    : await CountHistoryAsync(SessionId.From(summary.SessionId), cancellationToken).ConfigureAwait(false);
+                items.Add(summary with { MessageCount = count });
+            }
+            return page with { Items = items };
+        }
+        finally { _lock.Release(); }
+    }
+
+    private async Task<int> CountHistoryAsync(SessionId sessionId, CancellationToken cancellationToken)
+    {
+        var path = GetHistoryPath(sessionId);
+        if (!_fileSystem.File.Exists(path))
+            return 0;
+        await using var stream = _fileSystem.FileStream.New(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var reader = new StreamReader(stream);
+        var count = 0;
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+            try
+            {
+                // Match SessionJsonl's non-null, valid-entry count. Compaction marks entries
+                // historical but does not remove them from Session.MessageCount.
+                if (JsonSerializer.Deserialize<SessionEntry>(line, JsonOptions) is not null)
+                    count++;
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Skipping malformed session history JSONL entry");
+            }
+        }
+        return count;
+    }
+
+    private sealed record SessionSummaryMeta(
+        ConversationId? ConversationId,
+        ChannelKey? ChannelType,
+        SessionType? SessionType,
+        DateTimeOffset CreatedAt,
+        DateTimeOffset UpdatedAt,
+        SessionStatus Status = SessionStatus.Active,
+        int? MessageCount = null);
 
     protected override async Task<IReadOnlyList<GatewaySession>> EnumerateSessionsAsync(CancellationToken cancellationToken)
     {
@@ -465,7 +741,9 @@ public sealed class FileSessionStore : SessionStoreBase
             cancellationToken.ThrowIfCancellationRequested();
 
             var agentId = group.Key;
-            var legacy = await _legacyResolver.ResolveAsync(agentId, cancellationToken).ConfigureAwait(false);
+            var legacy = await _legacyResolver
+                .ResolveAsync(agentId, LegacyResolveReason.StartupMigration, cancellationToken)
+                .ConfigureAwait(false);
 
             // Bind first: pick the most-recently-updated Active orphan. Sealed/Suspended/
             // Expired orphans are not bound — they're history, not live work. The bind is
@@ -685,7 +963,11 @@ public sealed class FileSessionStore : SessionStoreBase
             // Phase 3a (#531): preserve every entry; collapse pre-Phase-3a multi-summary
             // state forward via SessionCompaction.ApplyLegacyHistoryProjection. The LLM-visible
             // filter (IsHistory + IsCrashSentinel) is applied downstream by the projector.
-            session.AddEntries(SessionCompaction.ApplyLegacyHistoryProjection(entries));
+            var projectedEntries = SessionCompaction.ApplyLegacyHistoryProjection(entries);
+            session.AddEntries(entries);
+            session.MarkCurrentHistoryPersisted();
+            if (!entries.SequenceEqual(projectedEntries))
+                session.ReplaceHistory(projectedEntries);
             session.UpdatedAt = meta.UpdatedAt;
         }
 
@@ -702,7 +984,9 @@ public sealed class FileSessionStore : SessionStoreBase
                     "unrecoverable orphan. Inspect the sidecar manually or delete it.");
             }
 
-            var legacy = await _legacyResolver.ResolveAsync(meta.AgentId.Value, cancellationToken).ConfigureAwait(false);
+            var legacy = await _legacyResolver
+                .ResolveAsync(meta.AgentId.Value, LegacyResolveReason.LoadTimeBackfill, cancellationToken)
+                .ConfigureAwait(false);
             session.ConversationId = legacy.ConversationId;
 
             if (session.Status == SessionStatus.Active)
@@ -736,7 +1020,9 @@ public sealed class FileSessionStore : SessionStoreBase
         if (session.ConversationId.IsInitialized())
             return;
 
-        var legacy = await _legacyResolver.ResolveAsync(session.AgentId, cancellationToken).ConfigureAwait(false);
+        var legacy = await _legacyResolver
+            .ResolveAsync(session.AgentId, LegacyResolveReason.SaveTimeStamp, cancellationToken)
+            .ConfigureAwait(false);
         session.ConversationId = legacy.ConversationId;
 
         // If this is the current active session, also bind it as the conversation's
@@ -752,8 +1038,48 @@ public sealed class FileSessionStore : SessionStoreBase
             session.SessionId, session.AgentId, legacy.ConversationId);
     }
 
+    private async Task PersistSessionAsync(GatewaySession session, CancellationToken cancellationToken)
+    {
+        if (await PersistWithReceiptsAsync(session, cancellationToken).ConfigureAwait(false)) return;
+        var historyPath = GetHistoryPath(session.SessionId);
+        var history = session.CaptureHistoryForPersistence();
+        if (history.RequiresReplacement)
+        {
+            await SessionJsonl.WriteAllAsync(
+                _fileSystem,
+                historyPath,
+                history.Entries,
+                JsonOptions,
+                cancellationToken).ConfigureAwait(false);
+        }
+        else if (history.Entries.Count > 0)
+        {
+            await SessionJsonl.AppendAsync(
+                _fileSystem,
+                historyPath,
+                history.Entries,
+                JsonOptions,
+                cancellationToken).ConfigureAwait(false);
+        }
+        else if (!_fileSystem.File.Exists(historyPath))
+        {
+            // Preserve the store contract that the first metadata-only save materializes both files,
+            // without serializing an already-persisted transcript merely to create an empty JSONL.
+            await SessionJsonl.AppendAsync(
+                _fileSystem,
+                historyPath,
+                Array.Empty<SessionEntry>(),
+                JsonOptions,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        session.AcknowledgeHistoryPersistence(history, new Dictionary<long, long>());
+        await WriteMetadataAsync(session, cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task WriteToFileAsync(GatewaySession session, CancellationToken cancellationToken)
     {
+        if (await PersistWithReceiptsAsync(session, cancellationToken).ConfigureAwait(false)) return;
         var historyPath = GetHistoryPath(session.SessionId);
         await SessionJsonl.WriteAllAsync(
             _fileSystem,
@@ -761,7 +1087,11 @@ public sealed class FileSessionStore : SessionStoreBase
             session.GetHistorySnapshot(),
             JsonOptions,
             cancellationToken).ConfigureAwait(false);
+        await WriteMetadataAsync(session, cancellationToken).ConfigureAwait(false);
+    }
 
+    private async Task WriteMetadataAsync(GatewaySession session, CancellationToken cancellationToken)
+    {
         var metaPath = GetMetaPath(session.SessionId);
         var meta = new SessionMeta(
             // P9-I (#674): never write AgentId on new sidecars. Agent ownership is hydrated
@@ -790,7 +1120,8 @@ public sealed class FileSessionStore : SessionStoreBase
             // Nullable<ConversationId>(HasValue=true, Value=default) and the Vogen STJ
             // converter would throw "uninitialized value object" at write time.
             session.ConversationId.IsInitialized() ? session.ConversationId : (ConversationId?)null,
-            session.Metadata.Count == 0 ? null : new Dictionary<string, object?>(session.Metadata));
+            session.Metadata.Count == 0 ? null : new Dictionary<string, object?>(session.Metadata),
+            session.MessageCount);
         await SessionMetadataSidecar.WriteAsync(
             _fileSystem,
             metaPath,
@@ -802,7 +1133,7 @@ public sealed class FileSessionStore : SessionStoreBase
     private string GetHistoryPath(SessionId sessionId) => Path.Combine(_storePath, SessionFileNames.HistoryFileName(sessionId.Value));
     private string GetMetaPath(SessionId sessionId) => Path.Combine(_storePath, SessionFileNames.MetadataFileName(sessionId.Value));
 
-    private sealed record SessionMeta(
+    internal sealed record SessionMeta(
         // P9-I (#674): AgentId is now NULLABLE. New writes ALWAYS pass null — durable
         // agent ownership lives on Conversation.AgentId post-P9-I and is hydrated on
         // load via Conversation.AgentId. The legacy field is retained for back-compat
@@ -827,5 +1158,6 @@ public sealed class FileSessionStore : SessionStoreBase
         // (OwnedByRequester validates RemoteSessionId via sourceWorldId/sourceAgentId stashed
         // here). Historically this record dropped Metadata entirely, silently breaking the receiver
         // after any gateway restart on a FileSessionStore-backed deployment.
-        Dictionary<string, object?>? Metadata = null);
+        Dictionary<string, object?>? Metadata = null,
+        int? MessageCount = null);
 }

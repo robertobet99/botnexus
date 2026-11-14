@@ -95,6 +95,23 @@ public sealed class GatewayRestClientTests
     }
 
     [Fact]
+    public async Task GetAllConversationsAsync_encodes_absolute_cutoff_and_preserves_unbounded_overload()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/conversations", "[]");
+        var cutoff = new DateTimeOffset(2026, 10, 27, 12, 34, 56, TimeSpan.FromHours(5.5));
+        await client.GetAllConversationsAsync(cutoff);
+        var uri = new Uri(handler.LastRequestUrl ?? throw new InvalidOperationException("No request"));
+        var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(uri.Query);
+        DateTimeOffset.Parse(query["activitySince"].ToString(), System.Globalization.CultureInfo.InvariantCulture)
+            .ShouldBe(cutoff);
+        query.Count.ShouldBe(1);
+        await client.GetAllConversationsAsync((DateTimeOffset?)null);
+        handler.LastRequestUrl.ShouldEndWith("/api/conversations?effectiveActivity=true");
+        await client.GetAllConversationsAsync(CancellationToken.None);
+        handler.LastRequestUrl.ShouldEndWith("/api/conversations");
+    }
+    [Fact]
     public async Task GetHistoryAsync_calls_correct_url_with_limit_and_offset()
     {
         var (client, handler) = CreateClient();
@@ -112,6 +129,38 @@ public sealed class GatewayRestClientTests
         handler.LastRequestUrl.ShouldContain("conv1/history");
         handler.LastRequestUrl.ShouldContain("limit=25");
         handler.LastRequestUrl.ShouldContain("offset=10");
+    }
+
+    [Fact]
+    public async Task ExportConversationAsync_adds_selected_range_to_query()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/conversations/conv1/export/markdown", "export");
+
+        await client.ExportConversationAsync(
+            "conv1",
+            new ConversationExportRequest("markdown", FirstEntryId: "session 1#1", LastEntryId: "session 1#3"));
+
+        var requestUri = new Uri(handler.LastRequestUrl);
+        requestUri.AbsolutePath.ShouldBe("/api/conversations/conv1/export/markdown");
+        var query = System.Web.HttpUtility.ParseQueryString(requestUri.Query);
+        query["firstEntryId"].ShouldBe("session 1#1");
+        query["lastEntryId"].ShouldBe("session 1#3");
+    }
+
+    [Fact]
+    public async Task ExportSessionAsync_calls_session_export_route()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/sessions/session-1/export/md", "export");
+
+        await client.ExportSessionAsync("session-1", new ConversationExportRequest("markdown"));
+
+        handler.LastRequestUrl.ShouldContain("/api/sessions/session-1/export/md?");
+        handler.LastRequestUrl.ShouldContain("includeTools=true");
+        handler.LastRequestUrl.ShouldContain("includeThinking=false");
+        handler.LastRequestUrl.ShouldContain("includeSystemMessages=false");
+        handler.LastRequestUrl.ShouldContain("redactSecrets=true");
     }
 
     [Fact]
@@ -137,6 +186,64 @@ public sealed class GatewayRestClientTests
         conv.ShouldNotBeNull();
         conv!.ConversationId.ShouldBe("conv1");
     }
+
+    [Fact]
+    public async Task AddConversationBindingAsync_posts_typed_request_to_binding_endpoint()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/conversations/conv1/bindings", BindingJson());
+
+        var binding = await client.AddConversationBindingAsync(
+            "conv1",
+            new AddConversationBindingRequestDto("telegram", "chat:42/thread:7", "Interactive", "Single", "Support"));
+
+        handler.LastRequestMethod.ShouldBe("POST");
+        handler.LastRequestUrl.ShouldContain("/api/conversations/conv1/bindings");
+        using var body = JsonDocument.Parse(handler.LastRequestBody);
+        body.RootElement.GetProperty("channelType").GetString().ShouldBe("telegram");
+        body.RootElement.GetProperty("channelAddress").GetString().ShouldBe("chat:42/thread:7");
+        body.RootElement.TryGetProperty("threadId", out _).ShouldBeFalse();
+        binding?.BindingId.ShouldBe("b1");
+    }
+
+    [Fact]
+    public async Task RemoveConversationBindingAsync_deletes_binding_endpoint()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/conversations/conv1/bindings/b1", "{}");
+
+        var removed = await client.RemoveConversationBindingAsync("conv1", "b1");
+
+        removed.ShouldBeTrue();
+        handler.LastRequestMethod.ShouldBe("DELETE");
+        handler.LastRequestUrl.ShouldContain("/api/conversations/conv1/bindings/b1");
+    }
+
+    [Fact]
+    public async Task MoveConversationBindingAsync_posts_target_conversation()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/conversations/conv1/bindings/b1/move", BindingJson());
+
+        var binding = await client.MoveConversationBindingAsync(
+            "conv1", "b1", new MoveConversationBindingRequestDto("conv2"));
+
+        handler.LastRequestMethod.ShouldBe("POST");
+        using var body = JsonDocument.Parse(handler.LastRequestBody);
+        body.RootElement.GetProperty("targetConversationId").GetString().ShouldBe("conv2");
+        binding?.BindingId.ShouldBe("b1");
+    }
+
+    private static string BindingJson() => JsonSerializer.Serialize(new
+    {
+        bindingId = "b1",
+        channelType = "telegram",
+        channelAddress = "chat:42/thread:7",
+        mode = "Interactive",
+        threadingMode = "Single",
+        displayPrefix = "Support",
+        boundAt = DateTimeOffset.UtcNow
+    });
 
     [Fact]
     public async Task ArchiveConversationAsync_calls_delete_conversation_endpoint()
@@ -346,6 +453,100 @@ public sealed class GatewayRestClientTests
         success.ShouldBeFalse();
     }
 
+    // ── GetSessionsAsync paging (#2499, #2532) ───────────────────────────────────
+
+    // #2532: the endpoint returns a page object carrying totalCount/hasMore, not a bare array.
+    // Only the stub payload shape changes here - every URL assertion below is untouched.
+    private const string EmptySessionArray = """{"sessions":[],"totalCount":0,"hasMore":false}""";
+
+    /// <summary>
+    /// Backwards compatibility: a caller that supplies neither limit nor offset must produce the
+    /// exact URL the client always produced, so the server default keeps applying unchanged.
+    /// </summary>
+    [Fact]
+    public async Task GetSessionsAsync_without_paging_args_emits_no_limit_or_offset()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/sessions", EmptySessionArray);
+
+        await client.GetSessionsAsync();
+
+        handler.LastRequestUrl.ShouldBe($"{BaseUrl}sessions");
+    }
+
+    /// <summary>
+    /// Backwards compatibility for the agent-filtered form: still a bare <c>?agentId=</c>.
+    /// </summary>
+    [Fact]
+    public async Task GetSessionsAsync_with_only_agentId_emits_agentId_alone()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/sessions", EmptySessionArray);
+
+        await client.GetSessionsAsync("a1");
+
+        handler.LastRequestUrl.ShouldBe($"{BaseUrl}sessions?agentId=a1");
+    }
+
+    /// <summary>
+    /// Paging arguments are forwarded as query-string args so a caller can walk the whole roster.
+    /// </summary>
+    [Fact]
+    public async Task GetSessionsAsync_forwards_limit_and_offset_as_query_args()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/sessions", EmptySessionArray);
+
+        await client.GetSessionsAsync("a1", limit: 200, offset: 400);
+
+        handler.LastRequestUrl.ShouldBe($"{BaseUrl}sessions?agentId=a1&limit=200&offset=400");
+    }
+
+    /// <summary>Paging works without an agent filter (the portal bootstrap's global sweep).</summary>
+    [Fact]
+    public async Task GetSessionsAsync_forwards_paging_without_agentId()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/sessions", EmptySessionArray);
+
+        await client.GetSessionsAsync(agentId: null, limit: 50, offset: 50);
+
+        handler.LastRequestUrl.ShouldBe($"{BaseUrl}sessions?limit=50&offset=50");
+    }
+
+    /// <summary>
+    /// The conversation filter (#2532 AC3) is forwarded so a conversation-scoped read never has to
+    /// pull the agent's whole session history.
+    /// </summary>
+    [Fact]
+    public async Task GetSessionsAsync_forwards_conversationId()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/sessions", EmptySessionArray);
+
+        await client.GetSessionsAsync("a1", limit: 200, offset: 0, conversationId: "c1");
+
+        handler.LastRequestUrl.ShouldBe($"{BaseUrl}sessions?agentId=a1&limit=200&conversationId=c1");
+    }
+
+    /// <summary>
+    /// The response's totalCount/hasMore are surfaced to the caller - they are the only valid
+    /// termination signal for a paging walk (#2532 AC5).
+    /// </summary>
+    [Fact]
+    public async Task GetSessionsAsync_surfaces_totalCount_and_hasMore()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse(
+            "/api/sessions",
+            """{"sessions":[],"totalCount":107,"hasMore":true}""");
+
+        var page = await client.GetSessionsAsync("a1", limit: 50, offset: 0);
+
+        page.TotalCount.ShouldBe(107);
+        page.HasMore.ShouldBeTrue();
+    }
+
     // ── WriteWorkspaceFileAsync ──────────────────────────────────────────────────
 
     [Fact]
@@ -381,34 +582,88 @@ public sealed class GatewayRestClientTests
 
         success.ShouldBeFalse();
     }
+    [Fact]
+    public async Task ExecuteCommandAsync_posts_to_the_command_pipeline_and_returns_the_result()
+    {
+        // #2873: this seam did not exist, so CommandsController was unreachable from the portal.
+        var (client, handler) = CreateClient();
+        handler.SetResponse("/api/commands/execute", JsonSerializer.Serialize(new
+        {
+            title = "Gateway Status",
+            body = "Uptime: 3h",
+            isError = false
+        }));
+
+        var result = await client.ExecuteCommandAsync(new CommandExecuteRequestDto("/status", "a1", "s1"));
+
+        handler.LastRequestUrl.ShouldContain("/api/commands/execute");
+        handler.LastRequestMethod.ShouldBe("POST");
+        result.ShouldNotBeNull();
+        result!.Title.ShouldBe("Gateway Status");
+        result.Body.ShouldBe("Uptime: 3h");
+        result.IsError.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task RenderPromptTemplateAsync_surfaces_safe_general_bad_request_error()
+    {
+        var (client, handler) = CreateClient();
+        handler.SetResponse(
+            "/api/prompt-templates/render?agentId=farnsworth",
+            """{"error":"The rendered prompt is too large."}""",
+            HttpStatusCode.BadRequest);
+
+        var result = await client.RenderPromptTemplateAsync(
+            "farnsworth", "daily", new Dictionary<string, string>());
+
+        result.RenderedPrompt.ShouldBeNull();
+        result.Errors.ShouldBeEmpty();
+        result.GeneralError.ShouldBe("The rendered prompt is too large.");
+    }
+
+    [Fact]
+    public async Task ExecuteCommandAsync_returns_null_on_a_non_success_status()
+    {
+        // Sad path: an unstubbed path yields 404. Must return null so the caller can render a
+        // visible error rather than falling through to the agent.
+        var (client, _) = CreateClient();
+
+        var result = await client.ExecuteCommandAsync(new CommandExecuteRequestDto("/status", "a1", "s1"));
+
+        result.ShouldBeNull();
+    }
 }
 
 /// <summary>Minimal HTTP handler for stubbing REST responses by URL path.</summary>
 internal sealed class MockHttpMessageHandler : HttpMessageHandler
 {
-    private readonly Dictionary<string, string> _responses = new();
+    private readonly Dictionary<string, (string Json, HttpStatusCode Status)> _responses = new();
     public string LastRequestUrl { get; private set; } = string.Empty;
     public string LastRequestMethod { get; private set; } = string.Empty;
+    public string LastRequestBody { get; private set; } = string.Empty;
 
-    public void SetResponse(string urlPath, string json)
-        => _responses[urlPath] = json;
+    public void SetResponse(string urlPath, string json, HttpStatusCode status = HttpStatusCode.OK)
+        => _responses[urlPath] = (json, status);
 
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         LastRequestUrl = request.RequestUri?.ToString() ?? string.Empty;
         LastRequestMethod = request.Method.Method;
+        LastRequestBody = request.Content is null
+            ? string.Empty
+            : await request.Content.ReadAsStringAsync(cancellationToken);
 
-        foreach (var (path, json) in _responses)
+        foreach (var (path, response) in _responses)
         {
             if (LastRequestUrl.Contains(path))
             {
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                return new HttpResponseMessage(response.Status)
                 {
-                    Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
-                });
+                    Content = new StringContent(response.Json, System.Text.Encoding.UTF8, "application/json")
+                };
             }
         }
 
-        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        return new HttpResponseMessage(HttpStatusCode.NotFound);
     }
 }

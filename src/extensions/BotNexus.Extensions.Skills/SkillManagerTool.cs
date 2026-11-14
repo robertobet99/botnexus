@@ -47,6 +47,9 @@ public sealed class SkillManagerTool(
     public string Name => "skill_manage";
     public string Label => "Skill Manager (Write)";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Returns locally generated skill-management confirmations.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     public Tool Definition => new(
         Name,
         "Create, edit, patch, and delete skills and their supporting files. Create a skill when a complex task succeeded, errors were overcome, a user-corrected approach worked, a non-trivial workflow was discovered, or the user asks to remember a procedure. Update a skill when its instructions are stale, wrong, or missing pitfalls. Prefer patch over a full edit. A good skill has trigger conditions, numbered steps, exact commands, pitfalls, and verification steps; put reusable content in support files under references/, templates/, scripts/, or assets/. Avoid one-off PR/issue/session-artifact skills. Ask before creating or deleting skills in the foreground unless the user explicitly requested it. Only available when skill management is enabled for this agent.",
@@ -66,7 +69,7 @@ public sealed class SkillManagerTool(
                 "scope": {
                   "type": "string",
                   "enum": ["agent", "workspace", "shared"],
-                  "description": "Where to manage the skill: 'agent' (default) - this agent's private skills; 'workspace' - the current workspace; 'shared' - the global all-agent skills directory (requires AllowSharedSkillManagement). Default is workspace. Existing skills are matched across all scopes regardless of this value."
+                  "description": "Where to manage the skill: 'agent' - this agent's private skills; 'workspace' - the current workspace; 'shared' - the global all-agent skills directory (requires AllowSharedSkillManagement). Omitting this argument resolves to workspace, which is the default. Existing skills are matched across all scopes regardless of this value."
                 },
                 "content": {
                   "type": "string",
@@ -124,16 +127,23 @@ public sealed class SkillManagerTool(
         if (!TryResolveScope(arguments, out var scope, out var scopeError))
             return Task.FromResult(Error(scopeError));
 
-        return action.ToLowerInvariant() switch
+        try
         {
-            "create" => Task.FromResult(CreateSkill(name, scope, arguments)),
-            "edit" => Task.FromResult(EditSkill(name, arguments)),
-            "patch" => Task.FromResult(PatchSkill(name, arguments)),
-            "delete" => Task.FromResult(DeleteSkill(name)),
-            "write_file" => Task.FromResult(WriteFile(name, arguments)),
-            "remove_file" => Task.FromResult(RemoveFile(name, arguments)),
-            _ => Task.FromResult(Error($"Unknown action: '{action}'. Valid: create, edit, patch, delete, write_file, remove_file."))
-        };
+            return action.ToLowerInvariant() switch
+            {
+                "create" => Task.FromResult(CreateSkill(name, scope, arguments)),
+                "edit" => Task.FromResult(EditSkill(name, arguments)),
+                "patch" => Task.FromResult(PatchSkill(name, arguments)),
+                "delete" => Task.FromResult(DeleteSkill(name)),
+                "write_file" => Task.FromResult(WriteFile(name, arguments)),
+                "remove_file" => Task.FromResult(RemoveFile(name, arguments)),
+                _ => Task.FromResult(Error($"Unknown action: '{action}'. Valid: create, edit, patch, delete, write_file, remove_file."))
+            };
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            return Task.FromResult(Error($"Skill operation failed: {ex.Message}"));
+        }
     }
 
     // ──────────────────────────── create ────────────────────────────────────
@@ -259,11 +269,13 @@ public sealed class SkillManagerTool(
         if (!IsAllowedFilePath(relPath, out var reason))
             return Error(reason);
 
-        var targetPath = Path.Combine(skillDir, relPath);
+        var candidatePath = Path.Combine(skillDir, relPath);
 
         // Validate symlink resolution stays within skill boundary
-        if (!SkillPathValidator.TryValidate(targetPath, skillDir, _fs, out targetPath, out var symlinkError))
+        if (!SkillPathValidator.TryValidate(candidatePath, SkillPath.CreateRoot(skillDir, _fs), _fs, out var validated, out var symlinkError))
             return Error(symlinkError!);
+
+        var targetPath = validated.Value;
 
         if (!_fs.File.Exists(targetPath))
             return Error($"File '{relPath}' not found in skill '{name}'.");
@@ -311,7 +323,8 @@ public sealed class SkillManagerTool(
         if (!config.AllowSkillDeletion)
             return Error("Skill deletion is not enabled for this agent (AllowSkillDeletion = false).");
 
-        var skillDir = FindSkillDir(name, out var source);
+        // Removing a linked installation must remove the link, never its repository target.
+        var skillDir = FindSkillDir(name, out var source, resolveRoot: false);
         if (skillDir is null)
             return Error($"Skill '{name}' not found.");
 
@@ -351,24 +364,30 @@ public sealed class SkillManagerTool(
         if (CheckSourceWritable(source) is { } gate)
             return gate;
 
-        var targetPath = Path.Combine(skillDir, relPath);
+        var candidatePath = Path.Combine(skillDir, relPath);
 
         // Validate symlink resolution stays within skill boundary
-        if (!SkillPathValidator.TryValidate(targetPath, skillDir, _fs, out targetPath, out var writeSymlinkError))
+        if (!SkillPathValidator.TryValidate(candidatePath, SkillPath.CreateRoot(skillDir, _fs), _fs, out var validatedWrite, out var writeSymlinkError))
             return Error(writeSymlinkError!);
+
+        var targetPath = validatedWrite.Value;
 
         // Ensure the supporting sub-directory exists
         var targetDir = Path.GetDirectoryName(targetPath);
         if (!string.IsNullOrEmpty(targetDir))
             _fs.Directory.CreateDirectory(targetDir);
 
+        var backup = _fs.File.Exists(targetPath) ? _fs.File.ReadAllText(targetPath) : null;
         _fs.File.WriteAllText(targetPath, content);
 
         // Security scan
         var scan = SkillSecurityScanner.ScanDirectory(skillDir, fileSystem: _fs);
         if (scan.Critical > 0)
         {
-            _fs.File.Delete(targetPath);
+            if (backup is null)
+                _fs.File.Delete(targetPath);
+            else
+                _fs.File.WriteAllText(targetPath, backup);
             return Error($"File write blocked: security scan found {scan.Critical} critical finding(s). Rolled back.\n{FormatFindings(scan)}");
         }
 
@@ -402,11 +421,13 @@ public sealed class SkillManagerTool(
         if (CheckSourceWritable(source) is { } gate)
             return gate;
 
-        var targetPath = Path.Combine(skillDir, relPath);
+        var candidatePath = Path.Combine(skillDir, relPath);
 
         // Validate symlink resolution stays within skill boundary
-        if (!SkillPathValidator.TryValidate(targetPath, skillDir, _fs, out targetPath, out var removeSymlinkError))
+        if (!SkillPathValidator.TryValidate(candidatePath, SkillPath.CreateRoot(skillDir, _fs), _fs, out var validatedRemove, out var removeSymlinkError))
             return Error(removeSymlinkError!);
+
+        var targetPath = validatedRemove.Value;
 
         if (!_fs.File.Exists(targetPath))
             return Error($"File '{relPath}' not found in skill '{name}'.");
@@ -433,10 +454,12 @@ public sealed class SkillManagerTool(
     };
 
     /// <summary>
-    /// Maps the optional scope argument to a <see cref="SkillSource"/>. Defaults to agent.
+    /// Maps the optional scope argument to a <see cref="SkillSource"/>. When the argument is
+    /// omitted or blank the resolved scope is <see cref="SkillSource.Workspace"/>, which
+    /// preserves historical behaviour; this is the single authoritative statement of the default.
     /// Returns false with an error message for an unrecognised scope.
     /// </summary>
-    private static bool TryResolveScope(IReadOnlyDictionary<string, object?> arguments, out SkillSource scope, out string error)
+    internal static bool TryResolveScope(IReadOnlyDictionary<string, object?> arguments, out SkillSource scope, out string error)
     {
         error = string.Empty;
         var raw = ReadString(arguments, "scope");
@@ -477,15 +500,25 @@ public sealed class SkillManagerTool(
         return null;
     }
 
+    /// <summary>
+    /// The shared-scope refusal. #3495 acceptance criterion 4: name the config source that was
+    /// READ, rather than asserting a value the operator can see is different in their own file.
+    /// The original message stated "AllowSharedSkillManagement = false" to operators who had set
+    /// it to true everywhere - the value was right and the BINDING was broken, so the message sent
+    /// them to re-edit config that was already correct.
+    /// </summary>
     private static string SharedGateMessage()
-        => "Shared (all-agent) skill management is not enabled (AllowSharedSkillManagement = false). Copy the skill to the agent or workspace scope first.";
+        => "Shared (all-agent) skill management is not enabled: AllowSharedSkillManagement resolved " +
+           $"to false from {SkillsExtensionJson.ConfigSourceDescription}. Set " +
+           "\"allowSharedSkillManagement\": true there (keys bind case-insensitively), or copy the " +
+           "skill to the agent or workspace scope first.";
 
     /// <summary>
     /// Finds the skill directory for the given skill name across workspace, agent, and global sources.
     /// Mirrors SkillDiscovery priority (workspace overrides agent overrides global). Global is included
     /// so shared skills are discoverable; write operations gate Global via AllowSharedSkillManagement.
     /// </summary>
-    private string? FindSkillDir(string name, out SkillSource source)
+    private string? FindSkillDir(string name, out SkillSource source, bool resolveRoot = true)
     {
         foreach (var (dir, src) in new[] {
             (workspaceSkillsDir, SkillSource.Workspace),
@@ -498,7 +531,9 @@ public sealed class SkillManagerTool(
             if (_fs.Directory.Exists(candidate) && _fs.File.Exists(Path.Combine(candidate, "SKILL.md")))
             {
                 source = src;
-                return candidate;
+                return resolveRoot && config.AllowSymlinkedSkills
+                    ? SkillInstallationValidator.ResolveRoot(candidate, _fs, allowSymlinkedSkills: true)
+                    : candidate;
             }
         }
 

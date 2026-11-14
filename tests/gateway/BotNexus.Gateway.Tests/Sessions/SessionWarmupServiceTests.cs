@@ -23,7 +23,7 @@ public sealed class SessionWarmupServiceTests
         await service.StartAsync(CancellationToken.None);
         var sessions = await service.GetAvailableSessionsAsync(CancellationToken.None);
 
-        store.Verify(value => value.ListSummariesAsync(It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()), Times.AtLeastOnce);
+        store.Verify(value => value.ListSummariesAsync(It.IsAny<DateTimeOffset>(), It.IsAny<int?>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.AtLeastOnce);
         store.Verify(value => value.ListAsync(It.IsAny<BotNexus.Domain.Primitives.AgentId?>(), It.IsAny<CancellationToken>()), Times.Never);
         sessions.Where(summary => summary.SessionId == "startup-1").ShouldHaveSingleItem();
     }
@@ -69,7 +69,7 @@ public sealed class SessionWarmupServiceTests
         var service = CreateService(store.Object, CreateRegistry("agent-a"), new SessionWarmupOptions());
 
         await service.StartAsync(CancellationToken.None);
-        var sessions = await service.GetAvailableSessionsAsync("agent-a", CancellationToken.None);
+        var sessions = await service.GetAvailableSessionsAsync(AgentId.From("agent-a"), CancellationToken.None);
 
         sessions.Select(summary => summary.SessionId).ShouldHaveSingleItem().ShouldBe("user-agent");
     }
@@ -88,7 +88,7 @@ public sealed class SessionWarmupServiceTests
         var service = CreateService(store.Object, CreateRegistry("agent-a"), new SessionWarmupOptions());
 
         await service.StartAsync(CancellationToken.None);
-        var visibleIds = (await service.GetAvailableSessionsAsync("agent-a", CancellationToken.None))
+        var visibleIds = (await service.GetAvailableSessionsAsync(AgentId.From("agent-a"), CancellationToken.None))
             .Select(summary => summary.SessionId)
             .ToList();
 
@@ -109,7 +109,7 @@ public sealed class SessionWarmupServiceTests
         var service = CreateService(store.Object, CreateRegistry("agent-a"), new SessionWarmupOptions());
 
         await service.StartAsync(CancellationToken.None);
-        var visibleIds = (await service.GetAvailableSessionsAsync("agent-a", CancellationToken.None))
+        var visibleIds = (await service.GetAvailableSessionsAsync(AgentId.From("agent-a"), CancellationToken.None))
             .Select(summary => summary.SessionId)
             .ToList();
 
@@ -128,7 +128,7 @@ public sealed class SessionWarmupServiceTests
         var service = CreateService(store.Object, CreateRegistry("agent-a"), new SessionWarmupOptions());
 
         await service.StartAsync(CancellationToken.None);
-        var sessions = await service.GetAvailableSessionsAsync("agent-a", CancellationToken.None);
+        var sessions = await service.GetAvailableSessionsAsync(AgentId.From("agent-a"), CancellationToken.None);
 
         sessions.Select(summary => summary.SessionId).ShouldHaveSingleItem().ShouldBe("active-new");
     }
@@ -144,7 +144,7 @@ public sealed class SessionWarmupServiceTests
         var service = CreateService(store.Object, CreateRegistry("agent-a"), new SessionWarmupOptions());
 
         await service.StartAsync(CancellationToken.None);
-        var sessions = await service.GetAvailableSessionsAsync("agent-a", CancellationToken.None);
+        var sessions = await service.GetAvailableSessionsAsync(AgentId.From("agent-a"), CancellationToken.None);
 
         sessions.Select(summary => summary.SessionId).ShouldHaveSingleItem().ShouldBe("sealed-newest");
     }
@@ -188,7 +188,7 @@ public sealed class SessionWarmupServiceTests
         });
 
         await service.StartAsync(CancellationToken.None);
-        var sessions = await service.GetAvailableSessionsAsync("agent-a", CancellationToken.None);
+        var sessions = await service.GetAvailableSessionsAsync(AgentId.From("agent-a"), CancellationToken.None);
 
         sessions.Select(summary => summary.SessionId).ShouldContain("telegram-older");
         sessions.Select(summary => summary.SessionId).ShouldContain("telegram-newer");
@@ -220,7 +220,7 @@ public sealed class SessionWarmupServiceTests
         var service = CreateService(store.Object, CreateRegistry("agent-a", "agent-b"), new SessionWarmupOptions());
 
         await service.StartAsync(CancellationToken.None);
-        var available = await service.GetAvailableSessionsAsync("agent-a", CancellationToken.None);
+        var available = await service.GetAvailableSessionsAsync(AgentId.From("agent-a"), CancellationToken.None);
 
         available.Where(summary => summary.SessionId == "agent-a-session").ShouldHaveSingleItem();
         available.ShouldAllBe(summary => summary.AgentId == "agent-a");
@@ -239,7 +239,7 @@ public sealed class SessionWarmupServiceTests
         var available = await service.GetAvailableSessionsAsync(CancellationToken.None);
 
         available.ShouldBeEmpty();
-        store.Verify(value => value.ListSummariesAsync(It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()), Times.Never);
+        store.Verify(value => value.ListSummariesAsync(It.IsAny<DateTimeOffset>(), It.IsAny<int?>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
         store.Verify(value => value.ListAsync(It.IsAny<BotNexus.Domain.Primitives.AgentId?>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
@@ -261,12 +261,14 @@ public sealed class SessionWarmupServiceTests
                 sessions.Where(session => !agentId.HasValue || session.AgentId == agentId.Value).ToList());
         // Warmup now reads through the transcript-free summary path. Mirror the real default
         // implementation (map + retention-window filter) so the mock stays faithful.
-        store.Setup(value => value.ListSummariesAsync(It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((DateTimeOffset updatedAfter, CancellationToken _) =>
-                (IReadOnlyList<SessionSummary>)sessions
-                    .Where(session => session.UpdatedAt >= updatedAfter)
-                    .Select(SessionSummary.FromSession)
-                    .ToList());
+        store.Setup(value => value.ListSummariesAsync(It.IsAny<DateTimeOffset>(), It.IsAny<int?>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((DateTimeOffset updatedAfter, int? limit, int offset, CancellationToken _) =>
+                SessionSummaryWindow.Apply(
+                    sessions
+                        .Where(session => session.UpdatedAt >= updatedAfter)
+                        .Select(SessionSummary.FromSession),
+                    limit,
+                    offset));
         return store;
     }
 

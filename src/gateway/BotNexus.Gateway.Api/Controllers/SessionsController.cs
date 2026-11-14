@@ -1,4 +1,5 @@
 using BotNexus.Gateway.Abstractions.Agents;
+using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Abstractions.Sessions;
@@ -7,12 +8,12 @@ using AgentId = BotNexus.Domain.Primitives.AgentId;
 using SessionId = BotNexus.Domain.Primitives.SessionId;
 using SessionType = BotNexus.Domain.Primitives.SessionType;
 using BotNexus.Gateway.Api;
+using BotNexus.Gateway.Api.Export;
+using BotNexus.Memory;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System.Globalization;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -34,6 +35,8 @@ public sealed class SessionsController : ControllerBase
     private readonly ILogger<SessionsController>? _logger;
     private readonly TranscriptExportOptions _transcriptExport;
     private readonly IAgentSupervisor? _supervisor;
+    private readonly IMemoryStoreFactory? _memoryStoreFactory;
+    private readonly IConversationStore? _conversations;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SessionsController"/> class.
@@ -44,13 +47,26 @@ public sealed class SessionsController : ControllerBase
     /// <param name="logger">Optional logger for swallowed sink faults.</param>
     /// <param name="transcriptExport">Transcript export options controlling render-time secret redaction; when null, redaction defaults off.</param>
     /// <param name="supervisor">Agent supervisor used to read the live rendered system prompt off an active handle for the debug inspector; optional so tests without a running gateway still resolve the controller.</param>
+    /// <param name="memoryStoreFactory">
+    /// Resolves the per-agent memory store so a session delete also removes that session's indexed
+    /// memory rows (#2956). Optional: memory is a configurable subsystem and the controller must
+    /// resolve without it.
+    /// </param>
+    /// <param name="conversations">
+    /// Conversation store used by the format-parameterised export route to attach the session's
+    /// parent conversation summary (#3278 acceptance criterion 4). Optional so test harnesses that
+    /// construct this controller directly keep resolving; when absent the export route returns 404
+    /// rather than silently emitting a transcript with no provenance header.
+    /// </param>
     public SessionsController(
         ISessionStore sessions,
         ISubAgentManager? subAgentManager = null,
         ISecurityEventSink? securityEvents = null,
         ILogger<SessionsController>? logger = null,
         IOptions<TranscriptExportOptions>? transcriptExport = null,
-        IAgentSupervisor? supervisor = null)
+        IAgentSupervisor? supervisor = null,
+        IMemoryStoreFactory? memoryStoreFactory = null,
+        IConversationStore? conversations = null)
     {
         _transcriptExport = transcriptExport?.Value ?? new TranscriptExportOptions();
         _sessions = sessions;
@@ -58,6 +74,8 @@ public sealed class SessionsController : ControllerBase
         _securityEvents = securityEvents;
         _logger = logger;
         _supervisor = supervisor;
+        _memoryStoreFactory = memoryStoreFactory;
+        _conversations = conversations;
     }
 
     /// <summary>Lists sessions, optionally filtered by agent ID.</summary>
@@ -70,41 +88,61 @@ public sealed class SessionsController : ControllerBase
     /// When <c>true</c>, includes sealed and expired sessions. When <c>false</c> (default),
     /// only active and suspended sessions are returned.
     /// </param>
+    /// <param name="offset">Zero-based offset into the newest-first <b>filtered</b> session list (default 0).</param>
+    /// <param name="limit">Maximum number of sessions to return (default 50, max 200).</param>
+    /// <param name="conversationId">When set, only sessions linked to this conversation are returned (#2532 AC3).</param>
     /// <returns>The list result.</returns>
     [HttpGet]
     public async Task<ActionResult> List(
         [FromQuery] string? agentId,
         [FromQuery] bool includeInactive = false,
+        [FromQuery] int offset = 0,
+        [FromQuery] int limit = 50,
+        [FromQuery] string? conversationId = null,
         CancellationToken cancellationToken = default)
     {
+        // #2411: this collection endpoint scales with session count, the one axis that grows
+        // without bound on a long-lived gateway. Validate and clamp exactly as the
+        // {sessionId}/history and {sessionId}/debug endpoints in this file already do.
+        if (offset < 0)
+            return BadRequest(new { error = "offset must be greater than or equal to zero." });
+
+        if (limit <= 0)
+            return BadRequest(new { error = "limit must be greater than zero." });
+
+        var boundedLimit = Math.Min(limit, 200);
+
         string? normalizedAgentId = null;
         if (!string.IsNullOrWhiteSpace(agentId))
             normalizedAgentId = AgentId.From(agentId).Value;
 
-        IReadOnlyList<SessionSummary> summaries;
+        SessionSummaryPage page;
         try
         {
-            // Use the transcript-free summary read so the portal sidebar never pays for
-            // hydrating every session's full transcript just to render metadata. The slow
-            // path (ListAsync -> EnumerateSessions) materialised the whole history table -
-            // seconds on a large DB. ListSummariesAsync derives MessageCount from a COUNT(*)
-            // aggregate (#1581 fixed warmup the same way; this closes the REST/portal gap).
-            // DateTimeOffset.MinValue keeps the historical "return every session" contract;
-            // agent/status filtering is applied below to preserve the previous behaviour.
-            summaries = await _sessions.ListSummariesAsync(DateTimeOffset.MinValue, cancellationToken);
+            // #2532: the agent and status filters are part of the STORE query, not applied to the
+            // page after it comes back. Filtering a page post-hoc put limit/offset in a different
+            // coordinate space from the rows the client received: a client advancing offset by the
+            // number of rows it got crept forward one row at a time and only terminated by walking
+            // the entire global session table (120+ requests observed in the wild). With the
+            // predicate in the store, offset addresses exactly the set the client is consuming.
+            //
+            // DateTimeOffset.MinValue keeps the historical "no time window" contract.
+            page = await _sessions.ListSummaryPageAsync(
+                new SessionSummaryQuery(
+                    DateTimeOffset.MinValue,
+                    normalizedAgentId,
+                    string.IsNullOrWhiteSpace(conversationId) ? null : conversationId,
+                    includeInactive,
+                    boundedLimit,
+                    offset),
+                cancellationToken);
         }
         catch (SessionStoreUnavailableException)
         {
             return StatusCode(StatusCodes.Status503ServiceUnavailable, new { error = "Session store temporarily unavailable. Please retry." });
         }
 
-        IEnumerable<SessionSummary> filtered = summaries;
-        if (normalizedAgentId is not null)
-            filtered = filtered.Where(s => string.Equals(s.AgentId, normalizedAgentId, StringComparison.Ordinal));
-        if (!includeInactive)
-            filtered = filtered.Where(s => s.Status is SessionStatus.Active or SessionStatus.Suspended);
-
-        var result = filtered.Select(s => new
+        var items = page.Items.Select(s => new
         {
             sessionId = s.SessionId,
             agentId = s.AgentId,
@@ -118,8 +156,19 @@ public sealed class SessionsController : ControllerBase
             messageCount = s.MessageCount,
             createdAt = s.CreatedAt,
             updatedAt = s.UpdatedAt
+        }).ToList();
+
+        // #2532 AC5: total/hasMore are the authoritative termination signal. Clients must not
+        // infer exhaustion from a short page - the server clamps limit to its own maximum, so
+        // "returned < requested" says nothing about whether more rows exist (#2499).
+        return Ok(new
+        {
+            sessions = items,
+            totalCount = page.TotalCount,
+            hasMore = page.HasMore,
+            offset,
+            limit = boundedLimit
         });
-        return Ok(result);
     }
 
     /// <summary>
@@ -165,16 +214,16 @@ public sealed class SessionsController : ControllerBase
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>The list sub agents result.</returns>
     [HttpGet("{sessionId}/subagents")]
-    [ProducesResponseType(typeof(IReadOnlyList<SubAgentInfo>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(IReadOnlyList<SubAgentRunDetail>), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<ActionResult<IReadOnlyList<SubAgentInfo>>> ListSubAgents(string sessionId, CancellationToken cancellationToken)
+    public async Task<ActionResult<IReadOnlyList<SubAgentRunDetail>>> ListSubAgents(string sessionId, CancellationToken cancellationToken)
     {
         var session = await _sessions.GetAsync(SessionId.From(sessionId), cancellationToken);
         if (session is null)
             return NotFound();
 
         var subAgents = await _subAgentManager.ListAsync(SessionId.From(sessionId), cancellationToken);
-        return Ok(subAgents);
+        return Ok(subAgents.Select(info => SubAgentRunDetail.FromLive(info)).ToArray());
     }
 
     /// <summary>
@@ -187,9 +236,9 @@ public sealed class SessionsController : ControllerBase
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>List of sub-agent session summaries.</returns>
     [HttpGet("{sessionId}/subagents/history")]
-    [ProducesResponseType(typeof(IReadOnlyList<SubAgentSessionSummary>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(IReadOnlyList<SubAgentRunDetail>), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<ActionResult<IReadOnlyList<SubAgentSessionSummary>>> GetSubAgentHistory(
+    public async Task<ActionResult<IReadOnlyList<SubAgentRunDetail>>> GetSubAgentHistory(
         string sessionId,
         CancellationToken cancellationToken)
     {
@@ -215,6 +264,11 @@ public sealed class SessionsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult> KillSubAgent(string sessionId, string subAgentId, CancellationToken cancellationToken)
     {
+        var clientWriteFailure = await ClientConversationWriteGuard.CheckSessionAsync(this, _conversations,
+            await _sessions.GetAsync(SessionId.From(sessionId), cancellationToken), cancellationToken: cancellationToken);
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var typedSessionId = SessionId.From(sessionId);
         var session = await _sessions.GetAsync(typedSessionId, cancellationToken);
         if (session is null)
@@ -271,7 +325,7 @@ public sealed class SessionsController : ControllerBase
 
         var totalCount = session.History.Count;
         var entries = session.GetHistorySnapshot(offset, boundedLimit);
-        return Ok(new SessionHistoryResponse(offset, boundedLimit, totalCount, entries));
+        return Ok(new SessionHistoryResponse(offset, boundedLimit, totalCount, entries, session.RunCompletion));
     }
 
     /// <summary>
@@ -296,6 +350,79 @@ public sealed class SessionsController : ControllerBase
 
         var bytes = System.Text.Encoding.UTF8.GetBytes(markdown);
         return File(bytes, "text/markdown", $"session-{sessionId}.md");
+    }
+
+    /// <summary>
+    /// Exports the session transcript in the requested format, including the parent conversation
+    /// summary when the session is linked to one (issue #3278).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the format-parameterised route that adds HTML output. The pre-existing
+    /// <c>{sessionId}/export/markdown</c> action above is deliberately left in place and unchanged:
+    /// it has a published byte-for-byte output contract gated on <see cref="TranscriptExportOptions"/>,
+    /// and MVC's literal-segment precedence means <c>markdown</c> continues to bind there rather than
+    /// to this route's <c>{format}</c> parameter. Existing callers therefore see no change at all,
+    /// while <c>html</c> falls through to here.
+    /// </para>
+    /// <para>
+    /// Redaction defaults to ON here, unlike the legacy route, because this route has no historical
+    /// output to preserve (#3278 acceptance criterion 5).
+    /// </para>
+    /// </remarks>
+    /// <param name="sessionId">Session identifier.</param>
+    /// <param name="format">Export format: <c>markdown</c> or <c>html</c>.</param>
+    /// <param name="firstEntryId">
+    /// Optional partial-range start: the entry id of the first included entry (issue #3279). Supply
+    /// with <paramref name="lastEntryId"/>; supplying one without the other is a 400.
+    /// </param>
+    /// <param name="lastEntryId">Optional partial-range end: the entry id of the last included entry.</param>
+    /// <param name="includeTools">Whether tool calls and results are included.</param>
+    /// <param name="includeThinking">Whether assistant reasoning is included.</param>
+    /// <param name="includeSystemMessages">Whether system messages and conversation instructions are included.</param>
+    /// <param name="redactSecrets">Whether recognised secrets are redacted before rendering.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The rendered transcript as a UTF-8 file download, 400 for an unknown format or an invalid range, or 404.</returns>
+    [HttpGet("{sessionId}/export/{format}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> ExportTranscript(
+        string sessionId,
+        string format,
+        [FromQuery] string? firstEntryId = null,
+        [FromQuery] string? lastEntryId = null,
+        [FromQuery] bool includeTools = true,
+        [FromQuery] bool includeThinking = false,
+        [FromQuery] bool includeSystemMessages = true,
+        [FromQuery] bool redactSecrets = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (!ExportFormat.TryParse(format, out var exportFormat))
+            return BadRequest(new { error = "format must be 'markdown' or 'html'." });
+
+        var (range, rangeError) = ExportRangeBinding.Bind(firstEntryId, lastEntryId);
+        if (rangeError is not null)
+            return BadRequest(rangeError);
+
+        if (_conversations is null)
+            return NotFound();
+
+        var assembler = new ExportDocumentAssembler(_conversations, _sessions);
+        var result = await assembler.AssembleSessionRangeAsync(
+            SessionId.From(sessionId), range, cancellationToken);
+
+        if (!result.IsSuccess || result.Document is null)
+            return ExportRangeBinding.ToActionResult(result, exportFormat, this);
+
+        var options = new ExportContentOptions(
+            includeTools,
+            includeThinking,
+            includeSystemMessages,
+            redactSecrets);
+        var filtered = ExportContentFilter.Apply(result.Document, options);
+
+        return ExportResponse.File(filtered, exportFormat, this, options.RedactSecrets);
     }
 
     /// <summary>
@@ -430,20 +557,30 @@ public sealed class SessionsController : ControllerBase
         if (authorizationFailure is not null)
             return authorizationFailure;
 
+        var clientWriteFailure = await ClientConversationWriteGuard.CheckSessionAsync(this, _conversations,
+            session, cancellationToken: cancellationToken);
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
+        var patch = new Dictionary<string, object?>();
         foreach (var property in metadataPatch.EnumerateObject())
         {
-            if (property.Value.ValueKind == JsonValueKind.Null)
-            {
-                session.Metadata.Remove(property.Name);
-                continue;
-            }
-
-            session.Metadata[property.Name] = ConvertJsonElement(property.Value);
+            // A JSON null means "remove this key"; the store's merge honours that convention.
+            patch[property.Name] = property.Value.ValueKind == JsonValueKind.Null
+                ? null
+                : ConvertJsonElement(property.Value);
         }
 
-        session.UpdatedAt = DateTimeOffset.UtcNow;
-        await _sessions.SaveAsync(session, cancellationToken);
-        return Ok(session.Metadata);
+        // #2132: patch through the narrow atomic mutation instead of read-mutate-SaveAsync. The
+        // whole-aggregate save would rewrite the transcript from the snapshot read above, silently
+        // discarding any turn the agent appended while this request was in flight.
+        var result = await _sessions.PatchMetadataAsync(SessionId.From(sessionId), patch, cancellationToken);
+        return result.Outcome switch
+        {
+            SessionMutationOutcome.NotFound => NotFound(),
+            SessionMutationOutcome.Conflict => Conflict(new { error = "Session metadata could not be updated because the session changed concurrently." }),
+            _ => Ok(result.Metadata)
+        };
     }
 
     private ObjectResult? AuthorizeSessionCaller(GatewaySession session)
@@ -482,7 +619,7 @@ public sealed class SessionsController : ControllerBase
                 "gateway.session.access.denied",
                 SecurityEventOutcome.Denied,
                 SecurityEventSeverity.Medium,
-                Actor: new SecurityEventActor(SecurityActorKind.Operator, HashActor(callerId)),
+                Actor: new SecurityEventActor(SecurityActorKind.Operator, ActorPseudonym.For(callerId)),
                 Target: new SecurityEventTarget(SecurityTargetKind.Session, sessionReference),
                 Policy: SecurityPolicyDecision.Deny,
                 Control: SecurityControlFamily.Authorization);
@@ -495,19 +632,6 @@ public sealed class SessionsController : ControllerBase
         }
     }
 
-    /// <summary>
-    /// Hashes a caller id to a short opaque hex token so security events carry a stable pseudonym
-    /// instead of the raw identity. SHA-256 truncated to 8 bytes is enough for correlation; it is
-    /// not reversible and never stores the plaintext.
-    /// </summary>
-    private static string HashActor(string id)
-    {
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(id ?? string.Empty));
-        var sb = new StringBuilder(16);
-        for (var i = 0; i < 8; i++)
-            sb.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
-        return sb.ToString();
-    }
 
     /// <summary>Deletes a session.</summary>
     /// <summary>
@@ -534,8 +658,59 @@ public sealed class SessionsController : ControllerBase
         if (authorizationFailure is not null)
             return authorizationFailure;
 
+        var clientWriteFailure = await ClientConversationWriteGuard.CheckSessionAsync(this, _conversations,
+            session, cancellationToken: cancellationToken);
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         await _sessions.DeleteAsync(sid, cancellationToken);
+
+        // #2956: the session row and its indexed memory rows are two stores that only ever
+        // diverged in one direction - memory indexing had an insert path and no delete path - so
+        // deleting a session used to be cosmetic and its content stayed searchable forever.
+        // Prune here, in the same operation, and only after authorization has passed.
+        await PruneSessionMemoryAsync(session.AgentId.Value, sid.Value, cancellationToken);
+
         return NoContent();
+    }
+
+    /// <summary>
+    /// Removes the deleted session's indexed memory rows (#2956).
+    /// </summary>
+    /// <remarks>
+    /// Best-effort by design: the session row is already gone by the time this runs, so failing the
+    /// request would report a delete that did in fact happen and would make the endpoint
+    /// non-idempotent on retry for a fault the caller cannot act on. The divergence is logged
+    /// instead, and the startup reconciliation pass converges it on the next restart.
+    /// </remarks>
+    private async Task PruneSessionMemoryAsync(string agentId, string sessionId, CancellationToken cancellationToken)
+    {
+        if (_memoryStoreFactory is null)
+            return;
+
+        try
+        {
+            // #2608: a reaped sub-agent workspace has no store; opening it is unrecoverable.
+            if (!_memoryStoreFactory.StoreLocationExists(AgentId.From(agentId)))
+                return;
+
+            var store = _memoryStoreFactory.Create(AgentId.From(agentId));
+            var pruned = await store.DeleteBySessionAsync(sessionId, cancellationToken);
+            if (pruned > 0)
+            {
+                _logger?.LogInformation(
+                    "Pruned {PrunedRows} memory row(s) for deleted session '{SessionId}'.",
+                    pruned,
+                    sessionId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(
+                ex,
+                "Failed to prune memory rows for deleted session '{SessionId}'; startup reconciliation will converge them.",
+                sessionId);
+        }
     }
 
     /// <summary>Suspends an active session.</summary>
@@ -557,13 +732,29 @@ public sealed class SessionsController : ControllerBase
         if (authorizationFailure is not null)
             return authorizationFailure;
 
+        var clientWriteFailure = await ClientConversationWriteGuard.CheckSessionAsync(this, _conversations,
+            session, cancellationToken: cancellationToken);
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         if (session.Status != SessionStatus.Active)
             return Conflict(new { error = $"Cannot suspend session in '{session.Status}' state." });
 
-        session.Status = SessionStatus.Suspended;
-        session.UpdatedAt = DateTimeOffset.UtcNow;
-        await _sessions.SaveAsync(session, cancellationToken);
-        return Ok(session);
+        // #2132: compare-and-set on the persisted status. The pre-check above is a fast, friendly
+        // rejection; this is the authoritative one, and it writes only the status column so a turn
+        // appended concurrently is not rolled back by a whole-aggregate save.
+        var transition = await _sessions.TransitionStatusAsync(
+            SessionId.From(sessionId),
+            [SessionStatus.Active],
+            SessionStatus.Suspended,
+            cancellationToken);
+
+        return transition.Outcome switch
+        {
+            SessionMutationOutcome.NotFound => NotFound(),
+            SessionMutationOutcome.Conflict => Conflict(new { error = $"Cannot suspend session in '{transition.Status}' state." }),
+            _ => Ok(await _sessions.GetAsync(SessionId.From(sessionId), cancellationToken))
+        };
     }
 
     /// <summary>Resumes a suspended session.</summary>
@@ -585,13 +776,27 @@ public sealed class SessionsController : ControllerBase
         if (authorizationFailure is not null)
             return authorizationFailure;
 
+        var clientWriteFailure = await ClientConversationWriteGuard.CheckSessionAsync(this, _conversations,
+            session, cancellationToken: cancellationToken);
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         if (session.Status != SessionStatus.Suspended)
             return Conflict(new { error = $"Cannot resume session in '{session.Status}' state." });
 
-        session.Status = SessionStatus.Active;
-        session.UpdatedAt = DateTimeOffset.UtcNow;
-        await _sessions.SaveAsync(session, cancellationToken);
-        return Ok(session);
+        // #2132: see Suspend - the authoritative check is the store-level compare-and-set.
+        var transition = await _sessions.TransitionStatusAsync(
+            SessionId.From(sessionId),
+            [SessionStatus.Suspended],
+            SessionStatus.Active,
+            cancellationToken);
+
+        return transition.Outcome switch
+        {
+            SessionMutationOutcome.NotFound => NotFound(),
+            SessionMutationOutcome.Conflict => Conflict(new { error = $"Cannot resume session in '{transition.Status}' state." }),
+            _ => Ok(await _sessions.GetAsync(SessionId.From(sessionId), cancellationToken))
+        };
     }
 
     /// <summary>Seals a completed sub-agent session to prevent reuse.</summary>
@@ -617,6 +822,11 @@ public sealed class SessionsController : ControllerBase
         if (authorizationFailure is not null)
             return authorizationFailure;
 
+        var clientWriteFailure = await ClientConversationWriteGuard.CheckSessionAsync(this, _conversations,
+            session, cancellationToken: cancellationToken);
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         // Phase 5 / F-6 step 2b (#555): sub-agent eligibility is driven by the
         // typed SessionType discriminator (persisted on the session row by
         // SqliteSessionStore / FileSessionStore; back-filled for legacy rows by
@@ -632,10 +842,21 @@ public sealed class SessionsController : ControllerBase
         if (session.Status == SessionStatus.Sealed)
             return NoContent();
 
-        session.Status = SessionStatus.Sealed;
-        session.UpdatedAt = DateTimeOffset.UtcNow;
-        await _sessions.SaveAsync(session, cancellationToken);
-        return Ok(new { sessionId = sid.Value, status = "Sealed", updatedAt = session.UpdatedAt });
+        // #2132: seal via compare-and-set so a concurrent transcript append is not rolled back and
+        // a competing seal/reset is reported rather than overwritten.
+        var transition = await _sessions.TransitionStatusAsync(
+            sid,
+            [SessionStatus.Expired],
+            SessionStatus.Sealed,
+            cancellationToken);
+
+        return transition.Outcome switch
+        {
+            SessionMutationOutcome.NotFound => NotFound(),
+            SessionMutationOutcome.Conflict when transition.Status == SessionStatus.Sealed => NoContent(),
+            SessionMutationOutcome.Conflict => Conflict(new { error = $"Cannot seal session in '{transition.Status}' state." }),
+            _ => Ok(new { sessionId = sid.Value, status = "Sealed", updatedAt = transition.UpdatedAt })
+        };
     }
 
     private static object? ConvertJsonElement(JsonElement element)
@@ -702,9 +923,14 @@ public sealed class SessionsController : ControllerBase
         /// </summary>
         /// <param name="subAgentId">The sub agent id.</param>
         /// <param name="resultSummary">The result summary.</param>
+        /// <param name="outcome">The measured tool/provider outcome of the run (#3565).</param>
         /// <param name="ct">The ct.</param>
         /// <returns>The on completed async result.</returns>
-        public Task OnCompletedAsync(string subAgentId, string resultSummary, CancellationToken ct = default)
+        public Task OnCompletedAsync(
+            string subAgentId,
+            string resultSummary,
+            SubAgentRunOutcome? outcome = null,
+            CancellationToken ct = default)
             => Task.CompletedTask;
     }
 }

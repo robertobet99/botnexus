@@ -1,8 +1,11 @@
 @inject IJSRuntime JS
 @inject IClientStateStore Store
 @inject IAgentInteractionService Interaction
+@inject IGatewayRestClient Rest
 @inject IPortalPreferencesService Prefs
 @inject ISlashCommandDispatcher CommandDispatcher
+@inject IServiceProvider ServiceProvider
+@inject NavigationManager Nav
 @implements IDisposable
 @using System.Text.Json
 @using System.Text.Encodings.Web
@@ -28,11 +31,11 @@
                         {
                             @if (IsReadOnly)
                             {
-                                <h3 class="conversation-title" title="@ActiveConversationId">@ActiveConversationTitle</h3>
+                                <h3 class="conversation-title" title="@DisplayedConversationId">@PortalText.SingleLine(ActiveConversationTitle)</h3>
                             }
                             else
                             {
-                                <h3 class="conversation-title editable" @onclick="StartEditTitle" title="@($"{ActiveConversationId} - click to rename")">@ActiveConversationTitle</h3>
+                                <h3 class="conversation-title editable" @onclick="StartEditTitle" title="@($"{DisplayedConversationId} - click to rename")">@PortalText.SingleLine(ActiveConversationTitle)</h3>
                             }
                             @if (ActiveConversation?.IsDefault == true)
                             {
@@ -42,7 +45,7 @@
                     }
                     else
                     {
-                        <h3>@DisplayName</h3>
+                        <h3 class="conversation-title">@PortalText.SingleLine(DisplayName)</h3>
                     }
                 </div>
             </div>
@@ -55,41 +58,37 @@
         <div class="chat-header-actions">
             <button class="toggle-btn @(!ShowThinking ? "toggled-off" : "")" data-testid="chat-thinking-toggle"
                     @onclick="ToggleThinking" title="Toggle thinking visibility">
-                💭
+                <Icon Name="thinking" Size="16" />
             </button>
             <button class="toggle-btn @(!ShowTools ? "toggled-off" : "")" data-testid="chat-tools-toggle"
                     @onclick="ToggleTools" title="Toggle tool visibility">
-                🔧
+                <Icon Name="tools" Size="16" />
             </button>
-            @if (CanManageActiveConversation)
+            @if (HasActiveConversation)
             {
-                <button class="conversation-header-action @(ActiveConversation?.IsPinned == true ? "pinned" : "")"
-                        data-testid="chat-pin-conversation-btn"
-                        title="@(ActiveConversation?.IsPinned == true ? "Unpin conversation" : "Pin conversation to top")"
-                        aria-label="@(ActiveConversation?.IsPinned == true ? "Unpin conversation" : "Pin conversation to top")"
-                        aria-pressed="@(ActiveConversation?.IsPinned == true ? "true" : "false")"
-                        @onclick="ToggleActiveConversationPinAsync">
-                    &#x1F4CC;
-                </button>
-                <button class="conversation-header-action archive"
-                        data-testid="chat-archive-conversation-btn"
-                        title="Archive conversation"
-                        aria-label="Archive conversation"
-                        @onclick="ArchiveActiveConversationAsync">
-                    &#x1F5D1;&#xFE0F;
+                <button class="conversation-header-action"
+                        data-testid="chat-export-btn"
+                        title="Export conversation"
+                        aria-label="Export conversation"
+                        @onclick="OpenExportDialog">
+                    <Icon Name="save" Size="16" Class="bn-icon-inherit" />
                 </button>
             }
             <button class="config-btn" data-testid="chat-config-btn" @onclick="OpenConfig" title="Agent configuration">
-                ⚙
+                <Icon Name="configuration" Size="16" Class="bn-icon-inherit" />
             </button>
             @if (!IsReadOnly)
             {
                 <button class="new-chat-btn" data-testid="chat-new-session-btn" @onclick="ConfirmNewSession" title="Start a new session in this conversation"
                         disabled="@IsStreaming">
-                    ↺ New session
+                    <Icon Name="refresh" Size="14" Class="bn-icon-inherit" /> New session
                 </button>
             }
         </div>
+        @if (HasActiveConversation)
+        {
+            <ConversationActionMenu Actions="@BuildActiveConversationActions()" />
+        }
         <div class="chat-header-overflow">
             <button class="chat-header-overflow-trigger"
                     @onclick="ToggleMobileActionsMenu"
@@ -104,31 +103,15 @@
                     <button class="toggle-btn @(!ShowThinking ? "toggled-off" : "")"
                             @onclick="ToggleThinkingFromMenu"
                             title="Toggle thinking visibility">
-                        💭
+                        <Icon Name="thinking" Size="16" />
                     </button>
                     <button class="toggle-btn @(!ShowTools ? "toggled-off" : "")"
                             @onclick="ToggleToolsFromMenu"
                             title="Toggle tool visibility">
-                        🔧
+                        <Icon Name="tools" Size="16" />
                     </button>
-                    @if (CanManageActiveConversation)
-                    {
-                        <button class="conversation-header-action @(ActiveConversation?.IsPinned == true ? "pinned" : "")"
-                                title="@(ActiveConversation?.IsPinned == true ? "Unpin conversation" : "Pin conversation to top")"
-                                aria-label="@(ActiveConversation?.IsPinned == true ? "Unpin conversation" : "Pin conversation to top")"
-                                aria-pressed="@(ActiveConversation?.IsPinned == true ? "true" : "false")"
-                                @onclick="ToggleActiveConversationPinFromMenuAsync">
-                            &#x1F4CC;
-                        </button>
-                        <button class="conversation-header-action archive"
-                                title="Archive conversation"
-                                aria-label="Archive conversation"
-                                @onclick="ArchiveActiveConversationFromMenuAsync">
-                            &#x1F5D1;&#xFE0F;
-                        </button>
-                    }
                     <button class="config-btn" @onclick="OpenConfigFromMenu" title="Agent configuration">
-                        ⚙
+                        <Icon Name="configuration" Size="16" Class="bn-icon-inherit" />
                     </button>
                     @if (!IsReadOnly)
                     {
@@ -136,7 +119,7 @@
                                 @onclick="ConfirmNewSessionFromMenu"
                                 title="Start a new session in this conversation"
                                 disabled="@IsStreaming">
-                            ↺ New session
+                            <Icon Name="refresh" Size="14" Class="bn-icon-inherit" /> New session
                         </button>
                     }
                 </div>
@@ -144,9 +127,63 @@
         </div>
         @if (!IsReadOnly)
         {
-            <SessionControls AgentId="@AgentId" />
+            <SessionControls AgentId="@AgentId" ConversationId="@DisplayedConversationId" />
         }
     </header>
+
+    @if (_showExportDialog)
+    {
+        <div class="reset-confirm-overlay" @onclick="CloseExportDialog">
+            <div class="reset-confirm-dialog export-dialog" role="dialog" aria-modal="true" aria-label="Export conversation"
+                 data-testid="export-dialog" @onclick:stopPropagation="true">
+                <h3>Export conversation</h3>
+                <label>Scope
+                    <select value="@_exportScope" @onchange="ChangeExportScope" data-testid="export-scope">
+                        <option value="conversation">Whole conversation</option>
+                        <option value="session">Current active session</option>
+                        <option value="selected">Selected messages</option>
+                    </select>
+                </label>
+                @if (_exportScope == "selected")
+                {
+                    <div class="export-message-list" aria-label="Messages available for export">
+                        @foreach (var item in SelectableExportMessages)
+                        {
+                            <button type="button"
+                                    class="export-message-selector @(IsExportMessageSelected(item.Index) ? "selected" : null)"
+                                    data-testid="export-message-selector"
+                                    aria-pressed="@(IsExportMessageSelected(item.Index) ? "true" : "false")"
+                                    @onclick="() => SelectExportMessage(item.Index)">
+                                <strong>@AuthorLabel(item.Message.Role)</strong>
+                                <span>@ExportMessageSummary(item.Message)</span>
+                            </button>
+                        }
+                    </div>
+                }
+                <label>Format
+                    <select @bind="_exportFormat" data-testid="export-format">
+                        <option value="markdown">Markdown</option>
+                        <option value="html">HTML</option>
+                    </select>
+                </label>
+                <label><input type="checkbox" @bind="_exportIncludeTools" data-testid="export-include-tools" /> Include tool calls and results</label>
+                <label><input type="checkbox" @bind="_exportIncludeThinking" data-testid="export-include-thinking" /> Include thinking</label>
+                <label><input type="checkbox" @bind="_exportIncludeSystem" data-testid="export-include-system" /> Include system messages and conversation instructions</label>
+                <label><input type="checkbox" @bind="_exportRedactSecrets" data-testid="export-redact-secrets" /> Redact recognised secrets (privacy control)</label>
+                <p class="text-muted" data-testid="export-preview">@ExportPreview</p>
+                @if (_exportError is not null)
+                {
+                    <p role="alert" data-testid="export-error">@_exportError</p>
+                }
+                <div class="reset-confirm-actions">
+                    <button class="cancel-btn" data-testid="export-cancel-btn" @onclick="CloseExportDialog">Cancel</button>
+                    <button class="confirm-btn" data-testid="export-download-btn" @onclick="DownloadExportAsync" disabled="@(_exportBusy || !CanDownloadExport)">
+                        @(_exportBusy ? "Exporting…" : "Download")
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
 
     @if (_showNewSessionConfirm)
     {
@@ -178,7 +215,7 @@
                     <button class="tool-modal-close" type="button"
                             data-testid="tool-modal-close"
                             title="Close" aria-label="Close"
-                            @onclick="CloseToolModal">&#x2715;</button>
+                            @onclick="CloseToolModal"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button>
                 </div>
                 <pre class="tool-modal-content" data-testid="tool-modal-content">@_toolModalDecoded</pre>
             </div>
@@ -187,9 +224,12 @@
 
     @if (IsReadOnly)
     {
-        <div class="read-only-banner" role="status" aria-label="Read-only sub-agent session view">
-            <span class="read-only-badge">🔍 Sub-agent session</span>
-            <span class="read-only-status @(IsStreaming ? "" : "completed")">@GetSubAgentStatus()</span>
+        var observerStatus = ReadOnlyStatus;
+        <div class="read-only-banner" role="status" aria-label="Read-only conversation view">
+            <span class="read-only-badge"><Icon Name="visibility" Size="14" Class="bn-icon-inherit" /> @ReadOnlyOriginLabel</span>
+            <span class="read-only-status @observerStatus.CssClass">
+                <Icon Name="@observerStatus.Icon" Size="13" Class="@observerStatus.IconClass" /><text> @observerStatus.Label</text>
+            </span>
             <span class="read-only-label">Read-only — you can observe but not interact</span>
         </div>
     }
@@ -239,6 +279,23 @@
             </div>
         }
 
+        @if (HasFoldedHistory)
+        {
+            @* #2936: pre-compaction rows are part of the transcript and are now returned by the
+               history endpoint, but they are not live context. They render collapsed behind this
+               toggle so scrolling up reaches them without them reading as ordinary recent turns. *@
+            <div class="folded-history-toggle" data-testid="folded-history-toggle">
+                <button class="load-more-btn"
+                        type="button"
+                        data-testid="folded-history-toggle-btn"
+                        aria-expanded="@(_showFoldedHistory ? "true" : "false")"
+                        @onclick="ToggleFoldedHistory">
+                    @(_showFoldedHistory
+                        ? $"Hide {FoldedHistoryCount} pre-compaction messages"
+                        : $"Show {FoldedHistoryCount} pre-compaction messages")
+                </button>
+            </div>
+        }
         @foreach (var msg in Messages)
         {
             @* Keyed wrapper: forces Blazor to diff message subtrees by identity, not list
@@ -247,7 +304,10 @@
                causes positional diffing to retarget retained text nodes onto the wrong logical
                message, duplicating streamed fragments in the DOM (garbled live messages that
                render fine on reload-from-store). display:contents keeps layout unchanged. *@
-            <div @key="msg.Id" style="display:contents">
+            <div @key="msg.Id"
+                 style="@(msg.IsFolded && !_showFoldedHistory ? "display:none" : "display:contents")"
+                 class="@(msg.IsFolded ? "folded-history-entry" : null)"
+                 data-folded="@(msg.IsFolded ? "true" : null)">
             @if (msg.IsBoundary)
             {
                 <div class="session-boundary" role="separator" aria-label="Session boundary">
@@ -273,7 +333,20 @@
                 <div class="message tool @(msg.ToolIsError == true ? "tool-error" : "") @(_expandedTools.Contains(msg.Id) ? "expanded" : "") @(!ShowTools ? "visibility-hidden" : "")"
                      style="@(!ShowTools ? "display:none" : "")">
                     <div class="tool-header" @onclick="() => ToggleToolDetails(msg.Id)">
-                        <span class="tool-icon">@(msg.ToolResult is null ? "⏳" : (msg.ToolIsError == true ? "❌" : "✅"))</span>
+                        <span class="tool-icon">
+                            @if (msg.ToolResult is null)
+                            {
+                                <Icon Name="running" Size="14" Class="bn-icon-inherit bn-icon-spin" />
+                            }
+                            else if (msg.ToolIsError == true)
+                            {
+                                <Icon Name="error" Size="14" />
+                            }
+                            else
+                            {
+                                <Icon Name="check" Size="14" />
+                            }
+                        </span>
                         <span class="tool-name">@ToolDescriptionFormatter.FormatDescription(msg.ToolName ?? "tool", msg.ToolArgs)</span>
                         @if (msg.ToolDuration is not null)
                         {
@@ -302,7 +375,14 @@
                                                 title="@(_copiedSectionId == $"{msg.Id}-args" ? "Copied!" : "Copy arguments")"
                                                 aria-label="@(_copiedSectionId == $"{msg.Id}-args" ? "Copied!" : "Copy arguments")"
                                                 @onclick="() => CopyToolSection(msg.Id, CopySectionArgs, msg.ToolArgs)">
-                                            @(_copiedSectionId == $"{msg.Id}-args" ? "✓" : "📋")
+                                            @if (_copiedSectionId == $"{msg.Id}-args")
+                                            {
+                                                <Icon Name="check" Size="13" />
+                                            }
+                                            else
+                                            {
+                                                <Icon Name="copy" Size="13" Class="bn-icon-inherit" />
+                                            }
                                         </button>
                                     </div>
                                     <pre class="tool-content">@msg.ToolArgs</pre>
@@ -326,7 +406,14 @@
                                                 title="@(_copiedSectionId == $"{msg.Id}-result" ? "Copied!" : "Copy result")"
                                                 aria-label="@(_copiedSectionId == $"{msg.Id}-result" ? "Copied!" : "Copy result")"
                                                 @onclick="() => CopyToolSection(msg.Id, CopySectionResult, msg.ToolResult)">
-                                            @(_copiedSectionId == $"{msg.Id}-result" ? "✓" : "📋")
+                                            @if (_copiedSectionId == $"{msg.Id}-result")
+                                            {
+                                                <Icon Name="check" Size="13" />
+                                            }
+                                            else
+                                            {
+                                                <Icon Name="copy" Size="13" Class="bn-icon-inherit" />
+                                            }
                                         </button>
                                     </div>
                                     <pre class="tool-content">@msg.ToolResult</pre>
@@ -343,7 +430,7 @@
                     <div class="thinking-block @(!ShowThinking ? "visibility-hidden" : "")"
                          style="@(!ShowThinking ? "display:none" : "")">
                         <details open>
-                            <summary class="thinking-summary">💭 Thinking…</summary>
+                            <summary class="thinking-summary"><Icon Name="thinking" Size="14" /> Thinking…</summary>
                             <div class="thinking-content">@msg.ThinkingContent</div>
                         </details>
                     </div>
@@ -353,9 +440,10 @@
                 {
                 <div class="message @msg.CssClass"
                      data-testid="message"
-                     data-message-role="@msg.Role">
+                     data-message-role="@msg.Role"
+                     data-author="@AuthorLabel(msg.Role)">
                     <div class="message-header">
-                        <span class="message-role">@msg.Role</span>
+                        <span class="message-role">@AuthorLabel(msg.Role)</span>
                         <div class="message-meta">
                             <span class="message-time">@FormatTimestamp(msg.Timestamp)</span>
                             @if (msg.Role == "Assistant" && !string.IsNullOrWhiteSpace(msg.Content))
@@ -365,7 +453,14 @@
                                         title="@(_copiedMessageId == msg.Id ? "Copied!" : "Copy message")"
                                         aria-label="@(_copiedMessageId == msg.Id ? "Copied!" : "Copy message")"
                                         @onclick="() => CopyMessage(msg.Id, msg.Content)">
-                                    @(_copiedMessageId == msg.Id ? "✓" : "📋")
+                                    @if (_copiedMessageId == msg.Id)
+                                    {
+                                        <Icon Name="check" Size="13" />
+                                    }
+                                    else
+                                    {
+                                        <Icon Name="copy" Size="13" Class="bn-icon-inherit" />
+                                    }
                                 </button>
                             }
                         </div>
@@ -398,6 +493,7 @@
                     {
                         <div class="message-content">@msg.Content</div>
                     }
+                    <AttachmentList Attachments="@msg.Attachments" />
                 </div>
                 }
             }
@@ -409,7 +505,7 @@
             <div class="thinking-block live @(!ShowThinking ? "visibility-hidden" : "")"
                  style="@(!ShowThinking ? "display:none" : "")">
                 <details open>
-                    <summary class="thinking-summary">💭 Thinking… <span class="streaming-indicator">●</span></summary>
+                    <summary class="thinking-summary"><Icon Name="thinking" Size="14" /> Thinking… <span class="streaming-indicator">●</span></summary>
                     <div class="thinking-content">@ThinkingBuffer</div>
                 </details>
             </div>
@@ -420,9 +516,10 @@
             <div class="message assistant streaming"
                  @key="@("__streaming__")"
                  data-testid="streaming-message"
-                 data-message-role="Assistant">
+                 data-message-role="Assistant"
+                 data-author="@AuthorLabel("Assistant")">
                 <div class="message-header">
-                    <span class="message-role">Assistant</span>
+                    <span class="message-role">@AuthorLabel("Assistant")</span>
                     <span class="message-time">now</span>
                 </div>
                 <div class="message-content">@CurrentStreamBuffer</div>
@@ -431,7 +528,7 @@
         }
     </div>
 
-    <SteeringQueuePanel ConversationId="@ActiveConversationId" />
+    <SteeringQueuePanel ConversationId="@DisplayedConversationId" />
 
     @if (_showCommandPalette)
     {
@@ -451,18 +548,28 @@
     {
         <div class="chat-input-area ask-user-input-area">
             <AskUserPrompt Prompt="PendingAskUserPrompt"
-                           ErrorMessage="_askUserError"
+                           ErrorMessage="@_askUserError"
                            OnSubmit="HandleAskUserSubmit"
                            OnTimeout="HandleAskUserTimeout" />
         </div>
     }
     else
     {
-        <div class="chat-input-area">
+        <div class="chat-input-area @(IsStreaming ? "composer-active" : null) @(!AnimateActiveRunIndicator ? "composer-motion-disabled" : null)"
+             data-testid="chat-composer"
+             aria-busy="@(IsStreaming ? "true" : "false")">
             @if (!IsReadOnly)
             {
+                @if (IsStreaming)
+                {
+                    <span class="composer-active-status" data-testid="chat-composer-status" role="status">
+                        <span class="composer-active-status-dot" aria-hidden="true"></span>
+                        Agent is working
+                    </span>
+                }
                 <textarea class="chat-input @ExpandingInputClass"
                           data-testid="chat-input"
+                          data-composer-context="@ComposerContextToken"
                           @ref="_inputElement"
                           @bind="_inputText"
                           @bind:event="oninput"
@@ -471,94 +578,363 @@
                           placeholder="@InputPlaceholder"
                           disabled="@(!IsConnected)" />
 
-                <div class="attachment-composer">
-                    <label class="attach-btn" data-testid="chat-attach" title="Attach files" aria-label="Attach files">&#x1F4CE;<InputFile class="attachment-input" OnChange="HandleFilesSelected" multiple /></label>
-                    @foreach (var attachment in _attachments)
+                <div class="composer-toolbar"
+                     data-testid="chat-composer-toolbar"
+                     role="toolbar"
+                     aria-label="Conversation actions">
+                    <button class="composer-action-btn expand-composer-btn" type="button"
+                            data-testid="chat-expand"
+                            @ref="_expandComposerButton"
+                            @onclick="OpenExpandedComposer"
+                            title="Expand composer"
+                            aria-label="Expand composer">
+                        <span aria-hidden="true">↗</span>
+                    </button>
+
+                    <button type="button" class="composer-action-btn prompt-template-open-btn"
+                            data-testid="prompt-template-open"
+                            aria-haspopup="dialog"
+                            aria-label="Insert prompt template"
+                            @ref="_promptTemplateOpenButton"
+                            @onclick="OpenPromptTemplatePicker"
+                            title="Insert a prompt template">
+                        <Icon Name="file" Size="18" Class="bn-icon-inherit" />
+                    </button>
+
+                    <div class="attachment-composer">
+                        <label class="composer-action-btn attach-btn" data-testid="chat-attach" title="Attach files" aria-label="Attach files"><span class="attach-paperclip" aria-hidden="true">📎</span><InputFile class="attachment-input" OnChange="HandleFilesSelected" multiple /></label>
+                    </div>
+
+                    @if (IsStreaming)
                     {
-                        <span class="attachment-chip" data-testid="attachment-chip"><span class="attachment-name">@attachment.FileName</span><span class="attachment-size">@FormatBytes(attachment.Size)</span><button type="button" data-testid="attachment-remove" aria-label="@($"Remove {attachment.FileName}")" @onclick="() => RemoveAttachment(attachment)">&#x2715;</button></span>
+                        <span class="composer-toolbar-divider" aria-hidden="true"></span>
+                        <button class="composer-action-btn steer-btn" data-testid="chat-steer-btn"
+                                @onclick="SteerAgent"
+                                disabled="@(string.IsNullOrWhiteSpace(_inputText))"
+                                aria-label="Steer at next turn boundary"
+                                title="Steer at next turn boundary (Enter)">
+                            <Icon Name="move" Size="18" Class="bn-icon-inherit" />
+                        </button>
+                        <button class="composer-action-btn interrupt-steer-btn" data-testid="chat-redirect-btn"
+                                @onclick="InterruptAndSteer"
+                                disabled="@(string.IsNullOrWhiteSpace(_inputText))"
+                                aria-label="Redirect immediately"
+                                title="Redirect immediately: stop the current step and use this message">
+                            <Icon Name="refresh" Size="18" Class="bn-icon-inherit" />
+                        </button>
+                        <button class="composer-action-btn followup-btn" data-testid="chat-followup-btn"
+                                @onclick="FollowUpAgent"
+                                disabled="@(string.IsNullOrWhiteSpace(_inputText))"
+                                aria-label="Queue follow-up after completion"
+                                title="Queue follow-up after the agent completes the whole loop">
+                            <Icon Name="add" Size="18" Class="bn-icon-inherit" />
+                        </button>
+                        <button class="composer-action-btn abort-btn" data-testid="chat-abort-btn"
+                                @onclick="AbortAgent"
+                                aria-label="Stop agent"
+                                title="Stop the agent (Escape)">
+                            <Icon Name="stop" Size="18" Class="bn-icon-inherit" />
+                        </button>
                     }
-                    @if (_attachmentError is not null) { <div class="attachment-error" role="alert">@_attachmentError</div> }
+                    else
+                    {
+                        <button class="composer-action-btn send-btn"
+                                data-testid="chat-send"
+                                @onclick="SendMessage"
+                                aria-label="Send message"
+                                title="Send message"
+                                disabled="@(!IsConnected || (string.IsNullOrWhiteSpace(_inputText) && _attachments.Count == 0))">
+                            <Icon Name="send" Size="18" Class="bn-icon-inherit" />
+                        </button>
+                    }
                 </div>
 
-                @if (IsStreaming)
+                @if (_attachments.Count > 0 || _attachmentError is not null)
                 {
-                    <button class="steer-btn" data-testid="chat-steer-btn"
-                            @onclick="SteerAgent"
-                            disabled="@(string.IsNullOrWhiteSpace(_inputText))"
-                            title="Steer: inject this guidance at the next turn boundary (Enter)">
-                        🔀 Steer
-                    </button>
-                    <button class="interrupt-steer-btn" data-testid="chat-redirect-btn"
-                            @onclick="InterruptAndSteer"
-                            disabled="@(string.IsNullOrWhiteSpace(_inputText))"
-                            title="Redirect: stop the current step and steer with this message right away">
-                        Redirect
-                    </button>
-                    <button class="followup-btn" data-testid="chat-followup-btn"
-                            @onclick="FollowUpAgent"
-                            disabled="@(string.IsNullOrWhiteSpace(_inputText))"
-                            title="Follow Up: queue this message to run after the agent finishes the whole loop">
-                        ➕ Follow Up
-                    </button>
-                    <button class="abort-btn" data-testid="chat-abort-btn"
-                            @onclick="AbortAgent"
-                            title="Stop the agent (Escape)">
-                        ⏹ Stop
-                    </button>
-                }
-                else
-                {
-                    <button class="send-btn"
-                            data-testid="chat-send"
-                            @onclick="SendMessage"
-                            disabled="@(!IsConnected || (string.IsNullOrWhiteSpace(_inputText) && _attachments.Count == 0))">
-                        Send
-                    </button>
+                    <div class="composer-attachments">
+                        @foreach (var attachment in _attachments)
+                        {
+                            <span class="attachment-chip" data-testid="attachment-chip"><span class="attachment-name">@attachment.FileName</span><span class="attachment-size">@FormatBytes(attachment.Size)</span><button type="button" data-testid="attachment-remove" aria-label="@($"Remove {attachment.FileName}")" @onclick="() => RemoveAttachment(attachment)"><Icon Name="close" Size="12" Class="bn-icon-inherit" /></button></span>
+                        }
+                        @if (_attachmentError is not null) { <div class="attachment-error" role="alert">@_attachmentError</div> }
+                    </div>
                 }
             }
         </div>
     }
+
+    @if (_expandedComposerOpen)
+    {
+        <div class="expanded-composer-overlay"
+             data-testid="expanded-composer-overlay"
+             @onkeydown="ExpandedComposerKeyDown">
+            <div class="expanded-composer-dialog"
+                 data-testid="expanded-composer"
+                 role="dialog"
+                 aria-modal="true"
+                 aria-labelledby="expanded-composer-title"
+                 @ref="_expandedComposerDialog">
+                <div class="expanded-composer-header">
+                    <h2 id="expanded-composer-title">Compose message</h2>
+                    <button type="button" class="expanded-composer-close"
+                            data-testid="expanded-composer-close"
+                            aria-label="Close expanded composer"
+                            @onclick="CloseExpandedComposer">
+                        <Icon Name="close" Size="16" Class="bn-icon-inherit" />
+                    </button>
+                </div>
+                <textarea class="expanded-composer-input"
+                          data-testid="expanded-composer-input"
+                          @ref="_expandedInputElement"
+                          @bind="_inputText"
+                          @bind:event="oninput"
+                          @bind:after="HandleExpandedInputChanged"
+                          placeholder="Write a message. Enter inserts a new line."
+                          disabled="@(!IsConnected)" />
+                <div class="expanded-attachment-composer">
+                    <label class="attach-btn" data-testid="expanded-chat-attach" title="Attach files" aria-label="Attach files">&#x1F4CE;<InputFile class="attachment-input" OnChange="HandleFilesSelected" multiple /></label>
+                    @foreach (var attachment in _attachments)
+                    {
+                        <span class="attachment-chip" data-testid="expanded-attachment-chip"><span class="attachment-name">@attachment.FileName</span><span class="attachment-size">@FormatBytes(attachment.Size)</span><button type="button" data-testid="expanded-attachment-remove" aria-label="@($"Remove {attachment.FileName}")" @onclick="() => RemoveAttachment(attachment)"><Icon Name="close" Size="12" Class="bn-icon-inherit" /></button></span>
+                    }
+                    @if (_attachmentError is not null) { <div class="attachment-error" role="alert">@_attachmentError</div> }
+                </div>
+                @if (_expandedComposerError is not null)
+                {
+                    <div class="expanded-composer-error" data-testid="expanded-composer-error" role="alert">@_expandedComposerError</div>
+                }
+                <div class="expanded-composer-actions">
+                    @if (IsStreaming)
+                    {
+                        <button class="steer-btn" data-testid="expanded-composer-steer" @onclick="ExpandedSteerAsync" disabled="@(!HasDraft)">🔀 Steer</button>
+                        <button class="interrupt-steer-btn" data-testid="expanded-composer-redirect" @onclick="ExpandedRedirectAsync" disabled="@(!HasDraft)">Redirect</button>
+                        <button class="followup-btn" data-testid="expanded-composer-followup" @onclick="ExpandedFollowUpAsync" disabled="@(!HasDraft)"><Icon Name="add" Size="14" /> Follow Up</button>
+                    }
+                    else
+                    {
+                        <button class="send-btn" data-testid="expanded-composer-send" @onclick="ExpandedSendAsync" disabled="@(!IsConnected || !HasDraft)">Send</button>
+                    }
+                </div>
+            </div>
+        </div>
+    }
 </div>
 
-<AgentConfigPanel @ref="_configPanel" AgentId="@AgentId" />
+@if (_promptPickerOpen)
+{
+    <div class="prompt-template-overlay" @onclick="ClosePromptTemplatePicker">
+        <section class="prompt-template-dialog" data-testid="prompt-template-dialog" role="dialog" aria-modal="true"
+                 aria-labelledby="prompt-template-title" @ref="_promptTemplateDialog" @onclick:stopPropagation="true"
+                 @onkeydown="HandlePromptTemplateKeyDown">
+            <header>
+                <div><h3 id="prompt-template-title">Insert prompt template</h3><p>Preview first; insertion never sends.</p></div>
+                <button type="button" data-testid="prompt-template-close" aria-label="Close prompt template picker" @onclick="ClosePromptTemplatePicker">×</button>
+            </header>
+            @if (_promptTemplatesLoading)
+            {
+                <p data-testid="prompt-template-loading" role="status">Loading templates…</p>
+            }
+            else if (_promptTemplatesError is not null)
+            {
+                <p data-testid="prompt-template-error" role="alert">We couldn’t load prompt templates. Try again.</p>
+            }
+            else if (_selectedPromptTemplate is null)
+            {
+                <input data-testid="prompt-template-search" class="prompt-template-search" value="@_promptTemplateSearch"
+                       @oninput="HandlePromptTemplateSearch" @onkeydown="HandlePromptTemplateSearchKeyDown"
+                       aria-label="Search prompt templates" aria-controls="prompt-template-list"
+                       aria-activedescendant="@ActivePromptTemplateOptionId" autocomplete="off" />
+                @if (FilteredPromptTemplates.Count == 0)
+                {
+                    <p data-testid="prompt-template-empty">No prompt templates found.</p>
+                }
+                else
+                {
+                    <div id="prompt-template-list" class="prompt-template-list" role="listbox" aria-label="Prompt templates">
+                        @for (var index = 0; index < FilteredPromptTemplates.Count; index++)
+                        {
+                            var template = FilteredPromptTemplates[index];
+                            <button type="button" id="@PromptTemplateOptionId(template)" role="option" aria-selected="@(index == _promptTemplateIndex)"
+                                    class="prompt-template-option @(index == _promptTemplateIndex ? "selected" : "")"
+                                    @onclick="() => SelectPromptTemplate(template)">
+                                <strong>@template.Name</strong><span>@template.Description</span><small>@template.Source</small>
+                            </button>
+                        }
+                    </div>
+                }
+            }
+            else
+            {
+                <button type="button" class="prompt-template-back" @onclick="BackToPromptTemplateList">← Templates</button>
+                <div data-testid="prompt-template-parameters" class="prompt-template-parameters">
+                    <h4>@_selectedPromptTemplate.Name</h4>
+                    @foreach (var parameter in _selectedPromptTemplate.Parameters)
+                    {
+                        <label>
+                            <span>@parameter.Name @if (parameter.Required) { <strong aria-label="required">*</strong> }</span>
+                            @if (!string.IsNullOrWhiteSpace(parameter.Description)) { <small>@parameter.Description</small> }
+                            <input data-testid="@($"prompt-template-parameter-{parameter.Name}")"
+                                   value="@PromptTemplateParameterValue(parameter.Name)"
+                                   @oninput="args => SetPromptTemplateParameter(parameter.Name, args.Value?.ToString())" />
+                        </label>
+                    }
+                </div>
+                @if (_promptTemplateGeneralError is not null)
+                {
+                    <p data-testid="prompt-template-render-error" class="prompt-template-validation" role="alert">@_promptTemplateGeneralError</p>
+                }
+                @if (_promptTemplateValidationErrors.Count > 0)
+                {
+                    <div class="prompt-template-validation" role="alert">
+                        @foreach (var error in _promptTemplateValidationErrors.SelectMany(pair => pair.Value)) { <p>@error</p> }
+                    </div>
+                }
+                @if (_promptTemplatePreview is not null)
+                {
+                    <pre data-testid="prompt-template-preview" class="prompt-template-preview">@_promptTemplatePreview</pre>
+                }
+                <footer>
+                    <button type="button" data-testid="prompt-template-preview-button" @onclick="PreviewPromptTemplate">Preview</button>
+                    <button type="button" data-testid="prompt-template-insert" @onclick="InsertPromptTemplate" disabled="@(_promptTemplatePreview is null)">Insert</button>
+                </footer>
+            }
+        </section>
+    </div>
+}
+
+<AgentConfigPanel @ref="_configPanel" AgentId="@AgentId" ConversationId="@DisplayedConversationId" />
 
 @code {
     [Parameter, EditorRequired]
     public string AgentId { get; set; } = default!;
+
+    /// <summary>
+    /// The conversation this pane binds to, supplied explicitly by its owner. Portal composition
+    /// disables ambient fallback so route state remains authoritative.
+    /// </summary>
+    [Parameter]
+    public string? ConversationId { get; set; }
+
 
     private AgentState? Agent => Store.GetAgent(AgentId);
 
     protected override void OnInitialized()
     {
         Store.OnChanged += HandleStoreChanged;
+        Prefs.OnChanged += HandlePreferenceChanged;
     }
+
+    /// <summary>
+    /// Conversation switches arrive as a parameter change, so route navigation resets the draft,
+    /// prompt picker, and scroll state against the newly named conversation.
+    /// </summary>
+    protected override void OnParametersSet()
+    {
+        var conversationId = DisplayedConversationId;
+        if (!string.Equals(conversationId, _lastParameterConversationId, StringComparison.Ordinal))
+        {
+            PreserveAndSwitchDraft(conversationId);
+            _lastParameterConversationId = conversationId;
+            _forceScrollNext = true;
+            if (_promptPickerOpen)
+                ClosePromptTemplatePicker();
+        }
+    }
+
+    private string? _lastParameterConversationId;
+    private bool _promptPickerOpen;
+    private bool _promptTemplatesLoading;
+    private string? _promptTemplatesError;
+    private string _promptTemplateSearch = string.Empty;
+    private IReadOnlyList<PromptTemplateDescriptorDto> _promptTemplates = [];
+    private PromptTemplateDescriptorDto? _selectedPromptTemplate;
+    private int _promptTemplateIndex;
+    private readonly Dictionary<string, string> _promptTemplateParameters = new(StringComparer.Ordinal);
+    private IReadOnlyDictionary<string, string[]> _promptTemplateValidationErrors = new Dictionary<string, string[]>();
+    private string? _promptTemplatePreview;
+    private string? _promptTemplateGeneralError;
+    private string? _promptPickerConversationToken;
+    private long _promptPreviewGeneration;
+    private bool _promptPickerNeedsFocus;
+    private bool _promptPickerRestoreFocus;
+    private ElementReference _promptTemplateDialog;
+    private ElementReference _promptTemplateOpenButton;
 
     private void HandleStoreChanged()
     {
         if (PendingAskUserPrompt is null)
             _askUserError = null;
 
+        var conversationId = DisplayedConversationId;
+        if (!string.Equals(conversationId, _draftConversationId, StringComparison.Ordinal))
+            PreserveAndSwitchDraft(conversationId);
+
         _ = InvokeAsync(StateHasChanged);
     }
+
+    private void HandlePreferenceChanged() => _ = InvokeAsync(StateHasChanged);
 
     public void Dispose()
     {
         Store.OnChanged -= HandleStoreChanged;
+        Prefs.OnChanged -= HandlePreferenceChanged;
         _loadMoreRef?.Dispose();
         _attachmentPasteRef?.Dispose();
     }
     private ConversationState? ActiveConversation =>
-        Agent?.ActiveConversationId is not null ? Agent.Conversations.GetValueOrDefault(Agent.ActiveConversationId) : null;
+        DisplayedConversationId is string convId ? Agent?.Conversations.GetValueOrDefault(convId) : null;
 
     private string DisplayName => Agent?.DisplayName ?? AgentId;
-    private string? ActiveConversationId => Agent?.ActiveConversationId;
+
+    // #2185: assistant-role messages are labelled with the participating agent's display
+    // name instead of the generic "Assistant" protocol role. The protocol role value is kept
+    // verbatim in data-message-role for assistant-vs-user classification and CSS; only the
+    // human-facing author label is substituted. Non-assistant roles (User, Tool, System,
+    // Error) keep their role text. Falls back to the role text when no display name resolves.
+    private string AuthorLabel(string role)
+    {
+        if (string.Equals(role, "Assistant", StringComparison.OrdinalIgnoreCase))
+        {
+            var name = DisplayName;
+            return string.IsNullOrWhiteSpace(name) ? role : name;
+        }
+
+        return role;
+    }
+    private string? DisplayedConversationId => ConversationId;
     private bool HasActiveConversation => ActiveConversation is not null;
     private string? ActiveConversationTitle => ActiveConversation?.Title;
+    private ConversationRenderProjection? ActiveProjection =>
+        ActiveConversation?.Project(Store.ActiveSelectionSource);
+    private string ReadOnlyOriginLabel => ActiveProjection?.ReadOnlyLabel ?? "Read-only conversation";
+    private ReadOnlyBannerStatus ReadOnlyStatus =>
+        IsStreaming || Agent?.ObserverStatus == SubAgentObserverStatus.Running
+            ? new("Running", "running", string.Empty, "bn-icon-inherit bn-icon-spin")
+            : Agent?.ObserverStatus switch
+            {
+                SubAgentObserverStatus.Completed => new("Completed", "check", "completed", string.Empty),
+                SubAgentObserverStatus.Failed => new("Failed", "error", "failed", string.Empty),
+                SubAgentObserverStatus.Killed => new("Killed", "stop", "killed", string.Empty),
+                _ => new("Idle", "visibility", "idle", "bn-icon-inherit")
+            };
 private bool IsStreaming =>
-        Agent?.ActiveConversationId is string activeConvId
+        DisplayedConversationId is string activeConvId
             ? Store.GetStreamState(activeConvId).IsTurnActive
             : false; // no active conversation = not in turn
-    private bool IsReadOnly => (Agent?.IsReadOnly ?? false) || (ActiveConversation?.IsVirtualSession ?? false);
+    // #2248: read-only is a VIEW concern, not a session-type-data concern. It is true when EITHER
+    // the agent is an IMMUTABLE observer/sub-agent (Agent.IsReadOnly now derives from the immutable
+    // IsObserverAgent, NOT the mutable SessionType), OR the active conversation's typed render
+    // projection says so. #2305: that projection is computed ONLY from the conversation's immutable,
+    // init-only (Kind, Source) origin plus the store's ActiveSelectionSource - it subsumes the old
+    // SelectionSource.SubAgentView check AND the deleted mutable virtual-session probe. Every input
+    // is immutable, so a concurrent RegisterSession(agent-subagent) or any inbound sub-agent/cron
+    // event can never flip this true and hide the user's composer / new-session / send controls.
+    // Cron conversations stay read-only because the server stamps Source == ConversationSource.Cron,
+    // which the projection maps to IsUnattended => IsReadOnly.
+    private bool IsReadOnly =>
+        (Agent?.IsReadOnly ?? false)
+        || (ActiveConversation?.Project(Store.ActiveSelectionSource).IsReadOnly
+            ?? Store.ActiveSelectionSource == SelectionSource.SubAgentView);
     private bool CanManageActiveConversation =>
         HasActiveConversation && !IsReadOnly && ActiveConversation?.IsDefault != true;
     private bool IsConnected => Agent?.IsConnected ?? false;
@@ -571,9 +947,17 @@ private bool IsStreaming =>
     private bool HasMessages => Messages.Count > 0;
     private bool HistoryLoadFailed => ActiveConversation?.HistoryLoadFailed ?? false;
     private bool HasMoreHistory => ActiveConversation?.HasMoreHistory ?? false;
+
+    // #2936: pre-compaction (folded) rows are returned by the history endpoint so the transcript is
+    // reachable, but they are hidden by default and revealed by an explicit toggle.
+    private bool _showFoldedHistory;
+    private int FoldedHistoryCount => Messages.Count(m => m.IsFolded);
+    private bool HasFoldedHistory => FoldedHistoryCount > 0;
+
+    private void ToggleFoldedHistory() => _showFoldedHistory = !_showFoldedHistory;
     private bool IsLoadingMore => _isLoadingMore;
     private AskUserPromptState? PendingAskUserPrompt =>
-        ActiveConversationId is not null ? Store.GetPendingAskUser(ActiveConversationId) : null;
+        DisplayedConversationId is not null ? Store.GetPendingAskUser(DisplayedConversationId) : null;
     // The broad IsStreaming (= IsTurnActive) keeps steer/stop controls visible across the whole
     // run loop, but it also flips true on RunStarted BEFORE the first token. Gating the live
     // streaming/thinking bubbles on that would paint a (now-cleared, but historically stale)
@@ -582,16 +966,48 @@ private bool IsStreaming =>
     // which MessageStart asserts only once real content is arriving (mirrors the mobile Chat.razor
     // guard). ClearBuffers on RunStarted is the belt; this guard is the braces.
     private bool IsMessageStreaming =>
-        ActiveConversationId is string convId && Store.GetStreamState(convId).IsStreaming;
+        DisplayedConversationId is string convId && Store.GetStreamState(convId).IsStreaming;
     private string ThinkingBuffer => ActiveConversation?.StreamState.ThinkingBuffer ?? string.Empty;
     private string CurrentStreamBuffer => ActiveConversation?.StreamState.Buffer ?? string.Empty;
     private string ExpandingInputClass => Prefs?.Current?.ExpandingInput == true ? "expanding" : string.Empty;
+    private bool AnimateActiveRunIndicator => Prefs?.Current?.AnimateActiveRunIndicator != false;
 
     private string _inputText = "";
+    private sealed record ConversationDraft(string Text, IReadOnlyList<DraftAttachment> Attachments);
+    private readonly Dictionary<string, ConversationDraft> _draftsByConversation = new(StringComparer.Ordinal);
+    private string? _draftConversationId;
+    // ── #2918 prompt-history recall ─────────────────────────────────────
+    // Session-scoped, in-memory, component-local, and keyed by the conversation this panel is
+    // rendering. It is deliberately NOT a shared DI service: #3062 made the conversation id a
+    // route-owned parameter (see DisplayedConversationId), so identity is known at send time and
+    // there is nothing to reconcile later. That removes the empty-key bucket and the adoption
+    // heuristic that leaked one conversation's prompts into another.
+    private readonly Dictionary<string, List<string>> _historyByConversation = new(StringComparer.Ordinal);
+    private const int MaxHistoryEntries = 50;
+    // #3451: what the seed last consumed for a conversation - the transcript length it saw, and the
+    // message that was then at the FRONT of it. Together these let a later seed tell a load-more
+    // PREPEND (older page inserted ahead of the remembered head) apart from an ordinary append,
+    // without re-deriving - and thereby clobbering - history the citizen is already walking.
+    private readonly Dictionary<string, (int Count, ChatMessage? Head)> _historySeedMark = new(StringComparer.Ordinal);
+    // -1 means "not currently navigating history"; otherwise an index into the current list.
+    private int _historyIndex = -1;
+    // The draft stashed when history navigation began, restored on Esc or Down-past-newest.
+    private string? _historyDraftStash;
+    // The conversation the pointer/stash belong to; a change resets them (see OnParametersSet).
+    private string? _historyConversationId;
+    // Set when a recall changed _inputText so OnAfterRenderAsync moves the caret to the end AFTER
+    // the bound value reaches the DOM, and re-runs the expanding-textarea resize.
+    private bool _pendingCaretToEnd;
     private readonly List<DraftAttachment> _attachments = [];
     private string? _attachmentError;
+    private bool _expandedComposerOpen;
+    private string? _expandedComposerConversationId;
+    private string? _expandedComposerError;
+    private ElementReference _expandComposerButton;
+    private ElementReference _expandedComposerDialog;
+    private ElementReference _expandedInputElement;
+    private bool _expandedComposerFocusPending;
     private DotNetObjectReference<ChatPanel>? _attachmentPasteRef;
-    private bool _attachmentPasteBound;
     private ElementReference _messagesContainer;
         private ElementReference _inputElement;
     // #1691: load-more (scroll-up pagination) state.
@@ -599,14 +1015,259 @@ private bool IsStreaming =>
     private bool _loadMoreObserverBound;
     private DotNetObjectReference<ChatPanel>? _loadMoreRef;
 
+    private bool HasDraft => !string.IsNullOrWhiteSpace(_inputText) || _attachments.Count > 0;
+    private string ComposerContextToken => $"{AgentId}:{DisplayedConversationId}";
+    private string? ActivePromptTemplateOptionId => FilteredPromptTemplates.Count == 0
+        ? null
+        : PromptTemplateOptionId(FilteredPromptTemplates[Math.Min(_promptTemplateIndex, FilteredPromptTemplates.Count - 1)]);
+    private string PromptTemplateOptionId(PromptTemplateDescriptorDto template)
+    {
+        for (var index = 0; index < _promptTemplates.Count; index++)
+        {
+            if (ReferenceEquals(_promptTemplates[index], template))
+                return $"prompt-template-option-{index}";
+        }
+
+        return "prompt-template-option-unavailable";
+    }
+
+    private IReadOnlyList<PromptTemplateDescriptorDto> FilteredPromptTemplates => _promptTemplates
+        .Where(template => string.IsNullOrWhiteSpace(_promptTemplateSearch)
+            || template.Name.Contains(_promptTemplateSearch, StringComparison.OrdinalIgnoreCase)
+            || (template.Description?.Contains(_promptTemplateSearch, StringComparison.OrdinalIgnoreCase) ?? false))
+        .ToList();
+
+    private async Task OpenPromptTemplatePicker()
+    {
+        _promptPickerOpen = true;
+        _promptTemplatesLoading = true;
+        _promptTemplatesError = null;
+        _promptPickerConversationToken = DisplayedConversationId;
+        _promptPickerNeedsFocus = true;
+        _promptPickerRestoreFocus = false;
+        ResetPromptTemplateSelection();
+        try { _promptTemplates = await Rest.GetPromptTemplatesAsync(AgentId); }
+        catch { _promptTemplatesError = "load-failed"; _promptTemplates = []; }
+        finally { _promptTemplatesLoading = false; }
+    }
+
+    private void ClosePromptTemplatePicker()
+    {
+        if (!_promptPickerOpen) return;
+        _promptPickerOpen = false;
+        _promptPickerConversationToken = null;
+        _promptPickerNeedsFocus = false;
+        _promptPickerRestoreFocus = true;
+        ResetPromptTemplateSelection();
+    }
+
+    private void ResetPromptTemplateSelection()
+    {
+        _selectedPromptTemplate = null;
+        _promptTemplateSearch = string.Empty;
+        _promptTemplateIndex = 0;
+        _promptTemplateParameters.Clear();
+        _promptTemplateValidationErrors = new Dictionary<string, string[]>();
+        _promptTemplatePreview = null;
+        _promptTemplateGeneralError = null;
+        _promptPreviewGeneration++;
+    }
+
+    private void HandlePromptTemplateSearch(ChangeEventArgs args)
+    {
+        _promptTemplateSearch = args.Value?.ToString() ?? string.Empty;
+        _promptTemplateIndex = 0;
+    }
+
+    private void HandlePromptTemplateSearchKeyDown(KeyboardEventArgs args)
+    {
+        var templates = FilteredPromptTemplates;
+        if (templates.Count == 0) return;
+        if (args.Key == "ArrowDown") _promptTemplateIndex = Math.Min(_promptTemplateIndex + 1, templates.Count - 1);
+        else if (args.Key == "ArrowUp") _promptTemplateIndex = Math.Max(_promptTemplateIndex - 1, 0);
+        else if (args.Key == "Enter") SelectPromptTemplate(templates[Math.Min(_promptTemplateIndex, templates.Count - 1)]);
+    }
+
+    private void HandlePromptTemplateKeyDown(KeyboardEventArgs args)
+    {
+        if (args.Key == "Escape") ClosePromptTemplatePicker();
+    }
+
+    private void SelectPromptTemplate(PromptTemplateDescriptorDto template)
+    {
+        _selectedPromptTemplate = template;
+        _promptTemplateParameters.Clear();
+        foreach (var parameter in template.Parameters)
+            _promptTemplateParameters[parameter.Name] = parameter.Default ?? string.Empty;
+        InvalidatePromptTemplatePreview();
+    }
+
+    private void BackToPromptTemplateList() => SelectPromptTemplateList();
+
+    private void SelectPromptTemplateList()
+    {
+        _selectedPromptTemplate = null;
+        InvalidatePromptTemplatePreview();
+    }
+
+    private string PromptTemplateParameterValue(string name) => _promptTemplateParameters.GetValueOrDefault(name, string.Empty);
+
+    private void SetPromptTemplateParameter(string name, string? value)
+    {
+        _promptTemplateParameters[name] = value ?? string.Empty;
+        InvalidatePromptTemplatePreview();
+    }
+
+    private void InvalidatePromptTemplatePreview()
+    {
+        _promptPreviewGeneration++;
+        _promptTemplatePreview = null;
+        _promptTemplateGeneralError = null;
+        _promptTemplateValidationErrors = new Dictionary<string, string[]>();
+    }
+
+    private async Task PreviewPromptTemplate()
+    {
+        if (_selectedPromptTemplate is null || !PromptPickerContextIsCurrent) return;
+        var generation = ++_promptPreviewGeneration;
+        var templateName = _selectedPromptTemplate.Name;
+        var parameters = new Dictionary<string, string>(_promptTemplateParameters, StringComparer.Ordinal);
+        try
+        {
+            var result = await Rest.RenderPromptTemplateAsync(AgentId, templateName, parameters);
+            if (!PromptPickerContextIsCurrent || generation != _promptPreviewGeneration) return;
+            _promptTemplatePreview = result.RenderedPrompt;
+            _promptTemplateValidationErrors = result.Errors;
+            _promptTemplateGeneralError = result.GeneralError;
+        }
+        catch
+        {
+            if (!PromptPickerContextIsCurrent || generation != _promptPreviewGeneration) return;
+            _promptTemplatePreview = null;
+            _promptTemplateGeneralError = "The template could not be rendered.";
+            _promptTemplateValidationErrors = new Dictionary<string, string[]>();
+        }
+    }
+
+    private bool PromptPickerContextIsCurrent => _promptPickerOpen
+        && string.Equals(_promptPickerConversationToken, DisplayedConversationId, StringComparison.Ordinal);
+
+    private async Task InsertPromptTemplate()
+    {
+        if (_promptTemplatePreview is null || !PromptPickerContextIsCurrent) return;
+        var token = _promptPickerConversationToken;
+        var expectedComposerContext = $"{AgentId}:{token}";
+        PromptTemplateInsertionResult result;
+        try
+        {
+            result = await JS.InvokeAsync<PromptTemplateInsertionResult>(
+                "chatComposer.replaceSelection", _inputElement, _promptTemplatePreview, expectedComposerContext);
+        }
+        catch { return; }
+        if (!string.Equals(token, DisplayedConversationId, StringComparison.Ordinal)) return;
+        _inputText = result.Value;
+        ResetHistoryNavigation();
+        ClosePromptTemplatePicker();
+        if (Prefs?.Current?.ExpandingInput == true)
+            await JS.InvokeVoidAsync("chatScroll.autoResizeTextarea", _inputElement, Prefs.Current.ExpandingInputMaxLines);
+    }
+
     private async Task HandleInputChanged()
     {
+        // #2918: real user typing ends history navigation - the recalled text has become the
+        // user's own draft, so there is no longer a stash to restore.
+        ResetHistoryNavigation();
         UpdateCommandPalette();
         if (Prefs?.Current?.ExpandingInput == true)
             await JS.InvokeVoidAsync("chatScroll.autoResizeTextarea", _inputElement, Prefs.Current.ExpandingInputMaxLines);
         // Update command palette on every input change so typing slash triggers it.
         UpdateCommandPalette();
     }
+
+    private Task HandleExpandedInputChanged()
+    {
+        ResetHistoryNavigation();
+        _expandedComposerError = null;
+        return Task.CompletedTask;
+    }
+
+    private void PreserveAndSwitchDraft(string? conversationId)
+    {
+        if (_draftConversationId is not null)
+            _draftsByConversation[_draftConversationId] = new(_inputText, _attachments.ToArray());
+
+        _draftConversationId = conversationId;
+        _inputText = "";
+        _attachments.Clear();
+        if (conversationId is not null && _draftsByConversation.TryGetValue(conversationId, out var draft))
+        {
+            _inputText = draft.Text;
+            _attachments.AddRange(draft.Attachments);
+        }
+
+        _attachmentError = null;
+        _expandedComposerError = null;
+        _expandedComposerOpen = false;
+        _expandedComposerConversationId = null;
+    }
+
+    private void OpenExpandedComposer()
+    {
+        if (DisplayedConversationId is not { } conversationId)
+            return;
+
+        if (!string.Equals(_draftConversationId, conversationId, StringComparison.Ordinal))
+            PreserveAndSwitchDraft(conversationId);
+        _expandedComposerConversationId = conversationId;
+        _expandedComposerError = null;
+        _expandedComposerOpen = true;
+        _expandedComposerFocusPending = true;
+    }
+
+    private async Task CloseExpandedComposer()
+    {
+        _expandedComposerOpen = false;
+        _expandedComposerConversationId = null;
+        _expandedComposerError = null;
+        try { await JS.InvokeVoidAsync("chatScroll.closeComposerDialog", _expandComposerButton); } catch { }
+    }
+
+    private async Task ExpandedComposerKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+            await CloseExpandedComposer();
+    }
+
+    private async Task RunExpandedDispatchAsync(Func<string, string, IReadOnlyList<DraftAttachment>, Task> dispatch)
+    {
+        if (!_expandedComposerOpen
+            || !string.Equals(_expandedComposerConversationId, DisplayedConversationId, StringComparison.Ordinal))
+        {
+            await CloseExpandedComposer();
+            return;
+        }
+
+        try
+        {
+            if (await DispatchDraftAsync(dispatch))
+                await CloseExpandedComposer();
+        }
+        catch (Exception ex)
+        {
+            _expandedComposerError = ex.Message;
+        }
+    }
+
+    private Task ExpandedSendAsync() => RunExpandedDispatchAsync((convId, text, attachments) =>
+        Interaction.DeliverMessageAsync(AgentId, convId, text, InboundDeliveryMode.Auto, attachments));
+    private Task ExpandedSteerAsync() => RunExpandedDispatchAsync((convId, text, attachments) =>
+        Interaction.DeliverMessageAsync(AgentId, convId, text, InboundDeliveryMode.Steer, attachments));
+    private Task ExpandedRedirectAsync() => RunExpandedDispatchAsync((convId, text, attachments) =>
+        Interaction.DeliverMessageAsync(AgentId, convId, text, InboundDeliveryMode.Interrupt, attachments));
+    private Task ExpandedFollowUpAsync() => RunExpandedDispatchAsync((convId, text, attachments) =>
+        attachments.Count == 0
+            ? Interaction.FollowUpAsync(AgentId, convId, text)
+            : Interaction.FollowUpAsync(AgentId, convId, text, attachments));
 
     private async Task ToggleExpandingInput()
         => await Prefs.SetExpandingInputAsync(!Prefs.Current.ExpandingInput);
@@ -628,16 +1289,154 @@ private bool IsStreaming =>
     private string _selectedCommand = "";
     private bool _forceScrollNext;
     private bool _wasActive;
-    private string? _lastActiveConversationId;
+    private string? _lastDisplayedConversationId;
     private int _lastRenderedMessageCount;
     private bool _showNewSessionConfirm;
     private bool _showMobileActionsMenu;
+    private bool _showExportDialog;
+    private bool _exportBusy;
+    private bool _exportIncludeTools = true;
+    private bool _exportIncludeThinking;
+    private bool _exportIncludeSystem;
+    private bool _exportRedactSecrets = true;
+    private string _exportFormat = "markdown";
+    private string _exportScope = "conversation";
+    private int? _exportFirstIndex;
+    private int? _exportLastIndex;
+    private string? _exportError;
     private string? _copiedMessageId;
     private string? _copiedSectionId;
     private string? _askUserError;
     private static readonly TimeSpan s_copyFeedbackDuration = TimeSpan.FromSeconds(2);
     private const string CopySectionArgs = "args";
     private const string CopySectionResult = "result";
+
+    private IReadOnlyList<(int Index, ChatMessage Message)> SelectableExportMessages => Messages
+        .Select((message, index) => (Index: index, Message: message))
+        .Where(item => !string.IsNullOrWhiteSpace(item.Message.ServerEntryId))
+        .Where(item => !item.Message.IsFolded || _showFoldedHistory)
+        .Where(item => !item.Message.IsToolCall || ShowTools)
+        .ToArray();
+
+    private bool CanDownloadExport => _exportScope switch
+    {
+        "session" => !string.IsNullOrWhiteSpace(ActiveConversation?.ActiveSessionId),
+        "selected" => _exportFirstIndex is not null && _exportLastIndex is not null,
+        _ => true
+    };
+
+    private string ExportPreview => _exportScope switch
+    {
+        "session" when ActiveConversation?.ActiveSessionId is null => "This conversation has no active session to export.",
+        "session" => $"Current active session in {_exportFormat} format.",
+        "selected" when _exportFirstIndex is null => "Choose the first message in the visible range.",
+        "selected" when _exportLastIndex is null => "Choose the last message in the visible range.",
+        "selected" => $"{SelectedExportMessageCount} visible messages in {_exportFormat} format.",
+        _ => $"Whole conversation in {_exportFormat} format."
+    } + " Sensitive instructions, tools, and reasoning are included only when selected.";
+
+    private int SelectedExportMessageCount => _exportFirstIndex is { } first && _exportLastIndex is { } last
+        ? SelectableExportMessages.Count(item => item.Index >= Math.Min(first, last) && item.Index <= Math.Max(first, last))
+        : 0;
+
+    private bool IsExportMessageSelected(int index) =>
+        _exportFirstIndex is { } first && _exportLastIndex is { } last
+            ? index >= Math.Min(first, last) && index <= Math.Max(first, last)
+            : _exportFirstIndex == index;
+
+    private static string ExportMessageSummary(ChatMessage message)
+    {
+        var content = message.Content.ReplaceLineEndings(" ").Trim();
+        if (content.Length == 0)
+            content = message.ToolName ?? message.BoundaryLabel ?? "Message";
+        return content.Length <= 80 ? content : $"{content[..77]}...";
+    }
+
+    private void ChangeExportScope(ChangeEventArgs args)
+    {
+        _exportScope = args.Value?.ToString() ?? "conversation";
+        ClearExportSelection();
+        _exportError = null;
+    }
+
+    private void SelectExportMessage(int index)
+    {
+        if (_exportFirstIndex is null || _exportLastIndex is not null)
+        {
+            _exportFirstIndex = index;
+            _exportLastIndex = null;
+            return;
+        }
+
+        _exportLastIndex = index;
+    }
+
+    private void ClearExportSelection()
+    {
+        _exportFirstIndex = null;
+        _exportLastIndex = null;
+    }
+
+    private void OpenExportDialog()
+    {
+        _exportError = null;
+        _showExportDialog = true;
+    }
+
+    private void CloseExportDialog()
+    {
+        if (_exportBusy)
+            return;
+        _showExportDialog = false;
+        _exportError = null;
+        ClearExportSelection();
+    }
+
+    private async Task DownloadExportAsync()
+    {
+        if (DisplayedConversationId is not { } conversationId || _exportBusy)
+            return;
+
+        _exportBusy = true;
+        _exportError = null;
+        try
+        {
+            var selected = _exportScope == "selected"
+                ? SelectableExportMessages
+                    .Where(item => IsExportMessageSelected(item.Index))
+                    .Select(item => item.Message)
+                    .ToArray()
+                : [];
+            var request = new ConversationExportRequest(
+                _exportFormat,
+                _exportIncludeTools,
+                _exportIncludeThinking,
+                _exportIncludeSystem,
+                _exportRedactSecrets,
+                selected.FirstOrDefault()?.ServerEntryId,
+                selected.LastOrDefault()?.ServerEntryId);
+            var download = _exportScope == "session" && ActiveConversation?.ActiveSessionId is { } sessionId
+                ? await Rest.ExportSessionAsync(sessionId, request)
+                : await Rest.ExportConversationAsync(conversationId, request);
+            if (download is null)
+            {
+                _exportError = "The export could not be downloaded. Try again.";
+                return;
+            }
+
+            await JS.InvokeVoidAsync(
+                "BotNexus.downloadFile",
+                download.FileName,
+                download.ContentType,
+                Convert.ToBase64String(download.Content));
+            _showExportDialog = false;
+            ClearExportSelection();
+        }
+        finally
+        {
+            _exportBusy = false;
+        }
+    }
 
     // ── Tool pop-out modal state ────────────────────────────────────────
     private bool _toolModalOpen;
@@ -688,7 +1487,7 @@ private bool IsStreaming =>
         _editingTitle = false;
         var draft = _titleDraft.Trim();
         if (!string.IsNullOrWhiteSpace(draft) && draft != ActiveConversationTitle)
-            await Interaction.RenameConversationAsync(AgentId, ActiveConversationId, draft);
+            await Interaction.RenameConversationAsync(AgentId, DisplayedConversationId, draft);
         else
             StateHasChanged();
     }
@@ -958,7 +1757,9 @@ private bool IsStreaming =>
         _showCommandPalette = false;
         _inputText = "";
 
-        await CommandDispatcher.ExecuteAsync(AgentId, cmd);
+        if (DisplayedConversationId is not { } convId) return;
+
+        await CommandDispatcher.ExecuteAsync(AgentId, convId, cmd);
     }
 
     private async Task OpenConfig()
@@ -973,23 +1774,40 @@ private bool IsStreaming =>
         await OpenConfig();
     }
 
-    private async Task ToggleActiveConversationPinAsync()
+    private IReadOnlyList<ConversationActionDefinition> BuildActiveConversationActions()
     {
-        if (!CanManageActiveConversation || ActiveConversationId is null || ActiveConversation is null)
-            return;
-
-        await Interaction.SetConversationPinnedAsync(AgentId, ActiveConversationId, !ActiveConversation.IsPinned);
+        if (ActiveConversation is not { } conversation)
+            return [];
+        var projection = conversation.Project(Store.ActiveSelectionSource);
+        var sectionsState = ServiceProvider.GetService<ConversationSectionsState>();
+        var currentSectionId = sectionsState?.GetAssignedSectionId(conversation.ConversationId);
+        var sections = (sectionsState?.Sections ?? []).Select(section => new ConversationActionSection(
+            section.SectionId, section.Name, string.Equals(section.SectionId, currentSectionId, StringComparison.Ordinal))).ToList();
+        return ConversationActionDefinitions.Create(
+            new(true, conversation.IsDefault, IsReadOnly, projection.IsUnattended, conversation.IsPinned, sections),
+            new(
+                () => { StartEditTitle(); return Task.CompletedTask; },
+                pinned => Interaction.SetConversationPinnedAsync(AgentId, conversation.ConversationId, pinned),
+                ArchiveActiveConversationAsync,
+                sectionId => MoveActiveConversationAsync(conversation.ConversationId, sectionId)));
     }
 
-    private async Task ToggleActiveConversationPinFromMenuAsync()
+    private async Task MoveActiveConversationAsync(string conversationId, string? sectionId)
     {
-        _showMobileActionsMenu = false;
-        await ToggleActiveConversationPinAsync();
+        var sectionsApi = ServiceProvider.GetService<SectionsApiClient>();
+        var sectionsState = ServiceProvider.GetService<ConversationSectionsState>();
+        if (sectionsApi is null || sectionsState is null)
+            return;
+        var changed = sectionId is null
+            ? await sectionsApi.UnassignAsync(AgentId, conversationId)
+            : await sectionsApi.AssignAsync(AgentId, sectionId, conversationId);
+        if (changed)
+            await sectionsState.ReloadAsync();
     }
 
     private async Task ArchiveActiveConversationAsync()
     {
-        if (!CanManageActiveConversation || ActiveConversationId is null || ActiveConversation is null)
+        if (!CanManageActiveConversation || DisplayedConversationId is null || ActiveConversation is null)
             return;
 
         if (Prefs.Current.ArchiveConfirmEnabled)
@@ -999,13 +1817,8 @@ private bool IsStreaming =>
                 return;
         }
 
-        await Interaction.ArchiveConversationAsync(AgentId, ActiveConversationId);
-    }
-
-    private async Task ArchiveActiveConversationFromMenuAsync()
-    {
-        _showMobileActionsMenu = false;
-        await ArchiveActiveConversationAsync();
+        await Interaction.ArchiveConversationAsync(AgentId, DisplayedConversationId);
+        Nav.NavigateTo($"agent/{Uri.EscapeDataString(AgentId)}");
     }
 
     private void ConfirmNewSession()
@@ -1083,13 +1896,53 @@ private bool IsStreaming =>
             return;
 
         _showNewSessionConfirm = false;
-        await Interaction.ResetSessionAsync(AgentId);
+        // #3211: the reset targets the conversation this panel is rendering, never an ambient one.
+        if (DisplayedConversationId is not { } convId) return;
+        await Interaction.ResetSessionAsync(AgentId, convId);
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         try
         {
+            if (_promptPickerOpen && _promptPickerNeedsFocus)
+            {
+                _promptPickerNeedsFocus = false;
+                try { await JS.InvokeVoidAsync("chatComposer.focusFirst", _promptTemplateDialog); } catch { }
+            }
+            else if (!_promptPickerOpen && _promptPickerRestoreFocus)
+            {
+                _promptPickerRestoreFocus = false;
+                try { await JS.InvokeVoidAsync("chatComposer.focusElement", _promptTemplateOpenButton); } catch { }
+            }
+
+            // #2918: a recall changed _inputText; now that the bound value is in the DOM, move the
+            // caret to the end and re-run the expanding-textarea resize. Guarded so a detached
+            // element (view switched mid-flight) cannot throw.
+            if (_pendingCaretToEnd)
+            {
+                _pendingCaretToEnd = false;
+                try
+                {
+                    await JS.InvokeVoidAsync("chatScroll.moveCaretToEnd", _inputElement);
+                    if (Prefs?.Current?.ExpandingInput == true)
+                        await JS.InvokeVoidAsync("chatScroll.autoResizeTextarea", _inputElement, Prefs.Current.ExpandingInputMaxLines);
+                }
+                catch { /* textarea detached before the caret could be placed */ }
+            }
+
+            if (_expandedComposerOpen && _expandedComposerFocusPending)
+            {
+                _expandedComposerFocusPending = false;
+                try { await JS.InvokeVoidAsync("chatScroll.openComposerDialog", _expandedComposerDialog, _expandedInputElement); } catch { }
+            }
+
+            if (_expandedComposerOpen)
+            {
+                _attachmentPasteRef ??= DotNetObjectReference.Create(this);
+                await JS.InvokeVoidAsync("chatAttachments.bindPaste", _expandedInputElement, _attachmentPasteRef);
+            }
+
             // Focus-trap entry: when the tool pop-out modal opens, move focus into the
             // dialog so Esc / Tab are captured and screen readers land inside it.
             if (_toolModalOpen && !_toolModalFocused)
@@ -1115,11 +1968,13 @@ private bool IsStreaming =>
                 _enterPreventionBound = true;
             }
 
-            if (!_attachmentPasteBound && !IsReadOnly && !hasInlinePrompt)
+            // The DOM element is the binding authority. Blazor can replace this textarea while the
+            // component survives (ask-user and read-only transitions), so offer the current element
+            // to the idempotent JS binder after every render instead of caching component-level state.
+            if (!IsReadOnly && !hasInlinePrompt)
             {
                 _attachmentPasteRef ??= DotNetObjectReference.Create(this);
                 await JS.InvokeVoidAsync("chatAttachments.bindPaste", _inputElement, _attachmentPasteRef);
-                _attachmentPasteBound = true;
             }
 
             // #1691: attach the scroll-to-top observer once so scrolling up fetches the next older
@@ -1157,10 +2012,10 @@ private bool IsStreaming =>
 
             var currentConvId = ActiveConversation?.ConversationId;
             var currentCount = Messages.Count;
-            if (currentConvId != _lastActiveConversationId)
+            if (currentConvId != _lastDisplayedConversationId)
             {
                 _forceScrollNext = true;
-                _lastActiveConversationId = currentConvId;
+                _lastDisplayedConversationId = currentConvId;
                 _lastRenderedMessageCount = currentCount;
             }
             else if (currentCount > _lastRenderedMessageCount + 5)
@@ -1188,6 +2043,280 @@ private bool IsStreaming =>
         }
     }
 
+    // ── #2918 prompt-history recall ─────────────────────────────────────
+
+    /// <summary>
+    /// Returns a SNAPSHOT of the prompt history for the conversation this panel renders, oldest
+    /// first. Never returns the live backing list, and never creates a bucket: reading history
+    /// must not mutate it. When there is no conversation id there is no history — by construction
+    /// nothing is ever recorded without one, so recall has nothing to surface.
+    /// </summary>
+    private IReadOnlyList<string> CurrentHistory()
+    {
+        SyncHistoryConversation();
+        if (_historyConversationId is not { } convId)
+            return [];
+        SeedHistoryFromTranscript(convId);
+        return _historyByConversation.TryGetValue(convId, out var list) ? list.ToArray() : [];
+    }
+
+    /// <summary>
+    /// #2918 follow-up: seeds this conversation's history from the rendered transcript, ONCE, the
+    /// first time recall asks for it.
+    ///
+    /// Why this exists: <c>DispatchDraftAsync</c> is not the only way a prompt reaches a
+    /// conversation. The prompt that CREATES a conversation is dispatched by
+    /// <c>StartConversationService</c> from the landing page, before this panel instance exists,
+    /// and a reload discards in-memory history for prompts that were genuinely sent. In both cases
+    /// the prompt is visible in the transcript but was never recorded here, so recall could not
+    /// reach the oldest entry - the conversation's first prompt was permanently unreachable.
+    ///
+    /// Deriving the seed from <c>Messages</c> rather than carrying state across navigation is what
+    /// keeps this free of the store that review rejected: no new service, no DI, no
+    /// cross-conversation carrier, and therefore no empty-key bucket for another conversation to
+    /// adopt from. The seed is keyed by the SAME route-owned conversation id the transcript is
+    /// rendered from, so an entry still cannot cross conversations.
+    ///
+    /// Seeding is skipped once a bucket exists, so a live send is never overwritten and the
+    /// transcript cannot re-add a prompt the citizen has already navigated past. The ONE exception
+    /// (#3451) is a load-more prepend: <c>Messages</c> is the PAGINATED transcript, so latching per
+    /// conversation made recall permanently blind to older prompts revealed later by
+    /// <c>LoadMoreHistory</c>. That case is handled by <see cref="ReseedPrependedPrefix"/>, which
+    /// only ever adds entries AHEAD of the existing list and never rewrites its tail.
+    /// </summary>
+    private void SeedHistoryFromTranscript(string convId)
+    {
+        if (_historyByConversation.ContainsKey(convId))
+        {
+            ReseedPrependedPrefix(convId);
+            return;
+        }
+
+        var messages = Messages;
+        var seeded = new List<string>();
+        foreach (var msg in messages)
+        {
+            // Folded (pre-compaction) messages are deliberately included: they are real prompts the
+            // citizen sent, and excluding them would reintroduce an unreachable-oldest-entry gap.
+            if (!string.Equals(msg.Role, "User", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var text = msg.Content?.Trim();
+            if (string.IsNullOrWhiteSpace(text))
+                continue;
+            if (seeded.Count > 0 && string.Equals(seeded[^1], text, StringComparison.Ordinal))
+                continue; // Same consecutive-duplicate rule RecordPromptHistory applies.
+            seeded.Add(text);
+        }
+
+        if (seeded.Count > MaxHistoryEntries)
+            seeded.RemoveRange(0, seeded.Count - MaxHistoryEntries);
+
+        _historyByConversation[convId] = seeded;
+        _historySeedMark[convId] = (messages.Count, messages.Count > 0 ? messages[0] : null);
+    }
+
+    /// <summary>
+    /// #3451: absorbs user prompts revealed by a transcript load-more into an ALREADY-seeded
+    /// conversation, oldest first, ahead of everything recall already knows.
+    ///
+    /// A prepend is identified structurally, not guessed: the transcript grew by <c>delta</c> and
+    /// the message now at index <c>delta</c> is REFERENCE-identical to the one that was at the
+    /// front when the seed last ran. An ordinary append (a live send, a server echo) grows the same
+    /// count but leaves the head where it was, so it fails that test and is ignored - which is what
+    /// keeps the #2919 guarantee intact that the transcript can never re-add a prompt the citizen
+    /// has navigated past, nor clobber a live send.
+    ///
+    /// Only the newly-visible prefix is examined; the existing list is spliced on unchanged, so
+    /// live-recorded entries are neither reordered nor duplicated. The same consecutive-duplicate
+    /// rule and <see cref="MaxHistoryEntries"/> bound as the initial seed are re-applied at the
+    /// join, so the two paths cannot disagree.
+    /// </summary>
+    private void ReseedPrependedPrefix(string convId)
+    {
+        if (!_historySeedMark.TryGetValue(convId, out var mark) || mark.Head is null)
+            return;
+        if (!_historyByConversation.TryGetValue(convId, out var list))
+            return;
+
+        var messages = Messages;
+        var delta = messages.Count - mark.Count;
+        if (delta <= 0)
+            return;
+        // Not a prepend unless the remembered head is still exactly delta positions further along.
+        if (delta >= messages.Count || !ReferenceEquals(messages[delta], mark.Head))
+            return;
+
+        var prefix = new List<string>();
+        for (var i = 0; i < delta; i++)
+        {
+            var msg = messages[i];
+            if (!string.Equals(msg.Role, "User", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var text = msg.Content?.Trim();
+            if (string.IsNullOrWhiteSpace(text))
+                continue;
+            if (prefix.Count > 0 && string.Equals(prefix[^1], text, StringComparison.Ordinal))
+                continue;
+            prefix.Add(text);
+        }
+
+        // The seam between the prepended prefix and the existing list is a consecutive pair too.
+        if (prefix.Count > 0 && list.Count > 0 && string.Equals(prefix[^1], list[0], StringComparison.Ordinal))
+            prefix.RemoveAt(prefix.Count - 1);
+
+        // The mark advances even when the prefix contributed nothing (an older page of pure
+        // assistant turns), so the next load-more is measured from the transcript we just consumed.
+        _historySeedMark[convId] = (messages.Count, messages[0]);
+
+        if (prefix.Count == 0)
+            return;
+
+        list.InsertRange(0, prefix);
+        var trimmed = 0;
+        if (list.Count > MaxHistoryEntries)
+        {
+            trimmed = list.Count - MaxHistoryEntries;
+            list.RemoveRange(0, trimmed);
+        }
+
+        // The navigation pointer is an INDEX, so inserting ahead of it would silently re-point it at
+        // a different prompt mid-walk - the citizen presses Up once and jumps several entries. Shift
+        // it by the net insertion so it keeps addressing the entry it was already on.
+        if (_historyIndex >= 0 && string.Equals(_historyConversationId, convId, StringComparison.Ordinal))
+            _historyIndex = Math.Clamp(_historyIndex + prefix.Count - trimmed, 0, list.Count - 1);
+    }
+
+    /// <summary>
+    /// Re-points the navigation pointer and draft stash at the conversation currently being
+    /// rendered, clearing both when it changes, so a stash can never be restored into a different
+    /// conversation. Called from every history entry point rather than from a render-loop poller.
+    /// </summary>
+    private void SyncHistoryConversation()
+    {
+        var current = DisplayedConversationId;
+        if (string.Equals(current, _historyConversationId, StringComparison.Ordinal))
+            return;
+        _historyConversationId = current;
+        _historyIndex = -1;
+        _historyDraftStash = null;
+    }
+
+    /// <summary>
+    /// Records a submitted prompt against the supplied conversation and leaves navigation mode.
+    /// <paramref name="convId"/> is the route-owned id the send was actually dispatched to.
+    ///
+    /// The empty/null conversation id is NOT a bucket. There is no empty key, no later migration,
+    /// and no adoption of stranded entries — a prompt that cannot be attributed to a conversation
+    /// is simply not recorded. That is what makes the cross-conversation leak structurally
+    /// impossible rather than merely unlikely: an unrelated conversation cannot inherit an entry
+    /// that was never stored. Whitespace-only prompts and consecutive duplicates are not stored;
+    /// each conversation's list is bounded, dropping oldest first.
+    /// </summary>
+    private void RecordPromptHistory(string? convId, string text)
+    {
+        if (string.IsNullOrWhiteSpace(convId) || string.IsNullOrWhiteSpace(text))
+        {
+            ResetHistoryNavigation();
+            return;
+        }
+
+        // Seed BEFORE appending. The first send in a conversation would otherwise create an empty
+        // bucket, and the seed - which skips conversations that already have one - would never run,
+        // permanently stranding the prompt that created the conversation.
+        SeedHistoryFromTranscript(convId);
+
+        if (!_historyByConversation.TryGetValue(convId, out var list))
+        {
+            list = [];
+            _historyByConversation[convId] = list;
+        }
+
+        if (list.Count == 0 || !string.Equals(list[^1], text, StringComparison.Ordinal))
+        {
+            list.Add(text);
+            if (list.Count > MaxHistoryEntries)
+                list.RemoveRange(0, list.Count - MaxHistoryEntries);
+        }
+
+        ResetHistoryNavigation();
+    }
+
+    /// <summary>Leaves history-navigation mode and drops the stashed draft.</summary>
+    private void ResetHistoryNavigation()
+    {
+        _historyIndex = -1;
+        _historyDraftStash = null;
+    }
+
+    /// <summary>
+    /// Restores the draft stashed when navigation began and leaves navigation mode. Safe to call
+    /// when not navigating (it is then a no-op on the draft).
+    /// </summary>
+    private void RestoreStashedDraft()
+    {
+        if (_historyIndex == -1)
+            return;
+        _inputText = _historyDraftStash ?? string.Empty;
+        ResetHistoryNavigation();
+        _pendingCaretToEnd = true;
+    }
+
+    /// <summary>
+    /// Moves through this conversation's prompt history. <paramref name="direction"/> below zero
+    /// recalls older prompts, above zero newer. When <paramref name="requireEdge"/> is true (bare
+    /// arrows) the move only happens if the caret is on the first line (Up) or last line (Down),
+    /// so caret navigation inside a multi-line draft is never hijacked; Alt+arrow passes false as
+    /// an unconditional fallback. Entering navigation stashes the current draft; moving newer than
+    /// the most recent entry restores it and exits.
+    /// </summary>
+    private async Task NavigateHistoryAsync(int direction, bool requireEdge)
+    {
+        var history = CurrentHistory();
+        if (history.Count == 0)
+            return;
+
+        if (requireEdge)
+        {
+            CaretLinePosition pos;
+            try
+            {
+                pos = await JS.InvokeAsync<CaretLinePosition>("chatScroll.caretLinePosition", _inputElement);
+            }
+            catch
+            {
+                return; // Textarea detached mid-flight (view switched) - abort safely.
+            }
+
+            if (direction < 0 && !pos.OnFirstLine)
+                return;
+            if (direction > 0 && !pos.OnLastLine)
+                return;
+        }
+
+        if (_historyIndex == -1)
+        {
+            if (direction > 0)
+                return; // Down does nothing when not already navigating.
+            _historyDraftStash = _inputText;
+            _historyIndex = history.Count - 1;
+        }
+        else
+        {
+            var next = _historyIndex + direction;
+            if (next < 0)
+                return; // Already at the oldest entry.
+            if (next >= history.Count)
+            {
+                RestoreStashedDraft();
+                return;
+            }
+            _historyIndex = next;
+        }
+
+        _inputText = history[_historyIndex];
+        _pendingCaretToEnd = true;
+    }
+
     private async Task HandleKeyDown(KeyboardEventArgs e)
     {
         UpdateCommandPalette();
@@ -1208,29 +2337,83 @@ private bool IsStreaming =>
         }
         else if (e is { Key: "Escape" })
         {
+            // Precedence is deliberate and ordered by consequence, not by convenience.
+            // ABORT WINS over draft restoration (#2918 review blocker): stopping a running agent is
+            // a safety control, and it must not be shadowed by a text-recall convenience. Pressing
+            // Up mid-stream and then Esc previously restored the draft and left the agent running.
+            // The draft is still restored here — it just does not consume the keystroke.
             if (_showCommandPalette)
+            {
                 _showCommandPalette = false;
-            else if (IsStreaming)
-                await AbortAgent();
+            }
+            else
+            {
+                RestoreStashedDraft();
+                if (IsStreaming)
+                    await AbortAgent();
+            }
         }
         else if (e is { Key: "Tab" } && _showCommandPalette && _filteredCommands.Count > 0)
         {
             _inputText = _filteredCommands[0].Name + " ";
             _showCommandPalette = false;
         }
+        // #2918: bare arrows recall history only at the caret's edge line (the JS probe decides);
+        // Alt+arrow is the unconditional fallback. The palette check is the ONLY disambiguation
+        // this feature needs: while the slash-command palette is open the arrows belong to it, so
+        // recall stands down. Making the palette itself keyboard-navigable is a separate feature
+        // and is deliberately not included here.
+        else if (e is { Key: "ArrowUp" } && !_showCommandPalette)
+        {
+            await NavigateHistoryAsync(-1, requireEdge: !e.AltKey);
+        }
+        else if (e is { Key: "ArrowDown" } && !_showCommandPalette)
+        {
+            await NavigateHistoryAsync(1, requireEdge: !e.AltKey);
+        }
+    }
+
+    // #2484: the send family (Send / Steer / Follow Up / Redirect) shares ONE draft-consumption
+    // envelope so a future fifth path cannot be added that silently ignores _attachments. Each
+    // path supplies only its dispatch delegate; snapshot, guard, clear and error handling live here.
+    // #3211: every action path takes the conversation explicitly. DispatchDraftAsync hands the
+    // route-owned DisplayedConversationId to the dispatch lambda, so steer/follow-up/redirect can no
+    // longer land on a conversation other than the one this panel is rendering.
+    private async Task<bool> DispatchDraftAsync(Func<string, string, IReadOnlyList<DraftAttachment>, Task> dispatch)
+    {
+        if (DisplayedConversationId is not { } convId) return false;
+        var text = _inputText?.Trim() ?? string.Empty;
+        if ((string.IsNullOrEmpty(text) && _attachments.Count == 0) || !IsConnected) return false;
+        var attachments = _attachments.ToArray();
+        await dispatch(convId, text, attachments);
+        // Consume the logical draft only after delivery accepts it. A rejected delivery remains
+        // fully retryable in either composer and must not create a phantom prompt-history entry.
+        RecordPromptHistory(convId, text);
+        _draftsByConversation.Remove(convId);
+
+        // Delivery is asynchronous. A conversation switch or further edit during the await must
+        // never let this old completion clear whichever draft is current now.
+        if (string.Equals(_draftConversationId, convId, StringComparison.Ordinal)
+            && string.Equals(_inputText?.Trim(), text, StringComparison.Ordinal)
+            && _attachments.SequenceEqual(attachments))
+        {
+            _inputText = "";
+            _attachments.Clear();
+            _attachmentError = null;
+            _showCommandPalette = false;
+            _forceScrollNext = true;
+        }
+
+        return true;
     }
 
     private async Task SendMessage()
-    {
-        var text = _inputText?.Trim() ?? string.Empty;
-        if ((string.IsNullOrEmpty(text) && _attachments.Count == 0) || !IsConnected) return;
-        var attachments = _attachments.ToArray();
-        _inputText = ""; _attachments.Clear(); _attachmentError = null; _showCommandPalette = false; _forceScrollNext = true;
-        if (attachments.Length == 0)
-            await Interaction.SendMessageAsync(AgentId, text);
-        else
-            await Interaction.SendMessageAsync(AgentId, text, attachments);
-    }
+        => _ = await DispatchDraftAsync((convId, text, attachments) =>
+            // #3063: the send path requires the conversation explicitly. convId here is the
+            // route-supplied ConversationId parameter (falling back to the agent's selection),
+            // which is the same id the rest of this panel renders against.
+            Interaction.DeliverMessageAsync(
+                AgentId, convId, text, InboundDeliveryMode.Auto, attachments));
 
     private async Task HandleFilesSelected(InputFileChangeEventArgs e)
     {
@@ -1248,6 +2431,14 @@ private bool IsStreaming =>
     [JSInvokable]
     public Task OnAttachmentsPasted(IReadOnlyList<DraftAttachment> attachments) => AddDraftAttachmentsAsync(attachments);
 
+    [JSInvokable]
+    public Task OnAttachmentPasteFailed()
+    {
+        _attachmentError = "Could not attach the pasted image. Try pasting again or use Attach files.";
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
     public Task AddDraftAttachmentsAsync(IReadOnlyList<DraftAttachment> attachments)
     {
         _attachmentError = null;
@@ -1264,35 +2455,31 @@ private bool IsStreaming =>
     private static string FormatBytes(long bytes) => bytes >= 1024 * 1024 ? $"{bytes / (1024d * 1024d):0.#} MB" : $"{Math.Max(1, bytes / 1024d):0.#} KB";
 
     private async Task SteerAgent()
-    {
-        var text = _inputText?.Trim();
-        if (string.IsNullOrEmpty(text) || !IsConnected)
-            return;
-
-        _inputText = "";
-        await Interaction.SteerAsync(AgentId, text);
-    }
+        => _ = await DispatchDraftAsync((convId, text, attachments) => Interaction.DeliverMessageAsync(
+            AgentId, convId, text, InboundDeliveryMode.Steer, attachments));
 
     private async Task FollowUpAgent()
-    {
-        var text = _inputText?.Trim();
-        if (string.IsNullOrEmpty(text) || !IsConnected)
-            return;
+        => _ = await DispatchDraftAsync((convId, text, attachments) =>
+        {
+            UpdateCommandPalette();
+            return attachments.Count == 0
+                ? Interaction.FollowUpAsync(AgentId, convId, text)
+                : Interaction.FollowUpAsync(AgentId, convId, text, attachments);
+        });
 
-        _inputText = "";
-        UpdateCommandPalette();
-        await Interaction.FollowUpAsync(AgentId, text);
+    private async Task AbortAgent()
+    {
+        if (DisplayedConversationId is not { } convId) return;
+        await Interaction.AbortAsync(AgentId, convId);
     }
 
-    private async Task AbortAgent() => await Interaction.AbortAsync(AgentId);
     private async Task InterruptAndSteer()
-    {
-        var message = _inputText.Trim();
-        if (string.IsNullOrWhiteSpace(message)) return;
-        _inputText = "";
-        UpdateCommandPalette();
-        await Interaction.InterruptAndSteerAsync(AgentId, message);
-    }
+        => _ = await DispatchDraftAsync((convId, text, attachments) =>
+        {
+            UpdateCommandPalette();
+            return Interaction.DeliverMessageAsync(
+                AgentId, convId, text, InboundDeliveryMode.Interrupt, attachments);
+        });
 
     // #1691: invoked from JS (chatScroll.observeTopForLoadMore) when the user scrolls near the top.
     // Fetches and prepends the next older page, preserving the visual scroll position so the view
@@ -1302,7 +2489,7 @@ private bool IsStreaming =>
 
     private async Task LoadMoreHistory()
     {
-        if (_isLoadingMore || ActiveConversationId is not { } convId)
+        if (_isLoadingMore || DisplayedConversationId is not { } convId)
             return;
         if (ActiveConversation is not { HasMoreHistory: true })
             return;
@@ -1397,5 +2584,9 @@ private bool IsStreaming =>
         };
     }
 
-    private string GetSubAgentStatus() => IsStreaming ? "⏳ Running" : "✅ Completed";
+    private readonly record struct ReadOnlyBannerStatus(
+        string Label,
+        string Icon,
+        string CssClass,
+        string IconClass);
 }

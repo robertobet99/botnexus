@@ -70,11 +70,89 @@ public sealed class StripedAsyncLock
     }
 
     /// <summary>
+    /// Acquires the distinct physical stripes for two keys in stripe-index order.
+    /// Colliding keys acquire their shared stripe only once. Cancellation while waiting
+    /// for the second stripe releases the first; disposal releases both exactly once.
+    /// </summary>
+    public async Task<IDisposable> AcquirePairAsync<TKey>(TKey firstKey, TKey secondKey, CancellationToken cancellationToken = default)
+        where TKey : notnull
+    {
+        var firstIndex = GetStripeIndex(firstKey);
+        var secondIndex = GetStripeIndex(secondKey);
+        if (firstIndex > secondIndex)
+            (firstIndex, secondIndex) = (secondIndex, firstIndex);
+
+        var first = _stripes[firstIndex];
+        await first.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (firstIndex == secondIndex)
+            return new Releaser(first);
+
+        try
+        {
+            var second = _stripes[secondIndex];
+            await second.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return new PairReleaser(new Releaser(first), new Releaser(second));
+        }
+        catch
+        {
+            first.Release();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Acquires the stripe for <paramref name="key"/>, giving up after <paramref name="timeout"/>
+    /// with a <see cref="StripeLockTimeoutException"/> that names the key and the bound (#3517).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The token-only <see cref="AcquireAsync{TKey}(TKey, CancellationToken)"/> has no bound of its
+    /// own: handed <see cref="CancellationToken.None"/> it waits forever on a stripe a wedged
+    /// caller never releases, and handed a token that is subsequently cancelled it surfaces a bare
+    /// <see cref="TaskCanceledException"/> whose stack says nothing about lock contention. #3517
+    /// hit both shapes from the cron one-shot delete path and neither was diagnosable from the log.
+    /// </para>
+    /// <para>
+    /// Cancellation and expiry are deliberately DISTINCT outcomes. A cancelled
+    /// <paramref name="cancellationToken"/> still throws <see cref="OperationCanceledException"/>,
+    /// because "my caller went away" and "somebody else is holding this and will not let go" call
+    /// for opposite responses: the first is retryable and uninteresting, the second is a stuck
+    /// peer that an operator has to be told about.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="TKey">The key type. <see cref="object.GetHashCode"/> is used.</typeparam>
+    /// <param name="key">The key whose stripe to acquire. Must not be null.</param>
+    /// <param name="timeout">
+    /// How long to wait before failing. Must be positive, or <see cref="Timeout.InfiniteTimeSpan"/>
+    /// to opt back into an unbounded wait.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the wait.</param>
+    /// <returns>A handle that releases the stripe when disposed.</returns>
+    /// <exception cref="StripeLockTimeoutException">The stripe was still held when the bound elapsed.</exception>
+    public async Task<IDisposable> AcquireAsync<TKey>(TKey key, TimeSpan timeout, CancellationToken cancellationToken = default)
+        where TKey : notnull
+    {
+        if (timeout != Timeout.InfiniteTimeSpan)
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero, nameof(timeout));
+
+        var stripe = GetStripe(key);
+        if (!await stripe.WaitAsync(timeout, cancellationToken).ConfigureAwait(false))
+            throw new StripeLockTimeoutException(key.ToString(), timeout);
+
+        return new Releaser(stripe);
+    }
+
+    /// <summary>
     /// Returns the <see cref="SemaphoreSlim"/> a key maps to. Exposed for tests that
     /// need to assert two keys land on the same or different stripes.
     /// </summary>
     internal SemaphoreSlim GetStripe<TKey>(TKey key)
         where TKey : notnull
+    {
+        return _stripes[GetStripeIndex(key)];
+    }
+
+    private int GetStripeIndex<TKey>(TKey key) where TKey : notnull
     {
         // Non-negative, well-distributed index. & with (length-1) is only valid for
         // power-of-two lengths, so use a modulo on the absolute hash to support any
@@ -82,7 +160,16 @@ public sealed class StripedAsyncLock
         // throws.
         var hash = key.GetHashCode();
         var index = (hash == int.MinValue ? 0 : Math.Abs(hash)) % _stripes.Length;
-        return _stripes[index];
+        return index;
+    }
+
+    private sealed class PairReleaser(IDisposable first, IDisposable second) : IDisposable
+    {
+        public void Dispose()
+        {
+            second.Dispose();
+            first.Dispose();
+        }
     }
 
     private sealed class Releaser(SemaphoreSlim stripe) : IDisposable

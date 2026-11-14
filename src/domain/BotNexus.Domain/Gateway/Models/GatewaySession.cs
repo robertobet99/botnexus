@@ -1,6 +1,8 @@
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Security;
 
+using System.Text.Json.Serialization;
+
 namespace BotNexus.Gateway.Abstractions.Models;
 
 /// <summary>
@@ -15,6 +17,7 @@ public sealed class GatewaySession
     private string? _callerId;
     private readonly ISecretRedactor? _redactor;
     private AgentId _agentId;
+    private Session _session;
 
     public GatewaySession()
         : this(new Session(), null)
@@ -23,12 +26,16 @@ public sealed class GatewaySession
 
     public GatewaySession(Session session, ISecretRedactor? redactor = null)
     {
-        Session = session ?? throw new ArgumentNullException(nameof(session));
+        _session = session ?? throw new ArgumentNullException(nameof(session));
         _redactor = redactor;
     }
 
-    /// <summary>Domain session state for persistence.</summary>
-    public Session Session { get; }
+    /// <summary>
+    /// Domain session state for persistence. The reference is replaced only by the
+    /// <c>init</c> accessors below, which run during object initialization before any
+    /// caller can observe <see cref="Runtime"/>; it is effectively readonly afterwards.
+    /// </summary>
+    public Session Session => _session;
 
     /// <summary>Infrastructure runtime state for thread-safe mutation and replay buffering.</summary>
     public GatewaySessionRuntime Runtime
@@ -46,8 +53,8 @@ public sealed class GatewaySession
     /// <summary>Unique session identifier.</summary>
     public SessionId SessionId
     {
-        get => Session.SessionId;
-        init => Session.SessionId = value;
+        get => _session.SessionId;
+        init => _session = _session with { SessionId = value };
     }
 
     /// <summary>
@@ -123,8 +130,8 @@ public sealed class GatewaySession
     /// <summary>When the session was created.</summary>
     public DateTimeOffset CreatedAt
     {
-        get => Session.CreatedAt;
-        init => Session.CreatedAt = value;
+        get => _session.CreatedAt;
+        init => _session = _session with { CreatedAt = value };
     }
 
     /// <summary>When the session was last active.</summary>
@@ -192,6 +199,13 @@ public sealed class GatewaySession
         set => Session.ExchangeCompletion = value;
     }
 
+    /// <summary>Latest authoritative run-completion disposition for history and diagnostics.</summary>
+    public RunCompletionSignal? RunCompletion
+    {
+        get => Session.RunCompletion;
+        set => Session.RunCompletion = value;
+    }
+
     /// <summary>
     /// Dedicated outbound-stream reconnect-replay peer for this session. The 8
     /// stream-replay members previously hosted on the facade (#575) collapsed
@@ -207,6 +221,24 @@ public sealed class GatewaySession
     /// Call on clean turn completion to prevent sentinels from persisting after a successful run.
     /// </summary>
     public void RemoveCrashSentinels() => Runtime.RemoveCrashSentinels();
+
+    /// <summary>
+    /// Creates an isolated candidate for a fenced aggregate write. History entries, metadata
+    /// dictionary, replay state and persistence bookkeeping are copied without changing the live session.
+    /// Publish the candidate through the store only after the write fence accepts it.
+    /// </summary>
+    public GatewaySession CreateDetachedCopy()
+    {
+        var runtime = Runtime.CreateDetachedCopy();
+        return new GatewaySession(runtime.Session, _redactor)
+        {
+            AgentId = AgentId,
+            CallerId = CallerId,
+            LastRenderedSystemPrompt = LastRenderedSystemPrompt,
+            LastRenderedSystemPromptAt = LastRenderedSystemPromptAt,
+            _runtime = runtime
+        };
+    }
 
     /// <summary>Thread-safe append to conversation history. Content is redacted before storage when a redactor is configured.</summary>
     public void AddEntry(SessionEntry entry) => Runtime.AddEntry(Redact(entry));
@@ -255,6 +287,18 @@ public sealed class GatewaySession
     /// <summary>Returns a snapshot of the history (safe to iterate).</summary>
     public IReadOnlyList<SessionEntry> GetHistorySnapshot() => Runtime.GetHistorySnapshot();
 
+    /// <summary>Captures append-only or replacement history work for a persistence attempt.</summary>
+    public SessionHistoryPersistenceSnapshot CaptureHistoryForPersistence() => Runtime.CaptureHistoryForPersistence();
+
+    /// <summary>Acknowledges the exact history prefix written by a persistence attempt.</summary>
+    public void AcknowledgeHistoryPersistence(
+        SessionHistoryPersistenceSnapshot snapshot,
+        IReadOnlyDictionary<long, long> insertedRowIds)
+        => Runtime.AcknowledgeHistoryPersistence(snapshot, insertedRowIds);
+
+    /// <summary>Marks history materialized from durable storage as already persisted.</summary>
+    public void MarkCurrentHistoryPersisted() => Runtime.MarkCurrentHistoryPersisted();
+
     /// <summary>
     /// Returns a paginated snapshot of the history (safe to iterate).
     /// </summary>
@@ -290,6 +334,24 @@ public sealed class GatewaySession
 /// </summary>
 public sealed record SessionEntry
 {
+    /// <summary>Authoritative agent execution identity; null means legacy or unmeasured.</summary>
+    public BotNexus.Domain.Primitives.AgentRunId? AgentRunId { get; init; }
+    /// <summary>
+    /// SQLite row identity used only by aggregate persistence reconciliation. It is deliberately
+    /// excluded from every wire/JSON representation; negative values are transient identities
+    /// assigned while an insert is in flight and are replaced with the durable row id on acknowledgement.
+    /// </summary>
+    [JsonIgnore]
+    public long? PersistenceId { get; set; }
+
+    /// <summary>
+    /// Stable idempotency key for inserting this row. Unlike <see cref="PersistenceId"/>, this is
+    /// assigned before I/O and survives a retry whose first commit had an ambiguous outcome.
+    /// It is persistence-only and never appears in transcript JSON or wire payloads.
+    /// </summary>
+    [JsonIgnore]
+    public string? PersistenceKey { get; set; }
+
     /// <summary>Message role.</summary>
     public required MessageRole Role { get; init; }
 
@@ -325,20 +387,61 @@ public sealed record SessionEntry
     /// </summary>
     public TriggerType? Trigger { get; init; }
 
+    /// <summary>
+    /// Optional origin attribution for this entry (issue #2840): who or what produced it, when the
+    /// producer is not simply "the human on the channel". <c>null</c> - the default and the value every
+    /// row persisted before #2840 reads back as - means no explicit attribution was supplied and the
+    /// entry's origin is whatever <see cref="Role"/> and the owning session already imply.
+    /// </summary>
+    /// <remarks>
+    /// This exists because a message that appears in a conversation with no provenance is worse than no
+    /// message: a reader cannot tell a scripted post from a human turn. It is deliberately a free-form
+    /// string rather than a typed citizen id - the callers that need it (cron command jobs, CI steps,
+    /// shell scripts) are not citizens and have no id in the world model. Treat it as untrusted display
+    /// text supplied by the caller; never as an authorization input.
+    /// </remarks>
+    public string? SenderId { get; init; }
+
     /// <summary>Tool name (when Role is <see cref="MessageRole.Tool"/>).</summary>
     public string? ToolName { get; init; }
 
     /// <summary>Tool call ID for correlating requests and results.</summary>
     public string? ToolCallId { get; init; }
 
-    /// <summary>Serialized JSON args for tool call (when Role is <see cref="MessageRole.Tool"/> and this is a ToolStart entry).</summary>
+    /// <summary>Serialized JSON args for tool call (when Role is <see cref="MessageRole.Tool"/>).</summary>
+    /// <remarks>
+    /// #2906: this is populated on BOTH rows of a tool-call pair - the start row and the result row -
+    /// so a result row is self-describing. A tool invoked with no arguments records an empty JSON
+    /// object (<c>{}</c>) rather than <c>null</c>, so "no args" stays distinguishable from
+    /// "args lost". <c>null</c> now means only "legacy row, or not a tool row".
+    /// </remarks>
     public string? ToolArgs { get; init; }
 
     /// <summary>True if the tool call resulted in an error.</summary>
     public bool ToolIsError { get; init; }
+    /// <summary>True for a synthetic interruption row, not an observed execution result.</summary>
+    public bool ToolIsIncomplete { get; init; }
 
     /// <summary>True if this entry is a compaction summary (not a real conversation message).</summary>
     public bool IsCompactionSummary { get; init; }
+
+    /// <summary>
+    /// True if this entry is a gateway-authored banner explaining that the turn was interrupted by an
+    /// unclean restart and is being auto-replayed (#3046). Like <see cref="IsCompactionSummary"/>, this
+    /// marks a <see cref="MessageRole.System"/> entry that MUST survive into the LLM view on cold resume
+    /// even though raw system entries are otherwise dropped there (the agent's system prompt is rebuilt
+    /// separately by <c>SystemPromptBuilder</c>).
+    /// </summary>
+    /// <remarks>
+    /// This exists as its own flag rather than reusing an existing role because the two honest choices
+    /// were both worse: prefixing the banner onto the replayed user message produces a transcript in
+    /// which the user's turn contains words the user never wrote, and emitting it as a
+    /// <see cref="MessageRole.User"/> entry fabricates a user turn outright. The whole defect being
+    /// fixed is the agent misreading provenance after a restart, so the fix must not forge provenance
+    /// to achieve it. <see cref="MessageRole.Notification"/> cannot carry it either - that role is
+    /// deliberately never forwarded to the LLM.
+    /// </remarks>
+    public bool IsReplayBanner { get; init; }
 
     /// <summary>
     /// True if this entry is a crash sentinel written before an agent turn begins.
@@ -371,6 +474,58 @@ public sealed record SessionEntry
     /// Null when the model did not produce reasoning blocks.
     /// </summary>
     public string? ThinkingContent { get; init; }
+
+    /// <summary>
+    /// Orthogonal, typed presentation/delivery kind for this transcript entry (issue #2149).
+    /// <c>null</c> (the default) means the entry carries no explicit kind and is treated as
+    /// <see cref="MessageKind.Message"/> - so legacy rows persisted before this field existed
+    /// default safely on replay. The gateway stamps <see cref="MessageKind.SubAgentCompletion"/>
+    /// on the inbound completion entry and <see cref="MessageKind.SubAgentResponse"/> on the
+    /// parent agent's response entry produced while handling that completion, letting channels
+    /// distinguish the three cases without re-parsing <see cref="Role"/>, ids, or content. Kept
+    /// orthogonal to <see cref="Role"/>, which remains the LLM/conversation role.
+    /// </summary>
+    public MessageKind? Kind { get; init; }
+
+    /// <summary>
+    /// Resolves the effective <see cref="MessageKind"/> for this entry, mapping the unset
+    /// <see cref="Kind"/> (including legacy rows) to <see cref="MessageKind.Message"/>.
+    /// </summary>
+    /// <returns>The stamped kind, or <see cref="MessageKind.Message"/> when none was supplied.</returns>
+    public MessageKind ResolveKind() => Kind ?? MessageKind.Message;
+
+    /// <summary>
+    /// True when this entry is the audit row recorded at the START of a tool call (#2906).
+    /// </summary>
+    /// <remarks>
+    /// Prefers the explicit <see cref="MessageKind.ToolStart"/> stamp. Rows persisted before #2906
+    /// carry no kind, so they fall back to the historical heuristic - a start row was the only tool
+    /// row that had <see cref="ToolArgs"/>. That fallback must stay for replay of existing
+    /// transcripts; it is exactly the ambiguity the typed kind removes going forward.
+    /// </remarks>
+    /// <returns><see langword="true"/> when this is a tool-start row.</returns>
+    public bool IsToolStartRow()
+    {
+        if (!Role.Equals(MessageRole.Tool))
+            return false;
+
+        if (Kind is { } kind)
+        {
+            if (kind.Equals(MessageKind.ToolStart))
+                return true;
+            if (kind.Equals(MessageKind.ToolResult))
+                return false;
+        }
+
+        return ToolArgs is not null;
+    }
+
+    /// <summary>
+    /// True when this entry is the audit row recorded for a tool call's RESULT (#2906), including
+    /// the synthesized row for a call that never completed.
+    /// </summary>
+    /// <returns><see langword="true"/> when this is a tool-result row.</returns>
+    public bool IsToolResultRow() => Role.Equals(MessageRole.Tool) && !IsToolStartRow();
 }
 
 /// <summary>

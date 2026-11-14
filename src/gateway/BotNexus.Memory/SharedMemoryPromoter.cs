@@ -1,3 +1,5 @@
+using System.Text.Json;
+using BotNexus.Domain.Text;
 using BotNexus.Memory.Learning;
 using BotNexus.Memory.Models;
 using Microsoft.Extensions.Logging;
@@ -38,6 +40,7 @@ public sealed class SharedMemoryPromoter
         ArgumentNullException.ThrowIfNull(items);
 
         var promoted = 0;
+        var refused = 0;
 
         foreach (var item in items)
         {
@@ -45,6 +48,24 @@ public sealed class SharedMemoryPromoter
 
             if (item.TargetStore is null)
                 continue;
+
+            // Promotion refusal (#3232 AC6). A shared store is read by agents that never saw the
+            // originating turn and cannot judge the content's origin for themselves, so promotion
+            // is an authority transfer, not a copy. Non-first-party material is refused rather
+            // than promoted-and-labelled: the label would have to survive every future read path
+            // to be worth anything, and one that forgets it reopens the laundering route this
+            // issue exists to close. The content stays in the origin agent's own store.
+            if (!item.IsPromotable)
+            {
+                refused++;
+                _logger.LogWarning(
+                    "Refusing to promote non-first-party knowledge to shared store '{Store}' for agent '{AgentId}': provenance={Provenance}, contributors=[{Contributors}]",
+                    item.TargetStore,
+                    agentId,
+                    item.Provenance,
+                    string.Join(", ", item.ContributingProvenances));
+                continue;
+            }
 
             if (!_registry.CanWrite(agentId, item.TargetStore))
             {
@@ -79,6 +100,12 @@ public sealed class SharedMemoryPromoter
                 SessionId = item.SourceSessionId,
                 TurnIndex = item.SourceTurnIndex,
                 SourceType = "dreaming",
+                // The promoted row carries the LEAST-TRUSTED contributing provenance, not a fresh
+                // first-party stamp (#3232 AC3/AC7). Re-stamping on ingest is the exact laundering
+                // step the trust boundary exists to prevent; the originating session is preserved
+                // separately so the promoted row does not lose its trail (#2480).
+                Provenance = item.Provenance,
+                OriginSessionId = item.SourceSessionId,
                 Content = item.Content,
                 MetadataJson = BuildMetadataJson(item),
                 CreatedAt = DateTimeOffset.UtcNow,
@@ -93,8 +120,8 @@ public sealed class SharedMemoryPromoter
         }
 
         _logger.LogInformation(
-            "Shared memory promotion complete: {Promoted}/{Total} items promoted for agent '{AgentId}'",
-            promoted, items.Count(i => i.TargetStore is not null), agentId);
+            "Shared memory promotion complete: {Promoted}/{Total} items promoted for agent '{AgentId}' ({Refused} refused as non-first-party)",
+            promoted, items.Count(i => i.TargetStore is not null), agentId, refused);
 
         return promoted;
     }
@@ -156,8 +183,22 @@ public sealed class SharedMemoryPromoter
             .ToHashSet();
 
     private static string Truncate(string text, int maxLength)
-        => text.Length <= maxLength ? text : text[..maxLength];
+        => TextTruncation.SafeTruncate(text, maxLength)!;
 
     private static string BuildMetadataJson(ExtractedKnowledge item)
-        => $"{{\"category\":\"{item.Category}\",\"confidence\":{item.Confidence:F2},\"sourceSession\":\"{item.SourceSessionId}\",\"sourceTurn\":{item.SourceTurnIndex}}}";
+    {
+        var contributingProvenances = item.ContributingProvenances
+            .Select(MemoryProvenance.Normalize)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        return JsonSerializer.Serialize(new
+        {
+            category = item.Category.ToString(),
+            confidence = Math.Round(item.Confidence, 2),
+            sourceSession = item.SourceSessionId,
+            sourceTurn = item.SourceTurnIndex,
+            contributingProvenances,
+        });
+    }
 }

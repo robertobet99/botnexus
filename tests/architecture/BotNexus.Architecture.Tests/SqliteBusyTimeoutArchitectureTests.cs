@@ -25,9 +25,8 @@ namespace BotNexus.Architecture.Tests;
 /// See #1435/#1436 for the shared-helper consolidation that will eventually replace these inline
 /// PRAGMAs.
 /// </summary>
-public sealed class SqliteBusyTimeoutArchitectureTests
+public sealed class SqliteBusyTimeoutArchitectureTests : ArchitectureTest
 {
-    private static string RepoRoot => FindRepoRoot();
 
     // The SQLite store source files that #1450 covers (relative to repo root).
     // SqliteConversationStore.cs was added in #1437 once PR #1442 unlocked the file.
@@ -45,10 +44,10 @@ public sealed class SqliteBusyTimeoutArchitectureTests
 
     // Post-#1541: the busy_timeout policy is owned by the shared SqliteConnectionFactory, which
     // attaches a StateChange Open-handler that applies `PRAGMA busy_timeout` on every open. A store
-    // satisfies the fence either by the literal inline pragma (legacy shape) OR by routing through
-    // the factory (SqliteConnectionFactory.Create / AttachBusyTimeout).
+    // satisfies the fence either by the literal inline pragma (legacy shape), by routing through
+    // SqliteConnectionFactory.Create, or by attaching the shared policy as a connection extension.
     private static readonly Regex BusyTimeoutPragma =
-        new(@"PRAGMA\s+busy_timeout|SqliteConnectionFactory\.(Create|AttachBusyTimeout)", RegexOptions.IgnoreCase);
+        new(@"PRAGMA\s+busy_timeout|SqliteConnectionFactory\.Create|\.AttachBusyTimeout\(", RegexOptions.IgnoreCase);
 
     // Post-#1436: the seven unblocked stores delegate journal-mode selection to the shared
     // SqliteWalMaintenance helper (WAL on local disk, DELETE on network mounts) instead of an
@@ -63,7 +62,7 @@ public sealed class SqliteBusyTimeoutArchitectureTests
     {
         foreach (var rel in StoreFiles)
         {
-            var path = Path.Combine(RepoRoot, rel.Replace('/', Path.DirectorySeparatorChar));
+            var path = Path.Combine(Repository.Root, rel.Replace('/', Path.DirectorySeparatorChar));
             File.Exists(path).ShouldBeTrue($"Expected SQLite store source not found: {path}");
         }
     }
@@ -73,7 +72,7 @@ public sealed class SqliteBusyTimeoutArchitectureTests
     {
         foreach (var rel in StoreFiles)
         {
-            var path = Path.Combine(RepoRoot, rel.Replace('/', Path.DirectorySeparatorChar));
+            var path = Path.Combine(Repository.Root, rel.Replace('/', Path.DirectorySeparatorChar));
             var source = File.ReadAllText(path);
 
             // Sanity: the file must still manage WAL - either the inline pragma or the shared
@@ -160,15 +159,101 @@ public sealed class SqliteBusyTimeoutArchitectureTests
             "If this fails, the busy_timeout detector is over-tight.");
     }
 
-    private static string FindRepoRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !File.Exists(Path.Combine(current.FullName, "BotNexus.slnx")))
-        {
-            current = current.Parent;
-        }
+    // #2977: the busy_timeout StateChange handler must not capture the connection it is attached
+    // to. Capturing the local (rather than using the event's sender) is what let a stale
+    // subscription prepare a statement against an already-disposed SQLitePCL.sqlite3 handle and
+    // throw ObjectDisposedException out of the callback, red-lighting the core gate.
+    private static readonly Regex CapturingBusyTimeoutHandler =
+        new(
+            @"StateChange\s*\+=\s*\(\s*_\s*,\s*\w+\s*\)\s*=>[\s\S]{0,400}?busy_timeout",
+            RegexOptions.IgnoreCase);
 
-        current.ShouldNotBeNull("Could not locate repo root (BotNexus.slnx) from " + AppContext.BaseDirectory);
-        return current!.FullName;
+    [Fact]
+    public void BusyTimeoutHandler_UsesSender_NotACapturedConnection()
+    {
+        const string rel = "src/persistence/BotNexus.Persistence.Sqlite/SqliteConnectionFactory.cs";
+        var path = Path.Combine(Repository.Root, rel.Replace('/', Path.DirectorySeparatorChar));
+        var source = File.ReadAllText(path);
+
+        // Precondition: this really is the file that owns the busy_timeout policy, so a rename
+        // cannot silently turn this fence into a no-op.
+        BusyTimeoutPragma.IsMatch(source).ShouldBeTrue(
+            $"Expected the busy_timeout policy to live in {rel}. If it moved, update this fence.");
+
+        CapturingBusyTimeoutHandler.IsMatch(source).ShouldBeFalse(
+            "The busy_timeout StateChange handler discards the event sender and must therefore be " +
+            "capturing the connection local. It must use the event's sender instead, so the " +
+            "subscription never holds - and never issues commands against - a connection whose " +
+            "underlying sqlite3 handle has been disposed. See #2977.\nFile: " + path);
     }
+
+    [Fact]
+    public void BusyTimeoutHandlerFence_IsNotVacuous_DetectsTheCapturingShape()
+    {
+        // Mutation guard: the exact pre-#2977 handler must be recognised by the detector, otherwise
+        // BusyTimeoutHandler_UsesSender_NotACapturedConnection passes for the wrong reason.
+        const string preFixHandler = @"
+            connection.StateChange += (_, e) =>
+            {
+                if (e.CurrentState == System.Data.ConnectionState.Open)
+                {
+                    using var pragma = connection.CreateCommand();
+                    pragma.CommandText = PRAGMA busy_timeout=5000;
+                    pragma.ExecuteNonQuery();
+                }
+            };";
+
+        CapturingBusyTimeoutHandler.IsMatch(preFixHandler).ShouldBeTrue(
+            "Vacuity guard: the detector must recognise the pre-#2977 capturing handler shape. " +
+            "If this fails, the lifetime fence above is vacuous.");
+    }
+
+    [Fact]
+    public void ProductionSqliteConnections_RouteThroughTheCanonicalFactory()
+    {
+        var violations = Directory
+            .EnumerateFiles(Path.Combine(Repository.Root, "src"), "*.cs", SearchOption.AllDirectories)
+            .Select(path => new
+            {
+                Relative = Path.GetRelativePath(Repository.Root, path).Replace('\\', '/'),
+                Source = File.ReadAllText(path),
+            })
+            .Where(file => !file.Relative.Equals(
+                "src/persistence/BotNexus.Persistence.Sqlite/SqliteConnectionFactory.cs",
+                StringComparison.OrdinalIgnoreCase))
+            .Where(file => Regex.IsMatch(file.Source, @"FOREIGN\s+KEY|REFERENCES\s+[A-Za-z_]", RegexOptions.IgnoreCase))
+            .Where(file => Regex.IsMatch(file.Source, @"new\s+SqliteConnection\s*\(", RegexOptions.IgnoreCase))
+            .Select(file => file.Relative)
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+
+        violations.ShouldBeEmpty(
+            "Production stores and writers must route connection opens through " +
+            "SqliteConnectionFactory so per-connection busy-timeout, foreign-key, and store-identity " +
+            "policies cannot be bypassed. This fence covers every production source file that " +
+            "declares a SQLite foreign-key relationship.");
+    }
+
+    [Fact]
+    public void BusyTimeoutHandlerFence_PositivePin_AcceptsTheSenderShape()
+    {
+        // Positive pin: the fixed shape (named handler taking sender) must NOT be flagged, so the
+        // detector is not merely rejecting every handler.
+        const string fixedHandler = @"
+            connection.StateChange += BusyTimeoutOnOpen;
+
+            void BusyTimeoutOnOpen(object? sender, System.Data.StateChangeEventArgs e)
+            {
+                if (e.CurrentState != System.Data.ConnectionState.Open) { return; }
+                if (sender is not SqliteConnection opened) { return; }
+                using var pragma = opened.CreateCommand();
+                pragma.CommandText = PRAGMA busy_timeout=5000;
+                pragma.ExecuteNonQuery();
+            }";
+
+        CapturingBusyTimeoutHandler.IsMatch(fixedHandler).ShouldBeFalse(
+            "Positive pin: the sender-based handler must be accepted. If this fails the detector is " +
+            "over-tight and would flag the corrected shape.");
+    }
+
 }

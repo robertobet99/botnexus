@@ -42,10 +42,8 @@ public sealed class AskUserToolTests
         });
 
         var executionTask = tool.ExecuteAsync("call-ask-user", arguments, onUpdate: updates.Add);
-        await Task.Delay(100);
-
-        executionTask.IsCompleted.ShouldBeFalse();
         var request = await WaitForRequestAsync(updates);
+        executionTask.IsCompleted.ShouldBeFalse();
         registry.TryComplete(request.ConversationId, request.RequestId, CreateResponse(request.RequestId, freeFormText: "Hermes")).ShouldBeTrue();
         await executionTask;
     }
@@ -197,6 +195,46 @@ public sealed class AskUserToolTests
     // ── ask_user durability (#1488): persist while pending, clear on resolve ──
 
     [Fact]
+    public async Task ExecuteAsync_UserInputRequiredCallback_CanReadPersistedPendingPrompt()
+    {
+        var registry = new AskUserResponseRegistry();
+        var store = new InMemoryConversationStore();
+        var conversationId = ConversationId.From("conversation-1");
+        await SeedConversationAsync(store, conversationId.Value);
+        var tool = CreateTool(registry, conversationId.Value, store);
+        var arguments = await tool.PrepareArgumentsAsync(new Dictionary<string, object?>
+        {
+            ["prompt"] = "Which environment should I deploy to?"
+        });
+        string? pendingJsonObservedByCallback = null;
+        AskUserRequest? emittedRequest = null;
+
+        var executionTask = tool.ExecuteAsync(
+            "call-ask-user",
+            arguments,
+            onUpdate: update =>
+            {
+                emittedRequest = update.Details as AskUserRequest;
+                pendingJsonObservedByCallback = store.GetAsync(conversationId).GetAwaiter().GetResult()?.PendingAskUserJson;
+            });
+
+        emittedRequest.ShouldNotBeNull();
+        pendingJsonObservedByCallback.ShouldNotBeNull(
+            "the pending checkpoint must be readable before UserInputRequired becomes observable");
+        using (var document = JsonDocument.Parse(pendingJsonObservedByCallback))
+        {
+            document.RootElement.GetProperty("requestId").GetString().ShouldBe(emittedRequest.RequestId);
+            document.RootElement.GetProperty("prompt").GetString().ShouldBe(emittedRequest.Prompt);
+        }
+
+        registry.TryComplete(
+            conversationId,
+            emittedRequest.RequestId,
+            CreateResponse(emittedRequest.RequestId, freeFormText: "staging")).ShouldBeTrue();
+        await executionTask;
+    }
+
+    [Fact]
     public async Task ExecuteAsync_PersistsPendingPrompt_WhileWaiting()
     {
         var registry = new AskUserResponseRegistry();
@@ -276,6 +314,61 @@ public sealed class AskUserToolTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_OnShutdownCancellation_PreservesDurableCheckpoint()
+    {
+        // #2047: a graceful gateway shutdown cancels the caller token mid-wait. The durable prompt
+        // must be PRESERVED (not cleared) so a restarted gateway can resume it - unlike an explicit
+        // user cancel, which is terminal and clears it.
+        var registry = new AskUserResponseRegistry();
+        var store = new InMemoryConversationStore();
+        await SeedConversationAsync(store, "conversation-1");
+        var tool = CreateTool(registry, "conversation-1", store);
+        var updates = new List<AgentToolResult>();
+        var arguments = await tool.PrepareArgumentsAsync(new Dictionary<string, object?>
+        {
+            ["prompt"] = "Survive a restart?"
+        });
+
+        using var shutdown = new CancellationTokenSource();
+        var executionTask = tool.ExecuteAsync("call-ask-user", arguments, shutdown.Token, updates.Add);
+        var request = await WaitForRequestAsync(updates);
+        await WaitForPendingJsonAsync(store, request.ConversationId, expectPresent: true);
+
+        shutdown.Cancel();
+        await Should.ThrowAsync<OperationCanceledException>(async () => await executionTask);
+
+        // The checkpoint is intentionally still present after a shutdown-driven cancellation.
+        var loaded = await store.GetAsync(request.ConversationId);
+        loaded!.PendingAskUserJson.ShouldNotBeNull();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WithNoTimeoutArgument_HasNoHardExpiry()
+    {
+        // #2047: without an explicit timeout_seconds the prompt no longer defaults to 300s; it stays
+        // pending well beyond the former default until the user answers.
+        var registry = new AskUserResponseRegistry();
+        var tool = CreateTool(registry, "conversation-1");
+        var updates = new List<AgentToolResult>();
+        var arguments = await tool.PrepareArgumentsAsync(new Dictionary<string, object?>
+        {
+            ["prompt"] = "No expiry"
+        });
+
+        var executionTask = tool.ExecuteAsync("call-ask-user", arguments, onUpdate: updates.Add);
+        var request = await WaitForRequestAsync(updates);
+
+        // The emitted request advertises no timeout policy.
+        request.Timeout.ShouldBeNull();
+        // Emitting the request proves registration completed. With no timeout policy, the only
+        // remaining completion paths are an explicit answer, cancellation, or caller shutdown.
+        executionTask.IsCompleted.ShouldBeFalse();
+
+        registry.TryComplete(request.ConversationId, request.RequestId, CreateResponse(request.RequestId, freeFormText: "late but fine")).ShouldBeTrue();
+        ReadText(await executionTask).ShouldContain("late but fine");
+    }
+
+    [Fact]
     public async Task ExecuteAsync_WithoutStore_DoesNotThrow()
     {
         // The conversation store is optional; the prompt must still work with no durability wired.
@@ -295,6 +388,69 @@ public sealed class AskUserToolTests
         ReadText(result).ShouldContain("yes");
     }
 
+    // -- ask_user pending soft-lock (#1916): pending state must never leak on failure --
+
+    [Fact]
+    public async Task PrepareArgumentsAsync_WithNonIntegerTimeout_ThrowsWithoutRegisteringPending()
+    {
+        // A validation failure (e.g. a non-integer timeout_seconds) must abort during argument
+        // preparation and NEVER create pending-input state. A call that never validated must not
+        // leave a live prompt behind.
+        var registry = new AskUserResponseRegistry();
+        var tool = CreateTool(registry, "conversation-1");
+
+        Func<Task> act = () => tool.PrepareArgumentsAsync(new Dictionary<string, object?>
+        {
+            ["prompt"] = "Respond soon",
+            ["timeout_seconds"] = "not-a-number"
+        });
+
+        await act.ShouldThrowAsync<ArgumentException>();
+        registry.TryGetPendingRequestId(ConversationId.From("conversation-1"), out _).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenUpdateCallbackThrows_AutoCancelsPendingSoSessionUnblocks()
+    {
+        // If anything fails after the registry entry is created (e.g. the widget-emit callback
+        // throws), the pending request must be auto-cancelled so the conversation does not stay
+        // permanently in pending-input state silently swallowing user messages (#1916, criterion 4).
+        var registry = new AskUserResponseRegistry();
+        var tool = CreateTool(registry, "conversation-1");
+        var arguments = await tool.PrepareArgumentsAsync(new Dictionary<string, object?>
+        {
+            ["prompt"] = "Which environment?"
+        });
+
+        Func<Task> act = () => tool.ExecuteAsync(
+            "call-ask-user",
+            arguments,
+            onUpdate: _ => throw new InvalidOperationException("widget emit failed"));
+
+        await act.ShouldThrowAsync<InvalidOperationException>();
+
+        // The pending registration must not survive the failure.
+        registry.TryGetPendingRequestId(ConversationId.From("conversation-1"), out _).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WithNumericStringTimeout_CoercesAndTimesOut()
+    {
+        // A numeric-string timeout must be coerced (not rejected after pending UI is created).
+        var registry = new AskUserResponseRegistry();
+        var tool = CreateTool(registry, "conversation-1");
+        var arguments = await tool.PrepareArgumentsAsync(new Dictionary<string, object?>
+        {
+            ["prompt"] = "Respond soon",
+            ["timeout_seconds"] = "1"
+        });
+
+        var result = await tool.ExecuteAsync("call-ask-user", arguments, onUpdate: _ => { });
+
+        var json = JsonDocument.Parse(ReadText(result));
+        json.RootElement.GetProperty("wasTimeout").GetBoolean().ShouldBeTrue();
+        registry.TryGetPendingRequestId(ConversationId.From("conversation-1"), out _).ShouldBeFalse();
+    }
     private static async Task SeedConversationAsync(InMemoryConversationStore store, string conversationId)
     {
         await store.CreateAsync(new Conversation
@@ -310,18 +466,19 @@ public sealed class AskUserToolTests
         ConversationId conversationId,
         bool expectPresent)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            var conversation = await store.GetAsync(conversationId);
-            var pending = conversation?.PendingAskUserJson;
-            if (expectPresent ? pending is not null : pending is null)
-                return pending;
+        string? pending = null;
+        await TestAwait.EventuallyAsync(
+            async () =>
+            {
+                var conversation = await store.GetAsync(conversationId);
+                pending = conversation?.PendingAskUserJson;
+                return expectPresent ? pending is not null : pending is null;
+            },
+            expectPresent
+                ? "the pending ask-user prompt to be persisted"
+                : "the pending ask-user prompt to be cleared");
 
-            await Task.Delay(25);
-        }
-
-        return (await store.GetAsync(conversationId))?.PendingAskUserJson;
+        return pending;
     }
 
     private static AskUserTool CreateTool(AskUserResponseRegistry registry, string conversationId)
@@ -341,19 +498,12 @@ public sealed class AskUserToolTests
 
     private static async Task<AskUserRequest> WaitForRequestAsync(IReadOnlyList<AgentToolResult> updates)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            if (updates.Count > 0)
-            {
-                return updates[^1].Details as AskUserRequest
-                    ?? throw new InvalidOperationException("Ask user update payload was not available in tool result details.");
-            }
+        await TestAwait.EventuallyAsync(
+            () => updates.Count > 0,
+            "the ask-user update callback to emit a request");
 
-            await Task.Delay(25);
-        }
-
-        throw new TimeoutException("Timed out waiting for ask_user update callback.");
+        return updates[^1].Details as AskUserRequest
+            ?? throw new InvalidOperationException("Ask user update payload was not available in tool result details.");
     }
 
     private static AskUserResponse CreateResponse(

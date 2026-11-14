@@ -8,6 +8,7 @@ using BotNexus.Agent.Providers.Core.Diagnostics;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Providers.Core.Utilities;
+using BotNexus.Gateway.Abstractions.Security;
 using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Agent.Providers.Core.Streaming;
@@ -54,11 +55,23 @@ public static class CompletionsStreamEngine
         LlmModel model,
         Context context,
         StreamOptions? options)
+        => StreamAsync(profile, httpClient, logger, model, context, options,
+            static (producer, cancellationToken) => Task.Run(producer, cancellationToken));
+
+    // Per-call dispatch seam lets tests hold work before scheduling without changing global state.
+    internal static LlmStream StreamAsync(
+        CompletionsTransportProfile profile,
+        HttpClient httpClient,
+        ILogger logger,
+        LlmModel model,
+        Context context,
+        StreamOptions? options,
+        Func<Func<Task>, CancellationToken, Task> dispatch)
     {
         var stream = new LlmStream();
         var ct = options?.CancellationToken ?? CancellationToken.None;
 
-        _ = Task.Run(async () =>
+        _ = dispatch(async () =>
         {
             using var activity = ProviderDiagnostics.Source.StartActivity(profile.ActivityName, ActivityKind.Client);
             activity?.SetTag("botnexus.provider.name", model.Provider);
@@ -67,6 +80,7 @@ public static class CompletionsStreamEngine
 
             try
             {
+                ct.ThrowIfCancellationRequested();
                 await StreamCoreAsync(profile, httpClient, logger, stream, model, context, options, ct);
                 activity?.SetStatus(ActivityStatusCode.Ok);
             }
@@ -75,13 +89,28 @@ public static class CompletionsStreamEngine
                 EmitAborted(stream, profile.Api, model);
                 activity?.SetStatus(ActivityStatusCode.Error, "Operation canceled");
             }
+            catch (ProviderTransientFinishReasonException ex)
+            {
+                // #3567: a transport-level finish reason must reach AgentLoopRunner's retry lane,
+                // which only ever inspects exceptions. Routing it through EmitError like any other
+                // failure would convert it back into a returned StopReason.Error message and end the
+                // run having spent zero of its four attempts.
+                logger.LogWarning(
+                    ex,
+                    "{Api} stream reported a transient finish reason for model {Model}; surfacing for retry",
+                    profile.Api,
+                    model.Id);
+                stream.EndFaulted(ex);
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            }
             catch (Exception ex)
             {
                 logger.LogError(ex, "{Api} stream failed for model {Model}", profile.Api, model.Id);
                 EmitError(stream, profile.Api, model, ex.Message);
                 activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             }
-        }, ct);
+        // Cancellation belongs to work/I/O, never dispatch: this producer owns terminalization.
+        }, CancellationToken.None);
 
         return stream;
     }
@@ -97,7 +126,8 @@ public static class CompletionsStreamEngine
         CancellationToken ct)
     {
         var compat = CompatResolver.Resolve(model);
-        var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+        var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, logger);
+        var apiKey = credential.Value;
         if (string.IsNullOrWhiteSpace(apiKey))
         {
             throw new InvalidOperationException(
@@ -114,6 +144,8 @@ public static class CompletionsStreamEngine
             if (modified is JsonObject obj)
                 payload = obj;
         }
+
+        payload.EnforceToolFree(options?.ToolChoiceMode, compat.SupportsTools != false);
 
         var url = $"{model.BaseUrl.TrimEnd('/')}/chat/completions";
 
@@ -154,14 +186,24 @@ public static class CompletionsStreamEngine
                 errorBody = $"<error body exceeded {ErrorBodyLimitBytes} bytes and was discarded>";
             }
             var providerError = ExtractProviderErrorMessage(errorBody, model);
-            profile.ThrowForError(response, providerError);
+            // #2881: the untrusted provider error body is about to become a persisted, user-visible
+            // exception message. Hand the profile's redactor down so ProviderHttpErrorHelper can
+            // scrub it at the single choke point. Typed local rather than an inline member access so
+            // the redaction seam is visible in this file to reader and fence alike.
+            ISecretRedactor? secretRedactor = profile.SecretRedactor;
+            profile.ThrowForError(response, providerError, secretRedactor);
         }
 
         using var responseStream = await response.Content.ReadAsStreamAsync(ct);
         // Bound the untrusted SSE body before a byte reaches the parser: every byte the StreamReader
         // consumes flows through the ByteCountingStream, so an unbounded body or a never-terminating
         // data: line trips the cap regardless of buffering (#1685). Caller owns the inner stream.
-        using var boundedStream = new ByteCountingStream(responseStream, MaxResponseBytes, MaxFrameBytes, leaveOpen: true);
+        using var boundedStream = new ByteCountingStream(
+            responseStream,
+            MaxResponseBytes,
+            MaxFrameBytes,
+            leaveOpen: true,
+            idleTimeout: StreamIdleTimeout.Resolve(options));
         using var reader = new StreamReader(boundedStream, Encoding.UTF8);
 
         await StreamProcessor.ParseOpenAiCompletionsAsync(
@@ -169,7 +211,7 @@ public static class CompletionsStreamEngine
             reader,
             model,
             profile.Api,
-            ParseUsage,
+            (usageElement, usage, usageModel) => usageElement.ParseUsage(usage, usageModel),
             MapStopReason,
             ExtractProviderErrorMessage,
             (s, m, msg, partial) => EmitError(s, profile.Api, m, msg, partial),
@@ -213,13 +255,23 @@ public static class CompletionsStreamEngine
     /// folding reported cached/cache-write tokens out of the billed input count, adding reasoning
     /// tokens into output, and attaching computed cost.
     /// </summary>
-    public static Usage ParseUsage(JsonElement usageElement, Usage usage, LlmModel model)
+    /// <remarks>
+    /// Reasoning tokens are BOTH summed into <see cref="Usage.Output"/> (preserving the inclusive
+    /// meaning every existing consumer and the cost arithmetic depend on) and carried separately on
+    /// <see cref="Usage.Reasoning"/> for attribution (#3297). The separate field stays <c>null</c>
+    /// when the provider reported no breakdown — absent is never coerced to a measured zero.
+    /// </remarks>
+    public static Usage ParseUsage(this JsonElement usageElement, Usage usage, LlmModel model)
     {
         var promptTokens = usage.Input + usage.CacheRead + usage.CacheWrite;
         var completionTokens = usage.Output;
         var reportedCachedTokens = usage.CacheRead;
         var cacheWriteTokens = usage.CacheWrite;
         var reasoningTokens = 0;
+
+        // Carried forward across chunks: a later usage element that omits the breakdown must not
+        // erase a reasoning count an earlier one reported. Stays null until something reports it.
+        var reportedReasoning = usage.Reasoning;
 
         if (usageElement.TryGetProperty("prompt_tokens", out var pt))
             promptTokens = pt.GetInt32();
@@ -243,6 +295,10 @@ public static class CompletionsStreamEngine
             completionDetails.TryGetProperty("reasoning_tokens", out var reasoning))
         {
             reasoningTokens = reasoning.GetInt32();
+
+            // #3297: attribute the reported count separately. Only assigned when the wire actually
+            // carried the field, so absent stays null rather than becoming a measured zero.
+            reportedReasoning = reasoningTokens;
         }
 
         var cacheReadTokens = cacheWriteTokens > 0
@@ -258,6 +314,7 @@ public static class CompletionsStreamEngine
             Output = outputTokens,
             CacheRead = cacheReadTokens,
             CacheWrite = cacheWriteTokens,
+            Reasoning = reportedReasoning,
             TotalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
         };
         updated = updated with { Cost = ModelRegistry.CalculateCost(model, updated) };
@@ -268,19 +325,42 @@ public static class CompletionsStreamEngine
     /// Maps a Chat Completions <c>finish_reason</c> to the core <see cref="StopReason"/> plus an
     /// optional human-readable error message for the failure-style reasons.
     /// </summary>
-    public static (StopReason StopReason, string? ErrorMessage) MapStopReason(string? reason) => reason switch
+    /// <remarks>
+    /// <c>content_filter</c> maps to <see cref="StopReason.Sensitive"/>, NOT
+    /// <see cref="StopReason.Error"/> (#3296). The Responses parser already normalized the
+    /// equivalent upstream condition (<c>incomplete_details.reason == "content_filter"</c>, and the
+    /// <c>content_filter</c> response status) to <c>Sensitive</c>, so the two APIs disagreed about
+    /// what the SAME provider decision means. Content filtering is a safety outcome, not an
+    /// infrastructure failure: reporting it as <c>Error</c> misattributed a policy decision in
+    /// persisted history and inflated any error-rate signal derived from <c>StopReason.Error</c>.
+    /// The human-readable message is deliberately retained -- it is the only place the reason for an
+    /// otherwise empty turn is stated.
+    /// <para>
+    /// <c>network_error</c> does NOT return a tuple: it THROWS
+    /// <see cref="ProviderTransientFinishReasonException"/> (#3567). It names a transport failure,
+    /// not a model outcome, and the agent loop's retry lane consumes only exceptions -- a returned
+    /// <see cref="StopReason.Error"/> message ended the run having spent zero of its four attempts.
+    /// Every other failure-style reason, <c>content_filter</c> and unknown values included, keeps its
+    /// terminal tuple and still ends the run on the first occurrence.
+    /// </para>
+    /// </remarks>
+    public static (StopReason StopReason, string? ErrorMessage) MapStopReason(string? reason)
     {
-        "stop" => (StopReason.Stop, null),
-        "end" => (StopReason.Stop, null),
-        "length" => (StopReason.Length, null),
-        "function_call" => (StopReason.ToolUse, null),
-        "tool_calls" => (StopReason.ToolUse, null),
-        "content_filter" => (StopReason.Error, "Content filtered by provider"),
-        "refusal" => (StopReason.Refusal, null),
-        "network_error" => (StopReason.Error, "Provider finish_reason: network_error"),
-        null => (StopReason.Stop, null),
-        _ => (StopReason.Error, $"Provider finish_reason: {reason}")
-    };
+        TransientFinishReasons.ThrowIfTransient(reason);
+
+        return reason switch
+        {
+            "stop" => (StopReason.Stop, null),
+            "end" => (StopReason.Stop, null),
+            "length" => (StopReason.Length, null),
+            "function_call" => (StopReason.ToolUse, null),
+            "tool_calls" => (StopReason.ToolUse, null),
+            "content_filter" => (StopReason.Sensitive, "Content filtered by provider"),
+            "refusal" => (StopReason.Refusal, null),
+            null => (StopReason.Stop, null),
+            _ => (StopReason.Error, $"Provider finish_reason: {reason}")
+        };
+    }
 
     /// <summary>
     /// Maps a <see cref="ThinkingLevel"/> to the provider's reasoning-effort string, honouring a
@@ -367,7 +447,17 @@ public static class CompletionsStreamEngine
     }
 
     /// <summary>
-    /// Pushes the canonical done event/end for a cancelled completion turn.
+    /// Pushes the canonical terminal event/end for a cancelled completion turn.
+    /// <para>
+    /// This is an <see cref="ErrorEvent"/>, not a <see cref="DoneEvent"/> (#3292). <c>DoneEvent</c>
+    /// is the normal-completion arm of the event union, so <c>DoneEvent(StopReason.Aborted)</c> was
+    /// a contradiction: a consumer switching on event type - the documented way to consume this
+    /// union - read a user cancellation as a successful turn. <c>AnthropicProvider</c> and
+    /// <c>CopilotMessagesProvider</c> already emitted the error shape; this converges on theirs.
+    /// The <see cref="StopReason"/> is unchanged, so anything keying off the finish reason (the
+    /// agent loop, telemetry outcome mapping, <c>MessageTransformer</c>'s replay filter) is
+    /// unaffected.
+    /// </para>
     /// </summary>
     public static void EmitAborted(LlmStream stream, string api, LlmModel model)
     {
@@ -382,7 +472,7 @@ public static class CompletionsStreamEngine
             ResponseId: null,
             Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
-        stream.Push(new DoneEvent(StopReason.Aborted, message));
+        stream.Push(new ErrorEvent(StopReason.Aborted, message));
         stream.End(message);
     }
 }

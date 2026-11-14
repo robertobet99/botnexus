@@ -111,7 +111,7 @@ The `AgentLoopRunner` is the core orchestration loop. It runs until the LLM stop
 ```text
 while (hasMoreToolCalls || pendingSteeringMessages):
     1. Drain any steering messages (injected mid-turn)
-    2. Optionally run TransformContext (compaction-aware trimming)
+    2. Optionally run AgentContextTransformer (compaction-aware trimming)
     3. Convert full timeline → provider Context
     4. Call LLM (full context sent)
     5. Accumulate streamed response → AssistantMessage
@@ -130,7 +130,7 @@ Each iteration of this loop is a separate stateless HTTP call to the provider. A
 |-------------------------------|-----------------------------------------------------------------------------------------|
 | `AgentLoopRunner.cs`          | Core turn loop — drain steering → call LLM → execute tools → repeat                    |
 | `ContextConverter.cs`         | Transforms `AgentContext` (agent messages) into provider `Context` (provider messages + tools) |
-| `DefaultMessageConverter.cs`  | Default conversion from `AgentMessage[]` to provider `Message[]`                        |
+| `ExtensionPoints/Messages/DefaultProviderMessageTransformer.cs` | Default transformation from `AgentMessage[]` to provider `Message[]`                |
 | `LlmClient.cs`               | Resolves API provider from registry and delegates streaming call                        |
 | `StreamAccumulator.cs`        | Collects SSE stream chunks into a complete `AssistantMessage`                           |
 | `AnthropicRequestBuilder.cs`  | Builds the JSON body for Anthropic Messages API                                         |
@@ -214,7 +214,11 @@ In-session compaction keeps the conversation in the **same session**. A user-ini
 The canonical reset sequence is owned by **`IConversationResetService.ResetActiveSessionAsync`** (default impl `DefaultConversationResetService`) so REST and SignalR cannot drift. The five steps are:
 
 1. **Stop the agent supervisor handle** for the active session — best-effort. Drops any in-memory handle so the next `GetOrCreateAsync` starts a fresh isolation strategy with a freshly-built system prompt.
-2. **Flush memory via `ISessionEndMemoryFlusher`** — best-effort. The agent gets one final synthetic turn to write a memory bridge (what it learned, decisions made, follow-ups) before the session is sealed, so the next session inherits the agent's intent without inheriting the raw turn history.
+2. **Flush memory via `ISessionEndMemoryFlusher`** - best-effort. The agent gets one final synthetic turn to write a memory bridge (what it learned, decisions made, follow-ups) before the session is sealed, so the next session inherits the agent's intent without inheriting the raw turn history. The turn runs under **`MemoryTrigger`** (`TriggerType.Memory`) in its own non-interactive `AgentSelf` session id shaped `memory:<agent>:<timestamp>:<suffix>`.
+
+   > **#3543.** The flusher previously resolved `TriggerType.Memory` from DI, but no such trigger was registered, so it always fell through to a `CronTrigger` fallback. With no job id in hand that path minted a malformed jobless `cron:<timestamp>:<guid>` session id, which the portal rendered as a session divider inside human conversations (reported as suspected cron poisoning) and which cron's job-scoped `cron:<jobId>:` scans could never claim. `MemoryTrigger` is now registered, the cron fallback is **deleted** - an absent memory trigger skips the flush rather than mislabelling it - and `CronTrigger` throws rather than minting a jobless id.
+   >
+   > The **305 pre-existing** jobless `cron:2026…` sessions are **deliberately left in place**, not migrated. They are sealed historical transcripts; rewriting live session ids would break `Conversation.ActiveSessionId` references and any stored pointer to them, for a purely cosmetic gain. They are inert, and the session-consistency `active-session-cron-poison` check already re-points any conversation still referencing one. New flushes no longer add to the set.
 3. **Cancel pending ask-user prompts** — any conversation-scoped `ask_user` waiters are cancelled so they don't block the new session.
 4. **Seal the active session in place** — set `Status = Sealed` and persist. Sessions are *not* archived (`ArchiveAsync` would delete from `InMemorySessionStore` and rename out of lookup in `FileSessionStore`); they remain readable via the session store for transcript/audit, just no longer Active.
 5. **Clear `Conversation.ActiveSessionId`** — persist the conversation. The next inbound through `DefaultConversationRouter` sees no active session and creates a new one.

@@ -90,6 +90,21 @@ public sealed class LlmClient
         }
     }
 
+    /// <summary>Executes a semantic generation using separate provider execution policy.</summary>
+    public LlmStream StreamSimple(
+        LlmModel model,
+        Context context,
+        GenerationOptions generation,
+        ProviderExecutionOptions? execution)
+        => StreamSimple(model, context, MapSimpleOptions(generation, execution));
+
+    /// <summary>Completes a semantic generation using separate provider execution policy.</summary>
+    public async Task<AssistantMessage> CompleteSimpleAsync(
+        LlmModel model,
+        Context context,
+        GenerationOptions generation,
+        ProviderExecutionOptions? execution)
+        => await StreamSimple(model, context, generation, execution).GetResultAsync();
     /// <summary>
     /// Executes complete simple async.
     /// </summary>
@@ -101,6 +116,49 @@ public sealed class LlmClient
         return await stream.GetResultAsync();
     }
 
+    /// <summary>
+    /// The capabilities declared by the provider that will serve <paramref name="model"/> (#2432).
+    /// <para>
+    /// Returns <see cref="ProviderCapabilities.Default"/> -- every quirk workaround OFF -- when no
+    /// provider is registered for the model's api. This read is a QUERY, made on the way into a
+    /// turn, and must not throw where the subsequent stream call will already throw a far better
+    /// diagnostic naming the missing api.
+    /// </para>
+    /// </summary>
+    /// <param name="model">The model whose serving provider is being asked.</param>
+    /// <returns>The declared capabilities, or the default when the api is unregistered.</returns>
+    public ProviderCapabilities GetCapabilities(LlmModel model)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        return ApiProviders.Get(model.Api)?.Capabilities ?? ProviderCapabilities.Default;
+    }
+
+    internal static SimpleStreamOptions MapSimpleOptions(
+        GenerationOptions generation,
+        ProviderExecutionOptions? execution)
+    {
+        ArgumentNullException.ThrowIfNull(generation);
+        return new SimpleStreamOptions
+        {
+            ToolChoiceMode = generation.ToolChoiceMode,
+            Temperature = generation.Temperature,
+            MaxTokens = generation.MaxTokens,
+            ContextWindow = generation.ContextWindow,
+            CancellationToken = generation.CancellationToken,
+            CacheRetention = generation.CacheRetention,
+            SessionId = generation.SessionId,
+            Reasoning = generation.Reasoning,
+            ThinkingBudgets = generation.ThinkingBudgets,
+            ApiKey = execution?.ApiKey,
+            Transport = execution?.Transport ?? Transport.Sse,
+            Headers = execution?.Headers is null ? null : new Dictionary<string, string>(execution.Headers),
+            OnPayload = execution?.OnPayload,
+            Metadata = execution?.Metadata is null ? null : new Dictionary<string, object>(execution.Metadata),
+            MaxRetryDelayMs = execution?.MaxRetryDelayMs ?? new ProviderExecutionOptions().MaxRetryDelayMs,
+            StreamSetupTimeoutMs = execution?.StreamSetupTimeoutMs ?? 0,
+            StreamIdleTimeoutMs = execution?.StreamIdleTimeoutMs
+        };
+    }
     private IApiProvider ResolveProvider(string api)
     {
         return ApiProviders.Get(api)

@@ -1,0 +1,563 @@
+using System.Diagnostics;
+using System.Text;
+
+namespace BotNexus.Agent.Core.Tools;
+
+/// <summary>
+/// Owns launched children in the host-shared assembly so separately loaded extensions see the same
+/// handles. Owner keys are supplied by trusted tool contributors, never by tool-call arguments.
+/// No operation attaches to an arbitrary OS PID. Running roots are never reaped; exited unresolved
+/// diagnostics count towards the same bounded retention cap as completed entries.
+/// </summary>
+public sealed class BackgroundProcessRegistry
+{
+    /// <summary>The host-wide lifecycle owner, shared across extension load contexts.</summary>
+    public static BackgroundProcessRegistry Instance { get; } = new();
+    private readonly object _gate = new();
+    private readonly Dictionary<int, (string Owner, BackgroundProcess Process)> _processes = [];
+    private readonly int _maxExitedRetained;
+
+    /// <summary>Allows isolated hosts/tests to choose a completed-entry retention cap.</summary>
+    public BackgroundProcessRegistry(int maxExitedRetained = 100)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(maxExitedRetained);
+        _maxExitedRetained = maxExitedRetained;
+    }
+
+    /// <summary>Transfers a live wrapper to the registry without replacing a still-owned PID.</summary>
+    public void Register(string owner, BackgroundProcess process)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        ArgumentNullException.ThrowIfNull(process);
+        lock (_gate)
+        {
+            if (_processes.TryGetValue(process.Pid, out var previous))
+            {
+                if (ReferenceEquals(previous.Process, process)) return;
+                if (!previous.Process.TryReleaseCompleted())
+                    throw new InvalidOperationException("PID is still owned by a tracked process.");
+            }
+            _processes[process.Pid] = (owner, process);
+            ReapCore();
+        }
+    }
+
+    /// <summary>Returns only children owned by the calling agent; absence never proves an OS process died.</summary>
+    public BackgroundProcess? Get(string owner, int pid)
+    {
+        lock (_gate)
+            return _processes.TryGetValue(pid, out var entry) && entry.Owner == owner ? entry.Process : null;
+    }
+
+    /// <summary>Reaps completed entries, then snapshots only this owner's registrations.</summary>
+    public IReadOnlyList<BackgroundProcess> List(string owner)
+    {
+        lock (_gate)
+        {
+            ReapCore();
+            return _processes.Values.Where(p => p.Owner == owner).Select(p => p.Process).ToArray();
+        }
+    }
+
+    /// <summary>Bounds terminal diagnostics, including unresolved termination, without evicting running roots.</summary>
+    public void Reap()
+    {
+        lock (_gate) ReapCore();
+    }
+
+    private void ReapCore()
+    {
+        var exited = _processes.Values.Where(p => p.Process.IsTerminal)
+            .OrderBy(p => p.Process.StartedAt).ToArray();
+        foreach (var entry in exited.Take(Math.Max(0, exited.Length - _maxExitedRetained)))
+        {
+            if (entry.Process.TryReleaseCompleted())
+                _processes.Remove(entry.Process.Pid);
+        }
+    }
+
+    /// <summary>Releases an explicitly owned entry; callers must arrange safe lifecycle cleanup first.</summary>
+    public bool Remove(string owner, int pid)
+    {
+        lock (_gate)
+        {
+            if (!_processes.TryGetValue(pid, out var entry) || entry.Owner != owner) return false;
+            if (!entry.Process.TryReleaseCompleted()) return false;
+            return _processes.Remove(pid);
+        }
+    }
+
+    /// <summary>Disposes this owner's entries during isolated-host cleanup, never another owner's children.</summary>
+    public void Clear(string owner)
+    {
+        lock (_gate)
+        {
+            foreach (var entry in _processes.Values.Where(p => p.Owner == owner).ToArray())
+            {
+                entry.Process.Dispose();
+                if (entry.Process.TryReleaseCompleted())
+                    _processes.Remove(entry.Process.Pid);
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Owns a started process, bounded stream drains, and stdin. Ordinary completion includes both
+/// stream drains. An exited root after an unconfirmed kill instead releases resources and retains
+/// unresolved diagnostics; cleanup is not evidence that descendants terminated.
+/// Background lifetimes are independent of the launching call after ownership transfer.
+/// </summary>
+public class BackgroundProcess : IDisposable
+{
+    private readonly Process _process;
+    private readonly object _gate = new();
+    private readonly BackgroundOutputBuffer _output = new();
+    private readonly Task _completion;
+    private readonly object _lifecycle = new();
+    private readonly SemaphoreSlim _inputGate = new(1, 1);
+    private readonly CancellationTokenSource _drainCancellation = new();
+    private readonly StreamReader _standardOutput;
+    private readonly StreamReader _standardError;
+    private readonly StreamWriter? _standardInput;
+    private StreamWriter StandardInput => _standardInput ?? _process.StandardInput;
+    private volatile bool _disposed;
+    private int _captureFailures;
+    private int _captureInterruptions;
+    private int? _exitCode;
+
+    /// <summary>Adopts a process started by a trusted caller; output must be redirected and unread.</summary>
+    public BackgroundProcess(Process process, string command, DateTimeOffset startedAt)
+        : this(process, command, startedAt, GetProcess(process).Id,
+            GetProcess(process).StandardOutput, GetProcess(process).StandardError)
+    {
+    }
+
+    internal BackgroundProcess(
+        Process process,
+        string command,
+        DateTimeOffset startedAt,
+        StreamReader? standardOutput,
+        StreamReader? standardError,
+        StreamWriter? standardInput = null)
+        : this(process, command, startedAt, GetProcess(process).Id,
+            standardOutput ?? throw new ArgumentNullException(nameof(standardOutput)),
+            standardError ?? throw new ArgumentNullException(nameof(standardError)), standardInput)
+    {
+    }
+
+    internal BackgroundProcess(
+        Process process,
+        string command,
+        DateTimeOffset startedAt,
+        int pid,
+        StreamReader standardOutput,
+        StreamReader standardError,
+        StreamWriter? standardInput = null)
+    {
+        _process = GetProcess(process);
+        Pid = pid;
+        Command = command;
+        StartedAt = startedAt;
+        try { ProcessName = process.ProcessName; }
+        catch (InvalidOperationException) { ProcessName = "exited"; }
+        _standardOutput = standardOutput;
+        _standardError = standardError;
+        _standardInput = standardInput;
+        _completion = CompleteAsync(DrainAsync(standardOutput), DrainAsync(standardError));
+    }
+
+    private static Process GetProcess(Process? process)
+        => process ?? throw new ArgumentNullException(nameof(process));
+
+    /// <summary>Captured PID remains available after handle disposal.</summary>
+    public int Pid { get; }
+    /// <summary>Original command retained for status and diagnostics.</summary>
+    public string Command { get; }
+    /// <summary>Launch time used for deterministic oldest-first retention.</summary>
+    public DateTimeOffset StartedAt { get; }
+    /// <summary>Captured OS name for diagnostics after termination.</summary>
+    public string ProcessName { get; }
+    /// <summary>True only when process exit and both redirected output drains completed successfully.</summary>
+    public bool IsComplete => IsTerminal && !KillUnconfirmed && !OutputCaptureIncomplete;
+    /// <summary>True when process exit and both drain attempts reached a terminal outcome.</summary>
+    public bool IsTerminal => _completion.IsCompletedSuccessfully;
+    /// <summary>True when final output may be partial because a redirected stream could not be drained.</summary>
+    public bool OutputCaptureIncomplete => Volatile.Read(ref _captureFailures) != 0 || Volatile.Read(ref _captureInterruptions) != 0;
+    /// <summary>Stable, content-safe output-integrity state for status and output consumers.</summary>
+    public string OutputCaptureStatus => !IsTerminal ? "capturing"
+        : Volatile.Read(ref _captureFailures) != 0 ? "incomplete (read failure)"
+        : Volatile.Read(ref _captureInterruptions) != 0 ? "incomplete (stream closed during cleanup)"
+        : "complete";
+    /// <summary>Termination of the tree was not confirmed; root exit alone never clears this uncertainty.</summary>
+    public bool KillUnconfirmed { get; private set; }
+    /// <summary>An exited root with uncertain descendants; resources are released, not reattached by PID.</summary>
+    public bool IsUnresolved => KillUnconfirmed && !IsRunning;
+    /// <summary>Separates OS root liveness from the outcome of a requested tree termination.</summary>
+    public string Status => IsRunning
+        ? KillUnconfirmed ? "running (termination unconfirmed)" : "running"
+        : IsUnresolved ? "exited (termination unresolved; operator intervention required)" : "exited";
+    /// <summary>Distinguishes normal completion from a requested termination.</summary>
+    public bool KillRequested { get; private set; }
+    /// <summary>OS liveness, independent of pending final output.</summary>
+    public bool IsRunning
+    {
+        get { try { return !_process.HasExited; } catch (InvalidOperationException) { return false; } }
+    }
+    /// <summary>Cached exit code survives retention and handle disposal.</summary>
+    public int? ExitCode
+    {
+        get { try { return _process.HasExited ? _process.ExitCode : null; } catch (InvalidOperationException) { return _exitCode; } }
+    }
+
+    private async Task DrainAsync(StreamReader reader)
+    {
+        // Read fixed-size chunks, not ReadLine: one unbroken line must not bypass the memory cap.
+        var buffer = new char[4096];
+        var decoder = new BackgroundOutputDecoder();
+        try
+        {
+            while (true)
+            {
+                // WaitAsync also bounds cleanup if an underlying stream ignores cancellation.
+                var count = await reader.ReadAsync(buffer.AsMemory(), _drainCancellation.Token)
+                    .AsTask().WaitAsync(_drainCancellation.Token).ConfigureAwait(false);
+                var clean = decoder.Append(buffer.AsSpan(0, count), final: count == 0);
+                lock (_gate) _output.AppendChunk(clean);
+                if (count == 0) return;
+            }
+        }
+        catch (OperationCanceledException) when (_drainCancellation.IsCancellationRequested)
+        {
+            Interlocked.Increment(ref _captureInterruptions);
+        }
+        catch (ObjectDisposedException)
+        {
+            Interlocked.Increment(ref _captureInterruptions);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+        {
+            Interlocked.Increment(ref _captureFailures);
+        }
+    }
+
+    private async Task CompleteAsync(Task stdout, Task stderr)
+    {
+        try
+        {
+            await _process.WaitForExitAsync().ConfigureAwait(false);
+            lock (_lifecycle)
+            {
+                if (!_disposed) _exitCode = _process.ExitCode;
+                if (KillUnconfirmed) ReleaseExitedUnresolved();
+            }
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+        {
+            Interlocked.Increment(ref _captureInterruptions);
+        }
+        catch (IOException)
+        {
+            Interlocked.Increment(ref _captureFailures);
+        }
+
+        // Each drain records its own outcome and returns normally so completion remains a bounded
+        // lifecycle signal rather than silently becoming an output-integrity signal.
+        await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
+    }
+
+    /// <summary>Waits for exit AND final output; cancellation cancels the wait, not the owned child.</summary>
+    public Task WaitForCompletionAsync(CancellationToken cancellationToken = default)
+        => _completion.WaitAsync(cancellationToken);
+
+    /// <summary>Compatibility wait whose successful return guarantees final output is available.</summary>
+    public bool WaitForExit(int milliseconds) => _completion.Wait(milliseconds);
+
+    /// <summary>Returns bounded tail output, disclosing dropped bytes even when requesting only a few lines.</summary>
+    public string GetOutput(int? tailLines = null)
+    {
+        lock (_gate)
+        {
+            var text = _output.RawSnapshot();
+            if (tailLines is > 0)
+            {
+                var lines = text.Split('\n');
+                var count = lines.Length - (text.EndsWith('\n') ? 1 : 0);
+                var start = Math.Max(0, count - tailLines.Value);
+                text = string.Join('\n', lines.AsSpan(start, count - start));
+            }
+            var retentionBanner = _output.FormatBanner();
+            var captureBanner = OutputCaptureIncomplete ? $"[output capture {OutputCaptureStatus}]" : string.Empty;
+            var terminationBanner = IsUnresolved
+                ? "[termination unresolved: root exited; descendants may still be running; operator intervention required]"
+                : KillUnconfirmed ? "[termination unconfirmed: root remains tracked for retry]" : string.Empty;
+            var banner = string.Join('\n', new[] { terminationBanner, captureBanner, retentionBanner }.Where(value => value.Length != 0));
+            return banner.Length == 0 ? text : text.Length == 0 ? banner : $"{banner}\n{text}";
+        }
+    }
+
+    /// <summary>Writes serialized interactive input to the retained child handle, never a PID reattachment.</summary>
+    public async Task WriteInputAsync(string content, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!IsRunning) throw new InvalidOperationException($"Process {Pid} has already exited.");
+
+        await _inputGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!IsRunning) throw new InvalidOperationException($"Process {Pid} has already exited.");
+            await StandardInput.WriteAsync(content.AsMemory(), cancellationToken).ConfigureAwait(false);
+            await StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _inputGate.Release();
+        }
+    }
+
+    /// <summary>Supplied launch input is finite: write it while output drains, then signal EOF.</summary>
+    public async Task WriteInitialInputAsync(string input, CancellationToken cancellationToken)
+    {
+        await StandardInput.WriteAsync(input.AsMemory(), cancellationToken).ConfigureAwait(false);
+        StandardInput.Close();
+    }
+
+    /// <summary>Retries a tree kill only while the owned root is live; exited uncertainty requires operator intervention.</summary>
+    public bool Kill()
+    {
+        bool confirmed;
+        lock (_lifecycle)
+        {
+            if (_disposed) return false;
+            if (IsUnresolved)
+            {
+                ReleaseExitedUnresolved();
+                return false;
+            }
+            KillRequested = true;
+            confirmed = KillCore();
+            KillUnconfirmed = !confirmed;
+            if (!confirmed) ReleaseExitedUnresolved();
+        }
+        // Never hold the lifecycle lock while waiting: exit observation uses it to cache status.
+        if (confirmed) _completion.Wait(2_000);
+        return confirmed;
+    }
+
+    /// <summary>Kill the tree BEFORE its root disappears; a failed observation must remain explicit.</summary>
+    protected virtual bool KillCore()
+    {
+        try
+        {
+            if (_process.HasExited) return !KillUnconfirmed;
+            _process.Kill(entireProcessTree: true);
+            return _process.WaitForExit(2_000);
+        }
+        catch (InvalidOperationException) { return !KillUnconfirmed; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+    }
+
+    private void ReleaseExitedUnresolved()
+    {
+        // Called with _lifecycle held, after kill publication or natural exit observation.
+        if (_disposed || IsRunning) return;
+        _exitCode = _process.ExitCode;
+        Interlocked.Increment(ref _captureInterruptions);
+        _drainCancellation.Cancel();
+        ReleaseResources();
+    }
+
+    private static void CloseReader(StreamReader reader)
+    {
+        // StreamReader.Dispose may reject an active read. Close its underlying pipe regardless.
+        reader.BaseStream.Dispose();
+        try { reader.Dispose(); }
+        catch (InvalidOperationException) { }
+    }
+
+    private void ReleaseResources()
+    {
+        _disposed = true;
+        CloseReader(_standardOutput);
+        CloseReader(_standardError);
+        // Test/adaptor readers may differ from the process's own redirected readers.
+        if (_process.StartInfo.RedirectStandardOutput) CloseReader(_process.StandardOutput);
+        if (_process.StartInfo.RedirectStandardError) CloseReader(_process.StandardError);
+        if (_process.StartInfo.RedirectStandardInput)
+        {
+            // Close the pipe first; disposing a writer must not block flushing to a surviving descendant.
+            StandardInput.BaseStream.Dispose();
+            try { StandardInput.Dispose(); }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+            // Closing the pipe does not synchronously finish a pending async writer operation.
+            // Its disposal must not prevent the owned process handle from being released.
+            catch (InvalidOperationException) { }
+        }
+        _process.Dispose();
+    }
+
+    /// <summary>Releases owned resources after root exit; an unconfirmed kill of a live root stays pinned.</summary>
+    public virtual void Dispose()
+    {
+        // Kill may wait for completion, whose exit observer also needs _lifecycle.
+        if (IsRunning && !Kill()) return;
+        lock (_lifecycle)
+        {
+            if (_disposed || IsRunning) return;
+            if (KillUnconfirmed) ReleaseExitedUnresolved();
+            else ReleaseResources();
+        }
+    }
+
+    // Reaping and kill publication share a lock: an exited root cannot be evicted while the
+    // termination operation is still deciding whether descendants may remain alive.
+    internal bool TryReleaseCompleted()
+    {
+        lock (_lifecycle)
+        {
+            if (!IsTerminal || IsRunning) return false;
+            Dispose();
+            return _disposed;
+        }
+    }
+}
+
+/// <summary>Shared UTF-8-byte-bounded tail buffer; extensions must not maintain divergent caps.</summary>
+public class BackgroundOutputBuffer
+{
+    private readonly StringBuilder _buffer = new();
+    private readonly int _maxOutputBytes;
+    /// <summary>Allows small caps in deterministic retention tests.</summary>
+    public BackgroundOutputBuffer(int maxOutputBytes = OutputRetentionPolicy.MaxOutputBytes) => _maxOutputBytes = maxOutputBytes;
+    /// <summary>Actual retained UTF-8 bytes, excluding disclosure.</summary>
+    public long RetainedBytes { get; private set; }
+    /// <summary>Cumulative UTF-8 bytes discarded from the head.</summary>
+    public long DiscardedBytes { get; private set; }
+    /// <summary>Line-oriented compatibility entry point.</summary>
+    public void AppendLine(string value) => AppendChunk(value + Environment.NewLine);
+    /// <summary>Appends bounded reader chunks without requiring a newline.</summary>
+    public void AppendChunk(string value)
+    {
+        if (value.Length == 0) return;
+
+        var previousLength = _buffer.Length;
+        var addedBytes = Encoding.UTF8.GetByteCount(value);
+        _buffer.Append(value);
+
+        // Correct the one boundary where independently counting the append differs from counting
+        // the concatenation: a UTF-16 surrogate pair split across calls.
+        if (previousLength > 0 && char.IsSurrogatePair(_buffer[previousLength - 1], _buffer[previousLength]))
+            addedBytes -= 2; // Two replacement scalars (3 + 3 bytes) become one supplementary scalar (4 bytes).
+
+        RetainedBytes += addedBytes;
+        if (RetainedBytes <= _maxOutputBytes) return;
+
+        var cut = 0;
+        long shed = 0;
+        while (cut < _buffer.Length && RetainedBytes - shed > _maxOutputBytes)
+        {
+            var (width, byteCount) = GetScalarSize(cut);
+            shed += byteCount;
+            cut += width;
+        }
+
+        var newlineSearchEnd = Math.Min(_buffer.Length, cut + 8193);
+        var newline = -1;
+        for (var index = cut; index < newlineSearchEnd; index++)
+        {
+            if (_buffer[index] != '\n') continue;
+            newline = index;
+            break;
+        }
+        if (newline >= cut)
+        {
+            while (cut <= newline)
+            {
+                var (width, byteCount) = GetScalarSize(cut);
+                shed += byteCount;
+                cut += width;
+            }
+        }
+        _buffer.Remove(0, cut);
+        RetainedBytes -= shed;
+        DiscardedBytes += shed;
+    }
+
+    private (int Width, int ByteCount) GetScalarSize(int index)
+    {
+        var value = _buffer[index];
+        if (index + 1 < _buffer.Length && char.IsSurrogatePair(value, _buffer[index + 1]))
+            return (2, 4);
+        if (char.IsSurrogate(value)) return (1, 3);
+        if (value <= '\x7f') return (1, 1);
+        return value <= '\x7ff' ? (1, 2) : (1, 3);
+    }
+
+    /// <summary>Returns the bounded payload without disclosure for byte-accounting callers.</summary>
+    public string RawSnapshot() => _buffer.ToString();
+    /// <summary>Uses the common head/tail loss contract rather than a local truncation message.</summary>
+    public string FormatBanner() => DiscardedBytes == 0 ? string.Empty : OutputRetentionPolicy.FormatTruncationBanner(RetainedBytes, DiscardedBytes, RetainedOutputPortion.Tail);
+    /// <summary>Returns the bounded payload plus any required loss disclosure.</summary>
+    public string Snapshot() => DiscardedBytes == 0 ? RawSnapshot() : $"{FormatBanner()}\n{RawSnapshot()}";
+}
+
+/// <summary>
+/// Bounded per-stream decoder: preserves split UTF-16 scalars and discards terminal escape sequences
+/// across arbitrary pipe-read boundaries before stdout and stderr are merged. No line buffering.
+/// </summary>
+public sealed class BackgroundOutputDecoder
+{
+    private enum EscapeState { Text, Escape, Csi, String, StringEscape, Intermediate }
+    private EscapeState _state;
+    private readonly Encoder _unicodeEncoder = Encoding.UTF8.GetEncoder();
+    private bool _osc;
+
+    /// <summary>Consumes a stream chunk; final flush replaces a dangling surrogate and drops incomplete escapes.</summary>
+    public string Append(ReadOnlySpan<char> text, bool final = false)
+    {
+        var output = new StringBuilder(text.Length + 1);
+        foreach (var c in text)
+        {
+            switch (_state)
+            {
+                case EscapeState.Escape:
+                    _state = c switch
+                    {
+                        '[' => EscapeState.Csi,
+                        ']' or 'P' or 'X' or '^' or '_' => EscapeState.String,
+                        >= '\x20' and <= '\x2f' => EscapeState.Intermediate,
+                        _ => EscapeState.Text,
+                    };
+                    _osc = c == ']';
+                    continue;
+                case EscapeState.Csi:
+                    if (c is >= '\x40' and <= '\x7e') _state = EscapeState.Text;
+                    continue;
+                case EscapeState.Intermediate:
+                    if (c is >= '\x30' and <= '\x7e') _state = EscapeState.Text;
+                    continue;
+                case EscapeState.String:
+                    if (c == '\x1b') _state = EscapeState.StringEscape;
+                    else if (c == '\x9c' || (_osc && c == '\x07')) _state = EscapeState.Text;
+                    continue;
+                case EscapeState.StringEscape:
+                    _state = c == '\\' ? EscapeState.Text : c == '\x1b' ? EscapeState.StringEscape : EscapeState.String;
+                    continue;
+            }
+            if (c == '\x1b') { _state = EscapeState.Escape; continue; }
+            if (c == '\x9b') { _state = EscapeState.Csi; continue; }
+            if (c == '\x9d') { _state = EscapeState.String; _osc = true; continue; }
+            if (c is '\x90' or '\x98' or '\x9e' or '\x9f') { _state = EscapeState.String; _osc = false; continue; }
+            if (c is >= '\x80' and <= '\x9f') continue;
+            output.Append(c);
+        }
+        // The framework's streaming encoder owns incomplete scalar state and replacement fallback.
+        // It emits complete UTF-8 scalars, so merging streams cannot separate surrogate halves.
+        var clean = output.ToString();
+        var bytes = new byte[Encoding.UTF8.GetMaxByteCount(clean.Length + 1)];
+        var count = _unicodeEncoder.GetBytes(clean.AsSpan(), bytes, flush: final);
+        return Encoding.UTF8.GetString(bytes, 0, count);
+    }
+}

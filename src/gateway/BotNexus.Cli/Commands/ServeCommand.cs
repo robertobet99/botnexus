@@ -1,18 +1,21 @@
 using System.CommandLine;
 using System.Diagnostics;
 using System.Net.Sockets;
-using System.Text.Json;
+using BotNexus.Gateway.Configuration;
 using Spectre.Console;
+using BotNexus.Cli.Services;
 
 namespace BotNexus.Cli.Commands;
 
 internal sealed class ServeCommand
 {
     private readonly GatewayCommand _gatewayCommand;
+    private readonly IGatewayProcessManager _processManager;
 
-    public ServeCommand(GatewayCommand gatewayCommand)
+    public ServeCommand(GatewayCommand gatewayCommand, IGatewayProcessManager processManager)
     {
         _gatewayCommand = gatewayCommand;
+        _processManager = processManager;
     }
 
     public Command Build(Option<bool> verboseOption, Option<string?> targetOption)
@@ -22,7 +25,7 @@ internal sealed class ServeCommand
 
         var probePortOption = new Option<int>("--port", () => 5050, "Port for the Probe web UI.");
         var probeSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
-        var gatewayUrlOption = new Option<string>("--gateway-url", () => "http://localhost:5005", "URL of a running BotNexus Gateway.");
+        var gatewayUrlOption = new Option<string>("--gateway-url", () => GatewayDefaults.LoopbackListenUrl, "URL of a running BotNexus Gateway.");
 
         var probeCommand = new Command("probe", "Start the BotNexus Probe diagnostic tool.")
         {
@@ -41,7 +44,7 @@ internal sealed class ServeCommand
         });
 
         // serve (default = gateway)
-        var servePortOption = new Option<int>("--port", () => 5005, "Port to listen on.");
+        var servePortOption = new Option<int>("--port", () => GatewayDefaults.ListenPort, "Port to listen on.");
         var serveSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
 
         var command = new Command("serve", "Start a BotNexus service in the foreground (development mode). Defaults to the gateway. Note: for production/background use, prefer 'gateway start' which runs the gateway as a detached process.")
@@ -67,7 +70,7 @@ internal sealed class ServeCommand
         return command;
     }
 
-    private static async Task<int> ServeGatewayAsync(string repoRoot, string home, int port, bool verbose, CancellationToken cancellationToken)
+    private async Task<int> ServeGatewayAsync(string repoRoot, string home, int port, bool verbose, CancellationToken cancellationToken)
     {
         var buildResult = await BuildCommand.BuildSolutionAsync(repoRoot, verbose, cancellationToken);
         if (buildResult != 0)
@@ -77,7 +80,7 @@ internal sealed class ServeCommand
 
         if (!File.Exists(gatewayDll))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Release build not found at: [dim]{Markup.Escape(gatewayDll)}[/]");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Release build not found at: [dim]{CliText.SafeDisplay(gatewayDll)}[/]");
             return 1;
         }
 
@@ -100,16 +103,18 @@ internal sealed class ServeCommand
             return 1;
         }
 
-        DeployExtensions(repoRoot, home, verbose);
+        await ReconcileLifecycleAsync(repoRoot, home, verbose, cancellationToken, "serve");
 
-        var gatewayUrl = $"http://localhost:{port}";
+        // The gateway binds gateway.listenUrl when one is configured, overriding the --urls
+        // argument below, so probe where it will actually listen rather than where we asked.
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(port, home);
         var lastExitCode = 0;
 
         while (true)
         {
             AnsiConsole.WriteLine();
             AnsiConsole.Write(new Rule("[bold blue]BotNexus Gateway[/]") { Justification = Justify.Left });
-            AnsiConsole.MarkupLine($"  [dim]URL:[/]         [green]{Markup.Escape(gatewayUrl)}[/]");
+            AnsiConsole.MarkupLine($"  [dim]URL:[/]         [green]{CliText.SafeDisplay(gatewayUrl)}[/]");
             AnsiConsole.MarkupLine("  [dim]Environment:[/] Development");
             AnsiConsole.MarkupLine("  Press [yellow]Ctrl+C[/] to stop the gateway.");
             AnsiConsole.WriteLine();
@@ -128,8 +133,13 @@ internal sealed class ServeCommand
             using var process = Process.Start(psi)
                 ?? throw new InvalidOperationException("Failed to start Gateway process.");
 
-            await process.WaitForExitAsync(cancellationToken);
-            lastExitCode = process.ExitCode;
+            lastExitCode = await ForegroundGatewayLifecycle.WaitForExitAsync(
+                process,
+                _processManager,
+                home,
+                gatewayDll,
+                gatewayUrl,
+                cancellationToken);
 
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine($"[dim]Gateway exited (code [yellow]{lastExitCode}[/]).[/]");
@@ -154,7 +164,7 @@ internal sealed class ServeCommand
 
         if (!File.Exists(probeDll))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Release build not found at: [dim]{Markup.Escape(probeDll)}[/]");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Release build not found at: [dim]{CliText.SafeDisplay(probeDll)}[/]");
             return 1;
         }
 
@@ -164,12 +174,16 @@ internal sealed class ServeCommand
             return 1;
         }
 
-        var probeUrl = $"http://localhost:{port}";
+        // The gateway binds gateway.listenUrl when one is configured, overriding the --urls
+        // argument below, so probe where it will actually listen rather than where we asked.
+        var probeUrl = GatewayProbeUrlResolver.ResolveFromHome(
+            port,
+            CliPaths.ResolveTarget(explicitTarget: null));
 
         AnsiConsole.WriteLine();
         AnsiConsole.Write(new Rule("[bold blue]BotNexus Probe[/]") { Justification = Justify.Left });
-        AnsiConsole.MarkupLine($"  [dim]URL:[/]     [green]{Markup.Escape(probeUrl)}[/]");
-        AnsiConsole.MarkupLine($"  [dim]Gateway:[/] [dim]{Markup.Escape(gatewayUrl)}[/]");
+        AnsiConsole.MarkupLine($"  [dim]URL:[/]     [green]{CliText.SafeDisplay(probeUrl)}[/]");
+        AnsiConsole.MarkupLine($"  [dim]Gateway:[/] [dim]{CliText.SafeDisplay(gatewayUrl)}[/]");
         AnsiConsole.WriteLine();
 
         var psi = new ProcessStartInfo
@@ -214,206 +228,103 @@ internal sealed class ServeCommand
     }
 
     /// <summary>
-    /// Deploys built extensions silently (no per-extension output) and returns the count deployed.
-    /// Used when a spinner is active so output doesn't interleave.
+    /// Deploys built in-tree and registered extensions silently and returns the count deployed.
+    /// Registered outputs are read from each registration's managed staging directory.
     /// </summary>
-    public static int DeployExtensionsSilent(string repoRoot, string home, bool verbose)
+    public static ExtensionDeploymentResult DeployExtensionsSilent(string repoRoot, string home, bool verbose)
+        => ReconcileExtensions(repoRoot, home);
+
+    /// <summary>Runs the shared non-fatal lifecycle reconciler after the platform build succeeds.</summary>
+    internal static async Task<ExtensionLifecycleResult> ReconcileLifecycleAsync(string repoRoot, string home, bool verbose, CancellationToken cancellationToken, string operation)
     {
-        var count = 0;
-        var extensionsRoot = Path.Combine(repoRoot, "src", "extensions");
-        if (!Directory.Exists(extensionsRoot))
-            return 0;
-
-        var destRoot = Path.Combine(home, "extensions");
-        var projects = Directory.GetFiles(extensionsRoot, "*.csproj", SearchOption.AllDirectories);
-        var deployedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var project in projects)
-        {
-            var projectDir = Path.GetDirectoryName(project)!;
-            var projectName = Path.GetFileNameWithoutExtension(project);
-            var manifestPath = Path.Combine(projectDir, "botnexus-extension.json");
-            if (!File.Exists(manifestPath))
-                continue;
-
-            string? extId;
-            try
-            {
-                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(manifestPath));
-                extId = doc.RootElement.GetProperty("id").GetString();
-            }
-            catch { continue; }
-
-            if (string.IsNullOrWhiteSpace(extId))
-                continue;
-
-            deployedIds.Add(extId);
-            var tfmDir = ResolveExtensionOutputDirectory(projectDir);
-            if (tfmDir is null)
-                continue;
-
-            var extDest = Path.Combine(destRoot, extId);
-            Directory.CreateDirectory(extDest);
-            var freshFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in Directory.GetFiles(tfmDir, "*", SearchOption.AllDirectories))
-            {
-                var relativePath = Path.GetRelativePath(tfmDir, file);
-                var destFile = Path.Combine(extDest, relativePath);
-                Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
-                File.Copy(file, destFile, overwrite: true);
-                freshFiles.Add(Path.GetFullPath(destFile));
-            }
-            var manifestDest = Path.Combine(extDest, "botnexus-extension.json");
-            File.Copy(manifestPath, manifestDest, overwrite: true);
-            freshFiles.Add(Path.GetFullPath(manifestDest));
-
-            // Prune stale files left over from earlier generations. Blazor content-hashes
-            // assets, so each rebuild emits new filenames while overwrite:true only refreshes
-            // matching names — old generations would otherwise accumulate unbounded. Best-effort:
-            // the running gateway may hold handles on some files, so mirror the stale-dir
-            // cleanup's locked-file tolerance and skip anything we cannot delete.
-            PruneStaleFiles(extDest, freshFiles);
-            count++;
-        }
-
-        // Clean stale extensions
-        if (Directory.Exists(destRoot))
-        {
-            foreach (var dir in Directory.GetDirectories(destRoot))
-            {
-                var dirName = Path.GetFileName(dir);
-                if (!deployedIds.Contains(dirName))
-                {
-                    try { Directory.Delete(dir, recursive: true); }
-                    catch { /* locked — leave it */ }
-                }
-            }
-        }
-
-        return count;
+        var result = await ExtensionLifecycleReconciler.CreateDefault(home, repoRoot, verbose).ReconcileAsync(cancellationToken: cancellationToken);
+        ExtensionRepositoryCommand.Report(result, operation);
+        return result;
     }
 
-    /// <summary>
-    /// Deploys built extensions from the repository to {home}/extensions.
-    /// Public to allow GatewayCommand to use it.
-    /// </summary>
+    /// <summary>Deploys built extensions and reports registered-source failures without failing startup.</summary>
     public static void DeployExtensions(string repoRoot, string home, bool verbose)
     {
-        var extensionsRoot = Path.Combine(repoRoot, "src", "extensions");
-        if (!Directory.Exists(extensionsRoot))
+        var result = ReconcileExtensions(repoRoot, home);
+        foreach (var failure in result.Failures)
         {
-            if (verbose)
-                AnsiConsole.MarkupLine("[blue][[deploy]][/] [dim]No extensions directory found \u2014 skipping.[/]");
-            return;
+            AnsiConsole.MarkupLine(
+                $"[yellow][[deploy]] WARNING:[/] {CliText.SafeDisplay(failure.Source)}: {CliText.SafeDisplay(failure.Message)}");
         }
 
-        var destRoot = Path.Combine(home, "extensions");
-
-        var projects = Directory.GetFiles(extensionsRoot, "*.csproj", SearchOption.AllDirectories);
-        var deployed = 0;
-        var deployedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var project in projects)
-        {
-            var projectDir = Path.GetDirectoryName(project)!;
-            var projectName = Path.GetFileNameWithoutExtension(project);
-            var manifestPath = Path.Combine(projectDir, "botnexus-extension.json");
-
-            if (!File.Exists(manifestPath))
-            {
-                if (verbose)
-                    AnsiConsole.MarkupLine($"[blue][[deploy]][/] [dim]Skipped {Markup.Escape(projectName)} (no manifest)[/]");
-                continue;
-            }
-
-            string? extId;
-            try
-            {
-                using var doc = JsonDocument.Parse(File.ReadAllText(manifestPath));
-                extId = doc.RootElement.GetProperty("id").GetString();
-            }
-            catch
-            {
-                AnsiConsole.MarkupLine($"[yellow][[deploy]] WARNING:[/] Could not read manifest for {Markup.Escape(projectName)}");
-                continue;
-            }
-
-            if (string.IsNullOrWhiteSpace(extId))
-                continue;
-
-            deployedIds.Add(extId);
-
-            var tfmDir = ResolveExtensionOutputDirectory(projectDir);
-            if (tfmDir is null)
-            {
-                if (verbose)
-                    AnsiConsole.MarkupLine($"[blue][[deploy]][/] [dim]No Debug/Release build output for {Markup.Escape(projectName)} \u2014 skipping.[/]");
-                continue;
-            }
-
-            var extDest = Path.Combine(destRoot, extId);
-            Directory.CreateDirectory(extDest);
-
-            var freshFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in Directory.GetFiles(tfmDir, "*", SearchOption.AllDirectories))
-            {
-                var relativePath = Path.GetRelativePath(tfmDir, file);
-                var destFile = Path.Combine(extDest, relativePath);
-                Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
-                File.Copy(file, destFile, overwrite: true);
-                freshFiles.Add(Path.GetFullPath(destFile));
-            }
-
-            var manifestDest = Path.Combine(extDest, "botnexus-extension.json");
-            File.Copy(manifestPath, manifestDest, overwrite: true);
-            freshFiles.Add(Path.GetFullPath(manifestDest));
-
-            // Prune stale files from earlier generations (see DeployExtensionsSilent for rationale).
-            PruneStaleFiles(extDest, freshFiles);
-            AnsiConsole.MarkupLine($"[blue][[deploy]][/] Deployed [green]{Markup.Escape(extId)}[/]");
-            deployed++;
-        }
-
-        // Clean stale extensions
-        if (Directory.Exists(destRoot))
-        {
-            foreach (var dir in Directory.GetDirectories(destRoot))
-            {
-                var dirName = Path.GetFileName(dir);
-                if (!deployedIds.Contains(dirName))
-                {
-                    try
-                    {
-                        Directory.Delete(dir, recursive: true);
-                        AnsiConsole.MarkupLine($"[blue][[deploy]][/] Removed stale: [dim]{Markup.Escape(dirName)}[/]");
-                    }
-                    catch
-                    {
-                        AnsiConsole.MarkupLine($"[yellow][[deploy]][/] Could not remove {Markup.Escape(dirName)} (files locked)");
-                    }
-                }
-            }
-        }
-
-        AnsiConsole.MarkupLine($"[green]✓[/] {deployed} extension(s) deployed to [dim]{Markup.Escape(destRoot)}[/]");
+        AnsiConsole.MarkupLine(
+            $"[green]✓[/] {result.DeployedCount} extension(s) deployed to [dim]{CliText.SafeDisplay(Path.Combine(home, "extensions"))}[/]");
     }
 
-    /// <summary>
-    /// Deletes files under <paramref name="extDest"/> that are not part of the freshly
-    /// deployed set. Content-hashed Blazor assets change filenames every rebuild, so
-    /// overwrite-only copying leaves stale generations behind. Best-effort: files the
-    /// running gateway still holds open are skipped rather than throwing, matching the
-    /// locked-file tolerance of the stale-directory cleanup.
-    /// </summary>
-    private static void PruneStaleFiles(string extDest, HashSet<string> freshFiles)
+    private static ExtensionDeploymentResult ReconcileExtensions(string repoRoot, string home)
     {
-        foreach (var existing in Directory.GetFiles(extDest, "*", SearchOption.AllDirectories))
+        var sources = DiscoverInTreeDeploymentSources(repoRoot).ToList();
+        sources.AddRange(DiscoverRegisteredDeploymentSources(home));
+        return ExtensionDeploymentReconciler.Reconcile(Path.Combine(home, "extensions"), sources);
+    }
+
+    private static IEnumerable<ExtensionDeploymentSource> DiscoverInTreeDeploymentSources(string repoRoot)
+    {
+        var root = Path.Combine(repoRoot, "src", "extensions");
+        if (!Directory.Exists(root))
+            yield break;
+
+        foreach (var project in Directory.GetFiles(root, "*.csproj", SearchOption.AllDirectories))
         {
-            if (freshFiles.Contains(Path.GetFullPath(existing)))
+            var projectDirectory = Path.GetDirectoryName(project)!;
+            var manifestPath = Path.Combine(projectDirectory, "botnexus-extension.json");
+            if (!File.Exists(manifestPath))
                 continue;
 
-            try { File.Delete(existing); }
-            catch { /* locked or in use - leave it */ }
+            var outputDirectory = ResolveExtensionOutputDirectory(projectDirectory);
+            if (outputDirectory is null)
+                continue;
+
+            yield return new ExtensionDeploymentSource(
+                $"in-tree:{Path.GetFileNameWithoutExtension(project)}",
+                outputDirectory,
+                Enabled: true,
+                Registered: false,
+                manifestPath);
+        }
+    }
+
+    private static IEnumerable<ExtensionDeploymentSource> DiscoverRegisteredDeploymentSources(string home)
+    {
+        var registrations = new ExtensionRepositoryRegistryService(
+                Path.Combine(home, "config.json"),
+                new System.IO.Abstractions.FileSystem())
+            .ListAsync()
+            .GetAwaiter()
+            .GetResult();
+
+        foreach (var registration in registrations)
+        {
+            if (!registration.Enabled)
+                continue;
+
+            var sourceName = $"repository:{registration.Id}";
+            var stagingRoot = Path.Combine(home, "extension-repositories", registration.Id, "staged");
+            if (!Directory.Exists(stagingRoot))
+            {
+                yield return new ExtensionDeploymentSource(sourceName, stagingRoot, true, true);
+                continue;
+            }
+
+            var roots = File.Exists(Path.Combine(stagingRoot, "botnexus-extension.json"))
+                ? [stagingRoot]
+                : Directory.GetDirectories(stagingRoot);
+            if (roots.Length == 0)
+            {
+                yield return new ExtensionDeploymentSource(sourceName, stagingRoot, true, true);
+                continue;
+            }
+
+            foreach (var output in roots)
+            {
+                var outputName = Path.GetFileName(output);
+                yield return new ExtensionDeploymentSource($"{sourceName}:{outputName}", output, true, true);
+            }
         }
     }
 
@@ -443,8 +354,10 @@ internal sealed class ServeCommand
         for (var i = seconds; i > 0; i--)
         {
             Console.Write($"\r   Restarting in {i}... ");
-            var deadline = DateTime.UtcNow.AddSeconds(1);
-            while (DateTime.UtcNow < deadline)
+            // #3738: the one-second tick is measured monotonically. A backwards host clock step would
+            // otherwise stall this inner spin indefinitely, wedging the restart countdown.
+            var tick = Stopwatch.StartNew();
+            while (tick.Elapsed < TimeSpan.FromSeconds(1))
             {
                 if (cancellationToken.IsCancellationRequested)
                 {

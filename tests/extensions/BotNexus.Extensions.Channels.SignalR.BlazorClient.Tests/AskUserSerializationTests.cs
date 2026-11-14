@@ -13,7 +13,7 @@ public sealed class AskUserSerializationTests
     public void HandleUserInputRequired_sets_pending_when_payload_present()
     {
         var store = new ClientStateStore();
-        var handler = new GatewayEventHandler(store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance);
+        var handler = new GatewayEventHandler(store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance, store);
 
         store.UpsertAgent(new AgentState
         {
@@ -21,7 +21,6 @@ public sealed class AskUserSerializationTests
             DisplayName = "Agent 1",
             IsConnected = true,
             SessionId = "sess-1",
-            ActiveConversationId = "conv-1"
         });
 
         var agent = store.GetAgent("agent-1")!;
@@ -32,6 +31,8 @@ public sealed class AskUserSerializationTests
             ActiveSessionId = "sess-1"
         };
         store.RegisterSession("agent-1", "sess-1");
+        // #3212: visibility is route-derived; state the displayed pane explicitly.
+        store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
         var evt = new AgentStreamEvent
         {
@@ -71,7 +72,7 @@ public sealed class AskUserSerializationTests
     public void HandleUserInputRequired_skips_when_inputType_null()
     {
         var store = new ClientStateStore();
-        var handler = new GatewayEventHandler(store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance);
+        var handler = new GatewayEventHandler(store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance, store);
 
         store.UpsertAgent(new AgentState
         {
@@ -79,7 +80,6 @@ public sealed class AskUserSerializationTests
             DisplayName = "Agent 1",
             IsConnected = true,
             SessionId = "sess-1",
-            ActiveConversationId = "conv-1"
         });
 
         var agent = store.GetAgent("agent-1")!;
@@ -90,6 +90,8 @@ public sealed class AskUserSerializationTests
             ActiveSessionId = "sess-1"
         };
         store.RegisterSession("agent-1", "sess-1");
+        // #3212: visibility is route-derived; state the displayed pane explicitly.
+        store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
         // Simulate pre-fix state: InputType is null (what happened when the enum
         // serialized as integer 0 and couldn't deserialize into string)

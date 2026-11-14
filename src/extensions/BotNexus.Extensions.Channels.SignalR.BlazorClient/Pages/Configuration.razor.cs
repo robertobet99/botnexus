@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using BotNexus.Extensions.Channels.SignalR.BlazorClient.Components;
 using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
 using Microsoft.AspNetCore.Components;
 
@@ -13,6 +14,9 @@ namespace BotNexus.Extensions.Channels.SignalR.BlazorClient.Pages;
 /// </summary>
 public partial class Configuration : IDisposable
 {
+    private const string SecretsSectionKey = "secrets";
+    private const string ExtensionRepositoriesSectionKey = "extension-repositories";
+
     /// <summary>
     /// Config section from the route (e.g. <c>/configuration/providers</c>). Selects which root
     /// section the sidebar highlights and which subtree <c>SchemaForm</c> renders (#1892). Null or
@@ -20,11 +24,14 @@ public partial class Configuration : IDisposable
     /// </summary>
     [Parameter] public string? Section { get; set; }
 
+    /// <summary>Optional schema-derived group within <see cref="Section"/>.</summary>
+    [Parameter] public string? Subsection { get; set; }
+
     [Inject] private NavigationManager Nav { get; set; } = default!;
 
     /// <summary>
     /// Ordered, user-editable top-level sections for the sidebar (key + label). Derived from the
-    /// root schema properties minus <see cref="NonPersistedSections"/>; label from <c>x-ui-label</c>,
+    /// root schema properties minus <see cref="PlatformConfigFormModel.NonPersistedSections"/>; label from <c>x-ui-label</c>,
     /// ordered by <c>x-ui-order</c>.
     /// </summary>
     private IReadOnlyList<(string Key, string Label)> Sections
@@ -34,12 +41,19 @@ public partial class Configuration : IDisposable
             var props = _schema?["schema"]?["properties"]?.AsObject();
             if (props is null)
                 return [];
-            return props
-                .Where(kv => kv.Value is JsonObject && !NonPersistedSections.Contains(kv.Key))
+            var schemaSections = props
+                .Where(kv => kv.Value is JsonObject && !PlatformConfigFormModel.NonPersistedSections.Contains(kv.Key))
                 .Select(kv => (kv.Key, Node: kv.Value!.AsObject()))
                 .OrderBy(x => x.Node["x-ui-order"]?.GetValue<int>() ?? int.MaxValue)
                 .ThenBy(x => x.Key, StringComparer.Ordinal)
-                .Select(x => (x.Key, Label: x.Node["x-ui-label"]?.GetValue<string>() ?? x.Key))
+                .Select(x => (x.Key, Label: x.Node["x-ui-label"]?.GetValue<string>() ?? x.Key));
+
+            // File-backed secrets are deliberately outside the platform config schema and save
+            // payload. Register the operator surface explicitly rather than inventing a schema
+            // property that would couple it to config persistence and revisioning (#3664).
+            return schemaSections
+                .Append((ExtensionRepositoriesSectionKey, "Extension Repositories"))
+                .Append((SecretsSectionKey, "Secrets"))
                 .ToList();
         }
     }
@@ -62,27 +76,106 @@ public partial class Configuration : IDisposable
         }
     }
 
-    private void SelectSection(string key)
+    private IReadOnlyList<(string Key, string Label)> ActiveSubsections =>
+        string.IsNullOrEmpty(ActiveSection) ? [] : SchemaForm.DescribeSubsections(_schema, ActiveSection);
+
+    private string ActiveSubsection
     {
-        Section = key;
-        Nav.NavigateTo($"/configuration/{key}");
+        get
+        {
+            var subsections = ActiveSubsections;
+            if (subsections.Count == 0)
+                return string.Empty;
+            return subsections.FirstOrDefault(item =>
+                       string.Equals(item.Key, Subsection, StringComparison.OrdinalIgnoreCase)).Key
+                   ?? subsections[0].Key;
+        }
     }
 
-    private JsonObject? _config;
-    private JsonObject? _schema;
-    private HashSet<string>? _rawSections;
-    private bool _loading = true;
-    private bool _saving;
-    private bool _dirty;
+    private async Task SelectSection(string key)
+    {
+        Section = key;
+        Subsection = null;
+        Nav.NavigateTo($"/configuration/{key}");
+        if (string.Equals(key, SecretsSectionKey, StringComparison.OrdinalIgnoreCase))
+            await LoadSecrets();
+    }
+
+    private void SelectSubsection(string key)
+    {
+        Subsection = key;
+        Nav.NavigateTo($"/configuration/{ActiveSection}/{key}");
+    }
+
+    private IReadOnlyList<ValidationErrorDisplay> ValidationErrors =>
+        _validationResult?.Errors.Select(error => new ValidationErrorDisplay(error, FindValidationTarget(error))).ToList()
+        ?? [];
+
+    private ValidationTarget? FindValidationTarget(string error)
+    {
+        var path = error.Split([' ', ':'], 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        if (string.IsNullOrEmpty(path))
+            return null;
+
+        var segments = path.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length < 2)
+            return null;
+
+        var section = Sections.FirstOrDefault(item =>
+            string.Equals(item.Key, segments[0], StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrEmpty(section.Key))
+            return null;
+
+        var propertyName = segments[1].Split('[', 2)[0];
+        var property = _schema?["schema"]?["properties"]?[section.Key]?["properties"]?[propertyName] as JsonObject;
+        if (property is null)
+            return null;
+
+        var subsections = SchemaForm.DescribeSubsections(_schema, section.Key);
+        var subsectionKey = property["x-ui-group"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(subsectionKey))
+            subsectionKey = "general";
+        var subsection = subsections.FirstOrDefault(item =>
+            string.Equals(item.Key, subsectionKey, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrEmpty(subsection.Key))
+            return null;
+
+        return new ValidationTarget(section.Key, section.Label, subsection.Key, subsection.Label);
+    }
+
+    private void SelectValidationTarget(ValidationTarget target)
+    {
+        _validationResult = null;
+        Section = target.SectionKey;
+        Subsection = target.SubsectionKey;
+        Nav.NavigateTo($"/configuration/{target.SectionKey}/{target.SubsectionKey}");
+    }
+
+    private sealed record ValidationTarget(
+        string SectionKey,
+        string SectionLabel,
+        string SubsectionKey,
+        string SubsectionLabel);
+
+    private sealed record ValidationErrorDisplay(string Message, ValidationTarget? Target);
+
+    private PlatformConfigFormModel? _form;
+    private PlatformConfigFormModel Form => _form ??= new PlatformConfigFormModel(ConfigService);
+    private JsonObject? _config => Form.Config;
+    private JsonObject? _schema => Form.Schema;
+    private bool _loading => Form.IsLoading;
+    private bool _saving => Form.IsSaving;
+    private bool _dirty => Form.IsDirty;
     private string? _statusMessage;
     private string _statusClass = "";
     private PlatformConfigService.ConfigValidationResult? _validationResult;
+    private IReadOnlyList<PlatformConfigService.SecretListItem>? _secrets;
+    private string _secretKey = string.Empty;
+    private string _secretValue = string.Empty;
+    private bool _secretsLoading;
+    private bool _secretMutationPending;
+    private string? _secretsError;
     private System.Timers.Timer? _statusTimer;
-
-    // Top-level keys that are never persisted from the settings UI: metadata and the agents tree
-    // (agents are managed through the dedicated agent editor, not the platform config form).
-    private static readonly HashSet<string> NonPersistedSections =
-        new(StringComparer.OrdinalIgnoreCase) { "$schema", "version", "agents" };
 
     protected override async Task OnInitializedAsync()
     {
@@ -91,72 +184,98 @@ public partial class Configuration : IDisposable
 
     private async Task LoadConfig()
     {
-        _loading = true;
-        _dirty = false;
         SetStatus("Loading...", "");
         StateHasChanged();
+        await Form.LoadAsync();
 
-        _schema = await ConfigService.LoadSchemaAsync();
-        _config = await ConfigService.LoadAsync();
-
-        // Load raw config to know which sections actually exist on disk, so we only persist sections
-        // the user materialised rather than default-injected ones.
-        var raw = await ConfigService.LoadRawAsync();
-        _rawSections = raw?.Select(kv => kv.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        _loading = false;
         if (_config is null || _schema is null)
             SetStatus("Failed to load", "error");
         else
             SetStatus("Loaded", "success", autoHide: true);
+        if (string.Equals(ActiveSection, SecretsSectionKey, StringComparison.OrdinalIgnoreCase))
+            await LoadSecrets();
         StateHasChanged();
     }
 
-    // SchemaForm edits _config in place and raises this on every change; flip the dirty flag so the
-    // Save button enables. We re-render because SchemaForm hands back the same instance reference.
-    private void OnConfigChanged(JsonObject updated)
+    private async Task LoadSecrets()
     {
-        _config = updated;
-        _dirty = true;
+        _secretsLoading = true;
+        _secretsError = null;
+        StateHasChanged();
+        _secrets = await ConfigService.ListSecretsAsync();
+        _secretsLoading = false;
+        if (_secrets is null)
+            _secretsError = "Failed to load secrets.";
         StateHasChanged();
     }
+
+    private async Task SaveSecret()
+    {
+        _secretMutationPending = true;
+        _secretsError = null;
+        var result = await ConfigService.SetSecretAsync(_secretKey, _secretValue);
+        _secretMutationPending = false;
+        if (!result.Success)
+        {
+            _secretsError = result.Error ?? "Failed to save secret.";
+            StateHasChanged();
+            return;
+        }
+
+        _secretKey = string.Empty;
+        _secretValue = string.Empty;
+        await LoadSecrets();
+    }
+
+    private async Task DeleteSecret(string key)
+    {
+        _secretMutationPending = true;
+        _secretsError = null;
+        var result = await ConfigService.DeleteSecretAsync(key);
+        _secretMutationPending = false;
+        if (!result.Success)
+        {
+            _secretsError = result.Error ?? "Failed to delete secret.";
+            StateHasChanged();
+            return;
+        }
+
+        await LoadSecrets();
+    }
+
+    private void OnConfigChanged(JsonObject updated)
+    {
+        Form.MarkConfigChanged(updated);
+        StateHasChanged();
+    }
+
+    private void OnPathChanged(string path) => Form.MarkPathChanged(path);
 
     private async Task SaveAll()
     {
-        if (_config is null || !_dirty) return;
-        _saving = true;
+        if (!_dirty) return;
         SetStatus("Saving...", "");
         StateHasChanged();
 
-        // Persist every top-level section that exists on disk (raw) and is user-editable. The schema
-        // form mutates the whole tree, so without per-section dirty tracking we save the materialised
-        // sections; default-only sections are skipped to avoid writing injected defaults to disk.
-        var sectionsToSave = _config
-            .Select(kv => kv.Key)
-            .Where(key => !NonPersistedSections.Contains(key))
-            .Where(key => _rawSections is null || _rawSections.Contains(key))
-            .ToList();
-
-        var allOk = true;
-        foreach (var section in sectionsToSave)
+        var outcome = await Form.SaveAsync();
+        if (outcome.Success)
         {
-            var node = _config[section];
-            if (node is null) continue;
-            var (success, error) = await ConfigService.SaveSectionAsync(section, node.DeepClone());
-            if (!success)
-            {
-                SetStatus($"Failed to save {section}: {error}", "error");
-                allOk = false;
-                break;
-            }
-        }
-
-        _saving = false;
-        if (allOk)
-        {
-            _dirty = false;
             SetStatus("Saved successfully", "success", autoHide: true);
+            await LoadConfig();
+            return;
         }
+
+        if (outcome.IsConflict)
+        {
+            SetStatus(
+                "Configuration changed elsewhere since this page loaded. Reload to see the current values, then re-apply your changes.",
+                "error");
+        }
+        else
+        {
+            SetStatus($"Failed to save: {outcome.Error}", "error");
+        }
+
         StateHasChanged();
     }
 

@@ -1,5 +1,9 @@
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
+using System.Text;
 using System.IO.Abstractions;
+
+using BotNexus.Gateway.Abstractions.Text;
 
 namespace BotNexus.Extensions.Skills.Security;
 
@@ -129,13 +133,33 @@ public static class SkillSecurityScanner
             RuleId: "env-harvesting",
             Severity: ScanSeverity.Critical,
             Message: "Environment variable access combined with network send — possible credential harvesting",
-            Pattern: new Regex(@"process\.env", RegexOptions.Compiled),
+            // #2809 clause 4: widened from the dotted-only `process\.env` to also cover the
+            // computed form `process["env"]`. Unlike dangerous-exec this needs no binding pass:
+            // `process` is a global, not an imported identifier, so there is no import site to
+            // alias. A local rebinding (`const p = process; p.env`) remains out of scope — it is a
+            // general alias-tracking problem for arbitrary globals, not a module-import question,
+            // and solving it lexically would produce false positives on any variable named `p`.
+            Pattern: new Regex(@"process\s*(?:\.\s*env\b|\[\s*[""']env[""']\s*\])", RegexOptions.Compiled),
             RequiresContext: new Regex(@"\bfetch\b|\bpost\b|http\.request", RegexOptions.Compiled | RegexOptions.IgnoreCase)),
     ];
 
     // -----------------------------------------------------------------------
     // Public API
     // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Computes a stable identity from scanner-owned fields. File location and evidence are
+    /// deliberately excluded because evidence is hostile source text and line numbers can drift.
+    /// </summary>
+    public static string ComputeFindingId(ScanFinding finding)
+        => ComputeFindingId(finding.RuleId, finding.Severity, finding.Message);
+
+    /// <summary>Computes the canonical identity for submitted scanner fields.</summary>
+    internal static string ComputeFindingId(string ruleId, ScanSeverity severity, string message)
+    {
+        var canonical = $"{ruleId.Trim().ToLowerInvariant()}\n{severity}\n{message}";
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
+    }
 
     /// <summary>
     /// Scans all scannable files in <paramref name="dirPath"/> and returns an
@@ -151,6 +175,22 @@ public static class SkillSecurityScanner
         maxFiles = Math.Max(1, maxFiles);
         maxFileBytes = Math.Max(1, maxFileBytes);
 
+        // Management scans after writing. Validation failures must be critical results,
+        // not exceptions that bypass the caller's existing rollback branch.
+        try
+        {
+            return ScanValidatedDirectory(dirPath, maxFiles, maxFileBytes, fs);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            return new ScanSummary(0, 1, 0, 0,
+                [new ScanFinding("invalid-installation", ScanSeverity.Critical, dirPath, 0,
+                    "Skill installation could not be safely validated or read. Check root, child links, access, and installation limits.", string.Empty)]);
+        }
+    }
+
+    private static ScanSummary ScanValidatedDirectory(string dirPath, int maxFiles, int maxFileBytes, IFileSystem fs)
+    {
         var files = CollectScannableFiles(dirPath, maxFiles, fs);
         var allFindings = new List<ScanFinding>();
         int scannedFiles = 0;
@@ -158,19 +198,12 @@ public static class SkillSecurityScanner
 
         foreach (var file in files)
         {
-            var fileInfo = fs.FileInfo.New(file);
+            var resolvedFile = SkillInstallationValidator.ResolveContainedPath(file, dirPath, fs);
+            var fileInfo = fs.FileInfo.New(resolvedFile);
             if (!fileInfo.Exists || fileInfo.Length > maxFileBytes)
                 continue;
 
-            string source;
-            try
-            {
-                source = fs.File.ReadAllText(file);
-            }
-            catch
-            {
-                continue;
-            }
+            var source = fs.File.ReadAllText(resolvedFile);
 
             scannedFiles++;
             var findings = ScanSource(source, file);
@@ -198,6 +231,10 @@ public static class SkillSecurityScanner
         var lines = source.Split('\n');
         var matchedLineRules = new HashSet<string>(StringComparer.Ordinal);
 
+        // #2809: bindings are resolved once per source; null when nothing is imported
+        // from child_process, in which case dangerous-exec behaves exactly as before.
+        var childProcessBindings = BuildChildProcessBindingPattern(source);
+
         // --- Line rules ---
         foreach (var rule in LineRules)
         {
@@ -211,6 +248,12 @@ public static class SkillSecurityScanner
             {
                 var line = lines[i];
                 var match = rule.Pattern.Match(line);
+
+                // Binding-aware fallback: an aliased or computed-member invocation of a
+                // child_process export is the same danger spelled differently.
+                if (!match.Success && rule.RuleId == "dangerous-exec" && childProcessBindings is not null)
+                    match = childProcessBindings.Match(line);
+
                 if (!match.Success)
                     continue;
 
@@ -265,7 +308,7 @@ public static class SkillSecurityScanner
             if (matchLine == 0)
             {
                 matchLine = 1;
-                matchEvidence = source.Length > EvidenceMaxLength ? source[..EvidenceMaxLength] : source;
+                matchEvidence = GraphemeSafeTruncation.Truncate(source, EvidenceMaxLength)!;
             }
 
             findings.Add(new ScanFinding(
@@ -286,55 +329,161 @@ public static class SkillSecurityScanner
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // child_process binding pass (#2809)
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Export names of <c>child_process</c> that actually execute a command. Kept
+    /// identical to the direct-form <c>dangerous-exec</c> pattern so both paths
+    /// agree on what "dangerous" means.
+    /// </summary>
+    private static readonly string[] ChildProcessExecExports =
+        ["exec", "execSync", "spawn", "spawnSync", "execFile", "execFileSync"];
+
+    /// <summary>Matches a <c>require("child_process")</c> / <c>require("node:child_process")</c> call.</summary>
+    private const string RequireChildProcess = @"require\s*\(\s*[""'](?:node:)?child_process[""']\s*\)";
+
+    /// <summary><c>const NAME = require("child_process")</c> — NAME holds the whole module.</summary>
+    private static readonly Regex RequireNamespaceBinding = new(
+        @"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*" + RequireChildProcess, RegexOptions.Compiled);
+
+    /// <summary><c>const { exec: run, spawn } = require("child_process")</c> — captures the destructure body.</summary>
+    private static readonly Regex RequireDestructureBinding = new(
+        @"(?:const|let|var)\s*\{([^}]*)\}\s*=\s*" + RequireChildProcess, RegexOptions.Compiled);
+
+    /// <summary><c>import ... from "node:child_process"</c> — captures the whole clause before <c>from</c>.</summary>
+    private static readonly Regex ImportClause = new(
+        @"import\s+([^;]*?)\s+from\s*[""'](?:node:)?child_process[""']", RegexOptions.Compiled);
+
+    /// <summary>A single identifier, optionally renamed (<c>spawn as launch</c> / <c>exec: run</c>).</summary>
+    private static readonly Regex BindingSpecifier = new(
+        @"^\s*([A-Za-z_$][\w$]*)\s*(?:(?:as|:)\s*([A-Za-z_$][\w$]*)\s*)?$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Records which local identifiers are bound to <c>child_process</c> exports, so the
+    /// scanner can answer a binding question instead of matching call-site spelling. Any
+    /// rename between import and call defeated the previous regex-only rule (#2809).
+    /// </summary>
+    /// <returns>
+    /// A regex matching an invocation through any recorded binding, or <c>null</c> when the
+    /// source binds nothing from <c>child_process</c>.
+    /// </returns>
+    private static Regex? BuildChildProcessBindingPattern(string source)
+    {
+        // Identifiers bound directly to an exec-capable export: `run(...)` executes.
+        var directBindings = new HashSet<string>(StringComparer.Ordinal);
+        // Identifiers holding the module itself: only `ns.exec(...)` / `ns["exec"](...)` executes.
+        var namespaceBindings = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (Match m in RequireNamespaceBinding.Matches(source))
+            namespaceBindings.Add(m.Groups[1].Value);
+
+        foreach (Match m in RequireDestructureBinding.Matches(source))
+            AddDestructuredBindings(m.Groups[1].Value, directBindings);
+
+        foreach (Match m in ImportClause.Matches(source))
+        {
+            var clause = m.Groups[1].Value;
+
+            // Named/aliased specifiers: import { spawn as launch } from ...
+            var braceStart = clause.IndexOf('{');
+            var braceEnd = clause.LastIndexOf('}');
+            if (braceStart >= 0 && braceEnd > braceStart)
+            {
+                AddDestructuredBindings(clause[(braceStart + 1)..braceEnd], directBindings);
+                clause = clause[..braceStart];
+            }
+
+            // Whatever remains is a default and/or namespace binding: `cp`, `* as cp`, `cp,`.
+            foreach (var part in clause.Split(','))
+            {
+                var token = part.Trim().TrimEnd(',').Trim();
+                if (token.StartsWith('*'))
+                {
+                    var idx = token.LastIndexOf(' ');
+                    token = idx >= 0 ? token[(idx + 1)..] : string.Empty;
+                }
+
+                if (IsIdentifier(token))
+                    namespaceBindings.Add(token);
+            }
+        }
+
+        var alternatives = new List<string>();
+
+        foreach (var name in directBindings)
+            alternatives.Add($@"\b{Regex.Escape(name)}\s*\(");
+
+        if (namespaceBindings.Count > 0)
+        {
+            var exports = string.Join("|", ChildProcessExecExports);
+            foreach (var name in namespaceBindings)
+            {
+                var ns = Regex.Escape(name);
+                // Dotted and computed member access are the same call through different syntax.
+                alternatives.Add($@"\b{ns}\s*\.\s*(?:{exports})\s*\(");
+                alternatives.Add($@"\b{ns}\s*\[\s*[""'](?:{exports})[""']\s*\]\s*\(");
+            }
+        }
+
+        return alternatives.Count == 0
+            ? null
+            : new Regex(string.Join("|", alternatives), RegexOptions.Compiled);
+    }
+
+    private static void AddDestructuredBindings(string specifierList, HashSet<string> directBindings)
+    {
+        foreach (var raw in specifierList.Split(','))
+        {
+            var specifier = BindingSpecifier.Match(raw);
+            if (!specifier.Success)
+                continue;
+
+            var exported = specifier.Groups[1].Value;
+            if (!ChildProcessExecExports.Contains(exported, StringComparer.Ordinal))
+                continue;
+
+            // The local name is the alias when renamed, otherwise the export name itself.
+            var local = specifier.Groups[2].Success ? specifier.Groups[2].Value : exported;
+            directBindings.Add(local);
+        }
+    }
+
+    private static bool IsIdentifier(string token)
+        => token.Length > 0
+            && (char.IsLetter(token[0]) || token[0] == '_' || token[0] == '$')
+            && token.All(c => char.IsLetterOrDigit(c) || c == '_' || c == '$');
+
     internal static bool IsScannable(string filePath)
         => ScannableExtensions.Contains(Path.GetExtension(filePath));
 
     private static string TruncateEvidence(string evidence)
-        => evidence.Length <= EvidenceMaxLength
-            ? evidence
-            : evidence[..EvidenceMaxLength] + "…";
+        // #2924: shared boundary policy. Evidence is arbitrary skill-file text and is rendered to
+        // the user, so a cut inside a cluster shows as a mangled glyph in the scan report.
+        => GraphemeSafeTruncation.Truncate(evidence, EvidenceMaxLength, "…")!;
 
     private static List<string> CollectScannableFiles(string dirPath, int maxFiles, IFileSystem fileSystem)
     {
         var files = new List<string>();
         if (!fileSystem.Directory.Exists(dirPath))
-            return files;
+            throw new InvalidDataException("Skill installation directory does not exist or cannot be accessed.");
 
-        var stack = new Stack<string>();
-        stack.Push(dirPath);
-
-        while (stack.Count > 0 && files.Count < maxFiles)
+        // Validate the entire installation before reading any source, even files outside
+        // the scan budget or excluded directories. The public API reports validation failures as critical.
+        var installationFiles = SkillInstallationValidator.CollectFiles(dirPath, fileSystem);
+        foreach (var entry in installationFiles)
         {
-            var currentDir = stack.Pop();
-            try
-            {
-                foreach (var entry in fileSystem.Directory.EnumerateFileSystemEntries(currentDir))
-                {
-                    if (files.Count >= maxFiles)
-                        break;
+            var parts = fileSystem.Path.GetRelativePath(dirPath, entry).Split(
+                [fileSystem.Path.DirectorySeparatorChar, fileSystem.Path.AltDirectorySeparatorChar],
+                StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Any(name => name.StartsWith('.') || string.Equals(name, "node_modules", StringComparison.OrdinalIgnoreCase)))
+                continue;
 
-                    var name = Path.GetFileName(entry);
-
-                    // Skip hidden dirs and node_modules
-                    if (name.StartsWith('.') || string.Equals(name, "node_modules", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    if (fileSystem.Directory.Exists(entry))
-                    {
-                        stack.Push(entry);
-                    }
-                    else if (fileSystem.File.Exists(entry) && IsScannable(entry))
-                    {
-                        files.Add(entry);
-                    }
-                }
-            }
-            catch
-            {
-                // Permission denied or similar — skip this directory
-            }
+            if (IsScannable(entry))
+                files.Add(entry);
+            if (files.Count >= maxFiles)
+                break;
         }
 
         return files;

@@ -1,3 +1,4 @@
+using BotNexus.Extensions.Plugins.Lifecycle;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Hooks;
 using BotNexus.Gateway.Abstractions.Models;
@@ -53,6 +54,29 @@ public sealed class SkillPromptHookHandler
         if (descriptor is null)
             return Task.FromResult<BeforePromptBuildResult?>(null);
 
+        // Skill discovery happens while the prompt is assembled. Carry the hook's authoritative
+        // provenance into scanner/discovery logs without relabelling this as a skill invocation.
+        // A real invocation is represented separately by DiagnosticTrigger.ToolInvocation and an
+        // actual tool-call id at the tool hook boundary.
+        using var originScope = _logger.BeginScope(new Dictionary<string, object?>
+        {
+            ["DiagnosticOriginKind"] = hookEvent.Origin.Kind.ToString(),
+            ["DiagnosticTrigger"] = hookEvent.Origin.Trigger.ToString(),
+            ["AgentId"] = hookEvent.Origin.AgentId.Value,
+            ["ConversationId"] = hookEvent.Origin.ConversationId is { } conversationId
+                ? conversationId.Value
+                : null,
+            ["SessionId"] = hookEvent.Origin.SessionId?.Value,
+            ["RunId"] = hookEvent.Origin.RunId?.Value,
+            ["ToolCallId"] = hookEvent.Origin.ToolCallId,
+            ["Channel"] = hookEvent.Origin.Channel,
+            ["TraceId"] = hookEvent.Origin.TraceId,
+            ["SpanId"] = hookEvent.Origin.SpanId,
+            ["CorrelationId"] = hookEvent.Origin.CorrelationId,
+            ["DiagnosticSource"] = hookEvent.Origin.SourceComponent,
+            ["DiagnosticCategory"] = hookEvent.Origin.Category
+        });
+
         var workspacePath = _workspaceManager.GetWorkspacePath(hookEvent.AgentId.Value);
 
         var botnexusHome = Path.Combine(ResolveUserHomePath(), ".botnexus");
@@ -61,11 +85,29 @@ public sealed class SkillPromptHookHandler
         var agentSkillsDir = Path.Combine(botnexusHome, "agents", hookEvent.AgentId.Value, "skills");
         var workspaceSkillsDir = Path.Combine(workspacePath, "skills");
 
-        var allSkills = SkillDiscovery.Discover(globalSkillsDir, agentSkillsDir, workspaceSkillsDir, _fileSystem, _logger);
+        // Plugin-shipped skills join at the global/shared tier (#2684). Resolution is driven by the
+        // installed-plugin record, so a directory that was never installed contributes nothing.
+        var pluginSkillsDirs = PluginSkillRootResolver.Resolve(
+            Path.Combine(botnexusHome, PluginSkillRootResolver.PluginRootDirectoryName),
+            _fileSystem);
+
+        var config = ResolveSkillsConfig(descriptor);
+
+        var allSkills = SkillDiscovery.Discover(
+            globalSkillsDir,
+            agentSkillsDir,
+            workspaceSkillsDir,
+            _fileSystem,
+            _logger,
+            pluginSkillsDirs: pluginSkillsDirs,
+            // #3355: the operator's scoped acknowledgements travel with the same per-agent config
+            // that already gates the skills system, so remediation is config-driven and auditable.
+            securityAcknowledgements: config?.SecurityAcknowledgements,
+            allowSymlinkedSkills: config?.AllowSymlinkedSkills ?? false);
+
         if (allSkills.Count == 0)
             return Task.FromResult<BeforePromptBuildResult?>(null);
 
-        var config = ResolveSkillsConfig(descriptor);
         var resolution = SkillResolver.Resolve(allSkills, config);
         if (resolution.Loaded.Count == 0 && resolution.Available.Count == 0)
             return Task.FromResult<BeforePromptBuildResult?>(null);
@@ -80,19 +122,11 @@ public sealed class SkillPromptHookHandler
         });
     }
 
+    /// <summary>
+    /// Binds through the extension's single JSON seam so camelCase operator config binds (#3495).
+    /// </summary>
     private static SkillsConfig? ResolveSkillsConfig(AgentDescriptor descriptor)
-    {
-        if (descriptor.ExtensionConfig.TryGetValue("botnexus-skills", out var element))
-        {
-            try
-            {
-                return System.Text.Json.JsonSerializer.Deserialize<SkillsConfig>(element.GetRawText());
-            }
-            catch { /* invalid config — use defaults */ }
-        }
-
-        return null;
-    }
+        => SkillsConfigResolver.Resolve(descriptor);
 
     private static string ResolveUserHomePath()
     {

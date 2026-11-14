@@ -33,6 +33,13 @@ public interface IPortalLoadService
     /// </summary>
     HubConnectionTuning? Tuning { get; set; }
 
+    /// <summary>
+    /// True while the portal is actively re-dialling after SignalR's automatic-reconnect budget was
+    /// exhausted and the connection reached its terminal <c>Closed</c> state (#2624). Lets the UI
+    /// show "Reconnecting" during a gateway restart instead of a bare, terminal "Disconnected".
+    /// </summary>
+    bool IsReconnecting { get; }
+
     /// <summary>Raised when <see cref="IsReady"/>, <see cref="IsLoading"/>, or <see cref="LoadError"/> changes.</summary>
     event Action? OnReadyChanged;
 
@@ -50,10 +57,19 @@ public interface IPortalLoadService
     Task InitializeAsync(string hubUrl, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Re-fetches agent and conversation data and reconnects SignalR if disconnected.
-    /// Intended for mobile app-resume and manual refresh flows.
+    /// Re-fetches agent and conversation data, reconciles the ACTIVE conversation's transcript from
+    /// REST (#3846), and reconnects SignalR if disconnected. Intended for mobile app-resume and
+    /// manual refresh flows. Each half is independently guarded: a failure of one does not abort
+    /// the others (#2541).
     /// </summary>
     Task RefreshAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Re-fetches portal data and reconciles the transcript for the conversation explicitly named
+    /// by the displayed route. Callers with route identity must use this overload instead of relying
+    /// on the store's last-selected conversation marker.
+    /// </summary>
+    Task RefreshAsync(string agentId, string conversationId, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Liveness-verified hub reset for mobile app resume (#1838). On foreground return, iOS may

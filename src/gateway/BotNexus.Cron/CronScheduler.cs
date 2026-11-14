@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
+using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Abstractions.Sessions;
 using Cronos;
 using Microsoft.Extensions.DependencyInjection;
@@ -16,12 +17,39 @@ public sealed class CronScheduler(
     IEnumerable<ICronAction> actions,
     IServiceScopeFactory scopeFactory,
     IOptionsMonitor<CronOptions> optionsMonitor,
-    ILogger<CronScheduler> logger) : BackgroundService
+    ILogger<CronScheduler> logger,
+    TimeProvider? timeProvider = null,
+    IPlannedShutdownState? plannedShutdownState = null) : BackgroundService
 {
     private readonly ICronStore _cronStore = cronStore;
     private readonly IServiceScopeFactory _scopeFactory = scopeFactory;
     private readonly IOptionsMonitor<CronOptions> _optionsMonitor = optionsMonitor;
     private readonly ILogger<CronScheduler> _logger = logger;
+    private readonly IPlannedShutdownState? _plannedShutdownState = plannedShutdownState;
+    // Serialize cohort capture with local admission, including the store-write/registry gap.
+    // Only pre-capture admissions are retained; after capture the cohort can only shrink.
+    private readonly SemaphoreSlim _runReconciliationGate = new(1, 1);
+    private readonly HashSet<RunId> _runsAdmittedBeforeCohortCapture = [];
+    private readonly Dictionary<RunId, StartupRunReconciliation> _startupRestartRuns = [];
+    private DateTimeOffset? _startupReconciliationBoundary;
+    private bool _startupCohortCaptured;
+
+    private sealed class StartupRunReconciliation(CronRun run)
+    {
+        public CronRun Run { get; } = run;
+        public bool TerminalWriteSucceeded { get; set; }
+    }
+
+    // #3545: manual runs accepted from a short-lived tool call belong to the scheduler. ExecuteAsync
+    // publishes the BackgroundService stopping token here, so accepted work outlives its caller
+    // without becoming detached from gateway shutdown. Direct unit-test use gets CancellationToken.None.
+    private CancellationToken _schedulerStoppingToken;
+    private readonly ConcurrentDictionary<string, Task> _ownedManualRuns = new(StringComparer.Ordinal);
+
+    // #2634: the lifecycle checks (notably expiry) must be assertable without wall-clock waits, so
+    // the scheduler reads "now" through an injectable TimeProvider. Optional and defaulting to the
+    // system clock, so every existing registration and call site is unaffected.
+    private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
     private readonly IReadOnlyDictionary<string, ICronAction> _actions = actions
         .GroupBy(action => action.ActionType, StringComparer.OrdinalIgnoreCase)
         .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
@@ -32,29 +60,437 @@ public sealed class CronScheduler(
     // possible but are cleaned up by the next scheduler-startup migration sweep.
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _jobLocks = new(StringComparer.Ordinal);
 
+    // #4283: a timed-out action may ignore cancellation and continue using its execution scope.
+    // Such a run retains same-job ownership until the action really exits; repeat manual fires fail
+    // closed and scheduled fires skip instead of parking a tick or overlapping the abandoned work.
+    private readonly ConcurrentDictionary<string, byte> _quarantinedJobs = new(StringComparer.Ordinal);
+
+    // #3160: THE registry of runs currently in flight in this process, keyed by RUN id.
+    //
+    // _jobLocks above looks like the right shape for this and is not: it is a serialisation mutex
+    // holding no cancellation handle whatsoever, which is precisely why a delete had nothing to
+    // signal. Keying by run id rather than job id is deliberate - a job can legitimately have more
+    // than one run registered at once (a second trigger parks on the per-job lock while the first
+    // executes), and a job-keyed map would silently drop one of them, leaving an uncancellable run.
+    // Cancelling a job therefore fans out over its runs by an EXACT ordinal job-id match; a prefix
+    // or loose comparison here is how deleting `job-1` would kill `job-10`.
+    private readonly ConcurrentDictionary<string, ActiveCronRun> _activeRuns = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// #3517: how many consecutive one-shot deletion failures a job is allowed before it is driven
+    /// to a terminal state instead of being re-armed for another attempt.
+    /// </summary>
+    /// <remarks>
+    /// Three, not one: a single transient store or archive hiccup should not strand a job that would
+    /// have cleaned itself up on the next tick. What must not survive is the UNBOUNDED case - the
+    /// reported incident retried the identical failure 154 times over 15 hours with no decay.
+    /// </remarks>
+    internal const int MaxOneShotDeleteAttempts = 3;
+
+    // #3517: consecutive one-shot deletion failures per job id. Process-scoped and deliberately not
+    // persisted - the bound exists to stop a wedged run's job hammering the error channel for the
+    // life of THIS process, and a gateway restart clears the wedged run along with the counter, so
+    // a fresh attempt after a restart is the correct behaviour rather than a leak.
+    private readonly ConcurrentDictionary<string, int> _oneShotDeleteFailures = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Number of runs currently registered as in flight in this process (#3160). Exposed so the
+    /// registry's lifecycle is assertable as an observable on every terminal path rather than
+    /// inferred from a log line - a leaked entry is both a memory leak and a stale cancellation
+    /// handle pointed at a run that has already finished.
+    /// </summary>
+    internal int ActiveRunCount => _activeRuns.Count;
+
+    /// <summary>
+    /// A single in-flight cron run: the source that cancels it and the signal that says the run has
+    /// actually <b>observed</b> that cancellation and left its action body (#3160 AC6).
+    /// </summary>
+    /// <remarks>
+    /// The observation signal is what makes a delete safe to proceed from. Cancelling and
+    /// immediately archiving the conversation / sweeping the run's sessions would race a run that
+    /// is still mid-write, which is the concrete corruption #3160 reports.
+    /// </remarks>
+    private sealed class ActiveCronRun(JobId jobId, CancellationTokenSource cts, QueuedCronDispatch? dispatch = null)
+    {
+        private volatile bool _operatorCancelled;
+
+        public JobId Job { get; } = jobId;
+        public CancellationTokenSource Cts { get; } = cts;
+        public QueuedCronDispatch? Dispatch { get; } = dispatch;
+
+        /// <summary>Completes when the run has left <c>RunActionAsync</c>'s body, however it ended.</summary>
+        public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>
+        /// Set when this run was cancelled by an operator delete/disable rather than by the host
+        /// token or its own timeout, so the terminal-status mapping can tell the three apart.
+        /// </summary>
+        /// <remarks>
+        /// #4731 review (round 2): a scheduled run shares its operator-cancel INTENT with the dispatch
+        /// record it was promoted from. The sweep may cancel that dispatch before it ever sees this
+        /// entry; reading the shared flag is what keeps that cancellation classified as an operator
+        /// abort rather than a host/shutdown abort or an error.
+        /// </remarks>
+        public bool OperatorCancelled => _operatorCancelled || Dispatch?.OperatorCancelled == true;
+
+        public void RequestOperatorCancel()
+        {
+            _operatorCancelled = true;
+            try
+            {
+                Cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The run reached its terminal path and disposed the source between our lookup and
+                // this call. There is nothing left to cancel, and racing a natural completion is
+                // not an error.
+            }
+        }
+    }
+
+    // #4688: dispatch is decoupled from completion. The tick used to `await Parallel.ForEachAsync`
+    // over every due job, so the scheduler loop could not reach its Task.Delay - and therefore could
+    // not run the due-scan again - until the SLOWEST job in the batch finished. Long agent-prompt
+    // jobs routinely run for minutes, so a handful of them parked the loop and starved EVERY job on
+    // the instance (including `command` jobs, which never touch an agent at all). Observed in
+    // production as whole-fleet silence with all jobs sharing one identical lastRunAt, punctuated by
+    // a single catch-up burst whenever the blocking batch finally drained.
+    //
+    // The tick now LAUNCHES due jobs and returns. Three invariants are preserved deliberately:
+    //   * the #2670 aggregate cap still bounds concurrency - via this semaphore, held across the
+    //     whole run, instead of by blocking the loop;
+    //   * nothing is dropped - a job that cannot get a slot waits for one on its own background
+    //     task rather than being skipped;
+    //   * a job already in flight is never re-dispatched by a later tick (see _inFlight).
+    private SemaphoreSlim? _dispatchSlots;
+    private int _dispatchSlotsCapacity;
+    private readonly object _dispatchSlotsGate = new();
+
+    // Set before the base shutdown unwinds, so an in-progress tick cannot dispatch a job AFTER the
+    // drain has snapshotted _inFlightTasks and thereby escape it.
+    private volatile bool _stopping;
+
+    // Internal ceiling for the shutdown drain. The caller's token governs normally; this exists so
+    // a direct StopAsync(CancellationToken.None) cannot hang the host forever on one wedged job.
+    private static readonly TimeSpan ShutdownDrainCeiling = TimeSpan.FromSeconds(30);
+
+    // #4688 (review B2): dispatched jobs must NOT run on the BackgroundService stopping token.
+    // BackgroundService.StopAsync cancels that token BEFORE our StopAsync body resumes, so using it
+    // meant every in-flight run took OperationCanceledException the instant shutdown began - the
+    // "drain" then merely waited for abort bookkeeping, while a long agent-prompt job was killed
+    // outright. Dispatch therefore gets its own source, cancelled only once the drain ceiling has
+    // elapsed. That yields a genuine grace period with a hard stop behind it.
+    private readonly CancellationTokenSource _dispatchCts = new();
+
+    // Guards the two CancellationTokenSource members that still throw ObjectDisposedException after
+    // Dispose (the Token getter and Cancel()), so a second StopAsync - or a late dispatch - cannot
+    // fault on an already-disposed source.
+    private volatile bool _disposed;
+
+    /// <summary>Cancels dispatched runs, tolerating an already-disposed source.</summary>
+    private void CancelDispatch()
+    {
+        if (_disposed)
+            return;
+
+        try
+        {
+            _dispatchCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Raced with Dispose; the runs it would have cancelled are already gone.
+        }
+    }
+
+    // Latch for the cap-mismatch warning (review W2): GetDispatchSlots runs on every tick that has
+    // due jobs, so an unlatched warning would log at tick cadence forever after a config edit.
+    private int _capWarned;
+
+    // Jobs currently dispatched-but-not-finished. Because the tick no longer awaits completion, a
+    // subsequent tick would otherwise see a still-running job as due again and stack concurrent
+    // copies of it. Entry is added synchronously during the tick, before the background task starts,
+    // so there is no window in which a job is in flight but not recorded.
+    private readonly ConcurrentDictionary<string, byte> _inFlight = new(StringComparer.Ordinal);
+
+    // Tracks in-flight runs so shutdown can drain them instead of tearing them down mid-write.
+    private readonly ConcurrentDictionary<Task, byte> _inFlightTasks = new();
+
+    // #4731 review P1: per-dispatch cancellation sources keyed by job id, so the operator seam can
+    // cancel a dispatch that is still waiting for a concurrency slot. One entry per job at most,
+    // because _inFlight already guarantees a single outstanding dispatch per job.
+    private readonly ConcurrentDictionary<string, QueuedCronDispatch> _queuedDispatches = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// #4731 review (round 2): the ONE per-dispatch record shared by the queued and active phases of
+    /// a scheduled fire - operator-cancel intent, the cancellation source, and a completion signal.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Completion"/> is set only from the dispatch task's outermost <c>finally</c>, i.e.
+    /// after <c>RunActionAsync</c> has written its terminal row (or the dispatch was abandoned before
+    /// stamping one). A sweep that awaits it therefore cannot report observation while the promoted
+    /// run can still execute or write, regardless of where the queued-to-active hand-off was when the
+    /// sweep took its snapshot.
+    /// </remarks>
+    private sealed class QueuedCronDispatch(CancellationTokenSource source)
+    {
+        private int _operatorCancelled;
+
+        public bool OperatorCancelled => Volatile.Read(ref _operatorCancelled) != 0;
+
+        public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>The run this dispatch was promoted into, once published (may outlive the dispatch on a quarantined timeout).</summary>
+        public volatile ActiveCronRun? Active;
+
+        /// <summary>Completes once the dispatch AND any run it promoted into have fully exited.</summary>
+        public async Task WaitFinishedAsync()
+        {
+            await Completion.Task.ConfigureAwait(false);
+            if (Active is { } active)
+                await active.Completed.Task.ConfigureAwait(false);
+        }
+
+        public void RequestOperatorCancel()
+        {
+            Interlocked.Exchange(ref _operatorCancelled, 1);
+            try
+            {
+                source.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The dispatch finished and released its source; nothing left to cancel.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the aggregate dispatch semaphore, rebuilding it if the configured cap changed.
+    /// </summary>
+    /// <remarks>
+    /// The gate is sized ONCE and then fixed for the lifetime of the scheduler.
+    ///
+    /// An earlier revision rebuilt the semaphore whenever <see cref="CronOptions.MaxConcurrentJobs"/>
+    /// changed. That did not bound anything: the replacement was constructed at FULL capacity while
+    /// N jobs still held permits on the superseded instance, so lowering the cap from 5 to 3 with 5
+    /// jobs running admitted 3 more for 8 concurrent - the cap went down and concurrency went up -
+    /// and an oscillating value minted a fresh full-capacity gate on every flip, making admission
+    /// unbounded. #2670 is a ceiling on billed model turns and provider connections, so "exceed it
+    /// by an arbitrary multiple by editing a config file" is not an acceptable relaxation.
+    ///
+    /// Honouring a live cap change correctly requires a resizable gate that tracks outstanding
+    /// permits and absorbs them as holders return. That is deliberately NOT built here: it is extra
+    /// concurrent machinery on the path that just caused a fleet-wide outage, for a setting that is
+    /// changed approximately never. A cap change therefore takes effect on the next restart, and
+    /// the first observed value wins.
+    /// </remarks>
+    private SemaphoreSlim GetDispatchSlots(int capacity)
+    {
+        lock (_dispatchSlotsGate)
+        {
+            if (_dispatchSlots is null)
+            {
+                _dispatchSlots = new SemaphoreSlim(capacity, capacity);
+                _dispatchSlotsCapacity = capacity;
+            }
+            else if (_dispatchSlotsCapacity != capacity && Interlocked.Exchange(ref _capWarned, 1) == 0)
+            {
+                _logger.LogWarning(
+                    "Cron MaxConcurrentJobs changed from {Current} to {Requested}, but the dispatch gate is "
+                    + "fixed for the process lifetime. The scheduler will keep using {Effective} until restart.",
+                    _dispatchSlotsCapacity,
+                    capacity,
+                    _dispatchSlotsCapacity);
+            }
+
+            return _dispatchSlots;
+        }
+    }
+
+    /// <summary>
+    /// Number of jobs currently dispatched but not yet finished. Exposed for tests and diagnostics.
+    /// </summary>
+    internal int InFlightCount => _inFlight.Count;
+
+    /// <summary>
+    /// Awaits every currently dispatched job. Exists because #4688 decoupled dispatch from
+    /// completion: a tick now returns while jobs are still running, so any caller that needs
+    /// "the work actually finished" (notably tests asserting run bookkeeping) must say so
+    /// explicitly instead of relying on the tick's old blocking side effect.
+    /// </summary>
+    internal async Task WaitForInFlightAsync(CancellationToken cancellationToken = default)
+    {
+        // Jobs can dispatch further work as slots free, so loop until the set is genuinely empty
+        // rather than snapshotting once.
+        // Removal from _inFlightTasks is done by a ContinueWith, and ExecuteSynchronously is only a
+        // HINT - the continuation may be queued instead of inlined. So WhenAll can return while the
+        // completed tasks are still present in the dictionary. Re-snapshotting without removing them
+        // would spin hot against an already-completed set. We therefore retire the snapshot here
+        // ourselves and yield before looking again.
+        while (true)
+        {
+            var pending = _inFlightTasks.Keys.ToArray();
+            if (pending.Length == 0)
+                return;
+
+            try
+            {
+                await Task.WhenAll(pending).WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                // Review B3: retire ONLY completed tasks. An unconditional eviction would, on
+                // ceiling cancellation, untrack runs that are still live - leaving _inFlightTasks
+                // empty while N jobs keep writing to the store, so every later drain returns
+                // instantly and the only handle on those runs is gone. Retiring the completed ones
+                // is what kills the hot spin; the rest stay tracked.
+                foreach (var task in pending)
+                {
+                    if (task.IsCompleted)
+                        _inFlightTasks.TryRemove(task, out _);
+                }
+            }
+
+            await Task.Yield();
+        }
+    }
+
     // One-shot legacy migration guard. The scheduler runs the legacy-conversation migration
     // exactly once per process lifetime, gated by this flag.
     private int _migrationRan;
 
+    /// <summary>
+    /// Distinct terminal reason stamped on runs reaped by <see cref="ReapOrphanedRunsAsync"/>, so an
+    /// orphaned run is never confused with a genuine action failure or a graceful abort (#2410).
+    /// </summary>
+    internal const string OrphanedRunReason = "Cron run orphaned - no terminal write was recorded by its owning process.";
+
+    /// <summary>
+    /// Durable terminal reason used when a cron occurrence is interrupted by an acknowledged
+    /// planned gateway restart. The same reason is used by graceful host cancellation and by the
+    /// next process's one-time startup reconciliation when the prior process died before its
+    /// terminal write committed.
+    /// </summary>
+    internal const string PlannedRestartReason =
+        "Cron run interrupted by a planned gateway restart; this occurrence was terminalized and was not reported as successful.";
+
+    /// <summary>
+    /// Executes a manual occurrence inline, rejecting new admission during planned shutdown.
+    /// A run whose durable start write has begun retains its normal execution lifecycle.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Planned shutdown has closed cron admission.</exception>
     public async Task<CronRun> RunNowAsync(JobId jobId, CancellationToken cancellationToken = default)
     {
+        ThrowIfPlannedShutdown();
         await _cronStore.InitializeAsync(cancellationToken).ConfigureAwait(false);
 
         var job = await _cronStore.GetAsync(jobId, cancellationToken).ConfigureAwait(false)
             ?? throw new KeyNotFoundException($"Cron job '{jobId}' was not found.");
 
-        return await RunActionAsync(job, CronTriggerType.Manual, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+        return await RunActionAsync(job, CronTriggerType.Manual, _timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Deletes a cron job and archives its associated conversation, if any.
+    /// Stamps and accepts a manual run, then executes it as scheduler-owned background work.
+    /// </summary>
+    /// <remarks>
+    /// The caller token governs only acceptance (initialization, job lookup, and the run-start
+    /// write). Once the run identity exists, execution uses the scheduler lifetime instead. The
+    /// existing <see cref="RunActionAsync"/> path still owns the normal timeout or unlimited
+    /// sentinel, active-run registration, operator cancellation, and same-job serialization.
+    /// Planned shutdown rejects new admission without a run row; it does not retrospectively
+    /// reject an accepted run or an in-progress durable start write.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">Planned shutdown has closed cron admission.</exception>
+    public async Task<CronRun> AcceptRunNowAsync(JobId jobId, CancellationToken cancellationToken = default)
+    {
+        ThrowIfPlannedShutdown();
+        await _cronStore.InitializeAsync(cancellationToken).ConfigureAwait(false);
+
+        var job = await _cronStore.GetAsync(jobId, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Cron job '{jobId}' was not found.");
+        var triggeredAt = _timeProvider.GetUtcNow();
+        ThrowIfPlannedShutdown();
+
+        // Preserve the authoritative expiry gate before writing a run row. An expired job is not
+        // accepted as background work, matching RunNowAsync's existing suppression behaviour.
+        if (IsExpired(job))
+            return await RunActionAsync(job, CronTriggerType.Manual, triggeredAt, cancellationToken).ConfigureAwait(false);
+
+        var run = await RecordLocallyAdmittedRunStartAsync(job.Id, cancellationToken).ConfigureAwait(false);
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var execution = ExecuteAcceptedManualRunAsync(job, run, triggeredAt, startGate.Task);
+        _ownedManualRuns[run.Id.Value] = execution;
+        startGate.TrySetResult();
+        return run;
+    }
+
+    private async Task ExecuteAcceptedManualRunAsync(
+        CronJob job,
+        CronRun run,
+        DateTimeOffset triggeredAt,
+        Task startGate)
+    {
+        await startGate.ConfigureAwait(false);
+        try
+        {
+            await RunActionAsync(
+                    job,
+                    CronTriggerType.Manual,
+                    triggeredAt,
+                    _schedulerStoppingToken,
+                    run)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_schedulerStoppingToken.IsCancellationRequested)
+        {
+            _logger.LogDebug(
+                "Accepted manual cron run '{RunId}' for job '{JobId}' stopped with the scheduler.",
+                run.Id,
+                job.Id);
+        }
+        catch (Exception ex)
+        {
+            // RunActionAsync records action failures itself. This guard observes failures from the
+            // scheduler plumbing so a fire-and-forget Task can never become unobserved.
+            _logger.LogError(
+                ex,
+                "Accepted manual cron run '{RunId}' for job '{JobId}' failed outside the normal run finalization path.",
+                run.Id,
+                job.Id);
+        }
+        finally
+        {
+            _ownedManualRuns.TryRemove(run.Id.Value, out _);
+        }
+    }
+
+    /// <summary>
+    /// Deletes a cron job, archives its associated conversation, and reclaims the
+    /// <c>cron:</c>-scoped run sessions the job owns.
     /// Per directive G-5, the conversation lives "until deleted" — deleting the job is
     /// the canonical signal to archive the conversation thread.
     /// </summary>
     /// <remarks>
-    /// Idempotent: missing jobs and missing conversations are not errors. The conversation
-    /// is archived first (best-effort) before the job row is removed, so a failure to
-    /// archive surfaces an error and leaves the job intact for retry.
+    /// Idempotent: missing jobs and missing conversations are not errors. #3160: any run this job
+    /// has in flight is cancelled FIRST and awaited (bounded) before anything is torn down, so the
+    /// archive and the session sweep cannot race a run that is still writing. The conversation
+    /// is archived next (best-effort) before the job row is removed, so a failure to
+    /// archive surfaces an error and leaves the job intact for retry. Session cleanup (#2893)
+    /// runs next and is best-effort in the opposite direction - a session-store failure is logged
+    /// and never aborts the delete.
+    /// #3517: the archive is SKIPPED (with a warning) when cancellation was not actually observed,
+    /// because a still-live run holds the conversation's write stripe and the archive is then
+    /// guaranteed to fail. Aborting the delete on that guaranteed failure is what produced the
+    /// unbounded retry loop.
+    /// #3521: the archive is also skipped when the job merely ADOPTED the conversation instead of
+    /// minting it. Ownership is the typed pair <c>(Source == Cron, SourceId == jobId)</c> stamped at
+    /// creation by <c>ConversationFactory.CreateForCron</c>; anything else is somebody else's thread
+    /// - in the reported incident, a human's 6,324-message default conversation. The skip logs at
+    /// Information (an adopted binding is a normal state, not a fault) and must NOT throw, or it
+    /// would re-enter the #3517 retry loop it was written alongside.
     /// </remarks>
     public async Task DeleteJobAsync(JobId jobId, CancellationToken cancellationToken = default)
     {
@@ -67,17 +503,64 @@ public sealed class CronScheduler(
             return;
         }
 
-        if (existing.ConversationId.HasValue)
+        // #3160: cancel BEFORE anything is torn down, and wait (bounded) for the run to observe it.
+        // Ordering is the whole fix. Archiving the conversation or sweeping the run's sessions while
+        // the action is still executing is not merely untidy - the run keeps writing into a
+        // conversation that has just been archived (resurrecting it) and the sweep deletes the very
+        // session rows the run is mid-write on. Both are states #3160 observed in production.
+        var cancellation = await CancelActiveRunsAsync(jobId, cancellationToken).ConfigureAwait(false);
+
+        // #3517: the #3160 ordering only holds when the cancellation was actually OBSERVED. When it
+        // was not, the run is still live and still holding this conversation's write stripe, so the
+        // archive below is not merely risky - it is guaranteed to fail, and its failure used to
+        // abort the whole delete and re-arm an unbounded retry. Skip it explicitly and say so.
+        // The delete itself still proceeds: fail-open, exactly as the cancellation watchdog does.
+        if (existing.ConversationId.HasValue && !cancellation.Observed)
+        {
+            _logger.LogWarning(
+                "Not archiving conversation '{ConversationId}' for cron job '{JobId}': {Count} in-flight run(s) never "
+                + "observed cancellation, so the conversation is still being written to. The job is being deleted anyway; "
+                + "the conversation is left active rather than blocking the delete on a step that cannot succeed.",
+                existing.ConversationId.Value,
+                jobId,
+                cancellation.Signalled);
+        }
+        else if (existing.ConversationId.HasValue)
         {
             try
             {
                 using var scope = _scopeFactory.CreateScope();
                 var conversations = scope.ServiceProvider.GetRequiredService<IConversationStore>();
-                await conversations.ArchiveAsync(existing.ConversationId.Value, cancellationToken).ConfigureAwait(false);
-                _logger.LogInformation(
-                    "Archived conversation '{ConversationId}' for deleted cron job '{JobId}'.",
-                    existing.ConversationId.Value,
-                    jobId);
+
+                // #3521: archive ONLY a conversation this job owns. `ConversationId` records where
+                // the job writes, which is not the same claim as "this job minted it" - #2412 also
+                // binds a job to a conversation that already existed. Ownership is read from the
+                // conversation's own write-once provenance rather than inferred from the id, because
+                // an id prefix is a convention and provenance is a fact.
+                //
+                // Every failure mode here is fail-OPEN by design: an unreadable row, a store that
+                // throws on the read, or a non-owned binding all SKIP the archive and let the delete
+                // proceed. Throwing would re-arm the unbounded MaybeDeleteOneShotJobAsync retry loop
+                // of #3517, and leaving a conversation active is trivially recoverable whereas
+                // archiving a human's thread is not.
+                if (!await OwnsConversationAsync(conversations, existing.ConversationId.Value, jobId, cancellationToken).ConfigureAwait(false))
+                {
+                    _logger.LogInformation(
+                        "Not archiving conversation '{ConversationId}' for cron job '{JobId}': the job ADOPTED this "
+                        + "conversation rather than minting it (its provenance is not Source=Cron with SourceId='{JobId}'). "
+                        + "The job is being deleted; the conversation is left active because it belongs to whoever created it.",
+                        existing.ConversationId.Value,
+                        jobId,
+                        jobId);
+                }
+                else
+                {
+                    await conversations.ArchiveAsync(existing.ConversationId.Value, "cron-delete-after-run", jobId.Value, "system", cancellationToken).ConfigureAwait(false);
+                    _logger.LogInformation(
+                        "Archived conversation '{ConversationId}' for deleted cron job '{JobId}'.",
+                        existing.ConversationId.Value,
+                        jobId);
+                }
             }
             catch (Exception ex)
             {
@@ -90,11 +573,140 @@ public sealed class CronScheduler(
             }
         }
 
+        await DeleteOwnedRunSessionsAsync(existing, cancellationToken).ConfigureAwait(false);
+
         await _cronStore.DeleteAsync(jobId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// #3521: whether <paramref name="conversationId"/> was MINTED by <paramref name="jobId"/>, as
+    /// opposed to merely bound to it by the #2412 mid-conversation default.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Ownership is the write-once pair <see cref="Conversation.Source"/> ==
+    /// <see cref="ConversationSource.Cron"/> AND <see cref="Conversation.SourceId"/> == the job id,
+    /// exactly as <c>ConversationFactory.CreateForCron</c> stamps it. The <c>SourceId</c> half is
+    /// load-bearing: without it, deleting job A would happily archive a conversation minted by job B.
+    /// </para>
+    /// <para>
+    /// Returns <c>false</c> - never throws - when the conversation cannot be read or the store
+    /// itself fails. A delete must not be blocked by an ownership check that could not be evaluated,
+    /// and an unarchived conversation is a recoverable state while a wrongly archived human thread
+    /// and an unbounded retry loop (#3517) are not.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> OwnsConversationAsync(
+        IConversationStore conversations,
+        ConversationId conversationId,
+        JobId jobId,
+        CancellationToken cancellationToken)
+    {
+        Conversation? conversation;
+        try
+        {
+            conversation = await conversations.GetAsync(conversationId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogInformation(
+                ex,
+                "Could not read conversation '{ConversationId}' to determine whether cron job '{JobId}' owns it; "
+                + "skipping the archive rather than risking one that was never the job's to make.",
+                conversationId,
+                jobId);
+            return false;
+        }
+
+        if (conversation is null)
+        {
+            // Already hard-deleted, or a dangling binding. Nothing to archive either way.
+            _logger.LogInformation(
+                "Conversation '{ConversationId}' bound to cron job '{JobId}' no longer exists; nothing to archive.",
+                conversationId,
+                jobId);
+            return false;
+        }
+
+        return conversation.Source == ConversationSource.Cron
+               && string.Equals(conversation.SourceId, jobId.Value, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Job-lifecycle session cleanup (#2893). Deletes the <c>cron:</c>-scoped run sessions the job
+    /// owns, so deleting a job leaves no unreferenced session rows or transcripts behind.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The per-run counterpart (<see cref="MaybeDeleteEphemeralRunSessionAsync"/>, #1561) only fires
+    /// when the job opted into <see cref="CronJob.DeleteAfterRun"/>, which is off by default. Every
+    /// other job therefore stranded one session plus one transcript per historical run at the moment
+    /// its owning job row was removed. This closes the job-lifecycle half of that ownership.
+    /// </para>
+    /// <para>
+    /// Eligibility is deliberately narrow and matches the id convention <c>CronTrigger</c> writes,
+    /// <c>cron:{jobIdSlug}:{timestamp}:{guid}</c>:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item>Scoped to the job's own agent, so an unrelated agent's sessions are never enumerated.</item>
+    ///   <item>Only ids beginning with <c>cron:{jobIdSlug}:</c> - the trailing colon is load-bearing,
+    ///   without it deleting <c>job-1</c> would also claim every session of <c>job-10</c>.</item>
+    ///   <item>The legacy jobId-less form <c>cron:{timestamp}:{guid}</c> is skipped: it cannot be
+    ///   attributed to a job, and a wrong guess destroys another job's transcript.</item>
+    /// </list>
+    /// <para>
+    /// Best-effort by construction: the whole sweep is wrapped so a session-store outage is logged
+    /// and swallowed rather than aborting the delete. Leaving the job row behind because reclamation
+    /// failed would make the delete permanently unachievable against a broken store, which is a worse
+    /// outcome than the leak this method exists to prevent. It runs after the conversation archive
+    /// (which does still abort the delete on failure) and before the job row is removed.
+    /// </para>
+    /// </remarks>
+    private async Task DeleteOwnedRunSessionsAsync(CronJob job, CancellationToken cancellationToken)
+    {
+        if (job.AgentId is not { } agentId)
+            return;
+
+        var prefix = $"cron:{Sanitize(job.Id.Value)}:";
+        var deleted = 0;
+
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var sessions = scope.ServiceProvider.GetRequiredService<ISessionStore>();
+            var owned = await sessions.ListAsync(agentId, cancellationToken).ConfigureAwait(false);
+
+            foreach (var session in owned)
+            {
+                if (!session.SessionId.Value.StartsWith(prefix, StringComparison.Ordinal))
+                    continue;
+
+                await sessions.DeleteAsync(session.SessionId, cancellationToken).ConfigureAwait(false);
+                deleted++;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to delete owned cron run sessions for job '{JobId}' (prefix '{Prefix}'). The job delete continues; any surviving sessions are orphaned.",
+                job.Id,
+                prefix);
+            return;
+        }
+
+        if (deleted > 0)
+        {
+            _logger.LogInformation(
+                "Deleted {Count} cron run session(s) (and their transcripts) owned by deleted cron job '{JobId}'.",
+                deleted,
+                job.Id);
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _schedulerStoppingToken = stoppingToken;
         await _cronStore.InitializeAsync(stoppingToken).ConfigureAwait(false);
         _logger.LogInformation("Cron scheduler started. Tick interval: {Interval}s", _optionsMonitor.CurrentValue?.TickIntervalSeconds ?? 60);
 
@@ -107,6 +719,18 @@ public sealed class CronScheduler(
         catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Legacy cron conversation migration failed. Scheduler will continue running.");
+        }
+
+        // #2410: startup sweep. Runs left stamped Running by a previous process that died without a
+        // terminal write (kill, host crash, OOM, power loss) are invisible AND unprunable; reap them
+        // before the first tick so the history reflects reality from the moment the scheduler starts.
+        try
+        {
+            await ReapOrphanedRunsAsync(stoppingToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Orphaned cron run reaping failed at startup. Scheduler will continue running.");
         }
 
         while (!stoppingToken.IsCancellationRequested)
@@ -132,40 +756,104 @@ public sealed class CronScheduler(
 
     private async Task ProcessTickAsync(CancellationToken ct)
     {
+        if (IsPlannedShutdown)
+            return;
+
+        // #2410: the reaper is periodic as well as startup-bound - a run can be orphaned by a crash
+        // of a sibling process while this scheduler keeps ticking. Failures here must never abort the
+        // tick, so they are logged and swallowed.
+        try
+        {
+            await ReapOrphanedRunsAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "Orphaned cron run reaping failed during tick.");
+        }
+
+        if (IsPlannedShutdown)
+            return;
+
         var jobs = await _cronStore.ListAsync(ct: ct).ConfigureAwait(false);
-        var now = DateTimeOffset.UtcNow;
+        if (IsPlannedShutdown)
+            return;
+
+        var now = _timeProvider.GetUtcNow();
 
         // Phase 1 (sequential): resolve NextRunAt for uninitialised or stale jobs.
         // These are cheap store-only operations with no agent I/O.
         var dueJobs = new List<(CronJob Job, CronExpression Expression)>();
         foreach (var job in jobs.Where(j => j.Enabled))
         {
+            if (IsPlannedShutdown)
+                return;
+
+            // #2634 (schedule time): an expired job is dropped from the due scan entirely, so it
+            // never even reaches the execute phase. This is the cheap early-out; it is NOT the
+            // authoritative gate (see IsExpired's call site in RunActionAsync) because a manual
+            // RunNowAsync bypasses this loop and an expiry can elapse between this scan and the
+            // actual fire. NextRunAt is deliberately left as-is: expiry suppresses execution, it
+            // does not mutate the stored job.
+            if (IsExpired(job))
+            {
+                _logger.LogDebug(
+                    "Cron job '{JobId}' is past its expiry ({ExpiresAt:o}); skipping in the due scan.",
+                    job.Id,
+                    job.ExpiresAt);
+                continue;
+            }
+
             if (!TryGetSchedule(job, out var expression))
                 continue;
 
-            var tz = ResolveTimeZone(job);
-            var computedNext = expression.GetNextOccurrence(now, tz);
+            var tz = CronTimeZoneResolver.Resolve(job.TimeZone, _logger, job.Id);
+            // #2810: transition policy lives in CronExpressionExtensions, never inline here.
+            var computedNext = expression.NextRun(now, tz);
 
             if (job.NextRunAt is null)
             {
-                var initialized = job with { NextRunAt = computedNext };
-                await _cronStore.UpdateAsync(initialized, ct).ConfigureAwait(false);
+                // #2133: narrow next_run_at write - never round-trips definition columns,
+                // so it cannot clobber a concurrent controller/tool definition edit.
+                await _cronStore.SetNextRunAtAsync(job.Id, computedNext, ct).ConfigureAwait(false);
                 continue;
             }
 
-            // Detect stale NextRunAt: if the schedule was changed to fire sooner
-            // than the stored value, correct it so the job isn't stuck waiting on
-            // a NextRunAt that no longer matches the current schedule.
-            if (computedNext is not null && computedNext < job.NextRunAt)
+            // Detect stale NextRunAt: if the schedule was changed to fire sooner than the stored
+            // value, correct it so the job isn't stuck waiting on a NextRunAt that no longer
+            // matches the current schedule.
+            //
+            // #3350: this correction is sound ONLY under the reading "NextRunAt is the expression's
+            // next occurrence, cached". It is unsound under the other reading the field used to
+            // carry - "the time this job asked to be woken" - because a job that deliberately backs
+            // off writes a LATER value on purpose, and "computed is sooner than stored" cannot tell
+            // a deliberate deferral from a stale cache. The two meanings now live in two fields:
+            // NextRunAt is the cache and is corrected freely here; BackoffUntil is the job-authored
+            // floor and is never moved forward by the scheduler.
+            var correctedNextRun = job.NextRunAt.Value;
+            if (computedNext is not null && computedNext < correctedNextRun)
             {
-                var corrected = job with { NextRunAt = computedNext };
-                await _cronStore.UpdateAsync(corrected, ct).ConfigureAwait(false);
-                if (computedNext > now)
-                    continue;
+                correctedNextRun = computedNext.Value;
+                await _cronStore.SetNextRunAtAsync(job.Id, correctedNextRun, ct).ConfigureAwait(false);
             }
 
-            if (job.NextRunAt > now)
+            // The effective wake is the LATER of the corrected cache and the job's own floor, so a
+            // correction can pull the cache back without pulling the job's requested pacing back
+            // with it. With no backoff - the overwhelmingly common case, and every row written
+            // before #3350 - this is exactly the pre-existing computation.
+            var effectiveNextRun = job.BackoffUntil is { } floor && floor > correctedNextRun
+                ? floor
+                : correctedNextRun;
+
+            if (IsPlannedShutdown)
+                return;
+
+            if (effectiveNextRun > now)
                 continue;
+
+            // The floor is consumed by the run it deferred: a spent backoff left in place would be
+            // indistinguishable to a later reader from a live one.
+            if (job.BackoffUntil is not null)
+                await _cronStore.SetBackoffUntilAsync(job.Id, null, ct).ConfigureAwait(false);
 
             dueJobs.Add((job, expression));
         }
@@ -173,59 +861,590 @@ public sealed class CronScheduler(
         if (dueJobs.Count == 0)
             return;
 
-        // Phase 2 (concurrent): execute all due jobs in parallel so a long-running
-        // agent prompt for one job does not delay other due jobs or user-facing sessions.
-        var runTasks = dueJobs.Select(async entry =>
+        // Phase 2 (bounded-concurrent): execute due jobs in parallel so a long-running agent prompt for
+        // one job does not delay other due jobs or user-facing sessions -- but bounded by an aggregate
+        // cap (#2670) so a synchronised tick cannot fan out an unbounded burst of billed model turns and
+        // provider connections. The remainder queue and run as slots free; NOTHING is dropped.
+        //
+        // This bound is deliberately independent of the per-job _jobLocks semaphore, which answers a
+        // different question (serialising repeat runs of ONE job).
+        var maxConcurrency = _optionsMonitor.CurrentValue.MaxConcurrentJobs;
+        if (maxConcurrency <= 0)
         {
-            var (job, expression) = entry;
-            var tz = ResolveTimeZone(job);
-            await RunActionAsync(job, CronTriggerType.Scheduled, now, ct).ConfigureAwait(false);
+            _logger.LogDebug(
+                "Cron MaxConcurrentJobs was {Configured}; falling back to the default of {Default}.",
+                maxConcurrency,
+                CronOptions.DefaultMaxConcurrentJobs);
+            maxConcurrency = CronOptions.DefaultMaxConcurrentJobs;
+        }
 
-            var latest = await _cronStore.GetAsync(job.Id, ct).ConfigureAwait(false) ?? job;
-            var updated = latest with { NextRunAt = expression.GetNextOccurrence(now, tz) };
-            await _cronStore.UpdateAsync(updated, ct).ConfigureAwait(false);
-        });
+        var slots = GetDispatchSlots(maxConcurrency);
 
-        await Task.WhenAll(runTasks).ConfigureAwait(false);
+        foreach (var (job, expression) in dueJobs)
+        {
+            var tz = CronTimeZoneResolver.Resolve(job.TimeZone, _logger, job.Id);
+
+            // #4688: claim the job BEFORE launching. TryAdd is the atomic guard that stops a later
+            // tick from re-dispatching a job that is still running.
+            if (_stopping || IsPlannedShutdown)
+            {
+                _logger.LogDebug("Cron scheduler admission is closed; not dispatching job '{JobId}'.", job.Id);
+                break;
+            }
+
+            if (!_inFlight.TryAdd(job.Id.Value, 0))
+            {
+                _logger.LogDebug(
+                    "Cron job '{JobId}' is still in flight from an earlier tick; not re-dispatching.",
+                    job.Id);
+                continue;
+            }
+
+            // #4688: advance NextRunAt at DISPATCH time, not completion. The old code rescheduled
+            // after the run finished, which was only safe because the tick blocked until then. With
+            // non-blocking dispatch, a job whose run outlives its own interval would otherwise look
+            // perpetually due and be re-dispatched on every tick.
+            //
+            // DELIVERY SEMANTICS - this is a deliberate trade, not an oversight. Previously a crash
+            // mid-run left NextRunAt in the past, so the restart saw the job as due and replayed the
+            // fire (at-least-once). Now the reschedule is already committed, so that fire is skipped
+            // (at-most-once). A duplicated agent-prompt fire is a billed, side-effecting re-run,
+            // whereas a skipped one self-corrects on the next interval - so at-most-once is the safer
+            // default here. Jobs that genuinely need replay should not rely on NextRunAt for it.
+            try
+            {
+                await _cronStore.SetNextRunAtAsync(job.Id, expression.NextRun(now, tz), ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Review S2: shutdown, not a reschedule failure. Stop the scan rather than logging
+                // one spurious error per remaining due job.
+                _inFlight.TryRemove(job.Id.Value, out _);
+                break;
+            }
+            catch (Exception ex)
+            {
+                _inFlight.TryRemove(job.Id.Value, out _);
+                _logger.LogError(ex, "Failed to reschedule cron job '{JobId}'; skipping this fire.", job.Id);
+                continue;
+            }
+
+            // #4688 review M2: SetNextRunAtAsync is a real await, and StopAsync may have begun (and
+            // even cancelled _dispatchCts) while it was in flight. The _stopping check above ran
+            // BEFORE that await, so re-check here: dispatching now would launch a run on an
+            // already-cancelled token that escapes the drain snapshot and stamps a doomed run row.
+            if (_stopping || _disposed || IsPlannedShutdown)
+            {
+                _inFlight.TryRemove(job.Id.Value, out _);
+                _logger.LogWarning(
+                    "Cron job '{JobId}' was rescheduled but not admitted due to scheduler shutdown; it will run at its next scheduled time.",
+                    job.Id);
+                break;
+            }
+
+            // Deliberately NOT 'ct': see _dispatchCts. The tick's token dies at the first instant
+            // of shutdown, which would defeat the drain entirely. The Token getter throws once the
+            // source is disposed, so bail rather than fault a tick racing a late Dispose.
+            if (_disposed)
+            {
+                _inFlight.TryRemove(job.Id.Value, out _);
+                break;
+            }
+
+            DispatchAsync(job, slots, now, _dispatchCts.Token);
+        }
     }
 
-    private async Task<CronRun> RunActionAsync(CronJob job, CronTriggerType triggerType, DateTimeOffset triggeredAt, CancellationToken ct)
+    /// <summary>
+    /// Launches one due job on a background task and returns immediately (#4688).
+    /// </summary>
+    /// <remarks>
+    /// The aggregate concurrency cap is enforced by awaiting <paramref name="slots"/> INSIDE the
+    /// background task. Waiting here rather than in the tick is what keeps the scheduler loop free
+    /// while still bounding fan-out: a job that cannot get a slot queues on its own task and runs as
+    /// soon as one frees, so the cap never causes a job to be dropped.
+    /// </remarks>
+    private void DispatchAsync(CronJob job, SemaphoreSlim slots, DateTimeOffset triggeredAt, CancellationToken dispatchToken)
     {
-        var run = await _cronStore.RecordRunStartAsync(job.Id, ct).ConfigureAwait(false);
+        // #4731 review P1: a job parked on the cap gate is in _inFlight but not yet in _activeRuns,
+        // so the operator seam (CancelActiveRunsAsync - behind delete and disable) could not reach
+        // it and the waiter later ran the captured definition of a job that had been disabled or
+        // deleted. Each dispatch therefore gets its own source, registered SYNCHRONOUSLY here so
+        // there is no window in which the dispatch exists but is unreachable. It stays registered
+        // until the run has finished, so an operator cancel landing between slot acquisition and
+        // RunActionAsync publishing its _activeRuns entry is still delivered (via the run's ct).
+        var queuedCts = CancellationTokenSource.CreateLinkedTokenSource(dispatchToken);
+        var queued = new QueuedCronDispatch(queuedCts);
+        _queuedDispatches[job.Id.Value] = queued;
+        var ct = queuedCts.Token;
+
+        var task = Task.Run(async () =>
+        {
+            var acquired = false;
+            try
+            {
+                await slots.WaitAsync(ct).ConfigureAwait(false);
+                acquired = true;
+                ThrowIfPlannedShutdown();
+
+                // #4731 review P1: RE-READ the job after the (possibly long) wait for a slot and
+                // revalidate against the fresh row. The due-scan snapshot is stale by now: the job
+                // may have been deleted, disabled or given an earlier ExpiresAt while queued. A
+                // missing row must NOT fall back to the captured definition.
+                var current = await _cronStore.GetAsync(job.Id, ct).ConfigureAwait(false);
+                if (current is null || !current.Enabled || IsExpired(current))
+                {
+                    _logger.LogInformation(
+                        "Cron job '{JobId}' was {Reason} while queued for a concurrency slot; the queued fire was dropped.",
+                        job.Id,
+                        current is null ? "deleted" : !current.Enabled ? "disabled" : "expired");
+                    return;
+                }
+
+                await RunActionAsync(current, CronTriggerType.Scheduled, triggeredAt, ct, acceptedRun: null, dispatch: queued).ConfigureAwait(false);
+            }
+            catch (PlannedShutdownAdmissionException)
+            {
+                // No durable run was admitted. This is suppression, not an action failure;
+                // do not invent terminal history or cancel work that was already admitted.
+                _logger.LogDebug("Cron admission closed for queued job '{JobId}' during planned shutdown.", job.Id);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown, or an operator cancel of a queued dispatch. RunActionAsync owns its own
+                // terminal bookkeeping once started; a waiter that never acquired a slot never
+                // stamped a run row, so there is nothing to add.
+                if (queued.OperatorCancelled && !dispatchToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation(
+                        "Queued dispatch of cron job '{JobId}' was cancelled by an operator delete/disable.",
+                        job.Id);
+                }
+            }
+            catch (Exception ex)
+            {
+                // A dispatched job must never fault the scheduler loop - by this point we are on a
+                // detached task, so an unobserved exception would otherwise escape entirely.
+                // #3659: attributed to the job it belongs to, so the lost work is identifiable.
+                _logger.LogError(
+                    ex,
+                    "Cron job '{JobId}' ('{JobName}') failed during dispatched execution. Other due jobs are unaffected.",
+                    job.Id,
+                    job.Name);
+
+                // #3659: best-effort attribution in run history too. A throw from the run-start
+                // write happens before any run row exists, so without this the failure would
+                // appear in history as if the job had never been due.
+                try
+                {
+                    await _cronStore.RecordRunFinalizationAsync(
+                        job.Id,
+                        triggeredAt,
+                        CronRunStatus.Error,
+                        ex.Message,
+                        ct).ConfigureAwait(false);
+                }
+                catch (Exception recordEx) when (!ct.IsCancellationRequested)
+                {
+                    _logger.LogWarning(
+                        recordEx,
+                        "Failed to record the dispatch failure of cron job '{JobId}' in run history.",
+                        job.Id);
+                }
+            }
+            finally
+            {
+                // The in-flight claim is released in its OWN finally, ahead of the slot release.
+                // If these shared one block, any throw from Release() (ObjectDisposedException,
+                // SemaphoreFullException) would skip TryRemove and strand the job as permanently
+                // in-flight - never dispatched again for the life of the process, with no log and
+                // no recovery. That is the exact whole-fleet-silence failure this change exists to
+                // fix, re-entering through a different door.
+                try
+                {
+                    _queuedDispatches.TryRemove(new KeyValuePair<string, QueuedCronDispatch>(job.Id.Value, queued));
+                    queued.Completion.TrySetResult();
+                    queuedCts.Dispose();
+                    _inFlight.TryRemove(job.Id.Value, out _);
+                }
+                finally
+                {
+                    if (acquired)
+                        slots.Release();
+                }
+            }
+        }, CancellationToken.None);
+
+        _inFlightTasks.TryAdd(task, 0);
+        _ = task.ContinueWith(
+            static (t, state) => ((ConcurrentDictionary<Task, byte>)state!).TryRemove(t, out _),
+            _inFlightTasks,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Drains dispatched-but-unfinished jobs on shutdown (#4688).
+    /// </summary>
+    /// <remarks>
+    /// Because dispatch is detached from the tick, stopping the BackgroundService no longer
+    /// implicitly waits for in-flight runs. Without this drain a shutdown could abandon a run
+    /// between its action completing and its terminal row being written - exactly the orphaned-run
+    /// state #2410 exists to clean up.
+    ///
+    /// This is a REAL grace period, not merely a wait for abort bookkeeping. Dispatched jobs run on
+    /// <see cref="_dispatchCts"/> rather than the BackgroundService stopping token, precisely
+    /// because the base implementation cancels that token before this method's body resumes; using
+    /// it would cancel every run at the first instant of shutdown and leave nothing to drain.
+    ///
+    /// Ordering: jobs are given a grace period to finish on their own, and only once it elapses is
+    /// <see cref="_dispatchCts"/> cancelled, which is the hard stop.
+    ///
+    /// How long that grace period actually is: the effective value is the SHORTER of the caller's
+    /// token and <see cref="ShutdownDrainCeiling"/>. Under a real host shutdown the caller's token
+    /// is the host's, governed by HostOptions.ShutdownTimeout - which this repo does not configure,
+    /// so it is the framework default (30 seconds on .NET 6 and later, including .NET 10; see
+    /// https://learn.microsoft.com/aspnet/core/fundamentals/host/generic-host?view=aspnetcore-10.0).
+    /// That happens to equal the ceiling below, so the ceiling is a backstop for a direct
+    /// StopAsync(CancellationToken.None), not the number that governs production. A minutes-long
+    /// agent-prompt job will still be cancelled at the host timeout; raising
+    /// HostOptions.ShutdownTimeout is the only thing that would change that.
+    /// </remarks>
+    public override void Dispose()
+    {
+        // Do not dispose a CancellationTokenSource while dispatched tasks may still be using it.
+        //
+        // Measured on net10.0 rather than assumed: a token whose CTS was cancelled and then disposed
+        // does NOT throw from Register or CreateLinkedTokenSource (that legacy contract was relaxed),
+        // and SemaphoreSlim.WaitAsync throws TaskCanceledException - an OperationCanceledException,
+        // which RunActionAsync's abort path already turns into a terminal row. So an in-flight run
+        // cannot be stranded by this.
+        //
+        // The guard stays because two members DID keep their ThrowIfDisposed, confirmed by probe:
+        // the Token property getter and Cancel(). Disposing early would make any later dispatch or
+        // a second StopAsync throw ObjectDisposedException. _dispatchCts owns no timer (CancelAfter
+        // is never called on it), so deferring to the GC when runs are outstanding costs nothing.
+        // #4731 review P2: dispatched runs use _dispatchCts, not the base stopping token, so a
+        // Dispose without StopAsync must cancel it or slot-held/queued runs keep going.
+        CancelDispatch();
+
+        if (_inFlightTasks.IsEmpty)
+        {
+            _disposed = true;
+            _dispatchCts.Dispose();
+        }
+
+        base.Dispose();
+    }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        // Set BEFORE the base unwind: if the stop token is already cancelled, base.StopAsync returns
+        // without ExecuteAsync having unwound, so a tick can still be mid-dispatch. The flag stops it
+        // launching work that would then escape the drain snapshot below.
+        _stopping = true;
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
+
+        if (_inFlightTasks.IsEmpty)
+        {
+            CancelDispatch();
+            return;
+        }
+
+        _logger.LogInformation("Cron scheduler draining {Count} in-flight job(s) before shutdown.", _inFlightTasks.Count);
+        try
+        {
+            using var ceiling = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            ceiling.CancelAfter(ShutdownDrainCeiling);
+            await WaitForInFlightAsync(ceiling.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Cron scheduler shutdown drain did not complete cleanly; cancelling in-flight runs.");
+        }
+        finally
+        {
+            // The hard stop, AFTER the grace period - not before it.
+            CancelDispatch();
+        }
+    }
+
+    private Task<CronRun> RunActionAsync(
+        CronJob job,
+        CronTriggerType triggerType,
+        DateTimeOffset triggeredAt,
+        CancellationToken ct)
+        => RunActionAsync(job, triggerType, triggeredAt, ct, acceptedRun: null);
+
+    private async Task<CronRun> RunActionAsync(
+        CronJob job,
+        CronTriggerType triggerType,
+        DateTimeOffset triggeredAt,
+        CancellationToken ct,
+        CronRun? acceptedRun,
+        QueuedCronDispatch? dispatch = null)
+    {
+        if (acceptedRun is null)
+            ThrowIfPlannedShutdown();
+
+        // #2634 (fire time -- the AUTHORITATIVE expiry gate). Checked BEFORE the run row is stamped
+        // so an expired job produces no run at all and, critically, never invokes its action.
+        //
+        // The schedule-time check in ProcessTickAsync alone is not sufficient: a manual RunNowAsync
+        // never passes through the due scan, and a job that was already due can have its expiry
+        // elapse between the scan and this call. Both would slip through. AC3 says the job "stops
+        // executing after that instant", so the gate lives where execution actually begins.
+        //
+        // Suppression only. The stored job is not disabled, not deleted, and not rewritten -- #2634
+        // explicitly rules out mutating an existing job implicitly.
+        if (acceptedRun is null && IsExpired(job))
+        {
+            _logger.LogInformation(
+                "Cron job '{JobId}' ('{JobName}') is past its expiry ({ExpiresAt:o}); the fire was suppressed and the action was not invoked.",
+                job.Id,
+                job.Name,
+                job.ExpiresAt);
+
+            return new CronRun
+            {
+                Id = RunId.From(Guid.NewGuid().ToString("N")),
+                JobId = job.Id,
+                StartedAt = triggeredAt,
+                CompletedAt = triggeredAt,
+                Status = CronRunStatus.Skipped,
+                Error = $"Job expired at {job.ExpiresAt:o}; execution suppressed."
+            };
+        }
+
+        if (_quarantinedJobs.ContainsKey(job.Id.Value))
+        {
+            const string reason = "A previous timed-out action is still exiting; overlapping execution was suppressed.";
+            _logger.LogWarning(
+                "Cron job '{JobId}' ('{JobName}') is quarantined by an action that ignored timeout cancellation; this fire was suppressed.",
+                job.Id,
+                job.Name);
+
+            // A suppressed due/manual occurrence is still an observable scheduler decision. Persist
+            // it instead of returning an invented in-memory row: otherwise history cannot explain
+            // why the occurrence did not execute, which is the exact blind spot exposed by #4283.
+            var skipped = acceptedRun ?? await RecordLocallyAdmittedRunStartAsync(job.Id, ct).ConfigureAwait(false);
+            await _cronStore.RecordRunCompleteAsync(
+                skipped.Id,
+                CronRunStatus.Skipped,
+                reason,
+                ct: CancellationToken.None).ConfigureAwait(false);
+            await FinalizeRunAsync(
+                job.Id,
+                job,
+                triggeredAt,
+                CronRunStatus.Skipped,
+                reason,
+                ct: CancellationToken.None).ConfigureAwait(false);
+
+            return skipped with
+            {
+                CompletedAt = _timeProvider.GetUtcNow(),
+                Status = CronRunStatus.Skipped,
+                Error = reason
+            };
+        }
+
+        var run = acceptedRun ?? await RecordLocallyAdmittedRunStartAsync(job.Id, ct).ConfigureAwait(false);
         var action = ResolveAction(NormalizeActionType(job.ActionType));
+
+        // #3160: from here on the run executes under its OWN linked token, not the caller's. That
+        // token is published in _activeRuns so DeleteJobAsync / CancelActiveRunAsync have something
+        // to signal - pre-#3160 the only cancellation source was a method local inside
+        // ExecuteActionWithTimeoutAsync, unreachable from every mutation path. The link preserves
+        // host cancellation exactly: a gateway shutdown still cancels `ct`, which still cancels
+        // this. Registration happens immediately after the run row is stamped, so the window in
+        // which a run exists but is uncancellable is a single store write rather than a whole turn.
+        var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var activeRun = new ActiveCronRun(job.Id, runCts, dispatch);
+        if (dispatch is not null)
+            dispatch.Active = activeRun;
+        _activeRuns[run.Id.Value] = activeRun;
+        var runCt = runCts.Token;
 
         // Serialize same-job runs in this process so the "create conversation -> CAS stamp"
         // window is single-threaded; concurrent triggers for OTHER jobs run unimpeded.
         var jobLock = _jobLocks.GetOrAdd(job.Id.Value, _ => new SemaphoreSlim(1, 1));
         try
         {
-            await jobLock.WaitAsync(ct).ConfigureAwait(false);
+            // #3160: waiting on runCt, not ct, so a job deleted while this trigger is still QUEUED
+            // behind a sibling run is released too. A queued run that only watched the host token
+            // would sit there and then execute the action of a job that no longer exists.
+            await jobLock.WaitAsync(runCt).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (runCt.IsCancellationRequested)
         {
+            if (activeRun.OperatorCancelled)
+            {
+                // Cancelled by an operator before it ever started: terminal, recorded as an
+                // explicit abort, and NOT rethrown - nobody asked the caller to fail.
+                await RecordAbortedRunAsync(run.Id, job, triggeredAt, CronRunStatus.Aborted, OperatorAbortReason)
+                    .ConfigureAwait(false);
+                ReleaseActiveRun(run.Id, activeRun);
+                await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
+                return run with { Status = CronRunStatus.Aborted, CompletedAt = _timeProvider.GetUtcNow(), Error = OperatorAbortReason };
+            }
+
             // Aborted while waiting for the per-job lock (another same-job run held it during a
             // shutdown/cancel). The run was already stamped Running by RecordRunStartAsync above,
             // so record the abort here too - otherwise it stays stuck Running. CancellationToken.None
             // for the write since `ct` is cancelled.
-            await RecordAbortedRunAsync(run.Id, job, triggeredAt).ConfigureAwait(false);
+            await RecordAbortedRunAsync(
+                    run.Id,
+                    job,
+                    triggeredAt,
+                    reason: ResolveHostAbortReason())
+                .ConfigureAwait(false);
+            ReleaseActiveRun(run.Id, activeRun);
+            // #2634 (AC2): a one-shot aborted before it even acquired the lock is still terminal --
+            // it will never run again on its own -- so the job is removed here too. Leaving it out
+            // would rebuild exactly the bug: an early-ending turn leaving the job scheduled forever.
+            await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
             throw;
         }
 
+        // #2641 AC1: hoisted out of the try so the OUTER error catch can still read the cost the
+        // action accumulated before it threw. Left null until assigned, so the catch distinguishes
+        // "failed before a context existed" (nothing to record) from "failed after doing work"
+        // (record it) - the difference between an honest NULL and a fabricated zero.
+        CronExecutionContext? executionContext = null;
+        IServiceScope? executionScope = null;
+        Task? abandonedAction = null;
+        CancellationTokenSource? abandonedTimeoutSource = null;
         try
         {
+            // A concurrent trigger can pass the pre-lock quarantine check while the first run is
+            // publishing its timeout outcome, then queue on this semaphore. Recheck after acquiring
+            // the lock so that trigger fails closed instead of starting after the abandoned action.
+            if (_quarantinedJobs.ContainsKey(job.Id.Value))
+            {
+                const string reason = "A previous timed-out action is still exiting; overlapping execution was suppressed.";
+                await _cronStore.RecordRunCompleteAsync(
+                    run.Id,
+                    CronRunStatus.Skipped,
+                    reason,
+                    ct: CancellationToken.None).ConfigureAwait(false);
+                await FinalizeRunAsync(
+                    job.Id,
+                    job,
+                    triggeredAt,
+                    CronRunStatus.Skipped,
+                    reason,
+                    ct: CancellationToken.None).ConfigureAwait(false);
+                return run with
+                {
+                    CompletedAt = _timeProvider.GetUtcNow(),
+                    Status = CronRunStatus.Skipped,
+                    Error = reason
+                };
+            }
+
             // Re-read the job inside the lock — another in-process run may have already
             // pinned ConversationId between the time we entered RunActionAsync and now.
             var jobForRun = await _cronStore.GetAsync(job.Id, ct).ConfigureAwait(false) ?? job;
 
-            using var scope = _scopeFactory.CreateScope();
+            var scope = _scopeFactory.CreateScope();
+            executionScope = scope;
+            if (jobForRun.PreconditionCommand is not null)
+            {
+                if (!NormalizeActionType(jobForRun.ActionType).Equals("agent-prompt", StringComparison.OrdinalIgnoreCase)
+                    || string.IsNullOrWhiteSpace(jobForRun.PreconditionCommand))
+                    throw new InvalidOperationException("preconditionCommand requires an agent-prompt job and a nonempty command.");
+                var probeContext = new CronExecutionContext
+                {
+                    Job = jobForRun, RunId = run.Id, TriggeredAt = triggeredAt,
+                    TriggerType = triggerType, Services = scope.ServiceProvider
+                };
+                // A failed probe throws into the existing error/alert path. No model fallback.
+                bool hasWork;
+                try
+                {
+                    hasWork = await Actions.CommandCronAction.EvaluatePreconditionAsync(probeContext, runCt).ConfigureAwait(false);
+                    runCt.ThrowIfCancellationRequested();
+                    if (!hasWork)
+                    {
+                        await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.NoWork, null, ct: ct).ConfigureAwait(false);
+                        await FinalizeRunAsync(job.Id, jobForRun, triggeredAt, CronRunStatus.NoWork, null, ct: ct).ConfigureAwait(false);
+                        return run with { Status = CronRunStatus.NoWork, CompletedAt = _timeProvider.GetUtcNow() };
+                    }
+                }
+                catch (OperationCanceledException) when (runCt.IsCancellationRequested)
+                {
+                    var status = activeRun.OperatorCancelled ? CronRunStatus.Aborted : CronRunStatus.Error;
+                    var reason = activeRun.OperatorCancelled ? OperatorAbortReason : ResolveHostAbortReason();
+                    await RecordAbortedRunAsync(run.Id, jobForRun, triggeredAt, status, reason).ConfigureAwait(false);
+                    if (!activeRun.OperatorCancelled) throw;
+                    return run with { Status = status, CompletedAt = _timeProvider.GetUtcNow(), Error = reason };
+                }
+            }
+            CronModelSelection? modelSelection = null;
+            if (CronModelRouting.UsesModel(jobForRun.ActionType))
+            {
+                var agents = scope.ServiceProvider.GetService<BotNexus.Gateway.Abstractions.Agents.IAgentRegistry>();
+                var descriptor = jobForRun.AgentId is { } owner ? agents?.Get(owner) : null;
+                var globalModel = _optionsMonitor.CurrentValue.DefaultModel;
+                if (descriptor is null && (!string.IsNullOrWhiteSpace(globalModel) || !string.IsNullOrWhiteSpace(jobForRun.Model)))
+                    throw new InvalidOperationException("Cron model routing requires a registered owning agent.");
+                if (descriptor is not null)
+                {
+                    var isExchange = jobForRun.ActionType.Equals("agent-converse", StringComparison.OrdinalIgnoreCase);
+                    var hasPin = !string.IsNullOrWhiteSpace(jobForRun.Model) || !string.IsNullOrWhiteSpace(globalModel);
+                    if (isExchange && hasPin)
+                    {
+                        var targetId = jobForRun.Metadata?.GetValueOrDefault("targetAgentId")?.ToString();
+                        var target = !string.IsNullOrWhiteSpace(targetId) ? agents?.Get(AgentId.From(targetId)) : null;
+                        if (target is null && !string.IsNullOrWhiteSpace(targetId))
+                        {
+                            var matches = agents?.GetAll().Where(a => string.Equals(a.DisplayName, targetId, StringComparison.OrdinalIgnoreCase)).ToList();
+                            if (matches?.Count == 1) target = matches[0];
+                        }
+                        if (target is null)
+                            throw new InvalidOperationException("Pinned cron exchange models require a registered local target so model permissions can be verified.");
+                        descriptor = target;
+                    }
+                    var conversations = scope.ServiceProvider.GetService<IConversationStore>();
+                    var conversation = jobForRun.ConversationId is { } conversationId && conversations is not null
+                        ? await conversations.GetAsync(conversationId, ct).ConfigureAwait(false) : null;
+                    // Exchanges and heartbeats resolve their actual conversations inside their
+                    // runtimes. Without an authored scheduling pin, preserve that fallback rather
+                    // than pinning a different job conversation or inventing an effective audit.
+                    var runtimeOwnsFallback = isExchange || jobForRun.ActionType.Equals("heartbeat", StringComparison.OrdinalIgnoreCase);
+                    if (!runtimeOwnsFallback || hasPin)
+                        modelSelection = CronModelRouting.Resolve(jobForRun.ActionType, jobForRun.Model, globalModel,
+                            conversation?.ModelOverride, descriptor,
+                            scope.ServiceProvider.GetService<BotNexus.Agent.Providers.Core.Registry.ModelRegistry>());
+                    if (modelSelection is not null)
+                    {
+                        if (jobForRun.ActionType.Equals("agent-converse", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var initiator = jobForRun.AgentId is { } initiatorId ? agents?.Get(initiatorId) : null;
+                            if (initiator is null || !AgentModelPermission.IsPermitted(initiator, modelSelection.ModelId))
+                                throw new InvalidOperationException("Cron exchange model is not permitted for the initiating agent.");
+                        }
+                        await _cronStore.RecordRunModelAsync(run.Id, modelSelection, ct).ConfigureAwait(false);
+                        run = run with { EffectiveModel = modelSelection };
+                    }
+                }
+            }
             var context = new CronExecutionContext
             {
-                Job = jobForRun,
+                Job = modelSelection is null ? jobForRun : jobForRun with { Model = modelSelection.QualifiedModel },
+                EffectiveModel = modelSelection,
                 RunId = run.Id,
                 TriggeredAt = triggeredAt,
                 TriggerType = triggerType,
-                Services = scope.ServiceProvider
+                Services = scope.ServiceProvider,
+                PersistSessionIdAsync = async (sessionId, cancellationToken) =>
+                {
+                    await _cronStore.RecordRunSessionAsync(run.Id, sessionId, cancellationToken).ConfigureAwait(false);
+                }
             };
+            executionContext = context;
 
             var timeoutSeconds = ResolveJobTimeout(jobForRun);
 
@@ -240,12 +1459,22 @@ public sealed class CronScheduler(
                 // a host abort rethrows (handled by the catch below); a timeout returns its error
                 // string; success returns null. This keeps the timeout/cancel discrimination out of
                 // the body (no doubled try/try) so the terminal-status mapping is a flat decision.
-                var timeoutError = await ExecuteActionWithTimeoutAsync(action, context, timeoutSeconds, ct)
+                // #3160: the action runs under the run-scoped token so an operator delete/disable
+                // can reach it. `runCt` is linked to `ct`, so host cancellation is unchanged.
+                var actionResult = await ExecuteActionWithTimeoutAsync(action, context, timeoutSeconds, runCt)
                     .ConfigureAwait(false);
+                abandonedAction = actionResult.AbandonedAction;
+                abandonedTimeoutSource = actionResult.AbandonedTimeoutSource;
+                if (abandonedAction is not null)
+                    _quarantinedJobs[job.Id.Value] = 0;
+                var timeoutError = actionResult.TimeoutError;
 
                 if (timeoutError is not null)
                 {
-                    await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.TimedOut, timeoutError, ct: ct)
+                    // #2641 AC1: a timed-out run records the cost of the work it did before the
+                    // timeout fired. This is the branch that matters most - a job that times out is
+                    // by definition one that consumed its entire budget.
+                    await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.TimedOut, timeoutError, cost: context.Cost, ct: ct)
                         .ConfigureAwait(false);
                     await FinalizeRunAsync(job.Id, jobForRun, triggeredAt, CronRunStatus.TimedOut, timeoutError, ct: ct)
                         .ConfigureAwait(false);
@@ -254,7 +1483,33 @@ public sealed class CronScheduler(
 
                 _logger.LogInformation("Cron job executed: {JobName} ({JobId}) action={ActionType} trigger={TriggerType}",
                     jobForRun.Name, jobForRun.Id, jobForRun.ActionType, triggerType);
-                await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.Ok, sessionId: context.SessionId, ct: ct).ConfigureAwait(false);
+
+                // #2985 + #3161: the terminal outcome of a completed action is no longer
+                // unconditionally Ok. Two independent conditions can demote it - an execution-class
+                // job that made zero tool calls, and a run whose primary delivery failed - so the
+                // decision lives in ONE resolver rather than being open-coded here, where a third
+                // condition would inevitably be bolted on with a different precedence.
+                var outcome = ResolveTerminalOutcome(jobForRun, context);
+
+                if (outcome.Status is CronRunStatus.NoToolCalls)
+                {
+                    _logger.LogWarning(
+                        "Cron job '{JobId}' ({JobName}) completed with zero tool invocations and is marked execution-class; recording status '{Status}'.",
+                        jobForRun.Id, jobForRun.Name, CronRunStatus.NoToolCalls);
+                }
+                else if (outcome.Status is CronRunStatus.DeliveryFailed)
+                {
+                    // #3161: the loudest case in the whole method. The turn worked; the output went
+                    // nowhere. Pre-#3161 this logged nothing at all and recorded 'ok'.
+                    _logger.LogError(
+                        "Cron job '{JobId}' ({JobName}) completed but its primary delivery failed; recording status '{Status}'. Delivery error: {DeliveryError}",
+                        jobForRun.Id, jobForRun.Name, CronRunStatus.DeliveryFailed, context.DeliveryError);
+                }
+
+                var terminalStatus = outcome.Status;
+                var terminalError = outcome.Error;
+
+                await _cronStore.RecordRunCompleteAsync(run.Id, terminalStatus, terminalError, sessionId: context.SessionId, cost: context.Cost, ct: ct).ConfigureAwait(false);
 
                 // Pinback via CAS: if the trigger created a new conversation for this run and the job
                 // has no pinned ConversationId yet, atomically stamp ours onto the job. If another
@@ -262,13 +1517,53 @@ public sealed class CronScheduler(
                 var winningConversationId = await TryPinConversationAsync(job.Id, jobForRun, context, scope.ServiceProvider, ct)
                     .ConfigureAwait(false);
 
-                await FinalizeRunAsync(job.Id, jobForRun, triggeredAt, CronRunStatus.Ok, error: null,
+                await FinalizeRunAsync(job.Id, jobForRun, triggeredAt, terminalStatus, error: terminalError,
                     conversationId: winningConversationId, ct: ct).ConfigureAwait(false);
 
-                return run with { Status = CronRunStatus.Ok, CompletedAt = DateTimeOffset.UtcNow, SessionId = context.SessionId };
+                if (terminalError is not null)
+                {
+                    // Reuse the EXISTING failure-alert path (#2557) rather than adding a parallel
+                    // notification channel: the whole point of #2985 is that run status is the
+                    // input to alerting, so making the outcome non-success is what makes alerting
+                    // possible at all. #3161 extends the same reasoning to delivery failure.
+                    var alertFailure = await MaybeSendFailureAlertAsync(jobForRun, triggeredAt, terminalError, ct).ConfigureAwait(false);
+
+                    // #3161 AC3: fail CLOSED. An alert that could not be delivered used to leave a
+                    // single Error log line and nothing else - no row, no query, nothing an operator
+                    // would ever see. Fold it into the run's recorded error so the double failure is
+                    // discoverable from run history. The run's STATUS is deliberately left alone,
+                    // preserving the #2557 AC7 containment that alert delivery never alters the run's
+                    // own outcome.
+                    terminalError = await RecordAlertDeliveryFailureAsync(
+                        run.Id, job.Id, triggeredAt, terminalStatus, terminalError, terminalError, alertFailure, ct).ConfigureAwait(false);
+                }
+
+                return run with { Status = terminalStatus, CompletedAt = DateTimeOffset.UtcNow, Error = terminalError, SessionId = context.SessionId };
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (runCt.IsCancellationRequested)
             {
+                // #3160: an operator deleted or disabled the job while this run was executing. That
+                // is a DELIBERATE terminal outcome, not a failure: it is recorded as `aborted` (a
+                // status distinct from both `error` and `timed_out`), it emits no failure alert, and
+                // it is NOT rethrown - the caller asked for the run to stop, so surfacing an
+                // OperationCanceledException to them would report their own successful request as a
+                // fault. Host cancellation keeps its pre-#3160 behaviour verbatim in the branch below.
+                if (activeRun.OperatorCancelled)
+                {
+                    _logger.LogInformation(
+                        "Cron run aborted by operator (job deleted or disabled while running). JobId: {JobId}, RunId: {RunId}",
+                        job.Id, run.Id);
+                    await RecordAbortedRunAsync(run.Id, job, triggeredAt, CronRunStatus.Aborted, OperatorAbortReason, context.Cost)
+                        .ConfigureAwait(false);
+                    return run with
+                    {
+                        Status = CronRunStatus.Aborted,
+                        CompletedAt = _timeProvider.GetUtcNow(),
+                        Error = OperatorAbortReason,
+                        SessionId = context.SessionId
+                    };
+                }
+
                 // The run was aborted via the host token (gateway shutdown, scheduler stop, or an
                 // explicit cancel of a manual run) rather than the per-job timeout. Without this
                 // branch the cancellation would leave the run permanently in the Running state it
@@ -278,26 +1573,807 @@ public sealed class CronScheduler(
                 _logger.LogWarning(
                     "Cron job aborted (cancellation requested). JobId: {JobId}, ActionType: {ActionType}",
                     job.Id, job.ActionType);
-                await RecordAbortedRunAsync(run.Id, job, triggeredAt).ConfigureAwait(false);
+                await RecordAbortedRunAsync(
+                        run.Id,
+                        job,
+                        triggeredAt,
+                        reason: ResolveHostAbortReason(),
+                        cost: context.Cost)
+                    .ConfigureAwait(false);
                 throw;
             }
             finally
             {
-                await MaybeDeleteEphemeralRunSessionAsync(jobForRun, context, scope.ServiceProvider).ConfigureAwait(false);
+                if (abandonedAction is null)
+                {
+                    await MaybeDeleteEphemeralRunSessionAsync(jobForRun, context, scope.ServiceProvider).ConfigureAwait(false);
+                    scope.Dispose();
+                    executionScope = null;
+                }
             }
         }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
+        catch (Exception ex) when (!runCt.IsCancellationRequested)
         {
+            // #3209: the FULL exception - type name, stack trace, build-machine source paths -
+            // stays here, in the structured log, which is the right home for it: a developer with
+            // log access loses nothing. Everything below records the sanitized PROJECTION instead,
+            // because run history is durable in cron.sqlite and the alert path re-exports it into a
+            // conversation an agent can read.
             _logger.LogError(ex, "Cron job execution failed. JobId: {JobId}, ActionType: {ActionType}", job.Id, job.ActionType);
-            await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.Error, ex.Message, ct: ct).ConfigureAwait(false);
-            await FinalizeRunAsync(job.Id, job, triggeredAt, CronRunStatus.Error, ex.ToString(), ct: ct).ConfigureAwait(false);
-            return run with { Status = CronRunStatus.Error, CompletedAt = DateTimeOffset.UtcNow, Error = ex.Message };
+            var projectedError = CronErrorProjection.Project(ex);
+            // #2641 AC1: a run that threw still cost what it cost. Passing the accumulated context
+            // cost here is what makes the acceptance criterion's "a failed run still records the
+            // cost of the work it did before failing" true on the error path, not just the timeout
+            // one.
+            await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.Error, ex.Message, cost: executionContext?.Cost, ct: ct).ConfigureAwait(false);
+            await FinalizeRunAsync(job.Id, job, triggeredAt, CronRunStatus.Error, projectedError, ct: ct).ConfigureAwait(false);
+            var errorPathAlertFailure = await MaybeSendFailureAlertAsync(job, triggeredAt, projectedError, ct).ConfigureAwait(false);
+            // #3161 AC3: same fail-closed recording on the error path. The containment seam is
+            // shared, so recording it for one terminal outcome only would leave the commonest
+            // failure shape - a broken job whose alert channel is ALSO broken - still invisible.
+            var recordedError = await RecordAlertDeliveryFailureAsync(
+                run.Id, job.Id, triggeredAt, CronRunStatus.Error, ex.Message, projectedError, errorPathAlertFailure, ct).ConfigureAwait(false);
+            return run with { Status = CronRunStatus.Error, CompletedAt = DateTimeOffset.UtcNow, Error = recordedError };
+        }
+        catch (Exception ex) when (activeRun.OperatorCancelled)
+        {
+            // #3160: an operator cancel that surfaced as something other than an OperationCanceledException
+            // (an action that wraps or translates its cancellation). The operator's intent is what
+            // decides the outcome, not the exception type the action happened to choose, so this is
+            // still an abort rather than an error - and still no alert.
+            _logger.LogInformation(
+                ex,
+                "Cron run aborted by operator; the action surfaced {ExceptionType} rather than a cancellation. JobId: {JobId}, RunId: {RunId}",
+                ex.GetType().Name, job.Id, run.Id);
+            await RecordAbortedRunAsync(run.Id, job, triggeredAt, CronRunStatus.Aborted, OperatorAbortReason)
+                .ConfigureAwait(false);
+            return run with { Status = CronRunStatus.Aborted, CompletedAt = _timeProvider.GetUtcNow(), Error = OperatorAbortReason };
         }
         finally
         {
-            jobLock.Release();
+            // #2634 (AC1/AC2): scheduler-driven one-shot removal. This sits in the SAME outermost
+            // finally that releases the per-job lock -- one level up from the finally that hosts
+            // MaybeDeleteEphemeralRunSessionAsync -- so it runs on EVERY terminal path: success,
+            // timeout, an action that threw, and a host cancellation that rethrows past the outer
+            // catch. Removal driven from the success path only would reproduce the original defect,
+            // where a job whose agent turn ended early was never cleaned up.
+            //
+            if (abandonedAction is not null && executionContext is not null && executionScope is not null)
+            {
+                // The quarantine dictionary is the retained same-job ownership signal. Release the
+                // semaphore so a trigger that queued just before quarantine was published can wake,
+                // recheck, and terminate as skipped rather than inheriting the original deadlock.
+                jobLock.Release();
+                _ = CompleteAbandonedActionAsync(
+                    abandonedAction,
+                    job,
+                    executionContext,
+                    executionScope,
+                    abandonedTimeoutSource,
+                    run.Id,
+                    activeRun);
+            }
+            else
+            {
+                executionScope?.Dispose();
+
+                // Ordering: the lock is released first so the delete cannot deadlock against a
+                // same-job waiter, and the delete is best-effort (never throws out of the finally).
+                jobLock.Release();
+
+                // #3160: deregister BEFORE MaybeDeleteOneShotJobAsync. That call routes through
+                // DeleteJobAsync, which now waits for this job's active runs to observe cancellation -
+                // and this run IS one of them. Releasing afterwards would have the run wait on itself
+                // for the full grace period on every one-shot job. Ordering here is load-bearing, not
+                // cosmetic.
+                ReleaseActiveRun(run.Id, activeRun);
+
+                await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
+            }
         }
     }
+
+    private async Task CompleteAbandonedActionAsync(
+        Task actionTask,
+        CronJob job,
+        CronExecutionContext context,
+        IServiceScope scope,
+        CancellationTokenSource? timeoutSource,
+        RunId runId,
+        ActiveCronRun activeRun)
+    {
+        try
+        {
+            await actionTask.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The run is already durably timed_out. Observe and log a late action failure without
+            // rewriting that terminal result or allowing an unobserved task exception.
+            _logger.LogWarning(
+                ex,
+                "Timed-out cron action exited with an error after quarantine. JobId: {JobId}, RunId: {RunId}",
+                job.Id,
+                runId);
+        }
+        finally
+        {
+            try
+            {
+                await MaybeDeleteEphemeralRunSessionAsync(job, context, scope.ServiceProvider).ConfigureAwait(false);
+            }
+            finally
+            {
+                timeoutSource?.Dispose();
+                scope.Dispose();
+                _quarantinedJobs.TryRemove(job.Id.Value, out _);
+                ReleaseActiveRun(runId, activeRun);
+                await MaybeDeleteOneShotJobAsync(job).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reason recorded on a run terminated because an operator deleted or disabled its job (#3160).
+    /// Held as a constant so the producer and the tests that pin the clause cannot drift apart.
+    /// </summary>
+    internal const string OperatorAbortReason = "Cron run aborted: the job was deleted or disabled by an operator while the run was executing.";
+
+    /// <summary>
+    /// Removes an in-flight run from the registry, disposes its cancellation source, and signals
+    /// waiters that the run has observed its cancellation and left the action body (#3160 AC5/AC6).
+    /// </summary>
+    /// <remarks>
+    /// Idempotent and non-throwing: it is reached from several terminal paths and from a
+    /// <c>finally</c>, so it must never be the thing that fails a run. The <b>signal comes before
+    /// the dispose</b> so a waiter released by <see cref="Completed"/> can never observe a
+    /// half-disposed entry.
+    /// </remarks>
+    private void ReleaseActiveRun(RunId runId, ActiveCronRun activeRun)
+    {
+        _activeRuns.TryRemove(new KeyValuePair<string, ActiveCronRun>(runId.Value, activeRun));
+        activeRun.Completed.TrySetResult();
+        if (activeRun.Dispatch is { } dispatch)
+        {
+            // #4731 review (round 2): the terminal row is written by now, so the dispatch can no
+            // longer write. Deregister and complete its record HERE rather than in the dispatch
+            // task's finally, so a one-shot self-delete issued after this point does not wait on
+            // its own dispatch.
+            foreach (var entry in _queuedDispatches)
+            {
+                if (ReferenceEquals(entry.Value, dispatch))
+                    _queuedDispatches.TryRemove(entry);
+            }
+
+            dispatch.Completion.TrySetResult();
+        }
+        try
+        {
+            activeRun.Cts.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Disposing the cancellation source for cron run '{RunId}' failed; the entry was still deregistered.", runId);
+        }
+    }
+
+    /// <summary>
+    /// Cancels every run of <paramref name="jobId"/> currently in flight in this process and waits
+    /// (bounded) for each to observe that cancellation (#3160). Returns how many runs were signalled.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the shared seam behind both operator paths - <see cref="DeleteJobAsync"/> and the
+    /// disable half of a definition update. Matching is an EXACT ordinal job-id comparison: a loose
+    /// or prefix match here is how removing <c>job-1</c> would also kill <c>job-10</c>'s run.
+    /// </para>
+    /// <para>
+    /// The wait is a grace period, never a guarantee. An action that swallows its cancellation token
+    /// must not be able to make its job permanently undeletable, so when
+    /// <see cref="CronOptions.ActiveRunCancellationGraceSeconds"/> elapses the method logs and
+    /// returns - the operator's removal always wins.
+    /// </para>
+    /// </remarks>
+    public async Task<int> CancelActiveRunAsync(JobId jobId, CancellationToken cancellationToken = default)
+        => (await CancelActiveRunsAsync(jobId, cancellationToken).ConfigureAwait(false)).Signalled;
+
+    /// <summary>
+    /// Outcome of a cancellation sweep: how many runs were signalled, and whether every one of them
+    /// was actually seen to leave its action body before the grace period elapsed (#3517).
+    /// </summary>
+    /// <param name="Signalled">How many in-flight runs were signalled. Zero means the job was idle.</param>
+    /// <param name="Observed">
+    /// <c>true</c> when every signalled run observed its cancellation (trivially true when none were
+    /// signalled). <c>false</c> means at least one run is STILL EXECUTING and still holds whatever
+    /// the run holds - which is precisely when a follow-on teardown step must not be attempted.
+    /// </param>
+    internal readonly record struct CancellationSweep(int Signalled, bool Observed);
+
+    /// <summary>
+    /// The <see cref="CancelActiveRunAsync"/> body, reporting whether cancellation was OBSERVED as
+    /// well as how many runs were signalled (#3517).
+    /// </summary>
+    /// <remarks>
+    /// The distinction is the whole of #3517. <see cref="CancelActiveRunAsync"/> returns a count,
+    /// which tells a caller nothing about whether the runs are gone - so <see cref="DeleteJobAsync"/>
+    /// proceeded into an archive that a still-live run made impossible, failed, and retried forever.
+    /// </remarks>
+    internal async Task<CancellationSweep> CancelActiveRunsAsync(JobId jobId, CancellationToken cancellationToken = default)
+    {
+        // #4731 review P1: also reach a dispatch still parked on the concurrency gate. It has no
+        // _activeRuns entry yet (no run row, no action invoked), so it needs no observation wait -
+        // cancelling its source is enough to guarantee the action never starts. Done AFTER the
+        // active runs below are flagged operator-cancelled, because the queued source is linked
+        // into a started run's token and cancelling it first would let that run classify the
+        // cancellation as a shutdown abort instead of an operator cancel.
+        _queuedDispatches.TryGetValue(jobId.Value, out var queued);
+
+        var matches = _activeRuns
+            .Where(entry => entry.Value.Job == jobId)
+            .Select(entry => entry.Value)
+            .ToList();
+
+        // Test-only seam: lets a test promote the queued dispatch into an active run between the
+        // snapshot above and the queued cancel below (#4731 review round 2).
+        if (AfterActiveSnapshotForTest is { } hook)
+            await hook(jobId).ConfigureAwait(false);
+
+        foreach (var active in matches)
+            active.RequestOperatorCancel();
+
+        // #4731 review (round 2): the queued record is the dispatch's single ownership record across
+        // BOTH phases. Setting intent on it marks any run it has been (or is about to be) promoted
+        // into as operator-cancelled, and its completion - set only after the dispatch has written
+        // its terminal row or provably never stamped one - is awaited below. A promotion that raced
+        // the snapshot above is therefore neither misclassified nor left unobserved.
+        queued?.RequestOperatorCancel();
+
+        var signalled = matches.Count + (queued is not null && !matches.Contains(queued.Active!) ? 1 : 0);
+        if (signalled == 0)
+            return new CancellationSweep(0, Observed: true);
+
+        _logger.LogInformation(
+            "Cancelled {Count} in-flight/queued cron run(s) for job '{JobId}' after an operator delete/disable.",
+            signalled,
+            jobId);
+
+        var graceSeconds = _optionsMonitor.CurrentValue?.ActiveRunCancellationGraceSeconds ?? 30;
+        var waits = matches.Select(active => active.Completed.Task).ToList();
+        if (queued is not null)
+            waits.Add(queued.WaitFinishedAsync());
+        var observed = Task.WhenAll(waits);
+
+        // Test-only seam: the queued cancel has been issued and the observation below is about to be
+        // awaited, so a test can check synchronously what the sweep is waiting on (#4731 review r4).
+        BeforeObservationWaitForTest?.Invoke(jobId, observed);
+
+        if (graceSeconds <= 0)
+        {
+            // No grace configured means no opportunity to observe. Report that honestly rather than
+            // claiming an observation that was never waited for.
+            return new CancellationSweep(signalled, Observed: observed.IsCompleted);
+        }
+
+        // Linked source so the grace timer is torn down the instant the runs are observed, rather
+        // than being left pending on the TimeProvider for the whole grace period on every delete.
+        using var graceCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var grace = Task.Delay(TimeSpan.FromSeconds(graceSeconds), _timeProvider, graceCts.Token);
+
+        var winner = await Task.WhenAny(observed, grace).ConfigureAwait(false);
+        await graceCts.CancelAsync().ConfigureAwait(false);
+
+        if (winner != observed)
+        {
+            // Fail OPEN. Blocking the delete forever on an uncooperative action would convert a
+            // runaway job into an unremovable one - strictly worse than the race this wait avoids.
+            _logger.LogWarning(
+                "Cron job '{JobId}' had {Count} in-flight run(s) that did not observe cancellation within {Grace}s; "
+                + "proceeding with the delete/disable anyway.",
+                jobId,
+                signalled,
+                graceSeconds);
+        }
+
+        return new CancellationSweep(signalled, Observed: winner == observed);
+    }
+
+    /// <summary>Test-only: invoked between the active-run snapshot and the queued cancel.</summary>
+    internal Func<JobId, Task>? AfterActiveSnapshotForTest { get; set; }
+
+    /// <summary>Test-only: invoked after the queued cancel, with the observation task the sweep is about to await.</summary>
+    internal Action<JobId, Task>? BeforeObservationWaitForTest { get; set; }
+
+    /// <summary>
+    /// Whether <paramref name="job"/> is past its <see cref="CronJob.ExpiresAt"/> instant (#2634).
+    /// </summary>
+    /// <remarks>
+    /// A thin adapter that binds the scheduler's <see cref="TimeProvider"/> to the one shared
+    /// predicate in <see cref="CronJobExpiry"/>. The comparison itself was extracted there by #3546
+    /// so <see cref="MissedRunDetectionService"/> could reach it: the scanner previously ignored
+    /// expiry entirely because this method was private, and a second inline <c>ExpiresAt</c>
+    /// comparison would only have re-created the divergence. Both scheduler call sites - the
+    /// due-scan early-out and the fire-time gate - still call this method, so there is exactly one
+    /// comparison in the assembly.
+    /// </remarks>
+    private bool IsExpired(CronJob job)
+        => CronJobExpiry.IsExpired(job, _timeProvider.GetUtcNow());
+
+    /// <summary>
+    /// Opt-in scheduler-driven one-shot removal (#2634): deletes the <b>job</b> after its first
+    /// terminal run when <see cref="CronJob.DeleteJobAfterRun"/> is set.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the job-scoped analogue of <see cref="MaybeDeleteEphemeralRunSessionAsync"/>
+    /// (#1561), which deletes the run's <i>session</i>. The two are independent and compose; neither
+    /// changes the other's semantics.
+    /// </para>
+    /// <para>
+    /// The job is re-read first, so an opt-in toggled off between trigger and completion is honoured
+    /// and a job already deleted mid-run is a no-op. Deletion goes through
+    /// <see cref="DeleteJobAsync"/> so the job's pinned conversation is archived exactly as it is for
+    /// a manual delete.
+    /// </para>
+    /// <para>
+    /// Best-effort and <see cref="CancellationToken.None"/>: this runs from a <c>finally</c> that is
+    /// frequently reached during host shutdown (where the caller's token is already cancelled) and on
+    /// the rethrow path of a cancelled run. A failure here is logged and swallowed so it can never
+    /// mask the run's real outcome or escape the finally.
+    /// </para>
+    /// </remarks>
+    private async Task MaybeDeleteOneShotJobAsync(CronJob job)
+    {
+        if (!job.DeleteJobAfterRun)
+            return;
+
+        // #3517: already terminal. Once the bound is reached the job has been disabled and no
+        // further deletion is attempted for the life of this process - re-entering here would let
+        // the attempt count (and the error) keep growing, which is the defect.
+        if (_oneShotDeleteFailures.TryGetValue(job.Id.Value, out var priorFailures) && priorFailures >= MaxOneShotDeleteAttempts)
+        {
+            _logger.LogDebug(
+                "One-shot removal not re-attempted for job '{JobId}': it already failed {Attempts} times and was disabled.",
+                job.Id,
+                priorFailures);
+            return;
+        }
+
+        try
+        {
+            var latest = await _cronStore.GetAsync(job.Id, CancellationToken.None).ConfigureAwait(false);
+            if (latest is null)
+            {
+                _oneShotDeleteFailures.TryRemove(job.Id.Value, out _);
+                return;
+            }
+
+            if (!latest.DeleteJobAfterRun)
+            {
+                _oneShotDeleteFailures.TryRemove(job.Id.Value, out _);
+                _logger.LogDebug(
+                    "One-shot removal skipped for job '{JobId}': deleteJobAfterRun was cleared while the run was in flight.",
+                    job.Id);
+                return;
+            }
+
+            await DeleteJobAsync(job.Id, CancellationToken.None).ConfigureAwait(false);
+            _oneShotDeleteFailures.TryRemove(job.Id.Value, out _);
+            _logger.LogInformation(
+                "Deleted one-shot cron job '{JobId}' ('{JobName}') after its terminal run (deleteJobAfterRun).",
+                job.Id,
+                job.Name);
+        }
+        catch (Exception ex)
+        {
+            var failures = _oneShotDeleteFailures.AddOrUpdate(job.Id.Value, 1, static (_, current) => current + 1);
+
+            if (failures < MaxOneShotDeleteAttempts)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to delete one-shot cron job '{JobId}' after its run (attempt {Attempt} of {Max}). The run outcome is "
+                    + "unaffected; removal will be retried after the next run.",
+                    job.Id,
+                    failures,
+                    MaxOneShotDeleteAttempts);
+                return;
+            }
+
+            // #3517: the bound. Past this point retrying is not a policy, it is a stuck job
+            // re-emitting an identical error every schedule interval forever - 81% of the platform's
+            // whole error budget in the reported window. Drive the job to a TERMINAL state instead
+            // and say so exactly once.
+            await DisableUndeletableOneShotJobAsync(job, failures, ex).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Terminal state for a one-shot job whose deletion has failed <see cref="MaxOneShotDeleteAttempts"/>
+    /// times: disabled, so it stops firing, with a single actionable error (#3517).
+    /// </summary>
+    /// <remarks>
+    /// Disabling rather than force-deleting is deliberate. The delete failed for a reason nobody has
+    /// diagnosed yet, and silently dropping the row would destroy the only evidence an operator has.
+    /// A disabled job stops consuming a provider round-trip every interval, stops re-emitting the
+    /// error, and stays visible for a human to inspect - which is what "terminal" has to mean here.
+    /// </remarks>
+    private async Task DisableUndeletableOneShotJobAsync(CronJob job, int failures, Exception cause)
+    {
+        try
+        {
+            var latest = await _cronStore.GetAsync(job.Id, CancellationToken.None).ConfigureAwait(false);
+            if (latest is null)
+            {
+                _oneShotDeleteFailures.TryRemove(job.Id.Value, out _);
+                return;
+            }
+
+            await _cronStore.UpdateDefinitionAsync(latest with { Enabled = false }, expectedOwnership: null, CancellationToken.None).ConfigureAwait(false);
+            await _cronStore.SetNextRunAtAsync(job.Id, null, CancellationToken.None).ConfigureAwait(false);
+
+            _logger.LogError(
+                cause,
+                "One-shot cron job '{JobId}' ('{JobName}') could not be deleted after {Attempts} attempts and has been "
+                + "DISABLED so it stops firing. This is the terminal outcome: no further deletion attempts will be made. "
+                + "Investigate the cause below and remove the job manually.",
+                job.Id,
+                job.Name,
+                failures);
+        }
+        catch (Exception ex)
+        {
+            // Best-effort to the last: this runs from a finally and must never escape it.
+            _logger.LogError(
+                ex,
+                "One-shot cron job '{JobId}' could not be deleted after {Attempts} attempts, and disabling it also failed. "
+                + "The job requires manual removal.",
+                job.Id,
+                failures);
+        }
+    }
+
+    /// <summary>
+    /// Opt-in per-job failure alerting (#2557). Called on the run's transition to
+    /// <see cref="CronRunStatus.Error"/>, after the terminal run row has been written so the
+    /// consecutive-error streak can be derived from the existing run history rather than from a
+    /// second counter column that could drift from it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Delivery is best-effort and <b>never</b> fails the cron run: the run's own terminal state
+    /// has already been persisted by the time this runs, and every exception out of the sink is
+    /// caught and logged (AC7). A broken alert channel must not convert a job failure into a
+    /// second, different failure.
+    /// </para>
+    /// <para>
+    /// Error text crosses an external-delivery boundary, so it is routed through
+    /// <see cref="CronExternalDeliveryRedactor.RedactSummary"/> - the redaction seam that already
+    /// existed for exactly this purpose.
+    /// </para>
+    /// </remarks>
+    /// <returns>
+    /// <c>null</c> when the alert was delivered, skipped, or not applicable; otherwise the
+    /// alert-delivery failure text, so the caller can fail closed and record it (#3161 AC3). This
+    /// method still never throws.
+    /// </returns>
+    private async Task<string?> MaybeSendFailureAlertAsync(
+        CronJob job,
+        DateTimeOffset scheduledRunTime,
+        string? error,
+        CancellationToken ct)
+    {
+        try
+        {
+            // Re-read so an alert opt-in toggled between trigger and failure is honoured, and so
+            // a job deleted mid-run does not alert at all.
+            var latest = await _cronStore.GetAsync(job.Id, ct).ConfigureAwait(false);
+            if (latest is null || !latest.FailureAlertsEnabled)
+                return null;
+
+            if (latest.FailureAlertConversationId is not { } conversationId)
+            {
+                _logger.LogWarning(
+                    "Cron failure alert skipped: job '{JobId}' has alerts enabled but no FailureAlertConversationId configured.",
+                    job.Id);
+                return null;
+            }
+
+            var consecutiveErrors = await CountConsecutiveErrorsAsync(job.Id, ct).ConfigureAwait(false);
+            if (!ShouldAlertForStreakPosition(consecutiveErrors))
+                return null;
+
+            using var scope = _scopeFactory.CreateScope();
+            var sink = scope.ServiceProvider.GetService<ICronFailureAlertSink>();
+            if (sink is null)
+            {
+                _logger.LogWarning(
+                    "Cron failure alert skipped: no ICronFailureAlertSink is registered (job '{JobId}').",
+                    job.Id);
+                return null;
+            }
+
+            var redactor = scope.ServiceProvider.GetService<ISecretRedactor>();
+            var redactedError = redactor is null
+                ? null
+                : CronExternalDeliveryRedactor.RedactSummary(redactor, error);
+
+            var alert = new CronFailureAlert(
+                JobId: latest.Id,
+                JobName: latest.Name,
+                ScheduledRunTime: scheduledRunTime,
+                AttemptedAt: DateTimeOffset.UtcNow,
+                ConsecutiveErrorCount: consecutiveErrors,
+                Error: redactedError);
+
+            await sink.SendAsync(conversationId, alert, ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "Cron failure alert delivered for job '{JobId}' (consecutiveErrors={ConsecutiveErrors}).",
+                latest.Id, consecutiveErrors);
+            return null;
+        }
+        catch (Exception alertEx)
+        {
+            // AC7: never let alert delivery fail the run. The run is already finalized above.
+            _logger.LogError(
+                alertEx,
+                "Cron failure alert delivery failed for job '{JobId}'. The cron run itself is unaffected.",
+                job.Id);
+            // #3161 AC3: the containment is preserved exactly - nothing is rethrown - but the
+            // failure is no longer *discarded*. It is returned so the caller can fail CLOSED and
+            // record it against the run, because a single Error log line is not an observable
+            // outcome: nothing queries it and no operator reads it.
+            return alertEx.Message;
+        }
+    }
+
+    /// <summary>
+    /// #3161 AC3: folds an alert-delivery failure into the run's recorded error so the double
+    /// failure (the run failed AND nobody could be told) is discoverable from run history rather
+    /// than existing only as a log line. Returns the error text now recorded on the run.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The run's <b>status</b> is deliberately left untouched and is re-written verbatim. That is
+    /// the #2557 AC7 containment this issue's AC5 requires preserving: a broken alert channel must
+    /// never convert one failure into a second, different one. Only the error text grows.
+    /// </para>
+    /// <para>
+    /// This helper is itself fully contained. If the store write fails we are already deep in a
+    /// double-failure path; throwing here would turn an observability improvement into a new way
+    /// for a cron run to blow up.
+    /// </para>
+    /// </remarks>
+    /// <param name="runId">The run whose history row is amended.</param>
+    /// <param name="jobId">The job whose <c>LastRunError</c> is amended.</param>
+    /// <param name="triggeredAt">The run's trigger instant, re-stamped unchanged.</param>
+    /// <param name="terminalStatus">The already-decided terminal status, re-written unchanged.</param>
+    /// <param name="runError">Error text already recorded on the run-history row.</param>
+    /// <param name="finalizationError">Error text already recorded as the job's <c>LastRunError</c>.</param>
+    /// <param name="alertFailure">The alert-delivery failure, or <c>null</c> when delivery was fine.</param>
+    /// <param name="ct">The cancellation token.</param>
+    /// <returns>The (possibly amended) error text now recorded on the run.</returns>
+    private async Task<string?> RecordAlertDeliveryFailureAsync(
+        RunId runId,
+        JobId jobId,
+        DateTimeOffset triggeredAt,
+        string terminalStatus,
+        string? runError,
+        string? finalizationError,
+        string? alertFailure,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(alertFailure))
+            return runError;
+
+        var suffix = $"{AlertDeliveryFailurePrefix}{alertFailure}";
+        var amendedRunError = Append(runError, suffix);
+        var amendedFinalizationError = Append(finalizationError, suffix);
+
+        try
+        {
+            await _cronStore.RecordRunCompleteAsync(runId, terminalStatus, amendedRunError, ct: ct).ConfigureAwait(false);
+            await _cronStore.RecordRunFinalizationAsync(jobId, triggeredAt, terminalStatus, amendedFinalizationError, ct).ConfigureAwait(false);
+        }
+        catch (Exception recordEx)
+        {
+            _logger.LogError(
+                recordEx,
+                "Failed to record the cron alert-delivery failure against run '{RunId}' of job '{JobId}'.",
+                runId, jobId);
+        }
+
+        return amendedRunError;
+
+        static string Append(string? existing, string addition)
+            => string.IsNullOrWhiteSpace(existing) ? addition : $"{existing} {addition}";
+    }
+
+    /// <summary>
+    /// Marker prefixed to the recorded error when a failure alert could not be delivered (#3161
+    /// AC3). Held as a constant so the fail-closed test and the producer cannot drift apart, and so
+    /// an operator scanning run history has one exact string to search for.
+    /// </summary>
+    internal const string AlertDeliveryFailurePrefix = "Failure alert could not be delivered: ";
+
+    /// <summary>
+    /// Length of the current unbroken error streak, derived from the newest run-history rows.
+    /// Returns at least 1 when called immediately after an error row was written.
+    /// </summary>
+    private async Task<int> CountConsecutiveErrorsAsync(JobId jobId, CancellationToken ct)
+    {
+        var history = await _cronStore.GetRunHistoryAsync(jobId, FailureAlertHistoryWindow, ct).ConfigureAwait(false);
+        var streak = 0;
+        foreach (var entry in history)
+        {
+            // History is newest-first; a non-error terminal outcome ends the streak. Rows still
+            // stamped Running are in-flight concurrent runs and are skipped rather than treated
+            // as a break, so a parallel run cannot silently reset the backoff.
+            if (string.Equals(entry.Status, CronRunStatus.Running, StringComparison.OrdinalIgnoreCase))
+                continue;
+            // #2985: a no_tool_calls run is a non-success outcome and belongs to the same streak
+            // as an error. Counting only Error here would restart the backoff at 1 on every
+            // zero-tool run, so a job stuck in the do-nothing state would alert on EVERY run -
+            // reproducing the noise the #2557 backoff exists to prevent.
+            if (!IsAlertableFailureStatus(entry.Status))
+                break;
+            streak++;
+        }
+
+        return streak == 0 ? 1 : streak;
+    }
+
+    /// <summary>
+    /// Terminal statuses that count toward the failure-alert streak (#2557 + #2985): the action
+    /// threw, or an execution-class run completed having done nothing. Both are non-success and
+    /// both are things an operator wants alerted on with the same backoff.
+    /// </summary>
+    private static bool IsAlertableFailureStatus(string status)
+        => string.Equals(status, CronRunStatus.Error, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, CronRunStatus.NoToolCalls, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, CronRunStatus.Incomplete, StringComparison.OrdinalIgnoreCase)
+            // #3161: a delivery failure is a non-success outcome of exactly the same standing. Left
+            // out, the streak would restart at 1 on every undelivered run, so the power-of-two
+            // backoff would alert on EVERY run of a job whose destination is permanently gone -
+            // rebuilding the noise #2557's backoff exists to prevent.
+            || string.Equals(status, CronRunStatus.DeliveryFailed, StringComparison.OrdinalIgnoreCase);
+
+    // #3160 (AC4): `aborted` is deliberately ABSENT from the set above. An operator who deleted or
+    // disabled a job does not want to be alarmed about the run they themselves killed, and counting
+    // their own action toward the error streak would additionally distort the backoff position of
+    // the next GENUINE failure. Note that CountConsecutiveErrorsAsync treats any non-alertable
+    // terminal status as a streak BREAK, which is the correct reading here: a deliberate stop says
+    // nothing about the job's health either way.
+
+    /// <summary>
+    /// Backoff schedule (AC5): alert on the FIRST failure of a streak, then on positions that are
+    /// exact powers of two (1, 2, 4, 8, 16, ...). Without this a job failing every minute would
+    /// deliver an alert every minute - becoming the noise the alert was meant to detect.
+    /// </summary>
+    private static bool ShouldAlertForStreakPosition(int consecutiveErrors)
+    {
+        if (consecutiveErrors <= 1)
+            return true;
+
+        // Power-of-two test: exactly one bit set.
+        return (consecutiveErrors & (consecutiveErrors - 1)) == 0;
+    }
+
+    /// <summary>
+    /// How far back the streak scan reads. Bounded so a job failing for months does not pull an
+    /// unbounded history; beyond this the streak simply saturates, which only makes the backoff
+    /// more conservative.
+    /// </summary>
+    private const int FailureAlertHistoryWindow = 64;
+
+    /// <summary>
+    /// THE single decision point for a completed action's terminal outcome (#2985 + #3161).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two independent conditions can demote a completed run, and their <b>precedence is
+    /// deliberate</b>: a delivery failure outranks the zero-tool-call outcome. If the output never
+    /// reached its destination, that is the operator's actionable problem and the thing they must
+    /// fix; "and it also made no tool calls" is a downstream detail. Recording the zero-tool status
+    /// instead would point the operator at the agent when the conversation is what is broken.
+    /// </para>
+    /// <para>
+    /// Kept as one resolver rather than two open-coded branches at the call site so a future third
+    /// condition has an obvious home and cannot be bolted on with an accidentally different
+    /// precedence.
+    /// </para>
+    /// </remarks>
+    /// <param name="job">The job as re-read inside the per-job lock.</param>
+    /// <param name="context">The completed execution context carrying the action's reports.</param>
+    /// <returns>The terminal status and its recorded reason (<c>null</c> reason for a clean success).</returns>
+    private static (string Status, string? Error) ResolveTerminalOutcome(CronJob job, CronExecutionContext context)
+    {
+        if (!string.IsNullOrWhiteSpace(context.DeliveryError))
+            return (CronRunStatus.DeliveryFailed, $"{DeliveryFailureReasonPrefix}{context.DeliveryError}");
+
+        if (context.RunCompletion is { } completion)
+        {
+            var openItems = completion.OpenItemIds.Count == 0
+                ? "identities unavailable"
+                : string.Join(", ", completion.OpenItemIds);
+            switch (completion.Status)
+            {
+                case "IncompleteWithoutStopReason":
+                    return (CronRunStatus.Incomplete,
+                        $"Agent run ended incomplete after bounded continuation; open checklist items: {openItems}.");
+                case "Parked":
+                    return (CronRunStatus.Parked,
+                        $"Agent run is legitimately parked; open checklist items: {openItems}.");
+                case "Failed":
+                    return (CronRunStatus.Error,
+                        string.IsNullOrWhiteSpace(completion.Detail)
+                            ? "Agent run reported a terminal failure."
+                            : completion.Detail);
+                case "Cancelled":
+                    return (CronRunStatus.Aborted,
+                        string.IsNullOrWhiteSpace(completion.Detail)
+                            ? "Agent run was cancelled."
+                            : completion.Detail);
+            }
+        }
+
+        var zeroToolCallOutcome = DetectZeroToolCallOutcome(job, context);
+        return zeroToolCallOutcome is null
+            ? (CronRunStatus.Ok, null)
+            : (CronRunStatus.NoToolCalls, zeroToolCallOutcome);
+    }
+
+    /// <summary>
+    /// Prefix on the reason recorded for a <see cref="CronRunStatus.DeliveryFailed"/> run (#3161
+    /// AC1: the recorded reason must name the condition). A constant so the test that pins the
+    /// clause and the producer cannot drift apart.
+    /// </summary>
+    internal const string DeliveryFailureReasonPrefix =
+        "Cron run completed but its primary delivery failed - the output reached nobody: ";
+
+    /// <summary>
+    /// #2985 clause 1: decides whether a completed action must terminate as
+    /// <see cref="CronRunStatus.NoToolCalls"/> instead of <see cref="CronRunStatus.Ok"/>, and
+    /// returns the human-readable reason recorded on the run (naming the zero-tool-call condition)
+    /// or <c>null</c> when the run is a normal success.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// BOTH conditions are required, and each guards a different way of getting this wrong:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// <c>ExecutionClass</c> (clause 4) - an unmarked job is untouched. A reporting or
+    /// classification job may legitimately answer from context with no tool call, and demoting
+    /// those would make the signal worthless within a day.
+    /// </description></item>
+    /// <item><description>
+    /// A <b>non-null</b> count - <c>null</c> means the action reported nothing (command, webhook,
+    /// or an interrupted turn that already has its own terminal outcome). Reading that silence as
+    /// zero would classify every shell job on the platform as a do-nothing run. Null is not zero.
+    /// </description></item>
+    /// </list>
+    /// </remarks>
+    private static string? DetectZeroToolCallOutcome(CronJob job, CronExecutionContext context)
+    {
+        if (!job.ExecutionClass)
+            return null;
+
+        if (context.ToolInvocationCount is not { } toolInvocationCount)
+            return null;
+
+        if (toolInvocationCount > 0)
+            return null;
+
+        return ZeroToolCallReason;
+    }
+
+    /// <summary>
+    /// Reason text recorded on a <see cref="CronRunStatus.NoToolCalls"/> run (#2985 clause 1: the
+    /// recorded reason must name the zero-tool-call condition). Held as a constant so the test
+    /// that pins the clause and the producer cannot drift apart.
+    /// </summary>
+    internal const string ZeroToolCallReason =
+        "Execution-class cron run completed with zero tool calls - the run performed no work.";
 
     /// <summary>
     /// Executes the action under its per-job timeout, discriminating a <i>timeout</i> from a
@@ -306,26 +2382,105 @@ public sealed class CronScheduler(
     /// when the host token (<paramref name="ct"/>) was cancelled (gateway shutdown / scheduler stop /
     /// explicit cancel) so the caller can record the abort and propagate cancellation.
     /// </summary>
-    private async Task<string?> ExecuteActionWithTimeoutAsync(
+    private readonly record struct ActionExecutionResult(
+        string? TimeoutError,
+        Task? AbandonedAction,
+        CancellationTokenSource? AbandonedTimeoutSource = null);
+
+    private async Task<ActionExecutionResult> ExecuteActionWithTimeoutAsync(
         ICronAction action,
         CronExecutionContext context,
-        int timeoutSeconds,
+        int? timeoutSeconds,
         CancellationToken ct)
     {
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+        // #2904: null is unlimited: keep ambient cancellation, but arm no deadline. Use the
+        // scheduler clock for the timer as well as duration, so cancellation is deterministic when
+        // a caller supplies a timer-aware TimeProvider (#4102).
+        using var deadlineCts = timeoutSeconds is int armedTimeout
+            ? new CancellationTokenSource(TimeSpan.FromSeconds(armedTimeout), _timeProvider)
+            : null;
+        var timeoutCts = deadlineCts is null
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : CancellationTokenSource.CreateLinkedTokenSource(ct, deadlineCts.Token);
+        var retainTimeoutSource = false;
 
+        // #2641 AC2: the scheduler owns the run clock. Stamped in a finally so it is recorded on
+        // EVERY exit - success, timeout, and host/operator cancellation alike - because a run that
+        // failed after 40 minutes is exactly the run an operator most needs the duration of.
+        var startedAt = _timeProvider.GetUtcNow();
         try
         {
-            await action.ExecuteAsync(context, timeoutCts.Token).ConfigureAwait(false);
-            return null;
+            var actionTask = action.ExecuteAsync(context, timeoutCts.Token);
+            if (timeoutSeconds is null)
+            {
+                await actionTask.ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+                return new ActionExecutionResult(null, null);
+            }
+
+            var timeoutSignal = Task.Delay(Timeout.InfiniteTimeSpan, timeoutCts.Token);
+            var completed = await Task.WhenAny(actionTask, timeoutSignal).ConfigureAwait(false);
+            if (completed == actionTask || ct.IsCancellationRequested)
+            {
+                // Host/operator cancellation keeps its established semantics: wait for the action
+                // to observe cancellation so teardown and active-run cancellation remain ordered.
+                await actionTask.ConfigureAwait(false);
+                // #4102: returning normally is not proof of success: actions may swallow
+                // cancellation. Reconcile provenance before resolving ok/no_tool_calls. Ambient
+                // host/operator intent wins if observed here, even when the deadline fired first.
+                ct.ThrowIfCancellationRequested();
+                timeoutCts.Token.ThrowIfCancellationRequested();
+                return new ActionExecutionResult(null, null);
+            }
+
+            // Give a cancellation-cooperative action a small bounded window to unwind. This keeps
+            // the established cooperative path (scope disposal and active-run release before the
+            // caller returns) while still bounding an action that ignores cancellation.
+            var cooperativeExit = await Task.WhenAny(actionTask, Task.Delay(TimeSpan.FromMilliseconds(100))).ConfigureAwait(false);
+            if (cooperativeExit == actionTask)
+            {
+                try
+                {
+                    await actionTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // Expected per-job timeout cancellation.
+                }
+
+                ct.ThrowIfCancellationRequested();
+                _logger.LogWarning(
+                    "Cron job timed out after {TimeoutSeconds}s. JobId: {JobId}, ActionType: {ActionType}",
+                    timeoutSeconds, context.Job.Id, context.Job.ActionType);
+                return new ActionExecutionResult($"Job exceeded {timeoutSeconds}s timeout", null);
+            }
+
+            if (ct.IsCancellationRequested)
+            {
+                // Preserve ambient cancellation's ordered teardown if it arrived during the
+                // cooperative window, rather than attributing that cancellation to the deadline.
+                await actionTask.ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+            }
+
+            _logger.LogWarning(
+                "Cron job timed out after {TimeoutSeconds}s and did not stop after cancellation; it was quarantined. JobId: {JobId}, ActionType: {ActionType}",
+                timeoutSeconds, context.Job.Id, context.Job.ActionType);
+            retainTimeoutSource = true;
+            return new ActionExecutionResult($"Job exceeded {timeoutSeconds}s timeout", actionTask, timeoutCts);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
             _logger.LogWarning(
                 "Cron job timed out after {TimeoutSeconds}s. JobId: {JobId}, ActionType: {ActionType}",
                 timeoutSeconds, context.Job.Id, context.Job.ActionType);
-            return $"Job exceeded {timeoutSeconds}s timeout";
+            return new ActionExecutionResult($"Job exceeded {timeoutSeconds}s timeout", null);
+        }
+        finally
+        {
+            context.RecordDuration((long)(_timeProvider.GetUtcNow() - startedAt).TotalMilliseconds);
+            if (!retainTimeoutSource)
+                timeoutCts.Dispose();
         }
     }
 
@@ -383,7 +2538,7 @@ public sealed class CronScheduler(
     }
 
     /// <summary>
-    /// The single "re-read latest job → <see cref="ICronStore.UpdateAsync"/> with the terminal
+    /// The single "re-read latest job → narrow <see cref="ICronStore.RecordRunFinalizationAsync"/> write of the terminal
     /// <c>LastRun*</c> fields" write-back shared by every terminal path (ok / timed_out / error /
     /// aborted). Re-reading inside the write avoids clobbering concurrent edits (schedule updates).
     /// Optionally carries a resolved <paramref name="conversationId"/> for the success path's CAS
@@ -398,30 +2553,290 @@ public sealed class CronScheduler(
         ConversationId? conversationId = null,
         CancellationToken ct = default)
     {
-        var latest = await _cronStore.GetAsync(jobId, ct).ConfigureAwait(false) ?? fallback;
-        await _cronStore.UpdateAsync(latest with
-        {
-            LastRunAt = triggeredAt,
-            LastRunStatus = status,
-            LastRunError = error,
-            ConversationId = conversationId ?? latest.ConversationId
-        }, ct).ConfigureAwait(false);
+        _ = fallback;
+        // #2133: terminal bookkeeping is a narrow last_run_* write that leaves definition
+        // columns, next_run_at, and the conversation pin untouched. This is what makes run
+        // finalization racing a concurrent definition edit safe - it can no longer overwrite
+        // the edit. The conversation pin (conversationId) was already persisted atomically by
+        // TrySetConversationIdAsync's CAS in TryPinConversationAsync, so it is not re-written
+        // here; passing it separately would reintroduce a read-modify-write clobber window.
+        _ = conversationId;
+        await _cronStore.RecordRunFinalizationAsync(jobId, triggeredAt, status, error, ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Records a cron run that was aborted via the host cancellation token (gateway shutdown,
-    /// scheduler stop, or an explicit cancel) as a failed run. The run was already stamped
-    /// <see cref="CronRunStatus.Running"/> by <see cref="ICronStore.RecordRunStartAsync"/>, so this
-    /// surfaces the abort as <see cref="CronRunStatus.Error"/> instead of leaving it stuck
-    /// <see cref="CronRunStatus.Running"/> forever (a silent non-success). The bookkeeping writes use
-    /// <see cref="CancellationToken.None"/> because the caller's token is already cancelled - passing
-    /// it would cancel the very writes that record the failure.
+    /// Marks cron runs that are still stamped <see cref="CronRunStatus.Running"/> but whose
+    /// <c>StartedAt</c> deviates from now by more than
+    /// <see cref="CronOptions.OrphanedRunThresholdSeconds"/> as <see cref="CronRunStatus.Error"/>
+    /// with the orphan reason (#2410).
     /// </summary>
-    private async Task RecordAbortedRunAsync(RunId runId, CronJob job, DateTimeOffset triggeredAt)
+    /// <remarks>
+    /// <para>
+    /// The write-path protection (<c>RecordAbortedRunAsync</c> on every abort path) only covers
+    /// graceful aborts. A process kill, host crash, OOM, or power loss leaves the row stamped
+    /// <c>running</c> forever - and because retention never deletes in-flight runs, such a row is
+    /// also permanently immune to <see cref="ICronStore.PurgeRunsOlderThanAsync"/> and accumulates.
+    /// Reaping converts it into a terminal, visible, prunable row.
+    /// </para>
+    /// <para>
+    /// The bound is deliberately compared as <c>Math.Abs(now - startedAt)</c>, not
+    /// <c>now - startedAt</c>. A future-dated <c>started_at</c> (clock skew, a restored database, a
+    /// forced run) yields a negative span, which a one-sided comparison never exceeds - that row
+    /// would be a permanent blind spot and could never be reaped. The symmetric comparison closes it.
+    /// </para>
+    /// </remarks>
+    /// <returns>The number of runs reaped.</returns>
+    internal async Task<int> ReapOrphanedRunsAsync(CancellationToken ct = default)
     {
-        const string abortReason = "Cron run aborted before completion.";
-        await _cronStore.RecordRunCompleteAsync(runId, CronRunStatus.Error, abortReason, ct: CancellationToken.None).ConfigureAwait(false);
-        await FinalizeRunAsync(job.Id, job, triggeredAt, CronRunStatus.Error, abortReason, ct: CancellationToken.None).ConfigureAwait(false);
+        await _runReconciliationGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var options = _optionsMonitor.CurrentValue ?? new CronOptions();
+            var bound = TimeSpan.FromSeconds(Math.Max(1, options.OrphanedRunThresholdSeconds));
+
+            // Freeze the startup boundary before any fallible read. A successful retry must not
+            // classify rows created by another process during the retry window as previous runs.
+            _startupReconciliationBoundary ??= _timeProvider.GetUtcNow();
+            var running = await _cronStore.ListRunningRunsAsync(ct).ConfigureAwait(false);
+            if (!_startupCohortCaptured)
+            {
+                // Resolve shutdown classification here, not during DI construction.
+                if (_plannedShutdownState?.PreviousShutdownWasPlanned == true)
+                {
+                    foreach (var run in running)
+                    {
+                        if (run.StartedAt <= _startupReconciliationBoundary.Value
+                            && !_runsAdmittedBeforeCohortCapture.Contains(run.Id)
+                            && !_activeRuns.ContainsKey(run.Id.Value))
+                        {
+                            _startupRestartRuns.Add(run.Id, new StartupRunReconciliation(run));
+                        }
+                    }
+                }
+                _startupCohortCaptured = true;
+                _runsAdmittedBeforeCohortCapture.Clear();
+            }
+
+            var reaped = 0;
+            var runningIds = running.Select(run => run.Id).ToHashSet();
+            var startupIds = _startupRestartRuns.Keys.ToHashSet();
+            foreach (var entry in _startupRestartRuns.Values.ToArray())
+            {
+                var run = entry.Run;
+                // Local execution wins even if ownership appeared after the snapshot. Drop this
+                // identity permanently rather than reclassifying it when its executor leaves.
+                if (_activeRuns.ContainsKey(run.Id.Value))
+                {
+                    _startupRestartRuns.Remove(run.Id);
+                    continue;
+                }
+
+                if (!entry.TerminalWriteSucceeded && !runningIds.Contains(run.Id))
+                {
+                    // Completion may have committed before its acknowledgement threw. Read the
+                    // exact identity, not bounded history, and only acknowledge our own outcome.
+                    // A failed read leaves this entry intact for the next reconciliation attempt.
+                    var persisted = await _cronStore.GetRunAsync(run.Id, ct).ConfigureAwait(false);
+                    if (persisted is null
+                        || persisted.Id != run.Id
+                        || persisted.JobId != run.JobId
+                        || persisted.StartedAt != run.StartedAt
+                        || !string.Equals(persisted.Status, CronRunStatus.Error, StringComparison.Ordinal)
+                        || !string.Equals(persisted.Error, PlannedRestartReason, StringComparison.Ordinal)
+                        || persisted.CompletedAt is null)
+                    {
+                        _startupRestartRuns.Remove(run.Id);
+                        continue;
+                    }
+                    entry.TerminalWriteSucceeded = true;
+                }
+
+                if (!entry.TerminalWriteSucceeded)
+                {
+                    await _cronStore.RecordRunCompleteAsync(
+                        run.Id, CronRunStatus.Error, PlannedRestartReason, ct: ct).ConfigureAwait(false);
+                    entry.TerminalWriteSucceeded = true;
+                }
+
+                // A terminal row vanishes from the running query. Retain its job bookkeeping
+                // until that succeeds, without repeating a successful run-terminal write.
+                await FinalizeReapedRunAsync(run, PlannedRestartReason, ct, requireMatchingOccurrence: true)
+                    .ConfigureAwait(false);
+                _startupRestartRuns.Remove(run.Id);
+                reaped++;
+                LogReapedRun(run, bound);
+            }
+
+            var now = _timeProvider.GetUtcNow();
+            foreach (var run in running)
+            {
+                if (startupIds.Contains(run.Id) || _activeRuns.ContainsKey(run.Id.Value))
+                    continue;
+
+                var ownerState = await GetOwnerSessionStateAsync(run.SessionId, ct).ConfigureAwait(false);
+                var ownerIsTerminal = run.SessionId.HasValue
+                    && ownerState is "sealed" or "expired" or "missing";
+                if (!ownerIsTerminal && (now - run.StartedAt).Duration() <= bound)
+                    continue;
+
+                var reason = ownerIsTerminal
+                    ? $"Cron run orphaned - owner session is {ownerState} and no active executor owns the run."
+                    : OrphanedRunReason;
+                await _cronStore.RecordRunCompleteAsync(run.Id, CronRunStatus.Error, reason, ct: ct)
+                    .ConfigureAwait(false);
+                await FinalizeReapedRunAsync(run, reason, ct).ConfigureAwait(false);
+                reaped++;
+                LogReapedRun(run, bound);
+            }
+
+            return reaped;
+        }
+        finally
+        {
+            _runReconciliationGate.Release();
+        }
+    }
+
+    private bool IsPlannedShutdown => _plannedShutdownState?.CurrentShutdownIsPlanned == true;
+
+    private sealed class PlannedShutdownAdmissionException()
+        : InvalidOperationException("Cron run admission is closed during planned shutdown.");
+
+    private void ThrowIfPlannedShutdown()
+    {
+        if (IsPlannedShutdown)
+            throw new PlannedShutdownAdmissionException();
+    }
+
+    private async Task<CronRun> RecordLocallyAdmittedRunStartAsync(JobId jobId, CancellationToken ct)
+    {
+        await _runReconciliationGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            // Recheck after waiting for the existing admission/reconciliation gate. Once this
+            // write begins, retain ownership through completion even if shutdown is then marked.
+            // The gateway marker does not share this gate: this is a process-local state check,
+            // not an atomic cross-process shutdown fence or a rollback of an in-progress write.
+            ThrowIfPlannedShutdown();
+            var run = await _cronStore.RecordRunStartAsync(jobId, ct).ConfigureAwait(false);
+            if (!_startupCohortCaptured)
+                _runsAdmittedBeforeCohortCapture.Add(run.Id);
+            return run;
+        }
+        finally
+        {
+            _runReconciliationGate.Release();
+        }
+    }
+
+    private async Task FinalizeReapedRunAsync(
+        CronRun run, string reason, CancellationToken ct, bool requireMatchingOccurrence = false)
+    {
+        var job = await _cronStore.GetAsync(run.JobId, ct).ConfigureAwait(false);
+        // Startup retries must not regress a newer running occurrence. The generic age reaper
+        // keeps its existing status-only cleanup for stale/corrupt timestamp bookkeeping.
+        if (job is not null
+            && string.Equals(job.LastRunStatus, CronRunStatus.Running, StringComparison.Ordinal)
+            && (!requireMatchingOccurrence || job.LastRunAt == run.StartedAt))
+        {
+            await _cronStore.RecordRunFinalizationAsync(
+                run.JobId, run.StartedAt, CronRunStatus.Error, reason, ct).ConfigureAwait(false);
+        }
+    }
+
+    private void LogReapedRun(CronRun run, TimeSpan bound)
+        => _logger.LogWarning(
+            "Reaped orphaned cron run '{RunId}' for job '{JobId}' (started_at {StartedAt:o}, bound {Bound}).",
+            run.Id, run.JobId, run.StartedAt, bound);
+
+    /// <summary>
+    /// Projects liveness evidence for run-history consumers. Running rows expose their age, the
+    /// persisted owner-session lifecycle, and whether this scheduler still owns an executor;
+    /// terminal rows retain null running-only fields.
+    /// </summary>
+    public async Task<IReadOnlyList<CronRun>> GetRunHealthAsync(
+        IReadOnlyList<CronRun> runs,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(runs);
+        var now = _timeProvider.GetUtcNow();
+        var result = new List<CronRun>(runs.Count);
+        foreach (var run in runs)
+        {
+            var isRunning = string.Equals(run.Status, CronRunStatus.Running, StringComparison.Ordinal);
+            result.Add(run with
+            {
+                RunningAge = isRunning ? (now - run.StartedAt).Duration() : null,
+                OwnerSessionState = isRunning
+                    ? await GetOwnerSessionStateAsync(run.SessionId, ct).ConfigureAwait(false)
+                    : null,
+                HasActiveExecutor = isRunning ? _activeRuns.ContainsKey(run.Id.Value) : null
+            });
+        }
+
+        return result;
+    }
+
+    private async Task<string> GetOwnerSessionStateAsync(SessionId? sessionId, CancellationToken ct)
+    {
+        if (!sessionId.HasValue)
+            return "none";
+
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var sessions = scope.ServiceProvider.GetService<ISessionStore>();
+            if (sessions is null)
+                return "unknown";
+
+            var session = await sessions.GetAsync(sessionId.Value, ct).ConfigureAwait(false);
+            return session?.Status.ToString().ToLowerInvariant() ?? "missing";
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                ex,
+                "Could not read owner session '{SessionId}' while reconciling cron run liveness.",
+                sessionId.Value);
+            return "unknown";
+        }
+    }
+
+    /// <summary>
+    /// Records a cron run that ended without completing its action as terminal, so it is never left
+    /// stuck <see cref="CronRunStatus.Running"/> (a silent non-success).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The default is the host-abort shape (gateway shutdown, scheduler stop, an explicit cancel of
+    /// a manual run), recorded as <see cref="CronRunStatus.Error"/>. #3160 parameterises the status
+    /// and reason so an <b>operator</b> abort - the job was deleted or disabled mid-run - can be
+    /// recorded as <see cref="CronRunStatus.Aborted"/> through the same seam, rather than growing a
+    /// second near-identical recording path that would inevitably drift.
+    /// </para>
+    /// <para>
+    /// The bookkeeping writes use <see cref="CancellationToken.None"/> because the caller's token is
+    /// already cancelled - passing it would cancel the very writes that record the outcome.
+    /// </para>
+    /// </remarks>
+    private string ResolveHostAbortReason()
+        => _plannedShutdownState?.CurrentShutdownIsPlanned == true
+            ? PlannedRestartReason
+            : "Cron run aborted before completion.";
+
+    private async Task RecordAbortedRunAsync(
+        RunId runId,
+        CronJob job,
+        DateTimeOffset triggeredAt,
+        string status = CronRunStatus.Error,
+        string? reason = null,
+        CronRunCost? cost = null)
+    {
+        const string hostAbortReason = "Cron run aborted before completion.";
+        var abortReason = reason ?? hostAbortReason;
+        // #2641 AC1: an aborted run is terminal and still records what it cost before the abort.
+        await _cronStore.RecordRunCompleteAsync(runId, status, abortReason, cost: cost, ct: CancellationToken.None).ConfigureAwait(false);
+        await FinalizeRunAsync(job.Id, job, triggeredAt, status, abortReason, ct: CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -537,7 +2952,7 @@ public sealed class CronScheduler(
             await conversations.SaveAsync(winnerConversation, ct).ConfigureAwait(false);
         }
 
-        await conversations.ArchiveAsync(loserConversationId, ct).ConfigureAwait(false);
+        await conversations.ArchiveAsync(loserConversationId, "cron-transient-cleanup", sessionId?.Value, "system", ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -550,10 +2965,10 @@ public sealed class CronScheduler(
     ///   <item>An active conversation titled <c>cron:&lt;jobId&gt;</c>.</item>
     ///   <item>An active conversation whose title matches the job's display name.</item>
     /// </list>
-    /// Any chosen conversation is pinned onto the job via CAS. Sessions whose
-    /// <see cref="SessionId"/> begins with <c>cron:</c> for this agent are rebound onto the
-    /// canonical conversation (skipping the canonical itself), and duplicate cron
-    /// conversations are archived.
+    /// Any chosen conversation is pinned onto the job via CAS. Sessions owned by this agent whose
+    /// <see cref="SessionId"/> begins with the exact <c>cron:{sanitizedJobId}:</c> prefix are
+    /// rebound onto the canonical conversation through the store's narrow metadata operation,
+    /// and duplicate cron conversations are archived.
     /// </summary>
     /// <remarks>
     /// Guarded by <see cref="_migrationRan"/> so it runs at most once per process. Idempotent.
@@ -580,7 +2995,7 @@ public sealed class CronScheduler(
 
         foreach (var job in jobs)
         {
-            if (ct.IsCancellationRequested) break;
+            ct.ThrowIfCancellationRequested();
             if (job.AgentId is not { } agentId) continue;
 
             try
@@ -660,29 +3075,13 @@ public sealed class CronScheduler(
         if (!job.ConversationId.HasValue || job.ConversationId.Value != canonical.ConversationId)
             await _cronStore.TrySetConversationIdAsync(job.Id, canonical.ConversationId, ct).ConfigureAwait(false);
 
-        // Rebind every cron:* session of this agent that points at any conversation other than canonical.
-        // Per blocker B4: scan by SessionId.StartsWith("cron:") regardless of current ConversationId,
-        // so we handle sessions that P9-B-2 backfill already bound to a per-agent legacy:* conversation.
-        var allSessions = await sessions.ListAsync(agentId, ct).ConfigureAwait(false);
+        // Match this job only. Sessions without the job slug (legacy `cron:{ts}:{guid}`) cannot
+        // be safely attributed. The store filters agent ownership and exact prefix before SQLite
+        // materializes any aggregate or transcript history.
         var jobIdSlug = Sanitize(job.Id.Value);
-        var reboundCount = 0;
-        foreach (var session in allSessions)
-        {
-            if (!session.SessionId.Value.StartsWith("cron:", StringComparison.Ordinal))
-                continue;
-
-            // Match this job only — sessions encode jobId as `cron:{jobIdSlug}:...`. Sessions without
-            // a jobId slug (legacy `cron:{ts}:{guid}`) cannot be safely attributed, so we skip them.
-            if (!session.SessionId.Value.StartsWith($"cron:{jobIdSlug}:", StringComparison.Ordinal))
-                continue;
-
-            if (session.ConversationId.IsInitialized() && session.ConversationId == canonical.ConversationId)
-                continue;
-
-            session.ConversationId = canonical.ConversationId;
-            await sessions.SaveAsync(session, ct).ConfigureAwait(false);
-            reboundCount++;
-        }
+        var sessionIdPrefix = $"cron:{jobIdSlug}:";
+        var reboundCount = await sessions.RebindSessionsAsync(
+            agentId, sessionIdPrefix, canonical.ConversationId, ct).ConfigureAwait(false);
 
         // Archive duplicate cron conversations for this agent that share the canonical title.
         var archivedCount = 0;
@@ -696,7 +3095,7 @@ public sealed class CronScheduler(
 
         foreach (var duplicate in duplicates)
         {
-            await conversations.ArchiveAsync(duplicate.ConversationId, ct).ConfigureAwait(false);
+            await conversations.ArchiveAsync(duplicate.ConversationId, "cron-duplicate-cleanup", jobIdSlug, "system", ct).ConfigureAwait(false);
             archivedCount++;
         }
 
@@ -738,36 +3137,56 @@ public sealed class CronScheduler(
         }
     }
 
-    private static TimeZoneInfo ResolveTimeZone(CronJob job)
-    {
-        if (string.IsNullOrWhiteSpace(job.TimeZone))
-            return TimeZoneInfo.Utc;
+    // #2748: resolution has exactly ONE definition (CronTimeZoneResolver). The scheduler used to
+    // carry its own weaker copy - a single FindSystemTimeZoneById with no Windows/IANA translation
+    // and no InvalidTimeZoneException handling - which made the next-run computation disagree with
+    // the actions that ran the job. Do NOT reintroduce a local wrapper here: call the resolver
+    // directly and pass _logger so a degradation to UTC is reported rather than swallowed.
+    // Guarded by CronSchedulerTimeZoneResolutionTests.
 
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(job.TimeZone);
-        }
-        catch (TimeZoneNotFoundException)
-        {
-            return TimeZoneInfo.Utc;
-        }
+    private int? ResolveJobTimeout(CronJob job)
+    {
+        var options = _optionsMonitor.CurrentValue ?? new CronOptions();
+        var fallback = options.DefaultJobTimeoutSeconds > 0 ? options.DefaultJobTimeoutSeconds : 3600;
+
+        // #2904: shape handling, the 0-means-unlimited sentinel and the invalid-value warning live
+        // in CronTimeoutResolver so this site and CommandCronAction cannot answer the same metadata
+        // value differently - they already had, the command action never accepted double/JsonElement.
+        return CronTimeoutResolver.Resolve(job, fallback, _logger);
     }
 
-    private int ResolveJobTimeout(CronJob job)
+    /// <summary>
+    /// Config-sourced half of the #2671 alert-target gate. Routes through the SAME
+    /// <see cref="CronAlertTarget.ValidateAsync"/> as the API seam so the three authoring paths
+    /// cannot answer "is this target reachable?" differently, but downgrades the outcome from
+    /// rejection to a warning: config jobs load at boot, where there is no operator to correct a
+    /// payload and a hard failure would take the whole scheduler down.
+    /// </summary>
+    /// <param name="jobIdString">Configured job id, named in the warning so it is actionable.</param>
+    /// <param name="configuredTarget">Raw configured target, or null/blank when alerting is off.</param>
+    /// <param name="ct">The cancellation token.</param>
+    private async Task WarnIfConfiguredAlertTargetUnresolvableAsync(
+        string jobIdString,
+        string? configuredTarget,
+        CancellationToken ct)
     {
-        if (job.Metadata is not null &&
-            job.Metadata.TryGetValue("timeoutSeconds", out var raw) &&
-            raw is not null)
-        {
-            if (raw is int i && i > 0) return i;
-            if (raw is long l && l > 0) return (int)Math.Min(l, int.MaxValue);
-            if (raw is double d && d > 0) return (int)d;
-            if (raw is System.Text.Json.JsonElement je && je.TryGetInt32(out var parsed) && parsed > 0) return parsed;
-            if (raw is string s && int.TryParse(s, out var ps) && ps > 0) return ps;
-        }
+        if (string.IsNullOrWhiteSpace(configuredTarget))
+            return;
 
-        var options = _optionsMonitor.CurrentValue ?? new CronOptions();
-        return options.DefaultJobTimeoutSeconds > 0 ? options.DefaultJobTimeoutSeconds : 3600;
+        using var scope = _scopeFactory.CreateScope();
+        var resolver = scope.ServiceProvider.GetService<ICronAlertTargetResolver>();
+        var validation = await CronAlertTarget
+            .ValidateAsync(resolver, ConversationId.From(configuredTarget), ct)
+            .ConfigureAwait(false);
+        if (validation.IsValid)
+            return;
+
+        _logger.LogWarning(
+            "Configured cron job '{JobId}' has an unresolvable failureAlertConversationId '{ConversationId}'. "
+            + "The job still loads, but its failure alerts cannot be delivered. {Reason}",
+            jobIdString,
+            configuredTarget,
+            validation.Error);
     }
 
     private async Task SyncConfiguredJobsAsync(CronOptions options, CancellationToken ct)
@@ -807,7 +3226,33 @@ public sealed class CronScheduler(
                 continue;
             }
 
+            // #2552: the declarative surface goes through the same shared boundary as the API so
+            // the two cannot drift. A config-declared job with a credential-bearing or non-http(s)
+            // webhook URL is skipped loudly rather than materialised into the store.
+            // #3779: and with the same operator-configured blocked-host list, read off the very
+            // options instance being reconciled - so a host the operator blocked cannot enter the
+            // store through the declarative door after being refused at the API one.
+            if (!CronWebhookUrl.TryNormalize(configuredJob.WebhookUrl, options.WebhookBlockedHosts, out var normalizedWebhookUrl, out var webhookRejectionReason))
+            {
+                // #2745: log the rule-specific reason so an operator can tell a blocked address
+                // class apart from a scheme/credentials rejection without reading the source.
+                _logger.LogWarning(
+                    "Skipping configured cron job '{JobId}' because its webhookUrl is invalid. {Reason}",
+                    jobIdString,
+                    webhookRejectionReason);
+                continue;
+            }
+
             var jobId = JobId.From(jobIdString);
+
+            // #2671 clause 5: a config-declared job whose failure-alert target does not resolve is
+            // WARNED about and still loaded. Refusing to boot the scheduler because one job's alert
+            // target went stale would be a strictly worse failure than the one being fixed - the
+            // deliberate asymmetry with the API seam, which rejects because a human is present to
+            // read the error and correct the payload.
+            await WarnIfConfiguredAlertTargetUnresolvableAsync(jobIdString, configuredJob.FailureAlertConversationId, ct)
+                .ConfigureAwait(false);
+
             var agentId = string.IsNullOrWhiteSpace(configuredJob.AgentId)
                 ? (AgentId?)null
                 : AgentId.From(configuredJob.AgentId);
@@ -826,11 +3271,19 @@ public sealed class CronScheduler(
                     TemplateName = configuredJob.TemplateName,
                     TemplateParameters = configuredJob.TemplateParameters,
                     Model = configuredJob.Model,
-                    WebhookUrl = configuredJob.WebhookUrl,
+                    WebhookUrl = normalizedWebhookUrl,
                     ShellCommand = configuredJob.ShellCommand,
+                    PreconditionCommand = configuredJob.PreconditionCommand,
                     Enabled = configuredJob.Enabled,
                     System = configuredJob.System,
                     DeleteAfterRun = configuredJob.DeleteAfterRun,
+                    DeleteJobAfterRun = configuredJob.DeleteJobAfterRun,
+                    ExpiresAt = ParseConfiguredExpiry(configuredJob.ExpiresAt, jobId),
+                    ExecutionClass = configuredJob.ExecutionClass,
+                FailureAlertsEnabled = configuredJob.FailureAlertsEnabled,
+                FailureAlertConversationId = string.IsNullOrWhiteSpace(configuredJob.FailureAlertConversationId)
+                    ? null
+                    : ConversationId.From(configuredJob.FailureAlertConversationId),
                     TimeZone = configuredJob.TimeZone,
                     CreatedBy = configuredJob.CreatedBy,
                     CreatedAt = DateTimeOffset.UtcNow,
@@ -850,18 +3303,54 @@ public sealed class CronScheduler(
                 TemplateName = configuredJob.TemplateName,
                 TemplateParameters = configuredJob.TemplateParameters,
                 Model = configuredJob.Model,
-                WebhookUrl = configuredJob.WebhookUrl,
+                WebhookUrl = normalizedWebhookUrl,
                 ShellCommand = configuredJob.ShellCommand,
+                PreconditionCommand = configuredJob.PreconditionCommand,
                 Enabled = configuredJob.Enabled,
                 System = configuredJob.System,
                 DeleteAfterRun = configuredJob.DeleteAfterRun,
+                DeleteJobAfterRun = configuredJob.DeleteJobAfterRun,
+                ExpiresAt = ParseConfiguredExpiry(configuredJob.ExpiresAt, jobId),
+                ExecutionClass = configuredJob.ExecutionClass,
+                FailureAlertsEnabled = configuredJob.FailureAlertsEnabled,
+                FailureAlertConversationId = string.IsNullOrWhiteSpace(configuredJob.FailureAlertConversationId)
+                    ? null
+                    : ConversationId.From(configuredJob.FailureAlertConversationId),
                 TimeZone = configuredJob.TimeZone ?? existing.TimeZone,
                 CreatedBy = configuredJob.CreatedBy ?? existing.CreatedBy,
                 Metadata = configuredJob.Metadata ?? existing.Metadata
             };
 
-            await _cronStore.UpdateAsync(merged, ct).ConfigureAwait(false);
+            // #2133: config-sync is a definition write only; runtime/conversation columns
+            // are scheduler/CAS-owned and must not be round-tripped here.
+            await _cronStore.UpdateDefinitionAsync(merged, expectedOwnership: null, ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Parses a config-declared expiresAt string (#2634). An unparseable value degrades to null
+    /// (no expiry) with a warning rather than throwing or guessing: a typo in config must never
+    /// silently suppress a job the operator still wants running.
+    /// </summary>
+    private DateTimeOffset? ParseConfiguredExpiry(string? expiresAt, JobId jobId)
+    {
+        if (string.IsNullOrWhiteSpace(expiresAt))
+            return null;
+
+        if (DateTimeOffset.TryParse(
+                expiresAt,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+                out var parsed))
+        {
+            return parsed;
+        }
+
+        _logger.LogWarning(
+            "Configured cron job '{JobId}' has an unparseable expiresAt value '{ExpiresAt}'; treating it as no expiry.",
+            jobId,
+            expiresAt);
+        return null;
     }
 
     private static string NormalizeActionType(string? actionType)

@@ -1,3 +1,4 @@
+using BotNexus.Gateway.Configuration;
 using System.CommandLine;
 using Spectre.Console;
 
@@ -5,7 +6,7 @@ namespace BotNexus.Cli.Commands;
 
 internal sealed class BuildCommand
 {
-    public Command Build(Option<bool> verboseOption)
+    public Command Build(Option<bool> verboseOption, Option<string?> targetOption)
     {
         var pathOption = new Option<string?>(
             "--path",
@@ -16,7 +17,7 @@ internal sealed class BuildCommand
             "--dev",
             "Build from a development repo clone instead of the install location.");
 
-        var command = new Command("build", "Build the BotNexus solution.")
+        var command = new Command("build", "Build the BotNexus deployment projects.")
         {
             pathOption,
             devOption
@@ -28,18 +29,42 @@ internal sealed class BuildCommand
             var dev = context.ParseResult.GetValueForOption(devOption);
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
             var repoRoot = ResolveRepoRoot(path, dev);
-            context.ExitCode = await BuildSolutionAsync(repoRoot, verbose, context.GetCancellationToken());
+            var exitCode = await BuildSolutionAsync(repoRoot, verbose, context.GetCancellationToken());
+            if (exitCode == 0)
+            {
+                var home = CliPaths.ResolveTarget(context.ParseResult.GetValueForOption(targetOption));
+                var result = await ExtensionLifecycleReconciler.CreateDefault(home, repoRoot, verbose).ReconcileAsync(cancellationToken: context.GetCancellationToken(), purpose: ExtensionLifecyclePurpose.RepositoryMaintenance);
+                ExtensionRepositoryCommand.Report(result, "build");
+            }
+            context.ExitCode = exitCode;
         });
 
         return command;
     }
 
+    /// <summary>
+    /// Microsoft.Build.Traversal project covering the deployment closure - every project under
+    /// <c>src/</c>. Built instead of the full solution so the 55 projects under <c>tests/</c> are
+    /// not evaluated at all. See <c>src/dirs.proj</c> for why the set is a wildcard.
+    /// </summary>
+    internal const string DeployProjectFileName = "src/dirs.proj";
+
+    /// <summary>
+    /// Chooses the deployment traversal project when it exists. Returns <c>null</c> when the
+    /// repository does not contain the build graph, which is a hard error.
+    /// </summary>
+    internal static string? ResolveBuildTarget(string repoRoot)
+    {
+        var deployProject = Path.Combine(repoRoot, DeployProjectFileName);
+        return File.Exists(deployProject) ? deployProject : null;
+    }
+
     internal static async Task<int> BuildSolutionAsync(string repoRoot, bool verbose, CancellationToken cancellationToken)
     {
-        var solution = Path.Combine(repoRoot, "BotNexus.slnx");
-        if (!File.Exists(solution))
+        var solution = ResolveBuildTarget(repoRoot);
+        if (solution is null)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Solution file not found: {Markup.Escape(solution)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(DeployProjectFileName)} not found in {CliText.SafeDisplay(repoRoot)}");
             return 1;
         }
 
@@ -47,7 +72,7 @@ internal sealed class BuildCommand
         // Falls back to "unknown" if git is unavailable or the directory is not a repo.
         var commitSha = ResolveCommitSha(repoRoot);
 
-        AnsiConsole.MarkupLine("[blue][[build]][/] Building solution (Release, skipping test projects)...");
+        AnsiConsole.MarkupLine("[blue][[build]][/] Building deployment projects (Release, skipping test projects)...");
 
         return await BuildOutputStreamer.RunAsync(solution, repoRoot, commitSha, verbose, cancellationToken);
     }

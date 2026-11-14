@@ -1,0 +1,207 @@
+# Matrix Channel
+
+The Matrix channel extension gives each agent its **own account on a Matrix homeserver**, so a human
+can DM an agent from any Matrix client (Element, FluffyChat, …) or invite it into a room, and the
+agent answers as a first-class Matrix user rather than through a shared gateway bot.
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Extension ID | `botnexus-matrix` |
+| Channel key | `matrix` |
+| Source | `BotNexus.Extensions.Channels.Matrix` |
+| DI extension | `AddBotNexusMatrixChannel(...)` |
+| Config section | `channels:matrix` |
+| Protocol | Matrix Client-Server API v3 (REST + JSON, no SDK dependency) |
+
+## Scope
+
+This is the **first vertical slice** of the Matrix adapter. The following are implemented:
+
+- Per-agent Matrix account configuration (homeserver, user ID, access token)
+- `/sync` long-poll loop with `since`-token continuity that survives a gateway restart, and a
+  bounded failure circuit breaker
+- Send and receive `m.room.message` events
+- Markdown → `org.matrix.custom.html` formatting
+- Streaming responses via in-place `m.replace` edits
+- Typing indicators while a turn is running
+- Auto-join on room invite (configurable)
+- Room, user, and sender-domain federation policies
+- Bounded inbound unencrypted `m.image` and `m.file` attachments
+- Authenticated Matrix media upload and download client operations
+- Read receipts after successful inbound dispatch
+
+The following are **deliberately deferred** and are not implemented here:
+
+- **End-to-end encryption**, including encrypted media descriptors - requires device-key management
+  (libolm/vodozemac)
+- **Federation identity verification** - cryptographic or remote-homeserver verification beyond
+  the configured sender-domain admission policy
+- Matrix **Spaces** mapping
+
+Media support is deliberately bounded. The adapter downloads only validated `mxc://` references
+from unencrypted `m.image` and `m.file` events; it never follows arbitrary HTTP(S) URLs. The client
+uses the current authenticated download endpoint
+`GET /_matrix/client/v1/media/download/{serverName}/{mediaId}` and streams the body through the
+configured byte ceiling. Upload uses an authenticated raw-body
+`POST /_matrix/media/v3/upload?filename=...` and returns the homeserver's `content_uri`. The upload
+API is available at the client seam, while outbound attachment dispatch remains deferred because the
+outbound message model has no content-parts contract.
+
+## Configuration
+
+Bind under `channels:matrix`. Each entry under `agents` is one Matrix account owned by one agent.
+
+```json
+{
+  "channels": {
+    "matrix": {
+      "homeserver": "https://matrix.example.com",
+      "syncTimeoutMs": 30000,
+      "streamingBufferMs": 750,
+      "maxMediaBytes": 20971520,
+      "mediaDownloadTimeoutSeconds": 30,
+      "agents": {
+        "farnsworth": {
+          "userId": "@farnsworth:example.com",
+          "accessToken": "syt_...",
+          "agentId": "farnsworth",
+          "autoJoin": true,
+          "allowedSenderDomains": ["example.com"],
+          "deniedSenderDomains": ["blocked.example"]
+        },
+        "nova": {
+          "userId": "@nova:example.com",
+          "accessToken": "syt_...",
+          "autoJoin": false
+        }
+      }
+    }
+  }
+}
+```
+
+### Top-level keys
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `homeserver` | string | — | Base URL of the homeserver shared by every account. |
+| `syncTimeoutMs` | integer | `30000` | `/sync` long-poll timeout. A non-positive value falls back to the default rather than busy-spinning. |
+| `streamingBufferMs` | integer | `750` | Minimum interval between streaming edits. `0` means edit on every delta. |
+| `maxMediaBytes` | integer | `20971520` (20 MiB) | Maximum inbound attachment size. Non-positive values fail safe to the default. |
+| `mediaDownloadTimeoutSeconds` | integer | `30` | Wall-clock budget per media download. Non-positive values fail safe to the default. |
+| `agents` | map | — | Per-agent accounts, keyed by agent name. |
+
+### Per-account keys
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `userId` | string | — | **Required.** Fully-qualified Matrix user ID, e.g. `@farnsworth:example.com`. |
+| `accessToken` | string | — | **Required.** Matrix access token. Sensitive; stored and displayed masked. |
+| `agentId` | string | the map key | BotNexus agent inbound messages route to. |
+| `homeserver` | string | the shared value | Per-account homeserver override. |
+| `autoJoin` | boolean | `true` | Whether the account accepts room invites automatically. |
+| `allowedRoomIds` | string[] | empty | Room allow-list. Empty permits all joined rooms. |
+| `allowedUserIds` | string[] | empty | Exact sender-user allow-list. Empty permits all senders that pass the domain policy. |
+| `allowedSenderDomains` | string[] | empty | Exact sender-domain allow-list. Empty permits every domain not explicitly denied. |
+| `deniedSenderDomains` | string[] | empty | Exact sender-domain deny-list. A matching denial takes precedence over an allowance. |
+
+Sender-domain policy is evaluated at the same inbound admission seam as `allowedUserIds`; it does
+not replace or bypass the per-user gate. A sender must pass both configured policies. Domains are
+taken from a syntactically complete Matrix user ID (`@localpart:domain`), trimmed when configured,
+and compared case-insensitively as complete strings. They are not suffix patterns: `example.com`
+does not match `example.com.evil` or `notexample.com`. If either domain list is configured, a
+malformed sender ID is rejected. If both domain lists are absent or empty, the adapter preserves the
+previous user-only behavior, including leaving malformed-sender handling to the existing admission
+path. Blank configured domain entries are ignored.
+
+An account missing its homeserver, user ID or access token is **skipped with a warning** — one bad
+entry does not prevent the other accounts from starting.
+
+### Obtaining an access token
+
+Create one Matrix user per agent on your homeserver, then log in once to mint a long-lived token:
+
+```bash
+curl -XPOST https://matrix.example.com/_matrix/client/v3/login \
+  -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"farnsworth"},"password":"..."}'
+```
+
+The `access_token` in the response goes into `accessToken`. The adapter sends it as a
+`Authorization: Bearer` header, never as a query parameter, so it does not land in homeserver access
+logs.
+
+## How it works
+
+- **Inbound.** Each account runs its own `/sync` long poll. `m.room.message` events in joined rooms
+  are translated into an `InboundMessage` and dispatched through `IChannelDispatcher`. The account's
+  own messages are suppressed (they echo back on the next sync), as are `m.replace` edits - an edit
+  is not a new user turn. Unencrypted image/file events preserve their caption/body and add a
+  `BinaryContentPart`; a missing or invalid MIME type becomes `application/octet-stream`. An
+  advertised oversize attachment is rejected before any download, and timeout/download failures
+  drop only the attachment so the text still reaches the agent. After dispatch succeeds, the
+  adapter sends an `m.read` receipt for that exact room and event. Rejected, failed, or cancelled
+  dispatches are not acknowledged. Receipt delivery is best effort: its failure is logged but does
+  not fail or replay the already handled message.
+- **Outbound.** `SendAsync` decodes the room from the channel address and sends an `m.room.message`
+  with a plain `body` plus an HTML `formatted_body` when the Markdown actually produced markup.
+- **Streaming.** The first delta sends a message; subsequent deltas edit that event in place via an
+  `m.replace` relation carrying the full accumulated text under `m.new_content`. Edits are rate
+  limited by `streamingBufferMs`.
+- **Channel address.** The room ID and optional thread root are folded into the opaque
+  `ChannelAddress` as `<roomId>` or `<roomId>/thread:<eventId>`. A Matrix room ID cannot contain a
+  forward slash, so `/` is a safe delimiter for this channel.
+
+### Capability flags
+
+| Flag | Value | Notes |
+|------|-------|-------|
+| `SupportsStreaming` | `true` | Send-then-edit via `m.replace`. |
+| `SupportsThinkingDisplay` | `false` | Thinking deltas are not rendered into rooms. |
+| `SupportsToolDisplay` | `false` | Tool activity is not rendered into rooms. |
+| `SupportsInboundImages` | `true` | Bounded unencrypted media from validated `mxc://` URIs. |
+| `StripsRuntimeContext` | `true` | Matrix rooms are a user-visible surface. |
+
+## Failure handling
+
+The sync loop is bounded by the shared `ChannelLoopCircuitBreaker`. A **terminal** fault — an HTTP
+401/403 from a revoked or invalid access token — parks the loop with a single error line rather than
+retrying a fault that cannot clear. Transient faults (429, 5xx, transport errors) retry with bounded
+exponential backoff.
+
+The `since` token is advanced **only after** a batch has been fully processed, so a crash mid-batch
+replays that batch rather than skipping the events it contained.
+
+Media has independent failure containment: the sender-advertised size is used only for early
+rejection, the HTTP stream enforces `maxMediaBytes` even when `Content-Length` is absent or false,
+and a linked `mediaDownloadTimeoutSeconds` wall-clock budget prevents slow-drip responses. A media
+failure is logged and the caption/body is still dispatched.
+
+## Sync continuity across restarts
+
+Each account's `next_batch` token is persisted durably, keyed by agent id and account name, in a
+SQLite database under the verified BotNexus home (`<data-root>/data/matrix-sync-cursor.sqlite`). On
+start, an account with a stored token resumes `/sync` from it; an account with no stored token
+performs a normal initial sync.
+
+This matters because restarts are routine — config reload, deploy, crash recovery. Without a durable
+cursor every restart re-issued `/sync` with `since: null`, and depending on what the homeserver
+returned for an initial sync the account either re-dispatched already-answered turns or silently
+missed messages sent during the restart window.
+
+The cursor is written on the same write-after-process boundary described above, so the durable token
+never names a batch that was not fully handled. A store read or write failure is **not** fatal: a
+failed read falls back to an initial sync and a failed write leaves the loop running with in-memory
+continuity only, each with a logged warning. Losing restart continuity is strictly better than a dead
+channel.
+
+## Registration
+
+```csharp
+services.Configure<MatrixChannelOptions>(config.GetSection("channels:matrix"));
+services.AddBotNexusMatrixChannel();
+```
+
+The default `IMatrixClientFactory` is registered with `TryAddSingleton`, so a host that needs custom
+transport behaviour can register its own implementation beforehand and keep it.

@@ -48,7 +48,7 @@ public sealed class McpToolContributor(ILoggerFactory loggerFactory) : IAgentToo
             };
 
             var entry = McpServerWarmupCache.EnsureStarted(
-                context.Descriptor.AgentId.Value,
+                context.Descriptor.AgentId,
                 warmupConfig,
                 loggerFactory.CreateLogger<McpServerManager>());
 
@@ -59,6 +59,18 @@ public sealed class McpToolContributor(ILoggerFactory loggerFactory) : IAgentToo
         // Per-session path for auth servers — resolve token and inject header.
         foreach (var (serverId, serverConfig) in authServers)
         {
+            // Validate the transport scheme BEFORE resolving the credential (#3012). The token is
+            // a full provider API key, so a non-TLS non-loopback destination must never get as far
+            // as having one resolved for it. Reuses the same skip-and-warn shape as the
+            // "no token resolved" case below.
+            if (!McpUrlSecurity.TryValidate(serverConfig.Url, carriesCredentials: true, out _, out var urlError))
+            {
+                loggerFactory.CreateLogger<McpToolContributor>().LogWarning(
+                    "MCP server '{ServerId}' has auth={Auth} configured but its url is not usable for credentials: {ErrorMessage} Skipping server.",
+                    serverId, serverConfig.Auth, urlError);
+                continue;
+            }
+
             var token = await context.GetProviderApiKeyAsync(serverConfig.Auth!, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -105,19 +117,5 @@ public sealed class McpToolContributor(ILoggerFactory loggerFactory) : IAgentToo
         => ResolveExtensionConfig<McpExtensionConfig>(descriptor, "botnexus-mcp");
 
     private static T? ResolveExtensionConfig<T>(AgentDescriptor descriptor, string extensionId) where T : class
-    {
-        if (descriptor.ExtensionConfig.TryGetValue(extensionId, out var element))
-        {
-            try
-            {
-                return System.Text.Json.JsonSerializer.Deserialize<T>(element.GetRawText());
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        return null;
-    }
+        => ExtensionConfigBinder.Bind<T>(descriptor, extensionId);
 }

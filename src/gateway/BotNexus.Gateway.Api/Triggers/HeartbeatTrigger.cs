@@ -5,6 +5,7 @@ using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Abstractions.Triggers;
 using BotNexus.Domain.Primitives;
 using BotNexus.Domain.World;
+using BotNexus.Gateway.Streaming;
 using Microsoft.Extensions.Logging;
 using GatewaySessionStatus = BotNexus.Gateway.Abstractions.Models.SessionStatus;
 
@@ -12,8 +13,8 @@ namespace BotNexus.Gateway.Api.Triggers;
 
 /// <summary>
 /// Internal trigger for heartbeat-scheduled sessions (<see cref="TriggerType.Heartbeat"/>).
-/// Routes into the agent's active soul session when soul is enabled, keeping heartbeat turns
-/// in today's soul context.  Falls back to a stable per-agent heartbeat conversation otherwise.
+/// Uses a fresh session in the stable per-agent heartbeat conversation so interactive
+/// and soul conversations cannot suppress or race heartbeat run admission.
 ///
 /// Phase 2: after each heartbeat turn, if the assistant response is a heartbeat acknowledgement
 /// (contains "HEARTBEAT_OK" within <see cref="AckMaxCharsDefault"/> chars), the user+assistant
@@ -46,40 +47,10 @@ public sealed class HeartbeatTrigger(
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
 
         var descriptor = registry.Get(agentId);
-        if (descriptor?.Soul?.Enabled == true)
-            return await RunInSoulSessionAsync(agentId, prompt, descriptor, request, ct).ConfigureAwait(false);
-
+        // Ownership checks must not share run admission or mutable routing with an
+        // interactive/soul conversation. Each occurrence gets its own session under
+        // the existing stable heartbeat conversation, regardless of agent activity.
         return await RunInHeartbeatSessionAsync(agentId, prompt, descriptor, request, ct).ConfigureAwait(false);
-    }
-
-    // -----------------------------------------------------------------
-    // Soul path - reuse today's active soul session
-    // -----------------------------------------------------------------
-    private async Task<SessionId> RunInSoulSessionAsync(
-        AgentId agentId,
-        string prompt,
-        AgentDescriptor? descriptor,
-        InternalTriggerRequest? request,
-        CancellationToken ct)
-    {
-        // P9-E (#645): soul sessions no longer carry SessionType.Soul. Discovery uses
-        // the canonical Metadata["soulDate"] tag that SoulTrigger.InitializeSoulSession
-        // stamps on every soul session, gated on Active status.
-        var allSessions = await sessions.ListAsync(agentId, ct).ConfigureAwait(false);
-        var soulSession = allSessions
-            .Where(s => s.Status == GatewaySessionStatus.Active && s.Metadata.ContainsKey("soulDate"))
-            .OrderByDescending(s => s.UpdatedAt)
-            .FirstOrDefault();
-
-        if (soulSession is null)
-        {
-            logger.LogDebug(
-                "HeartbeatTrigger: no active soul session for '{AgentId}', falling back to heartbeat session.",
-                agentId);
-            return await RunInHeartbeatSessionAsync(agentId, prompt, descriptor, request, ct).ConfigureAwait(false);
-        }
-
-        return await ExecuteInSessionAsync(agentId, soulSession.SessionId, prompt, descriptor, request, ct).ConfigureAwait(false);
     }
 
     // -----------------------------------------------------------------
@@ -103,16 +74,6 @@ public sealed class HeartbeatTrigger(
         session.SessionType = SessionType.AgentSelf;
         session.ConversationId = conversation.ConversationId;
         session.Metadata["triggerType"] = Type.Value;
-
-        if (string.IsNullOrWhiteSpace(request?.ModelOverride))
-            session.Metadata.Remove("modelOverride");
-        else
-            session.Metadata["modelOverride"] = request!.ModelOverride;
-
-        if (request?.CronJobId is null)
-            session.Metadata.Remove("cronJobId");
-        else
-            session.Metadata["cronJobId"] = request.CronJobId.Value.Value;
 
         if (conversation.ActiveSessionId != sessionId)
         {
@@ -138,6 +99,18 @@ public sealed class HeartbeatTrigger(
     {
         var session = preloadedSession
             ?? await sessions.GetOrCreateAsync(sessionId, agentId, ct).ConfigureAwait(false);
+
+        // The heartbeat session must publish the occurrence's
+        // selection before the supervisor resolves or reuses its handle.
+        if (string.IsNullOrWhiteSpace(request?.ModelOverride))
+            session.Metadata.Remove("modelOverride");
+        else
+            session.Metadata["modelOverride"] = request!.ModelOverride;
+        request?.ApplyCronModelMetadata(session);
+        if (request?.CronJobId is null)
+            session.Metadata.Remove("cronJobId");
+        else
+            session.Metadata["cronJobId"] = request.CronJobId.Value.Value;
 
         // --- Phase 2 (race-safe ack-prune, #573) ---------------------------
         // The soul path shares its session with concurrent flows (interactive
@@ -175,10 +148,49 @@ public sealed class HeartbeatTrigger(
         var preHeartbeatUpdatedAt = appendResult.PriorUpdatedAt;
         await sessions.SaveAsync(session, ct).ConfigureAwait(false);
 
+        if (request?.SessionCreatedAsync is not null)
+            await request.SessionCreatedAsync(sessionId, ct).ConfigureAwait(false);
         var handle = await supervisor.GetOrCreateAsync(agentId, sessionId, ct).ConfigureAwait(false);
-        var response = await handle.PromptAsync(prompt, ct).ConfigureAwait(false);
+        AgentResponse response;
+        try
+        {
+            response = await handle.PromptAsync(prompt, ct).ConfigureAwait(false);
+        }
+        catch (AgentPromptInterruptedException interrupted)
+        {
+            foreach (var entry in TriggerToolAuditProjector.ProjectToolEntries(interrupted.PartialResponse))
+                session.AddEntry(entry);
+            TriggerRunCostRecorder.Record(request, interrupted.PartialResponse);
+            ProviderTokenUsageRecorder.Record(session, interrupted.PartialResponse.Usage);
+            await sessions.SaveAsync(session, CancellationToken.None).ConfigureAwait(false);
+            throw new OperationCanceledException("Trigger run was interrupted.", interrupted,
+                ct.IsCancellationRequested ? ct : interrupted.CancellationToken);
+        }
+
+        // #2522 residual: stamp the provider's reported prompt-token count on the blocking path so
+        // the compactor's unit normalisation has a real ratio to work with (parity with the
+        // streaming path's MessageEnd recording).
+        ProviderTokenUsageRecorder.Record(session, response.Usage);
 
         var ackMaxChars = descriptor?.Heartbeat?.AckMaxChars ?? AckMaxCharsDefault;
+
+        // #2127 (addendum finding 1): a heartbeat turn that executed tools is NEVER an ack-only
+        // no-op, even when the final text looks like an acknowledgement. Pruning it would erase the
+        // only durable record that side-effecting tools ran. Persist the user turn, the tool
+        // timeline, and the assistant text so the audit trail survives instead of being pruned.
+        if (TriggerToolAuditProjector.HasToolActivity(response))
+        {
+            foreach (var toolEntry in TriggerToolAuditProjector.ProjectToolEntries(response))
+                session.AddEntry(toolEntry);
+            session.AddEntry(new SessionEntry { AgentRunId = response.AgentRunId, Role = MessageRole.Assistant, Content = response.Content });
+            await sessions.SaveAsync(session, ct).ConfigureAwait(false);
+
+            logger.LogInformation(
+                "HeartbeatTrigger: tool-active turn from agent '{AgentId}' session '{SessionId}' - ack-prune skipped to preserve tool audit records (jobId: {JobId}).",
+                agentId, sessionId, request?.CronJobId);
+
+            return sessionId;
+        }
 
         if (IsHeartbeatAck(response.Content, ackMaxChars))
         {
@@ -219,7 +231,7 @@ public sealed class HeartbeatTrigger(
         }
         else
         {
-            session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = response.Content });
+            session.AddEntry(new SessionEntry { AgentRunId = response.AgentRunId, Role = MessageRole.Assistant, Content = response.Content });
             await sessions.SaveAsync(session, ct).ConfigureAwait(false);
 
             logger.LogInformation(
@@ -272,15 +284,14 @@ public sealed class HeartbeatTrigger(
             return existing;
         }
 
-        var conversation = new Conversation
-        {
-            ConversationId = stableId,
-            AgentId = agentId,
-            Title = $"heartbeat:{agentId.Value}",
-            IsDefault = false,
-            // Heartbeat is a self-initiated system flow; the agent itself is the initiator.
-            Initiator = CitizenId.Of(agentId)
-        };
+        // Heartbeat is a schedule-driven tick, so it shares the Cron origination trigger, and it is
+        // a self-initiated system flow so the agent itself is the initiator. Minted through the
+        // single creation seam (#2310).
+        var conversation = ConversationFactory.CreateForCron(
+            stableId,
+            agentId,
+            title: $"heartbeat:{agentId.Value}",
+            initiator: CitizenId.Of(agentId));
         try
         {
             await conversations.CreateAsync(conversation, ct).ConfigureAwait(false);

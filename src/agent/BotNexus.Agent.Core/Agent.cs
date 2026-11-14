@@ -1,4 +1,7 @@
 using BotNexus.Agent.Core.Configuration;
+using BotNexus.Agent.Core.Diagnostics;
+using BotNexus.Agent.Core.ExtensionPoints.Messages;
+using BotNexus.Agent.Core.ExtensionPoints.RunCompletion;
 using BotNexus.Agent.Core.Loop;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core;
@@ -16,13 +19,15 @@ namespace BotNexus.Agent.Core;
 /// </remarks>
 public sealed class Agent
 {
-    private static readonly TransformContextDelegate IdentityTransformContext =
+    private static readonly AgentContextTransformer IdentityAgentContextTransformer =
         (messages, _) => Task.FromResult(messages);
 
+    // Creation-time configuration and message transformation.
     private readonly AgentOptions _options;
-    private readonly ConvertToLlmDelegate _convertToLlm;
+    private readonly ProviderMessageTransformer _providerMessageTransformer;
     private readonly AgentState _state;
-    private readonly TransformContextDelegate _transformContext;
+    private readonly AgentContextTransformer _agentContextTransformer;
+    // Pending input and run/state synchronization.
     private readonly PendingMessageQueue _steeringQueue;
     private readonly PendingMessageQueue _followUpQueue;
     private readonly SemaphoreSlim _runLock = new(1, 1);
@@ -30,11 +35,51 @@ public sealed class Agent
     private readonly object _stateLock = new();
     private readonly object _listenersLock = new();
 
+    // Subscriptions and the active run's lifecycle.
     private List<Func<AgentEvent, CancellationToken, Task>> _listeners = [];
     private CancellationTokenSource? _cts;
     private TaskCompletionSource? _activeRun;
     private AgentStatus _status = AgentStatus.Idle;
     private bool _skipInitialSteeringPollForNextRun;
+    private TaskCompletionSource? _maintenance;
+    private bool _admissionClosed;
+
+    /// <summary>
+    /// Reserves an idle agent against all run admission until disposal. Returns null when busy
+    /// or permanently closed. Disposal is idempotent and wakes queued producers; no model is run.
+    /// </summary>
+    public IDisposable? TryReserveMaintenance()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_admissionClosed || _status != AgentStatus.Idle || _maintenance is not null)
+                return null;
+            _maintenance = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            return new MaintenanceReservation(this, _maintenance);
+        }
+    }
+
+    /// <summary>
+    /// Permanently refuses new runs before host teardown begins. Existing runs must still be
+    /// aborted and awaited separately. A held maintenance reservation remains valid until released.
+    /// </summary>
+    public void CloseAdmission()
+    {
+        lock (_lifecycleLock) _admissionClosed = true;
+    }
+
+    private sealed class MaintenanceReservation(Agent owner, TaskCompletionSource completion) : IDisposable
+    {
+        public void Dispose()
+        {
+            lock (owner._lifecycleLock)
+            {
+                if (!ReferenceEquals(owner._maintenance, completion)) return;
+                owner._maintenance = null;
+                completion.TrySetResult();
+            }
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Agent"/> class.
@@ -55,23 +100,42 @@ public sealed class Agent
                 "MaxRetryDelayMs must be greater than zero when set.");
         }
 
+        AgentLoopConfig.ValidateToolResultBudget(options.MaxToolResults);
         _options = options;
-        _convertToLlm = options.ConvertToLlm ?? DefaultMessageConverter.ConvertToLlm;
-        _transformContext = options.TransformContext ?? IdentityTransformContext;
+        _providerMessageTransformer = options.ProviderMessageTransformer ?? DefaultProviderMessageTransformer.TransformAsync;
+        _agentContextTransformer = options.AgentContextTransformer ?? IdentityAgentContextTransformer;
 
         var initial = options.InitialState;
         _state = new AgentState
         {
+
             SystemPrompt = initial?.SystemPrompt,
             Model = initial?.Model ?? options.Model,
-            ThinkingLevel = initial?.ThinkingLevel
+            ThinkingLevel = initial?.ThinkingLevel,
+            Tools = initial?.Tools ?? [],
+            Messages = initial?.Messages ?? []
+
         };
-        _state.Tools = initial?.Tools ?? [];
-        _state.Messages = initial?.Messages ?? [];
 
         _steeringQueue = new PendingMessageQueue(options.SteeringMode);
-        _followUpQueue = new PendingMessageQueue(options.FollowUpMode);
+        _followUpQueue = new PendingMessageQueue(options.FollowUpMode)
+        {
+            Capacity = DefaultFollowUpQueueCapacity
+        };
     }
+
+    /// <summary>
+    /// Default bound on undrained follow-up messages (#2438).
+    /// </summary>
+    /// <remarks>
+    /// 64 is chosen as "far above any legitimate human or orchestration burst, far below
+    /// anything that could exhaust memory". A person queueing follow-ups behind one turn
+    /// realistically sends single digits; sub-agent completion fan-in is bounded by the
+    /// concurrent sub-agent cap, which is an order of magnitude below this. Anything that
+    /// reaches 64 undrained follow-ups is a runaway producer, and refusing it loudly is the
+    /// correct outcome. The bound is per-agent, not global.
+    /// </remarks>
+    public const int DefaultFollowUpQueueCapacity = 64;
 
     /// <summary>
     /// Gets the current agent state.
@@ -100,9 +164,54 @@ public sealed class Agent
     }
 
     /// <summary>
+    /// Gets a value indicating whether the agent will refuse to start a new run right now.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the predicate callers must use to decide "queue vs. send". It is defined as
+    /// <c>Status != AgentStatus.Idle</c> so that it agrees EXACTLY with the run guard in
+    /// <see cref="RunAsync"/>, which rejects any non-Idle status.
+    /// </para>
+    /// <para>
+    /// Testing <c>Status == AgentStatus.Running</c> instead leaves a hole: during
+    /// <see cref="AgentStatus.Aborting"/> such a test answers "not running" while the run guard
+    /// still throws <c>InvalidOperationException: Agent is already running.</c> Callers then take
+    /// the direct-send branch and the turn is lost. Because every soul/cron job for an agent shares
+    /// one Agent instance, a dropped turn there silently starves all of that agent's scheduled work
+    /// (upstream sytone/botnexus#4688).
+    /// </para>
+    /// </remarks>
+    public bool IsBusy
+    {
+        get
+        {
+            lock (_lifecycleLock)
+            {
+                return _admissionClosed || _maintenance is not null || _status != AgentStatus.Idle;
+            }
+        }
+    }
+
+    /// <summary>
     /// Gets a value indicating whether steering or follow-up messages are queued.
     /// </summary>
     public bool HasQueuedMessages => _steeringQueue.HasItems || _followUpQueue.HasItems;
+
+    /// <summary>
+    /// Gets or sets the maximum number of undrained follow-up messages the agent will hold.
+    /// Zero means unbounded.
+    /// </summary>
+    /// <remarks>
+    /// Bounding exists so a producer that can enqueue faster than turns complete (a portal
+    /// user hammering follow-up, a webhook fan-in) cannot grow the pending set without limit
+    /// while one long turn is in flight (#2438). Enqueue past the bound throws
+    /// <see cref="PendingMessageQueueFullException"/>; it never silently drops.
+    /// </remarks>
+    public int FollowUpQueueCapacity
+    {
+        get => _followUpQueue.Capacity;
+        set => _followUpQueue.Capacity = value;
+    }
 
     /// <summary>
     /// Gets or sets the queue consumption mode for steering messages.
@@ -181,6 +290,30 @@ public sealed class Agent
     }
 
     /// <summary>
+    /// Runs exactly one model turn with no tools or completion continuations.
+    /// </summary>
+    /// <param name="text">The finalization instruction.</param>
+    /// <param name="cancellationToken">The run deadline token.</param>
+    /// <returns>The messages produced by the single text-only turn.</returns>
+    public async Task<IReadOnlyList<AgentMessage>> PromptWithoutToolsAsync(
+        string text,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        var result = await RunAsync(
+                (context, config, emit, ct) => AgentLoopRunner.RunSingleProviderTurnAsync(
+                    new UserMessage(text),
+                    context with { Tools = [] },
+                    config,
+                    emit,
+                    ct),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return result;
+    }
+
+    /// <summary>
     /// Start a new agent run with a single message.
     /// </summary>
     /// <param name="message">The message to append to the timeline.</param>
@@ -196,6 +329,24 @@ public sealed class Agent
     }
 
     /// <summary>
+    /// Waits for any active run, atomically starts this prompt next, and invokes
+    /// <paramref name="onStartedAsync"/> after owning the run slot but before model execution.
+    /// </summary>
+    public Task<IReadOnlyList<AgentMessage>> PromptWhenAvailableAsync(
+        AgentMessage message,
+        Func<Task> onStartedAsync,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        ArgumentNullException.ThrowIfNull(onStartedAsync);
+        return RunAsync(
+            (context, config, emit, ct) => AgentLoopRunner.RunAsync([message], context, config, emit, ct),
+            cancellationToken,
+            waitForAvailability: true,
+            onStartedAsync);
+    }
+
+    /// <summary>
     /// Start a new agent run with one or more messages.
     /// </summary>
     /// <param name="messages">The messages to append to the timeline.</param>
@@ -205,6 +356,11 @@ public sealed class Agent
     /// <para>
     /// Throws InvalidOperationException if the agent is already running.
     /// Drains queued steering messages before starting the loop.
+    /// </para>
+    /// <para>
+    /// Admitted runs return <see cref="AgentRunMessages"/>, including cancellation evidence captured
+    /// before the run slot is released. Cancellation before admission throws without run evidence.
+    /// Synthetic runtime terminal messages are not provider turns; their usage remains unknown.
     /// </para>
     /// <para>
     /// All lifecycle events (agent_start, turn_start, message_start/update/end, tool_execution_start/end,
@@ -244,7 +400,7 @@ public sealed class Agent
     /// </para>
     /// <para>
     /// <strong>Important:</strong> The last message in context must convert to a user or tool result message
-    /// via ConvertToLlm. If it doesn't, the LLM provider will reject the request.
+    /// via the configured <see cref="ProviderMessageTransformer"/>. If it doesn't, the LLM provider will reject the request.
     /// </para>
     /// <para>
     /// Throws InvalidOperationException if the last message is from the assistant.
@@ -317,6 +473,25 @@ public sealed class Agent
     /// Clears all enqueued follow-up messages.
     /// </summary>
     public void ClearFollowUpQueue() => _followUpQueue.Clear();
+
+    /// <summary>
+    /// Atomically takes back a previously enqueued follow-up message by reference identity.
+    /// </summary>
+    /// <param name="message">The exact instance previously passed to <see cref="FollowUp"/>.</param>
+    /// <returns><c>true</c> when the message was still pending and has been removed.</returns>
+    /// <remarks>
+    /// Exists so a caller that enqueued a follow-up against a run which then settled without
+    /// consuming it can reclaim the message and re-deliver it, rather than leaving it stranded
+    /// in an idle agent's queue that will never be drained again (#2438). The removal is atomic
+    /// against the run loop's own drain, so the message is taken by exactly one of the two -
+    /// never both, never neither. Reference identity means only the caller's own instance is
+    /// reclaimed; concurrently queued follow-ups from other producers are untouched.
+    /// </remarks>
+    public bool TryReclaimFollowUp(AgentMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        return _followUpQueue.TryRemove(message);
+    }
 
     /// <summary>
     /// Clears both steering and follow-up message queues.
@@ -406,59 +581,135 @@ public sealed class Agent
     /// </remarks>
     public void Reset()
     {
-        ClearAllQueues();
-
-        lock (_stateLock)
+        lock (_lifecycleLock)
         {
-            _state.Messages = [];
-            _state.SetErrorMessage(null);
-            _state.SetStreamingMessage(null);
-            _state.SetPendingToolCalls([]);
+            if (_maintenance is not null)
+                throw new InvalidOperationException("Agent is reserved for maintenance.");
+            ClearAllQueues();
+            lock (_stateLock)
+            {
+                _state.Messages = [];
+                _state.SetErrorMessage(null);
+                _state.SetStreamingMessage(null);
+                _state.SetPendingToolCalls([]);
+            }
         }
     }
 
     private async Task<IReadOnlyList<AgentMessage>> RunAsync(
         Func<AgentContext, AgentLoopConfig, Func<AgentEvent, Task>, CancellationToken, Task<IReadOnlyList<AgentMessage>>> runner,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool waitForAvailability = false,
+        Func<Task>? onStartedAsync = null)
     {
-        await _runLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-
         CancellationTokenSource linkedCts;
         TaskCompletionSource activeRun;
-        try
+        while (true)
         {
-            lock (_lifecycleLock)
+            await _runLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            Task? priorRun = null;
+            try
             {
-                if (_status != AgentStatus.Idle)
+                lock (_lifecycleLock)
                 {
-                    throw new InvalidOperationException("Agent is already running.");
-                }
+                    ObjectDisposedException.ThrowIf(_admissionClosed, this);
+                    if (_status != AgentStatus.Idle || _maintenance is not null)
+                    {
+                        if (!waitForAvailability)
+                        {
+                            throw new InvalidOperationException("Agent is already running.");
+                        }
 
-                linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                activeRun = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                _cts = linkedCts;
-                _activeRun = activeRun;
-                _status = AgentStatus.Running;
+                        priorRun = _maintenance?.Task ?? _activeRun?.Task;
+                    }
+                    else
+                    {
+                        linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        activeRun = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                        _cts = linkedCts;
+                        _activeRun = activeRun;
+                        _status = AgentStatus.Running;
+                        break;
+                    }
+                }
             }
+            finally
+            {
+                _runLock.Release();
+            }
+
+            if (priorRun is null)
+            {
+                continue;
+            }
+            await priorRun.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        finally
+
+        var agentRunId = AgentRunId.Create();
+        IReadOnlyList<GuardObservation> observedGuards = [];
+        var evidenceLock = new object();
+        var runMessages = new List<AgentMessage>();
+        var pendingToolCalls = new HashSet<string>(StringComparer.Ordinal);
+        RunCompletionResult? completion = null;
+        async Task EmitRunEventAsync(AgentEvent evt, CancellationToken token)
         {
-            _runLock.Release();
+            lock (evidenceLock)
+            {
+                switch (evt)
+                {
+                    case MessageEndEvent end:
+                        if (end.Message is not UserMessage)
+                            runMessages.Add(end.Message);
+                        break;
+                    case ToolExecutionStartEvent start:
+                        pendingToolCalls.Add(start.ToolCallId);
+                        break;
+                    case ToolExecutionEndEvent end:
+                        pendingToolCalls.Remove(end.ToolCallId);
+                        break;
+                    case AgentEndEvent end:
+                        completion = end.Completion;
+                        break;
+                }
+            }
+            await HandleEventAsync(evt with { AgentRunId = agentRunId }, token).ConfigureAwait(false);
+        }
+
+        AgentRunMessages Snapshot(IReadOnlyList<AgentMessage> messages, AssistantAgentMessage? synthetic = null,
+            IReadOnlyList<AgentMessage>? evidenceMessages = null)
+        {
+            var token = completion?.Status == RunCompletionStatus.Cancelled
+                ? cancellationToken.IsCancellationRequested ? cancellationToken
+                    : linkedCts.IsCancellationRequested ? linkedCts.Token : new CancellationToken(true)
+                : CancellationToken.None;
+            lock (evidenceLock)
+            {
+                return new AgentRunMessages(messages, agentRunId, completion, pendingToolCalls, token, synthetic, evidenceMessages);
+            }
         }
 
         lock (_stateLock)
         {
+            _state.AgentRunId = agentRunId;
+            _state.RunStartIndex = _state.Messages.Count;
             _state.SetErrorMessage(null);
+            _state.SetLastCompletion(null);
         }
 
         try
         {
-            return await runner(
+            if (onStartedAsync is not null)
+            {
+                await onStartedAsync().ConfigureAwait(false);
+            }
+
+            var messages = await runner(
                     BuildContextSnapshot(),
-                    BuildLoopConfig(),
-                    @event => HandleEventAsync(@event, linkedCts.Token),
+                    BuildLoopConfig() with { AgentRunId = agentRunId, GuardEvidenceObserver = guards => observedGuards = guards },
+                    @event => EmitRunEventAsync(@event, linkedCts.Token),
                     linkedCts.Token)
                 .ConfigureAwait(false);
+            return Snapshot(messages);
         }
         catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
         {
@@ -478,17 +729,27 @@ public sealed class Agent
 
             try
             {
-                await HandleEventAsync(
-                        new AgentEndEvent([abortedMessage], null, DateTimeOffset.UtcNow),
+                await EmitRunEventAsync(
+                        new AgentEndEvent(
+                            [abortedMessage],
+                            null,
+                            DateTimeOffset.UtcNow,
+                            new RunCompletionResult(
+                                RunCompletionStatus.Cancelled,
+                                [],
+                                RunStopReason.Cancellation,
+                                "The run was cancelled.") { GuardObservations = observedGuards }) { AgentRunId = agentRunId },
                         CancellationToken.None)
                     .ConfigureAwait(false);
             }
             catch (Exception listenerEx)
             {
-                _options.OnDiagnostic?.Invoke($"Listener error during agent_end: {listenerEx.Message}");
+                if (_options.DiagnosticObserver is { } observer)
+                    DiagnosticNotification.Report(observer, $"Listener error during agent_end: {listenerEx.Message}");
             }
 
-            return [abortedMessage];
+            runMessages.Add(abortedMessage);
+            return Snapshot(runMessages, abortedMessage);
         }
         catch (Exception ex)
         {
@@ -508,17 +769,28 @@ public sealed class Agent
 
             try
             {
-                await HandleEventAsync(
-                        new AgentEndEvent([failureMessage], null, DateTimeOffset.UtcNow),
+                await EmitRunEventAsync(
+                        new AgentEndEvent(
+                            [failureMessage],
+                            null,
+                            DateTimeOffset.UtcNow,
+                            new RunCompletionResult(
+                                RunCompletionStatus.Failed,
+                                [],
+                                Detail: ex.Message) { GuardObservations = observedGuards }) { AgentRunId = agentRunId },
                         CancellationToken.None)
                     .ConfigureAwait(false);
             }
             catch (Exception listenerEx)
             {
-                _options.OnDiagnostic?.Invoke($"Listener error during agent_end: {listenerEx.Message}");
+                if (_options.DiagnosticObserver is { } observer)
+                    DiagnosticNotification.Report(observer, $"Listener error during agent_end: {listenerEx.Message}");
             }
 
-            return [failureMessage];
+            runMessages.Add(failureMessage);
+            // Preserve the core failure return contract; the gateway can separately project the
+            // captured timeline without changing collection membership for existing core callers.
+            return Snapshot([failureMessage], failureMessage, runMessages);
         }
         finally
         {
@@ -569,37 +841,78 @@ public sealed class Agent
             generationSettings = generationSettings with { SessionId = _options.SessionId };
         }
 
+        // Name arguments for clarity without changing the record's positional compatibility or evaluation order.
         return new AgentLoopConfig(
-            model,
-            _options.LlmClient,
-            _convertToLlm,
-            _transformContext,
-            _options.GetApiKey,
-            BuildQueueDelegate(_steeringQueue, _options.GetSteeringMessages),
-            BuildQueueDelegate(_followUpQueue, _options.GetFollowUpMessages),
-            _options.ToolExecutionMode,
-            _options.BeforeToolCall,
-            _options.AfterToolCall,
-            generationSettings,
-            _options.MaxRetryDelayMs,
-            skipInitialSteeringPoll,
-            _options.ToolTimeout ?? TimeSpan.FromSeconds(120),
-            _options.ClaimAudit,
-            _options.MaybeCompactAsync);
+            Model: model,
+            LlmClient: _options.LlmClient,
+            ProviderMessageTransformer: _providerMessageTransformer,
+            AgentContextTransformer: _agentContextTransformer,
+            ProviderExecutionOptionsProvider: _options.ProviderExecutionOptionsProvider,
+            SteeringMessageProvider: BuildMessageProvider(_steeringQueue, _options.SteeringMessageProvider),
+            FollowUpMessageProvider: BuildMessageProvider(_followUpQueue, _options.FollowUpMessageProvider),
+            ToolExecutionMode: _options.ToolExecutionMode,
+            ToolExecutionPolicy: _options.ToolExecutionPolicy,
+            ToolResultTransformer: _options.ToolResultTransformer,
+            GenerationSettings: generationSettings,
+            MaxRetryDelayMs: _options.MaxRetryDelayMs,
+            SkipInitialSteeringPoll: skipInitialSteeringPoll,
+            ToolTimeout: _options.ToolTimeout ?? TimeSpan.FromSeconds(120),
+            ClaimAudit: _options.ClaimAudit,
+            ContextCompactionService: BuildContextCompactionService(),
+            ToolExecutionPolicyTimeout: _options.ToolExecutionPolicyTimeout,
+            DiagnosticObserver: _options.DiagnosticObserver,
+            SuspensionRegistry: _options.SuspensionRegistry,
+            AuthProfile: _options.AuthProfile,
+            RetryRandomnessProvider: null,
+            MaxToolOutputBytes: _options.MaxToolOutputBytes,
+            ToolAuditGate: _options.ToolAuditGate,
+            ToolExecutionDecisionObserver: _options.ToolExecutionDecisionObserver,
+            ToolResultTextTransformer: _options.ToolResultTextTransformer,
+            RunCompletionPolicy: _options.RunCompletionPolicy,
+            MaxCompletionContinuations: _options.MaxCompletionContinuations,
+            CredentialInvalidationService: _options.CredentialInvalidationService,
+            RecoveryCoordinator: _options.RecoveryCoordinator,
+            RecoveryAdmissionTimeout: _options.RecoveryAdmissionTimeout,
+            ToolProgressPolicy: _options.ToolProgressPolicy,
+            MaxToolResults: _options.MaxToolResults,
+            ProviderRequestContextProvider: _options.ProviderRequestContextProvider,
+            ToolCapacityObserver: _options.ToolCapacityObserver);
     }
 
-    private static SimpleStreamOptions CloneGenerationSettings(SimpleStreamOptions source)
+    private Func<CancellationToken, Task<AgentContext?>>? BuildContextCompactionService()
     {
-        return source with
+        if (_options.ContextCompactionService is null)
         {
-            Headers = source.Headers is null ? null : new Dictionary<string, string>(source.Headers),
-            Metadata = source.Metadata is null ? null : new Dictionary<string, object>(source.Metadata),
+            return null;
+        }
+
+        return async cancellationToken =>
+        {
+            var refreshed = await _options.ContextCompactionService(cancellationToken).ConfigureAwait(false);
+            if (refreshed is null)
+            {
+                return null;
+            }
+
+            lock (_stateLock)
+            {
+                _state.SystemPrompt = refreshed.SystemPrompt;
+                _state.Messages = refreshed.Messages;
+                _state.Tools = refreshed.Tools;
+            }
+
+            return refreshed;
         };
     }
 
-    private static GetMessagesDelegate BuildQueueDelegate(
+    private static GenerationOptions CloneGenerationSettings(GenerationOptions source)
+    {
+        return source with { };
+    }
+
+    private static AgentMessageProvider BuildMessageProvider(
         PendingMessageQueue queue,
-        GetMessagesDelegate? extra)
+        AgentMessageProvider? extra)
     {
         return async cancellationToken =>
         {
@@ -653,7 +966,8 @@ public sealed class Agent
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _options.OnDiagnostic?.Invoke($"Listener threw: {ex.Message}");
+                if (_options.DiagnosticObserver is { } observer)
+                    DiagnosticNotification.Report(observer, $"Listener threw: {ex.Message}");
             }
         }
     }
@@ -711,9 +1025,10 @@ public sealed class Agent
                 case TurnEndEvent turnEnd when !string.IsNullOrWhiteSpace(turnEnd.Message.ErrorMessage):
                     _state.SetErrorMessage(turnEnd.Message.ErrorMessage);
                     break;
-                case AgentEndEvent:
+                case AgentEndEvent agentEnd:
                     _state.SetStreamingMessage(null);
                     _state.SetIsRunning(false);
+                    _state.SetLastCompletion(agentEnd.Completion);
                     break;
                 case AgentStartEvent:
                     _state.SetIsRunning(true);

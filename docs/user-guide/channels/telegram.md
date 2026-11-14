@@ -59,6 +59,9 @@ DM your bot and it will respond via the configured agent.
       "showToolActivity": true,
       "maxRichMessageLength": 32000,
       "processEditedMessages": false,
+      "maxMediaBytes": 20971520,
+      "mediaDownloadTimeoutSeconds": 30,
+      "errorCooldownMs": 60000,
       "webhookUrl": "string (optional)",
       "webhookSecretToken": "string (optional)"
     }
@@ -79,6 +82,9 @@ DM your bot and it will respond via the configured agent.
 | `showToolActivity` | bool | `true` | Surface tool executions to the chat as compact standalone status messages (e.g. `📄 read done`) as the agent runs, so you can see which tools are being called. Each tool is delivered as its own message using a shared cross-channel icon. Set `false` to show only the agent's replies. |
 | `maxRichMessageLength` | int | `32000` | Characters before splitting a Rich Message (the rich limit is 32768). Only used when `richMessages` is enabled. |
 | `processEditedMessages` | bool | `false` | When `true`, edited messages are processed as new messages. |
+| `maxMediaBytes` | long | `20971520` (20 MB) | Hard ceiling, in bytes, on any single inbound media attachment. The default matches the Telegram Bot API download limit. Oversize media is skipped and the message is still dispatched with its caption text. |
+| `mediaDownloadTimeoutSeconds` | int | `30` | Wall-clock budget, in seconds, for downloading a single inbound media attachment. A timeout skips the media only; the caption is still delivered. |
+| `errorCooldownMs` | int | `60000` (60 seconds) | Cooldown between streamed error replies for one chat within one bot runtime, while its tracking entry is retained. Values below 1 are treated as 1 ms, not as disabling the cooldown. |
 | `webhookUrl` | string | `null` | Set to enable webhook mode instead of polling (requires a public HTTPS URL). |
 | `webhookSecretToken` | string | `null` | Secret used to authenticate inbound webhook requests. When omitted in webhook mode, a strong token is generated automatically. Only used when `webhookUrl` is set. |
 
@@ -110,6 +116,16 @@ Each key under `bots` is a logical bot name. Each bot maps to its own token and 
 ```
 
 When `bots` is populated it takes precedence over the top-level single-bot fields.
+Set `errorCooldownMs` inside each `channels.telegram.bots.<name>` entry in that mode;
+for a single bot, set `channels.telegram.errorCooldownMs`.
+
+The error cooldown suppresses repeated `AgentStreamEventType.Error` replies. It is
+not a delay for ordinary messages or tool-activity status lines. The timestamp map
+is in memory and keyed by chat ID within each bot runtime, so forum topics in the
+same chat share the cooldown. Recreating the runtime resets it. The timestamp is
+reserved before the error is sent; it is not a delivery receipt or retry guarantee.
+In polling mode, periodic cleanup removes entries older than 30 minutes. A larger
+configured cooldown is therefore not a guaranteed long-term suppression period.
 
 ---
 
@@ -199,6 +215,33 @@ While a reply is being generated, Telegram shows a live **draft preview** that a
 ### Fallback
 
 Rich Messages are enabled by default (`richMessages: true`). If Telegram ever rejects a rich send (for example a very old client), the adapter automatically falls back to MarkdownV2, then plain text, so a reply is never dropped. Set `richMessages: false` to force the legacy MarkdownV2 path — in which case tables render as plain pipes and headings render as bold.
+
+---
+
+## Interactive prompts (`ask_user`)
+
+When an agent calls the `ask_user` tool, the question is delivered to Telegram as a real message with **tappable inline-keyboard buttons**. The agent is genuinely blocked until you answer, so the prompt is always sent immediately as its own message rather than being folded into the streaming reply.
+
+| Prompt kind | What you see |
+|---|---|
+| `free_form` | The question as plain text. Reply by typing. |
+| `single_choice` | One button per choice, plus **Cancel**. |
+| `choice_or_free_form` | Buttons **and** a typed reply are both accepted. |
+| `multiple_choice` / `allow_multiple` | Buttons toggle a check mark; tap **Submit** when done. |
+
+Every prompt carries a **Cancel** button, matching the portal - you are never forced to wait for a timeout.
+
+Once a prompt is answered the message is **edited in place** to show the chosen answer and the keyboard is removed, so a stale prompt cannot be tapped twice. Answering is idempotent: a double-tap, or a tap that races a typed reply or another client (such as the portal), resolves the prompt exactly once.
+
+### Long choice lists
+
+Telegram inline keyboards become unusable beyond roughly 30 buttons, so a prompt with more choices than that degrades to a **numbered text list** instead of failing to send. Reply with the number of your choice (or the choice text) and it resolves the same way.
+
+### Authorization
+
+A button is visible to everyone in a group chat, so button taps are authorized **identically to text messages** - both `allowedChatIds` and `allowedUserIds` are enforced on the callback. A tap from an unauthorized chat or user is rejected and leaves the prompt pending.
+
+> **Webhook users:** Telegram filters updates server-side. The adapter requests the `callback_query` update type automatically, but if you registered a webhook with an older BotNexus build, restart the gateway so the allow-list is re-registered - otherwise buttons render but taps never arrive.
 
 ---
 

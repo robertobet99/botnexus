@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
@@ -13,12 +14,20 @@ namespace BotNexus.Gateway.Tools;
 /// Allows an agent to pause mid-turn and request structured user input while preserving
 /// the active tool-call context.
 /// </summary>
+/// <remarks>
+/// As of issue #2047 the prompt is a durable, resumable checkpoint: it has no hard timeout by
+/// default and, crucially, is <em>not</em> cleared when the wait is cancelled by a graceful gateway
+/// shutdown or reload. The durable <see cref="Conversation.PendingAskUserJson"/> copy is cleared only
+/// when the prompt reaches an explicit terminal state (the user answers, the user cancels, or an
+/// optional caller-supplied timeout elapses). A shutdown mid-wait leaves the checkpoint intact so a
+/// restarted gateway can resume it via the durable checkpoint service.
+/// </remarks>
 public sealed class AskUserTool(
     IAskUserResponseRegistry responseRegistry,
     AgentId agentId,
     SessionId sessionId,
     ConversationId? conversationId,
-    IConversationStore? conversationStore = null) : IAgentTool
+    IConversationStore? conversationStore = null) : IDurableInteractiveWaitTool
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -27,10 +36,11 @@ public sealed class AskUserTool(
 
     public string Name => "ask_user";
     public string Label => "Ask User";
+    public ToolTimeoutArgument? TimeoutArgument => new("timeout_seconds", ToolTimeoutUnit.Seconds);
 
     public Tool Definition => new(
         Name,
-        "Pause execution and request user input before continuing.",
+        "Pause execution and request user input before continuing. The prompt is a durable checkpoint: it stays pending until the user answers or cancels, and survives gateway restarts.",
         JsonDocument.Parse("""
             {
               "type": "object",
@@ -64,7 +74,7 @@ public sealed class AskUserTool(
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 3600,
-                  "description": "Seconds to wait before timing out (default 300)."
+                  "description": "Optional non-terminal reminder-style wait limit. Omit (the default) for a durable prompt with no expiry that stays pending until the user answers or cancels."
                 }
               },
               "required": ["prompt"]
@@ -96,10 +106,15 @@ public sealed class AskUserTool(
         var prompt = ReadRequiredString(arguments, "prompt");
         var inputType = ReadInputType(arguments);
         var choices = ReadChoices(arguments);
-        var timeoutSeconds = Math.Clamp(ReadInt(arguments, "timeout_seconds") ?? 300, 1, 3600);
+        // #2047: no default hard timeout. A prompt is durable until the user answers or cancels.
+        // A caller may still opt into an explicit reminder-style limit; when supplied it is clamped
+        // to [1, 3600] seconds, otherwise the wait has no expiry.
+        var timeoutSeconds = ReadInt(arguments, "timeout_seconds");
+        TimeSpan? timeout = timeoutSeconds is { } seconds
+            ? TimeSpan.FromSeconds(Math.Clamp(seconds, 1, 3600))
+            : null;
         var allowMultiple = ReadBool(arguments, "allow_multiple") ?? inputType == AskUserInputType.MultipleChoice;
         var allowFreeForm = inputType is AskUserInputType.FreeForm or AskUserInputType.ChoiceOrFreeForm;
-        var timeout = TimeSpan.FromSeconds(timeoutSeconds);
         var registration = responseRegistry.Register(conversationId.Value, timeout);
 
         var request = new AskUserRequest
@@ -116,38 +131,64 @@ public sealed class AskUserTool(
             Timeout = timeout
         };
 
-        onUpdate?.Invoke(new AgentToolResult(Array.Empty<AgentToolContent>(), request));
-
-        // Persist the pending prompt as durable conversation-scoped state so a reloaded tab, a
-        // newly-opened window, mobile that missed the live UserInputRequired event, or a gateway
-        // restart can rehydrate it (ask_user durability, #1488). Best-effort: a persistence hiccup
-        // must never break the interactive prompt itself.
-        await PersistPendingPromptAsync(request, cancellationToken).ConfigureAwait(false);
-
+        // Tracks whether the wait reached an explicit terminal state (answer / cancel / timeout).
+        // Only a terminal state clears the durable checkpoint; a shutdown-driven cancellation of the
+        // in-memory wait must leave the checkpoint intact so a restarted gateway can resume it.
+        var reachedTerminalState = false;
         try
         {
+            // The registry entry above is live pending-input state. Any failure between here and
+            // the wait resolving (e.g. the widget-emit callback throwing) must cancel that entry,
+            // otherwise the conversation stays permanently pending and silently swallows every
+            // subsequent user message (#1916). The broad try/finally below already clears the
+            // durable copy on every exit path; extend it to own the registration lifetime too.
+            // Persist before exposing UserInputRequired. Once a channel can observe the event it
+            // must also be able to hydrate the same pending prompt from the durable store.
+            await PersistPendingPromptAsync(request, cancellationToken).ConfigureAwait(false);
+
+            onUpdate?.Invoke(new AgentToolResult(Array.Empty<AgentToolContent>(), request));
+
             var response = await registration.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            reachedTerminalState = true;
             return TextResult(JsonSerializer.Serialize(response, JsonOptions));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            // Graceful shutdown / reload / conversation switch cancelled the live wait. Do NOT clear
+            // the durable checkpoint - it is intentionally preserved so the prompt survives the
+            // restart and resumes when the user answers (#2047). Drop the in-memory waiter only.
             responseRegistry.Cancel(registration.RequestId);
             throw;
         }
         catch (OperationCanceledException)
         {
+            // The registry cancelled the wait (explicit user cancel via CancelAllForConversation, or
+            // an archive/reset). This is a terminal state: clear the durable checkpoint below.
+            reachedTerminalState = true;
             return TextResult(JsonSerializer.Serialize(new AskUserResponse
             {
                 RequestId = registration.RequestId,
                 WasCancelled = true
             }, JsonOptions));
         }
+        catch
+        {
+            // Any other failure after Register (widget emit, persistence rethrow, etc.) must not
+            // leave the registry entry live -- self-heal by cancelling so the session unblocks
+            // instead of soft-locking in pending-input state (#1916, criterion 4). Re-throw so the
+            // agent loop still receives the error.
+            responseRegistry.Cancel(registration.RequestId);
+            throw;
+        }
         finally
         {
-            // The wait has resolved by every path (answer, timeout, cancel, or exception) -- the
-            // prompt is no longer pending, so clear the durable copy. Using CancellationToken.None
-            // because the caller's token may already be cancelled and the clear must still run.
-            await ClearPendingPromptAsync(conversationId.Value, CancellationToken.None).ConfigureAwait(false);
+            if (reachedTerminalState)
+            {
+                // The prompt reached a terminal state, so clear the durable copy. Using
+                // CancellationToken.None because the caller's token may already be cancelled and the
+                // clear must still run.
+                await ClearPendingPromptAsync(conversationId.Value, CancellationToken.None).ConfigureAwait(false);
+            }
         }
     }
 
@@ -162,8 +203,17 @@ public sealed class AskUserTool(
             if (conversation is null)
                 return;
 
-            conversation.PendingAskUserJson = JsonSerializer.Serialize(request, JsonOptions);
-            await conversationStore.SaveAsync(conversation, cancellationToken).ConfigureAwait(false);
+            var pendingJson = JsonSerializer.Serialize(request, JsonOptions);
+
+            // SaveAsync is compare-and-swap guarded (#2471); a pin or canvas write landing between the
+            // read above and this save throws instead of clobbering. Retry through the shared helper,
+            // which re-reads and re-applies ONLY the pending-prompt field to the fresh aggregate (#2131).
+            _ = await ConversationSaveRetry.SaveWithRetryAsync(
+                conversationStore,
+                request.ConversationId,
+                conversation,
+                source => source with { PendingAskUserJson = pendingJson },
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -182,8 +232,14 @@ public sealed class AskUserTool(
             if (stored is null || stored.PendingAskUserJson is null)
                 return;
 
-            stored.PendingAskUserJson = null;
-            await conversationStore.SaveAsync(stored, cancellationToken).ConfigureAwait(false);
+            // Same CAS concern as the register path: re-apply only the clear to fresh state so a
+            // concurrent writer's columns survive the retry (#2131).
+            _ = await ConversationSaveRetry.SaveWithRetryAsync(
+                conversationStore,
+                conversation,
+                stored,
+                source => source.PendingAskUserJson is null ? null : source with { PendingAskUserJson = null },
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -229,20 +285,130 @@ public sealed class AskUserTool(
         };
     }
 
+    /// <summary>
+    /// Reads an optional <see cref="int"/> tool argument regardless of how the provider boxed the
+    /// underlying JSON number. Streaming tool-call parsing boxes JSON integers as CLR
+    /// <see cref="long"/> and any number carrying a decimal point as <see cref="double"/>, so the
+    /// previous switch - which handled only <see cref="JsonElement"/>/<see cref="int"/>/
+    /// <see cref="long"/>/<see cref="string"/> - rejected a schema-valid <c>timeout_seconds</c> with
+    /// a message asserting the very requirement the payload already met (issue #2415). It also cast
+    /// <see cref="long"/> to <see cref="int"/> unchecked, silently turning an out-of-range value into
+    /// a plausible one.
+    /// <para>
+    /// This mirrors <c>AgentConverseTool.TryReadInt32</c>: a value is accepted only when it
+    /// round-trips to <see cref="int"/> without loss. The duplication is deliberate - the two tools
+    /// live in assemblies with no shared dependency, and introducing one to host a helper is a
+    /// dependency decision that does not belong in a bug fix.
+    /// </para>
+    /// </summary>
     private static int? ReadInt(IReadOnlyDictionary<string, object?> args, string key)
     {
         if (!args.TryGetValue(key, out var value) || value is null)
             return null;
 
-        return value switch
+        if (TryReadInt32(value, out var parsed))
+            return parsed;
+
+        throw new ArgumentException(
+            $"Argument '{key}' must be a whole number that fits in a 32-bit integer. " +
+            $"Received {DescribeValue(value)}; expected an integer such as 300 (a JSON number, or a " +
+            "string containing only digits). Fractional, non-finite and out-of-range values are rejected " +
+            "because they cannot be represented without loss.");
+    }
+
+    private static bool TryReadInt32(object value, out int result)
+    {
+        switch (value)
         {
-            JsonElement { ValueKind: JsonValueKind.Number } element when element.TryGetInt32(out var number) => number,
-            JsonElement { ValueKind: JsonValueKind.String } element when int.TryParse(element.GetString(), out var parsed) => parsed,
-            int number => number,
-            long number => (int)number,
-            string text when int.TryParse(text, out var parsed) => parsed,
-            _ => throw new ArgumentException($"Argument '{key}' must be an integer.")
-        };
+            case int i:
+                result = i;
+                return true;
+            case sbyte or byte or short or ushort:
+                result = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+                return true;
+            case long l when l is >= int.MinValue and <= int.MaxValue:
+                result = (int)l;
+                return true;
+            case uint u when u <= int.MaxValue:
+                result = (int)u;
+                return true;
+            case ulong u when u <= int.MaxValue:
+                result = (int)u;
+                return true;
+            case double d when IsIntegralInt32(d):
+                result = (int)d;
+                return true;
+            case float f when IsIntegralInt32(f):
+                result = (int)f;
+                return true;
+            case decimal m when IsIntegralInt32(m):
+                result = (int)m;
+                return true;
+            case JsonElement { ValueKind: JsonValueKind.Number } element:
+                return TryReadJsonNumber(element, out result);
+            case JsonElement { ValueKind: JsonValueKind.String } element:
+                return TryParseInt32(element.GetString(), out result);
+            case string text:
+                return TryParseInt32(text, out result);
+            default:
+                result = 0;
+                return false;
+        }
+    }
+
+    private static bool TryReadJsonNumber(JsonElement element, out int result)
+    {
+        if (element.TryGetInt32(out result))
+            return true;
+
+        if (element.TryGetInt64(out var l) && l is >= int.MinValue and <= int.MaxValue)
+        {
+            result = (int)l;
+            return true;
+        }
+
+        if (element.TryGetDouble(out var d) && IsIntegralInt32(d))
+        {
+            result = (int)d;
+            return true;
+        }
+
+        result = 0;
+        return false;
+    }
+
+    private static bool IsIntegralInt32(double value)
+        => double.IsFinite(value)
+           && value % 1d == 0d
+           && value is >= int.MinValue and <= int.MaxValue;
+
+    private static bool IsIntegralInt32(decimal value)
+        => value % 1m == 0m
+           && value is >= int.MinValue and <= int.MaxValue;
+
+    private static bool TryParseInt32(string? text, out int result)
+        => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out result);
+
+    /// <summary>
+    /// Renders the value the caller actually sent so a rejection diagnoses rather than merely
+    /// asserts. #2415's core complaint was messages that restated a requirement without saying what
+    /// was received, leaving the model to retry blindly.
+    /// </summary>
+    private static string DescribeValue(object value)
+    {
+        if (value is JsonElement element)
+        {
+            var rendered = element.ValueKind is JsonValueKind.Object or JsonValueKind.Array
+                ? element.ValueKind.ToString().ToLowerInvariant()
+                : element.ToString();
+            return $"JSON {element.ValueKind.ToString().ToLowerInvariant()} '{rendered}'";
+        }
+
+        var text = value is IFormattable formattable
+            ? formattable.ToString(null, CultureInfo.InvariantCulture)
+            : value.ToString();
+
+        return $"{value.GetType().Name} '{text}'";
     }
 
     private static AskUserInputType ReadInputType(IReadOnlyDictionary<string, object?> arguments)

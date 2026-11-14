@@ -4,6 +4,8 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using System.Threading.Channels;
 using BotNexus.Extensions.Mcp.Protocol;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BotNexus.Extensions.Mcp.Transport;
 
@@ -13,6 +15,33 @@ namespace BotNexus.Extensions.Mcp.Transport;
 /// </summary>
 public sealed class HttpSseMcpTransport : IMcpTransport
 {
+    private const string SessionIdHeader = "Mcp-Session-Id";
+
+    /// <summary>Floor for SSE reconnect backoff, in milliseconds.</summary>
+    private const double MinReconnectDelayMs = 1_000;
+
+    /// <summary>Ceiling for SSE reconnect backoff, in milliseconds.</summary>
+    private const double MaxReconnectDelayMs = 30_000;
+
+    /// <summary>
+    /// Capacity of the inbound response buffer (#3400).
+    /// <para>
+    /// The SSE pump writes every inbound frame, but the correlator reads exactly ONE frame per
+    /// outbound request, so anything unmatched - a server-initiated notification, a duplicate, a
+    /// late reply to a call that already timed out - was retained for the life of the transport.
+    /// With an unbounded channel that is a remote-input-driven managed-heap growth path: a chatty
+    /// or hostile MCP endpoint can grow the gateway heap monotonically until dispose.
+    /// </para>
+    /// <para>
+    /// 256 is deliberately far above any legitimate in-flight depth (the client issues one request
+    /// at a time per transport) while still being a hard ceiling. The overflow policy is
+    /// <see cref="BoundedChannelFullMode.DropOldest"/>: the NEWEST response is the one a waiting
+    /// caller is most likely to be correlating, and a stale unmatched frame is by definition the
+    /// one nobody is waiting for. Drops are never silent - see <see cref="OnResponseDropped"/>.
+    /// </para>
+    /// </summary>
+    internal const int ResponseChannelCapacity = 256;
+
     private readonly Uri _endpoint;
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
@@ -21,10 +50,14 @@ public sealed class HttpSseMcpTransport : IMcpTransport
     private readonly IReadOnlyDictionary<string, string>? _headers;
 
     private string? _sessionId;
+    private readonly SemaphoreSlim _reinitLock = new(1, 1);
+    private int _sessionEpoch;
+    private int _reinitRequestId;
     private CancellationTokenSource? _sseCts;
     private Task? _sseTask;
-    private readonly Channel<JsonRpcResponse> _responseChannel =
-        Channel.CreateUnbounded<JsonRpcResponse>(new UnboundedChannelOptions { SingleReader = false });
+    private readonly Channel<JsonRpcResponse> _responseChannel;
+    private readonly ILogger _logger;
+    private int _droppedResponses;
     private bool _connected;
     private bool _disposed;
 
@@ -36,24 +69,91 @@ public sealed class HttpSseMcpTransport : IMcpTransport
     /// <param name="httpClient">Optional pre-configured HttpClient. If null, one is created internally.</param>
     /// <param name="connectTimeout">Connection timeout. Default: 30 seconds.</param>
     /// <param name="maxReconnectAttempts">Maximum SSE reconnection attempts. Default: 3.</param>
+    /// <param name="logger">Optional logger. Used to surface response-buffer saturation (#3400).</param>
     public HttpSseMcpTransport(
         Uri endpoint,
         IReadOnlyDictionary<string, string>? headers = null,
         HttpClient? httpClient = null,
         TimeSpan? connectTimeout = null,
-        int maxReconnectAttempts = 3)
+        int maxReconnectAttempts = 3,
+        ILogger? logger = null)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
         _endpoint = endpoint;
+        _logger = logger ?? NullLogger.Instance;
+        _responseChannel = Channel.CreateBounded<JsonRpcResponse>(
+            new BoundedChannelOptions(ResponseChannelCapacity)
+            {
+                SingleReader = false,
+                FullMode = BoundedChannelFullMode.DropOldest,
+            },
+            OnResponseDropped);
         _headers = headers;
         _ownsHttpClient = httpClient is null;
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? CreateDefaultHttpClient();
         _connectTimeout = connectTimeout ?? TimeSpan.FromSeconds(30);
         _maxReconnectAttempts = maxReconnectAttempts;
     }
 
+    /// <summary>
+    /// Creates the redirect-refusing handler backing the HttpClient used when the caller
+    /// supplies none.
+    /// <para>
+    /// <b>Security (#3012):</b> auto-redirect is disabled. <see cref="HttpClient"/> defaults to
+    /// <c>AllowAutoRedirect = true</c>, and the configured headers — which on the auth path include
+    /// a resolved BotNexus provider API key as <c>Authorization: Bearer &lt;token&gt;</c> — are attached
+    /// to the request itself, so the handler would replay them verbatim to a redirect target on an
+    /// arbitrary host and scheme. A malicious or compromised MCP server could therefore harvest the
+    /// credential with a single 302. Refusing to follow redirects keeps the credential bound to the
+    /// exact endpoint the operator configured; a redirect now surfaces as a non-success status the
+    /// caller reports rather than a silent cross-host disclosure.
+    /// </para>
+    /// <para>Exposed internally so tests can pin the security posture directly (#3012 AC4).</para>
+    /// </summary>
+    internal static HttpClientHandler CreateDefaultHandler()
+        => new() { AllowAutoRedirect = false };
+
+    private static HttpClient CreateDefaultHttpClient()
+        => new(CreateDefaultHandler(), disposeHandler: true);
+
+    /// <summary>
+    /// Number of inbound responses evicted because the bounded buffer was saturated (#3400).
+    /// A non-zero value means the transport is receiving frames faster than the correlator
+    /// consumes them, which is itself the diagnostic signal - the drop is observable, not silent.
+    /// </summary>
+    internal int DroppedResponses => Volatile.Read(ref _droppedResponses);
+
+    /// <summary>Current depth of the bounded inbound response buffer (#3400 test seam).</summary>
+    internal int BufferedResponseCount => _responseChannel.Reader.Count;
+
+    /// <summary>
+    /// Invoked by the bounded channel for every evicted response. Emits a warning naming the
+    /// endpoint so a saturating MCP server is attributable in the gateway log rather than
+    /// silently discarded.
+    /// </summary>
+    private void OnResponseDropped(JsonRpcResponse dropped)
+    {
+        var total = Interlocked.Increment(ref _droppedResponses);
+        _logger.LogWarning(
+            "MCP response buffer saturated for {Endpoint}: dropped oldest response (id {ResponseId}); capacity {Capacity}, total dropped {TotalDropped}.",
+            _endpoint,
+            dropped.Id,
+            ResponseChannelCapacity,
+            total);
+    }
+
     /// <summary>Gets the session ID assigned by the server, if any.</summary>
     internal string? SessionId => _sessionId;
+
+    /// <summary>The background SSE read loop task, if a persistent stream was established.</summary>
+    internal Task? SseLoopTask => _sseTask;
+
+    /// <summary>
+    /// Seam for the reconnect backoff delay so tests can observe the requested delays
+    /// without actually waiting. Defaults to <see cref="Task.Delay(TimeSpan, CancellationToken)"/>.
+    /// </summary>
+    internal Func<TimeSpan, CancellationToken, Task> DelayAsync { get; set; } =
+        static (d, c) => Task.Delay(d, c);
 
     /// <inheritdoc />
     public async Task ConnectAsync(CancellationToken ct = default)
@@ -109,13 +209,15 @@ public sealed class HttpSseMcpTransport : IMcpTransport
         if (!_connected)
             throw new InvalidOperationException("Transport is not connected.");
 
-        var request = CreateRequest(HttpMethod.Post);
-        request.Content = JsonContent.Create(message, JsonContext.Default.JsonRpcRequest);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-
-        var response = await _httpClient.SendAsync(
-            request,
+        var response = await SendWithSessionRecoveryAsync(
+            () =>
+            {
+                var request = CreateRequest(HttpMethod.Post);
+                request.Content = JsonContent.Create(message, JsonContext.Default.JsonRpcRequest);
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+                return request;
+            },
             HttpCompletionOption.ResponseHeadersRead,
             ct).ConfigureAwait(false);
 
@@ -149,10 +251,16 @@ public sealed class HttpSseMcpTransport : IMcpTransport
         if (!_connected)
             throw new InvalidOperationException("Transport is not connected.");
 
-        var request = CreateRequest(HttpMethod.Post);
-        request.Content = JsonContent.Create(message, JsonContext.Default.JsonRpcNotification);
+        using var response = await SendWithSessionRecoveryAsync(
+            () =>
+            {
+                var request = CreateRequest(HttpMethod.Post);
+                request.Content = JsonContent.Create(message, JsonContext.Default.JsonRpcNotification);
+                return request;
+            },
+            HttpCompletionOption.ResponseContentRead,
+            ct).ConfigureAwait(false);
 
-        var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         CaptureSessionId(response);
     }
@@ -225,10 +333,121 @@ public sealed class HttpSseMcpTransport : IMcpTransport
 
         _responseChannel.Writer.TryComplete();
         _sseCts?.Dispose();
+        _reinitLock.Dispose();
 
         if (_ownsHttpClient)
         {
             _httpClient.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Sends a request, recovering from an expired MCP session.
+    /// Per the MCP Streamable HTTP spec, HTTP 404 in response to a request that carried an
+    /// <c>Mcp-Session-Id</c> means the session expired; the client MUST start a new session by
+    /// re-sending <c>InitializeRequest</c> without a session id. The original request is then
+    /// replayed exactly once. Any other status code is returned unchanged to the caller so that
+    /// existing behaviour (EnsureSuccessStatusCode) is preserved.
+    /// </summary>
+    private async Task<HttpResponseMessage> SendWithSessionRecoveryAsync(
+        Func<HttpRequestMessage> requestFactory,
+        HttpCompletionOption completionOption,
+        CancellationToken ct)
+    {
+        var epoch = Volatile.Read(ref _sessionEpoch);
+        var request = requestFactory();
+        var carriedSessionId = request.Headers.Contains(SessionIdHeader);
+
+        var response = await _httpClient.SendAsync(request, completionOption, ct).ConfigureAwait(false);
+
+        // Fail closed: only an expired-session 404 is special-cased.
+        if (response.StatusCode != HttpStatusCode.NotFound || !carriedSessionId)
+        {
+            return response;
+        }
+
+        response.Dispose();
+
+        if (!await TryReinitializeSessionAsync(epoch, ct).ConfigureAwait(false))
+        {
+            throw new HttpRequestException(
+                $"MCP session expired at {_endpoint} and re-initialization failed.",
+                inner: null,
+                statusCode: HttpStatusCode.NotFound);
+        }
+
+        // Exactly one replay. Whatever comes back - including another 404 - is returned
+        // verbatim, so a server that keeps 404ing surfaces an error instead of looping.
+        return await _httpClient.SendAsync(requestFactory(), completionOption, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Clears the expired session and performs a fresh <c>initialize</c> handshake.
+    /// Serialised so concurrent in-flight requests cannot race two initializes; a caller whose
+    /// epoch is stale simply adopts the session another caller already established.
+    /// </summary>
+    private async Task<bool> TryReinitializeSessionAsync(int epoch, CancellationToken ct)
+    {
+        await _reinitLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (Volatile.Read(ref _sessionEpoch) != epoch)
+            {
+                // Another request already re-initialized while we waited.
+                return true;
+            }
+
+            _sessionId = null;
+
+            var initRequest = new JsonRpcRequest
+            {
+                Id = Interlocked.Decrement(ref _reinitRequestId),
+                Method = "initialize",
+                Params = JsonSerializer.SerializeToElement(
+                    new McpInitializeParams(), JsonContext.Default.McpInitializeParams),
+            };
+
+            var request = CreateRequest(HttpMethod.Post);
+            request.Content = JsonContent.Create(initRequest, JsonContext.Default.JsonRpcRequest);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+
+            using var response = await _httpClient.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return false;
+            }
+
+            CaptureSessionId(response);
+
+            // Drain the initialize result. It is deliberately NOT enqueued on the response
+            // channel - the caller is waiting for the reply to its own request id.
+            await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+            Interlocked.Increment(ref _sessionEpoch);
+
+            // notifications/initialized per MCP spec. Best-effort: a failure here must not
+            // mask the recovered session.
+            try
+            {
+                var notifyRequest = CreateRequest(HttpMethod.Post);
+                notifyRequest.Content = JsonContent.Create(
+                    new JsonRpcNotification { Method = "notifications/initialized" },
+                    JsonContext.Default.JsonRpcNotification);
+                using var notifyResponse = await _httpClient.SendAsync(notifyRequest, ct).ConfigureAwait(false);
+            }
+            catch (HttpRequestException)
+            {
+                // Best-effort.
+            }
+
+            return true;
+        }
+        finally
+        {
+            _reinitLock.Release();
         }
     }
 
@@ -240,9 +459,10 @@ public sealed class HttpSseMcpTransport : IMcpTransport
         // over HTTP/2, causing .NET's response stream to hang indefinitely.
         request.Version = HttpVersion.Version11;
 
-        if (_sessionId is not null)
+        var sessionId = _sessionId;
+        if (sessionId is not null)
         {
-            request.Headers.TryAddWithoutValidation("Mcp-Session-Id", _sessionId);
+            request.Headers.TryAddWithoutValidation(SessionIdHeader, sessionId);
         }
 
         if (_headers is not null)
@@ -258,7 +478,7 @@ public sealed class HttpSseMcpTransport : IMcpTransport
 
     private void CaptureSessionId(HttpResponseMessage response)
     {
-        if (response.Headers.TryGetValues("Mcp-Session-Id", out var values))
+        if (response.Headers.TryGetValues(SessionIdHeader, out var values))
         {
             var id = values.FirstOrDefault();
             if (!string.IsNullOrEmpty(id))
@@ -342,8 +562,8 @@ public sealed class HttpSseMcpTransport : IMcpTransport
             while (!ct.IsCancellationRequested && attempt < _maxReconnectAttempts)
             {
                 attempt++;
-                var delay = TimeSpan.FromMilliseconds(Math.Min(1000 * Math.Pow(2, attempt - 1), 30_000));
-                await Task.Delay(delay, ct).ConfigureAwait(false);
+                var delay = ComputeReconnectDelay(attempt);
+                await DelayAsync(delay, ct).ConfigureAwait(false);
 
                 try
                 {
@@ -360,9 +580,17 @@ public sealed class HttpSseMcpTransport : IMcpTransport
 
                     using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
                     using var reader = new StreamReader(stream);
-                    await ParseSseStreamAsync(reader, ct).ConfigureAwait(false);
+                    var eventsDelivered = await ParseSseStreamAsync(reader, ct).ConfigureAwait(false);
 
-                    attempt = 0;
+                    // Reset the consecutive-failure counter ONLY on evidence of progress:
+                    // at least one SSE event was parsed and delivered on this connection.
+                    // Returning from the read is NOT progress - a server that answers the
+                    // GET with 200 text/event-stream and an immediately-closed body returns
+                    // instantly, and resetting on that made the ceiling and the backoff inert.
+                    if (eventsDelivered > 0)
+                    {
+                        attempt = 0;
+                    }
                 }
                 catch (HttpRequestException) when (!ct.IsCancellationRequested)
                 {
@@ -377,10 +605,12 @@ public sealed class HttpSseMcpTransport : IMcpTransport
     /// <summary>
     /// Parses an SSE stream, extracting JSON-RPC response messages from <c>event: message</c> events.
     /// </summary>
-    internal async Task ParseSseStreamAsync(TextReader reader, CancellationToken ct)
+    /// <returns>The number of SSE events delivered to the response channel.</returns>
+    internal async Task<int> ParseSseStreamAsync(TextReader reader, CancellationToken ct)
     {
         string? eventType = null;
         string? data = null;
+        var delivered = 0;
 
         while (!ct.IsCancellationRequested)
         {
@@ -393,7 +623,7 @@ public sealed class HttpSseMcpTransport : IMcpTransport
                 {
                     if (eventType is null or "message")
                     {
-                        TryEnqueueResponse(data);
+                        delivered += TryEnqueueResponse(data) ? 1 : 0;
                     }
 
                     eventType = null;
@@ -418,23 +648,39 @@ public sealed class HttpSseMcpTransport : IMcpTransport
         // Flush any trailing event without a final blank line
         if (data is not null && eventType is null or "message")
         {
-            TryEnqueueResponse(data);
+            delivered += TryEnqueueResponse(data) ? 1 : 0;
         }
+
+        return delivered;
     }
 
-    private void TryEnqueueResponse(string json)
+    /// <summary>
+    /// Computes the reconnect backoff for the given consecutive-failure attempt number.
+    /// Grows exponentially, is never below <see cref="MinReconnectDelayMs"/> (so a rapidly
+    /// closing server cannot be polled at high frequency), and is capped at 30s.
+    /// </summary>
+    private static TimeSpan ComputeReconnectDelay(int attempt)
+    {
+        var exponential = MinReconnectDelayMs * Math.Pow(2, attempt - 1);
+        var bounded = Math.Min(Math.Max(exponential, MinReconnectDelayMs), MaxReconnectDelayMs);
+        return TimeSpan.FromMilliseconds(bounded);
+    }
+
+    private bool TryEnqueueResponse(string json)
     {
         try
         {
             var response = JsonSerializer.Deserialize(json, JsonContext.Default.JsonRpcResponse);
             if (response is not null)
             {
-                _responseChannel.Writer.TryWrite(response);
+                return _responseChannel.Writer.TryWrite(response);
             }
         }
         catch (JsonException)
         {
             // Skip malformed SSE data
         }
+
+        return false;
     }
 }

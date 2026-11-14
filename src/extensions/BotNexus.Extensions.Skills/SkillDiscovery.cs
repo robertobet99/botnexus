@@ -22,27 +22,59 @@ public static class SkillDiscovery
     private static readonly string[] LinkedFileDirs = ["references", "templates", "scripts", "assets"];
 
     /// <summary>
-    /// Discovers and merges skills from global, agent, and workspace directories.
+    /// Discovers and merges skills from plugin, global, agent, and workspace directories.
     /// </summary>
     /// <param name="globalSkillsDir">Optional path to the global skills directory.</param>
     /// <param name="agentSkillsDir">Optional path to the agent-level skills directory.</param>
     /// <param name="workspaceSkillsDir">Optional path to the workspace-level skills directory.</param>
     /// <param name="fileSystem">Optional filesystem abstraction (defaults to real filesystem).</param>
     /// <param name="logger">Optional logger; when supplied, emits warnings for skipped skills.</param>
+    /// <param name="trustMode">Trust verification mode applied to every scanned skill.</param>
+    /// <param name="pluginSkillsDirs">
+    /// Optional skills directories belonging to installed plugins (#2684), typically produced by
+    /// <c>PluginSkillRootResolver.Resolve</c>. Scanned FIRST, at the global/shared tier, so a
+    /// same-named global, agent or workspace skill still wins. Omitting this argument - or passing
+    /// an empty sequence, which is what a machine with no plugins installed yields - leaves the
+    /// pre-existing three-scope resolution byte-identical.
+    /// </param>
+    /// <param name="securityAcknowledgements">
+    /// Optional operator-recorded acknowledgements of specific critical scan findings (#3355).
+    /// Each entry clears exactly one <c>skill + ruleId + relative file</c> triple; any critical
+    /// finding NOT covered by an entry still skips the skill. Null or empty leaves the previous
+    /// "any critical finding blocks the skill" behaviour unchanged.
+    /// </param>
+    /// <param name="allowSymlinkedSkills">
+    /// Authorizes linked skill roots and ancestors, using their canonical directories as boundaries.
+    /// Child links must still remain contained. Defaults to false.
+    /// </param>
     public static IReadOnlyList<SkillDefinition> Discover(
         string? globalSkillsDir,
         string? agentSkillsDir,
         string? workspaceSkillsDir,
         IFileSystem? fileSystem = null,
         ILogger? logger = null,
-        SkillTrustMode trustMode = SkillTrustMode.Disabled)
+        SkillTrustMode trustMode = SkillTrustMode.Disabled,
+        IReadOnlyList<string>? pluginSkillsDirs = null,
+        IReadOnlyList<SkillSecurityAcknowledgement>? securityAcknowledgements = null,
+        bool allowSymlinkedSkills = false)
     {
         var fs = fileSystem ?? new FileSystem();
         var skills = new Dictionary<string, SkillDefinition>(StringComparer.OrdinalIgnoreCase);
 
-        ScanDirectory(skills, globalSkillsDir, SkillSource.Global, fs, logger, trustMode);
-        ScanDirectory(skills, agentSkillsDir, SkillSource.Agent, fs, logger, trustMode);
-        ScanDirectory(skills, workspaceSkillsDir, SkillSource.Workspace, fs, logger, trustMode);
+        // Plugin skills are scanned before the global directory rather than merged into it: they
+        // share the global tier but must LOSE a name collision with operator-authored shared
+        // content, and "scanned first" is precisely how this dictionary expresses "lower priority".
+        if (pluginSkillsDirs is { Count: > 0 })
+        {
+            foreach (var pluginSkillsDir in pluginSkillsDirs)
+            {
+                ScanDirectory(skills, pluginSkillsDir, SkillSource.Plugin, fs, logger, trustMode, securityAcknowledgements, allowSymlinkedSkills);
+            }
+        }
+
+        ScanDirectory(skills, globalSkillsDir, SkillSource.Global, fs, logger, trustMode, securityAcknowledgements, allowSymlinkedSkills);
+        ScanDirectory(skills, agentSkillsDir, SkillSource.Agent, fs, logger, trustMode, securityAcknowledgements, allowSymlinkedSkills);
+        ScanDirectory(skills, workspaceSkillsDir, SkillSource.Workspace, fs, logger, trustMode, securityAcknowledgements, allowSymlinkedSkills);
 
         return skills.Values.ToList();
     }
@@ -53,7 +85,9 @@ public static class SkillDiscovery
         SkillSource source,
         IFileSystem fileSystem,
         ILogger? logger,
-        SkillTrustMode trustMode)
+        SkillTrustMode trustMode,
+        IReadOnlyList<SkillSecurityAcknowledgement>? securityAcknowledgements,
+        bool allowSymlinkedSkills)
     {
         if (string.IsNullOrWhiteSpace(directory) || !fileSystem.Directory.Exists(directory))
             return;
@@ -67,7 +101,11 @@ public static class SkillDiscovery
             var dirName = Path.GetFileName(skillDir);
             try
             {
-                var skillFileInfo = fileSystem.FileInfo.New(skillMdPath);
+                var canonicalRoot = SkillInstallationValidator.ResolveRoot(skillDir, fileSystem, allowSymlinkedSkills);
+                var installationFiles = SkillInstallationValidator.CollectFiles(canonicalRoot, fileSystem);
+                var resolvedSkillMdPath = SkillInstallationValidator.ResolveContainedPath(
+                    fileSystem.Path.Combine(canonicalRoot, SkillFileName), canonicalRoot, fileSystem);
+                var skillFileInfo = fileSystem.FileInfo.New(resolvedSkillMdPath);
                 if (skillFileInfo.Length > MaxSkillFileBytes)
                 {
                     logger?.LogWarning(
@@ -76,8 +114,8 @@ public static class SkillDiscovery
                     continue;
                 }
 
-                var content = fileSystem.File.ReadAllText(skillMdPath);
-                var skill = SkillParser.Parse(dirName, content, skillDir, source);
+                var content = fileSystem.File.ReadAllText(resolvedSkillMdPath);
+                var skill = SkillParser.Parse(dirName, content, canonicalRoot, source);
 
                 if (!TryValidate(skill, dirName, skillDir, logger, out var reason))
                 {
@@ -87,20 +125,39 @@ public static class SkillDiscovery
                     continue;
                 }
 
-                // Security scan: block skills with critical findings
-                var scanSummary = SkillSecurityScanner.ScanDirectory(skillDir, fileSystem: fileSystem);
-                if (scanSummary.Critical > 0)
+                // Security scan: block skills with critical findings that no operator has
+                // acknowledged. #3355 — a bare count gave the operator nothing to act on, so the
+                // outstanding findings are named individually by relative path and ruleId.
+                var scanSummary = SkillSecurityScanner.ScanDirectory(canonicalRoot, fileSystem: fileSystem);
+                var outstanding = FindUnacknowledgedCriticalFindings(
+                    scanSummary, skill.Name, canonicalRoot, source, fileSystem, securityAcknowledgements);
+
+                if (outstanding.Count > 0)
                 {
-                    logger?.LogWarning(
-                        "Skill at '{SkillDir}' skipped: security scan found {CriticalCount} critical finding(s).",
-                        skillDir, scanSummary.Critical);
+                    foreach (var evidence in outstanding)
+                    {
+                        logger?.LogWarning(
+                            "Skill {SkillName} ({SkillScope}) blocked by {RuleId} {FindingSeverity} finding {ScannerFindingId} at {RelativePath}:{FindingLine}; scanner {ScannerVersion}, file {FileSha256}, revision {FindingId}, evidence {EvidenceStatus} ({EvidenceReason}).",
+                            evidence.Skill,
+                            evidence.Scope,
+                            evidence.RuleId,
+                            evidence.Severity,
+                            evidence.ScannerFindingId,
+                            evidence.RelativePath ?? "[missing]",
+                            evidence.Line,
+                            evidence.ScannerVersion,
+                            evidence.FileSha256,
+                            evidence.RevisionId ?? evidence.ScannerFindingId,
+                            evidence.IsComplete ? "complete" : "incomplete",
+                            evidence.MissingReason ?? "none");
+                    }
                     continue;
                 }
 
                 // Trust verification: check script integrity against catalog
                 if (trustMode != SkillTrustMode.Disabled)
                 {
-                    var trustResult = SkillTrustVerifier.Verify(skillDir, fileSystem);
+                    var trustResult = SkillTrustVerifier.Verify(SkillPath.CreateRoot(canonicalRoot, fileSystem), fileSystem);
                     if (!trustResult.Trusted)
                     {
                         var violations = string.Join("; ", trustResult.Violations);
@@ -121,7 +178,7 @@ public static class SkillDiscovery
 
                 // Enrich the skill with its bundled support files so they can be surfaced
                 // as load-on-demand context without injecting the entire directory.
-                skills[skill.Name] = skill with { LinkedFiles = DiscoverLinkedFiles(skillDir, fileSystem) };
+                skills[skill.Name] = skill with { LinkedFiles = DiscoverLinkedFiles(canonicalRoot, installationFiles, fileSystem) };
             }
             catch (Exception ex)
             {
@@ -133,11 +190,51 @@ public static class SkillDiscovery
     }
 
     /// <summary>
+    /// Reduces a scan summary to the critical findings the operator has NOT acknowledged,
+    /// formatted as <c>relative/path.mjs:LINE (ruleId)</c> so the log line alone is actionable.
+    /// </summary>
+    /// <remarks>
+    /// Matching is per-FINDING, never per-file and never per-skill: a second, different rule
+    /// firing in an already-acknowledged file yields a new entry here and still skips the skill.
+    /// That is the whole point of #3355 clause 3 — an acknowledgement records what a human
+    /// actually reviewed, so it must not inherit approval for something they never saw.
+    /// </remarks>
+    private static List<SkillSecurityFindingEvidence> FindUnacknowledgedCriticalFindings(
+        ScanSummary scanSummary,
+        string skillName,
+        string skillDir,
+        SkillSource source,
+        IFileSystem fileSystem,
+        IReadOnlyList<SkillSecurityAcknowledgement>? acknowledgements)
+    {
+        var outstanding = new List<SkillSecurityFindingEvidence>();
+
+        foreach (var finding in scanSummary.Findings)
+        {
+            if (finding.Severity != ScanSeverity.Critical)
+                continue;
+
+            var relative = Path.GetRelativePath(skillDir, finding.File).Replace('\\', '/');
+
+            var acknowledged = acknowledgements is { Count: > 0 }
+                && acknowledgements.Any(ack => SkillSecurityAcknowledgements.IsAcknowledged(
+                    ack, skillName, relative, finding.RuleId, finding.Severity,
+                    SkillSecurityScanner.ComputeFindingId(finding), fileSystem, finding.File));
+
+            if (!acknowledged)
+                outstanding.Add(SkillSecurityFindingEvidence.Create(
+                    skillName, source, skillDir, finding, fileSystem));
+        }
+
+        return outstanding;
+    }
+
+    /// <summary>
     /// Enumerates support files under the well-known linked-file directories
     /// (references/, templates/, scripts/, assets/) for a single skill. Paths are returned
     /// relative to the skill directory with forward slashes for cross-platform stability.
     /// </summary>
-    private static IReadOnlyList<SkillLinkedFile> DiscoverLinkedFiles(string skillDir, IFileSystem fileSystem)
+    private static IReadOnlyList<SkillLinkedFile> DiscoverLinkedFiles(string skillDir, IReadOnlyList<string> installationFiles, IFileSystem fileSystem)
     {
         var linked = new List<SkillLinkedFile>();
 
@@ -147,7 +244,8 @@ public static class SkillDiscovery
             if (!fileSystem.Directory.Exists(groupDir))
                 continue;
 
-            foreach (var file in fileSystem.Directory.GetFiles(groupDir, "*", SearchOption.AllDirectories))
+            foreach (var file in installationFiles.Where(file =>
+                         Path.GetRelativePath(skillDir, file).Replace('\\', '/').StartsWith(group + "/", StringComparison.OrdinalIgnoreCase)))
             {
                 var relative = Path.GetRelativePath(skillDir, file).Replace('\\', '/');
                 long size = 0;

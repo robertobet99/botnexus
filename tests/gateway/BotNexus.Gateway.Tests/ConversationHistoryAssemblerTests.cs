@@ -51,20 +51,67 @@ public sealed class ConversationHistoryAssemblerTests
     }
 
     [Fact]
+    public async Task AssembleAsync_ProjectsInlineOriginalContentPartsAsAttachments()
+    {
+        var conversationId = ConversationId.From("c_attachments");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-attachments"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.User,
+            Content = "see files",
+            Timestamp = Ts(0),
+            OriginalContentParts =
+            [
+                new BinaryContentPart { MimeType = "image/png", FileName = "photo.png", Data = [1, 2, 3] },
+                new TextContentPart { MimeType = "text/plain", FileName = "notes.txt", Text = "hello" },
+                new ReferenceContentPart { MimeType = "application/pdf", FileName = "remote.pdf", Uri = "https://example.invalid/file" }
+            ]
+        });
+        await sessions.SaveAsync(session);
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        var result = await assembler.AssembleAsync(conversationId, limit: 50, offset: 0);
+
+        result.ShouldNotBeNull();
+        var attachments = result!.Entries.ShouldHaveSingleItem().Attachments;
+        attachments.ShouldNotBeNull();
+        attachments.Count.ShouldBe(2);
+        attachments[0].FileName.ShouldBe("photo.png");
+        attachments[0].MimeType.ShouldBe("image/png");
+        attachments[0].Size.ShouldBe(3);
+        attachments[0].Base64Data.ShouldBe("AQID");
+        attachments[1].FileName.ShouldBe("notes.txt");
+        attachments[1].Base64Data.ShouldBe("aGVsbG8=");
+        attachments.ShouldNotContain(attachment => attachment.FileName == "remote.pdf");
+    }
+
+    [Fact]
     public async Task AssembleAsync_MultipleSessions_InsertsBoundaryMarkerBetweenThem()
     {
         var conversationId = ConversationId.From("c_two_sessions");
         var sessions = new InMemorySessionStore();
 
-        var first = await sessions.GetOrCreateAsync(SessionId.From("s-first"), AgentId.From("quill"));
-        first.Session.ConversationId = conversationId;
-        first.Session.CreatedAt = Ts(0);
+        // Session.CreatedAt is write-once (#2316), so build the sessions directly rather than
+        // creating-then-mutating; the in-memory store persists whatever SaveAsync is handed.
+        var first = new GatewaySession(new Session
+        {
+            SessionId = SessionId.From("s-first"),
+            ConversationId = conversationId,
+            CreatedAt = Ts(0)
+        });
+        first.HydrateAgentId(AgentId.From("quill"));
         first.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "in-first", Timestamp = Ts(1) });
         await sessions.SaveAsync(first);
 
-        var second = await sessions.GetOrCreateAsync(SessionId.From("s-second"), AgentId.From("quill"));
-        second.Session.ConversationId = conversationId;
-        second.Session.CreatedAt = Ts(10);
+        var second = new GatewaySession(new Session
+        {
+            SessionId = SessionId.From("s-second"),
+            ConversationId = conversationId,
+            CreatedAt = Ts(10)
+        });
+        second.HydrateAgentId(AgentId.From("quill"));
         second.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "in-second", Timestamp = Ts(11) });
         await sessions.SaveAsync(second);
 
@@ -109,6 +156,35 @@ public sealed class ConversationHistoryAssemblerTests
     }
 
     [Fact]
+    public async Task AssembleAsync_SkipsGhostEmptyAssistantEntries_ButKeepsThinkingOnly()
+    {
+        // #2921 AC5: a contentless assistant row (no content, no thinking, no tool linkage) is a
+        // ghost bubble and must not be replayed. A thinking-only row (#1198/#656) has something to
+        // render and must survive - this test fails if the guard over-reaches and drops it.
+        var conversationId = ConversationId.From("c_ghost");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "ping", Timestamp = Ts(0) });
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "real reply", Timestamp = Ts(1) });
+        // The ghost: empty content, empty thinking, no tool linkage.
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = string.Empty, Timestamp = Ts(2) });
+        // Legitimate thinking-only entry - must be preserved.
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = string.Empty, ThinkingContent = "reasoning", Timestamp = Ts(3) });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        var result = await assembler.AssembleAsync(conversationId, limit: 50, offset: 0);
+
+        result.ShouldNotBeNull();
+        result!.TotalCount.ShouldBe(3);
+        result.Entries[0].Content.ShouldBe("ping");
+        result.Entries[1].Content.ShouldBe("real reply");
+        result.Entries[2].ThinkingContent.ShouldBe("reasoning");
+    }
+
+    [Fact]
     public async Task AssembleAsync_DoesNotSkipUserContentThatHappensToSayNoReply()
     {
         // The NO_REPLY drop only applies to ASSISTANT entries. A user literally typing "NO_REPLY"
@@ -131,15 +207,202 @@ public sealed class ConversationHistoryAssemblerTests
     }
 
     [Fact]
-    public async Task AssembleAsync_SkipsFoldedHistoryEntries()
+    public async Task AssembleAsync_ReturnsFoldedHistoryEntries_FlaggedAsFolded()
     {
+        // #2936 (AC1, AC3): compaction removes an entry from the LLM context window; it is not a
+        // transcript deletion. Folded rows must be RETURNED (not filtered out of the candidate set)
+        // and must carry an explicit flag so the client can render them collapsed.
         var conversationId = ConversationId.From("c_folded");
         var sessions = new InMemorySessionStore();
         var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
         session.Session.ConversationId = conversationId;
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "pre-compaction", Timestamp = Ts(0), IsHistory = true });
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "live", Timestamp = Ts(1) });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        var result = await assembler.AssembleAsync(conversationId, limit: 50, offset: 0);
+
+        result.ShouldNotBeNull();
+        result!.TotalCount.ShouldBe(2);
+        var folded = result.Entries.Single(e => e.Content == "pre-compaction");
+        folded.IsFolded.ShouldBeTrue();
+        folded.Kind.ShouldBe("message");
+        result.Entries.Single(e => e.Content == "live").IsFolded.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task AssembleAsync_TotalCount_EqualsUnfilteredNonNoReplyTotal_WhenFolded()
+    {
+        // #2936 AC7: the regression guard. Before the fix the assembler dropped folded rows before
+        // paging, so 96.6% of a real compacted transcript was not even a paging candidate. The
+        // assembled count must now equal the unfiltered non-NO_REPLY, non-sentinel total.
+        var conversationId = ConversationId.From("c_folded_total");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+
+        for (var i = 0; i < 200; i++)
+            session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = $"old-{i}", Timestamp = Ts(i), IsHistory = true });
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "summary", Timestamp = Ts(200), IsCompactionSummary = true });
+        for (var i = 0; i < 10; i++)
+            session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = $"new-{i}", Timestamp = Ts(201 + i) });
+        // Genuinely non-content rows that must STILL be dropped (AC4).
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "NO_REPLY", Timestamp = Ts(400) });
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "sentinel", Timestamp = Ts(401), IsCrashSentinel = true });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        var result = await assembler.AssembleAsync(conversationId, limit: 50, offset: 0);
+
+        result.ShouldNotBeNull();
+        // 200 folded + 1 summary + 10 live == 211. NO_REPLY and the crash sentinel stay excluded.
+        result!.TotalCount.ShouldBe(211);
+        result.Entries.ShouldNotContain(e => e.Content == "NO_REPLY");
+        result.Entries.ShouldNotContain(e => e.Content == "sentinel");
+    }
+
+    [Fact]
+    public async Task AssembleAsync_FoldedCompactionSummary_StillEmittedAsCompactionMarker()
+    {
+        // #2936 AC4: a superseded compaction summary is itself IsHistory = true. It must still be
+        // projected with Kind = "compaction" (not as an ordinary message) and flagged folded.
+        var conversationId = ConversationId.From("c_folded_summary");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "older summary", Timestamp = Ts(0), IsCompactionSummary = true, IsHistory = true });
+        session.AddEntry(new SessionEntry { Role = MessageRole.System, Content = "current summary", Timestamp = Ts(1), IsCompactionSummary = true });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        var result = await assembler.AssembleAsync(conversationId, limit: 50, offset: 0);
+
+        result.ShouldNotBeNull();
+        result!.Entries.Count.ShouldBe(2);
+        result.Entries.ShouldAllBe(e => e.Kind == "compaction" && e.Reason == "compaction");
+        result.Entries.Single(e => e.Content == "older summary").IsFolded.ShouldBeTrue();
+        result.Entries.Single(e => e.Content == "current summary").IsFolded.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task AssembleAsync_ExpandsContiguousFoldedRun_IntoASinglePage()
+    {
+        // #2936 AC6: paging cost. At a 20-row page a 2,736-row compacted transcript is ~137
+        // sequential round trips. When a page lands inside a contiguous folded run the assembler
+        // extends it backwards over the rest of the run so the client gets the collapsed block in
+        // one response rather than walking it 20 rows at a time.
+        var conversationId = ConversationId.From("c_folded_run");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+
+        for (var i = 0; i < 300; i++)
+            session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = $"old-{i}", Timestamp = Ts(i), IsHistory = true });
+        for (var i = 0; i < 10; i++)
+            session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = $"new-{i}", Timestamp = Ts(300 + i) });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        // First page: the 10 live rows plus the 10 newest folded rows -- the page boundary lands
+        // inside the folded run, so the whole remaining run comes back with it.
+        var page = await assembler.AssembleAsync(conversationId, limit: 20, offset: 0);
+
+        page.ShouldNotBeNull();
+        page!.TotalCount.ShouldBe(310);
+        // The entire 300-row folded run is delivered in this one response instead of 15 more trips.
+        page.Entries.Count.ShouldBe(310);
+        page.Entries[0].Content.ShouldBe("old-0");
+        page.Entries[^1].Content.ShouldBe("new-9");
+        // One request reaches the start of the transcript -- far under the ~137 the bug implied.
+        page.Entries.Count.ShouldBe(page.TotalCount);
+    }
+
+    [Fact]
+    public async Task AssembleAsync_FoldedRunExpansion_IsBoundedByMaxFoldedPageEntries()
+    {
+        // #2936 AC6: the expansion must not let one request materialise an unbounded transcript.
+        var conversationId = ConversationId.From("c_folded_bounded");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+
+        const int foldedCount = 2000;
+        for (var i = 0; i < foldedCount; i++)
+            session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = $"old-{i}", Timestamp = Ts(i), IsHistory = true });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        var page = await assembler.AssembleAsync(conversationId, limit: 20, offset: 0);
+
+        page.ShouldNotBeNull();
+        page!.TotalCount.ShouldBe(foldedCount);
+        page.Entries.Count.ShouldBe(ConversationHistoryAssembler.MaxFoldedPageEntries);
+        // Still anchored at the newest end, so the client's offset arithmetic is unchanged.
+        page.Entries[^1].Content.ShouldBe($"old-{foldedCount - 1}");
+        page.Entries[0].Content.ShouldBe($"old-{foldedCount - ConversationHistoryAssembler.MaxFoldedPageEntries}");
+    }
+
+    [Fact]
+    public async Task AssembleAsync_SequentialPaging_ReachesStartOfCompactedTranscript()
+    {
+        // #2936 AC2 + AC6 end to end: walking backwards with offset += returned-count must reach
+        // the very first row of a multi-thousand-row compacted transcript, and must do so in a
+        // small number of requests rather than the ~137 a fixed 20-row page implies.
+        var conversationId = ConversationId.From("c_walk");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+
+        const int total = 2736;
+        for (var i = 0; i < total - 10; i++)
+            session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = $"row-{i}", Timestamp = Ts(i), IsHistory = true });
+        for (var i = total - 10; i < total; i++)
+            session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = $"row-{i}", Timestamp = Ts(i) });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+
+        var fetched = 0;
+        var requests = 0;
+        string? oldestSeen = null;
+        while (true)
+        {
+            var page = await assembler.AssembleAsync(conversationId, limit: 20, offset: fetched);
+            requests++;
+            if (page!.Entries.Count == 0)
+                break;
+
+            oldestSeen = page.Entries[0].Content;
+            fetched += page.Entries.Count;
+            if (fetched >= page.TotalCount)
+                break;
+
+            requests.ShouldBeLessThan(50, "paging must not degenerate into a ~137-request walk");
+        }
+
+        fetched.ShouldBe(total);
+        oldestSeen.ShouldBe("row-0");
+        // 2,736 rows at a fixed 20-row page would be 137 requests; the folded-run expansion caps it.
+        requests.ShouldBeLessThan(20);
+    }
+
+    [Fact]
+    public async Task AssembleAsync_SkipsCrashSentinelEntries()
+    {
+        // #2936 AC4: crash sentinels are genuinely non-content recovery placeholders and stay out of
+        // the transcript even though folded rows no longer do.
+        var conversationId = ConversationId.From("c_sentinel");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-1"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
         session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "kept", Timestamp = Ts(0) });
-        // Folded entry superseded by a compaction summary -- must be skipped.
-        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "folded-away", Timestamp = Ts(1), IsHistory = true });
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "sentinel", Timestamp = Ts(1), IsCrashSentinel = true });
         await sessions.SaveAsync(session);
 
         var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
@@ -148,7 +411,6 @@ public sealed class ConversationHistoryAssemblerTests
 
         result.ShouldNotBeNull();
         result!.TotalCount.ShouldBe(1);
-        result.Entries.ShouldNotContain(e => e.Content == "folded-away");
         result.Entries[0].Content.ShouldBe("kept");
     }
 
@@ -282,6 +544,63 @@ public sealed class ConversationHistoryAssemblerTests
         result.ShouldNotBeNull();
         result!.TotalCount.ShouldBe(0);
         result.Entries.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task AssembleAsync_ProjectsTypedMessageKind_ForCompletionAndResponseAndOrdinary()
+    {
+        // #2149: the conversation history projection must expose the orthogonal typed kind so
+        // replay recovers the message / subagent-completion / subagent-response distinction; a
+        // legacy/unstamped entry projects as "message".
+        var conversationId = ConversationId.From("c_kind");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-kind"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "completion", Timestamp = Ts(0), Kind = MessageKind.SubAgentCompletion });
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "parent reply", Timestamp = Ts(1), Kind = MessageKind.SubAgentResponse });
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "ordinary", Timestamp = Ts(2) });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+        var result = await assembler.AssembleAsync(conversationId, limit: 50, offset: 0);
+
+        result.ShouldNotBeNull();
+        var byContent = result!.Entries.Where(e => e.Content != null).ToDictionary(e => e.Content!);
+        // The history-envelope Kind stays "message" (not "boundary"); the orthogonal presentation
+        // kind is carried on the new MessageKind field so replay recovers it.
+        byContent["completion"].Kind.ShouldBe("message");
+        byContent["completion"].MessageKind.ShouldBe("subagent-completion");
+        byContent["parent reply"].MessageKind.ShouldBe("subagent-response");
+        // Role stays the LLM role, orthogonal to the presentation kind.
+        byContent["parent reply"].Role.ShouldBe("assistant");
+        byContent["ordinary"].MessageKind.ShouldBe("message");
+    }
+
+    [Fact]
+    public async Task AssembleAsync_ChannelProjection_CanSuppressSubAgentResponse_ByTypedKind()
+    {
+        // #2149: a channel/UI projection must be able to decide to suppress or specially render a
+        // subagent-response using the typed kind ALONE - never by parsing role, ids, or text.
+        var conversationId = ConversationId.From("c_suppress");
+        var sessions = new InMemorySessionStore();
+        var session = await sessions.GetOrCreateAsync(SessionId.From("s-suppress"), AgentId.From("quill"));
+        session.Session.ConversationId = conversationId;
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "hi", Timestamp = Ts(0) });
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "internal parent reply", Timestamp = Ts(1), Kind = MessageKind.SubAgentResponse });
+        await sessions.SaveAsync(session);
+
+        var assembler = await NewAssemblerAsync(conversationId, "quill", sessions);
+        var result = await assembler.AssembleAsync(conversationId, limit: 50, offset: 0);
+
+        result.ShouldNotBeNull();
+        // Emulate a channel projection choosing to hide subagent-response entries using ONLY the
+        // typed kind. It must be able to do so without inspecting role, sender/session ids, or text.
+        var visible = result!.Entries
+            .Where(e => e.MessageKind != MessageKind.SubAgentResponse.Value)
+            .ToList();
+
+        visible.ShouldContain(e => e.Content == "hi");
+        visible.ShouldNotContain(e => e.Content == "internal parent reply");
     }
 
     private static DateTimeOffset Ts(int minutes) => new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero).AddMinutes(minutes);

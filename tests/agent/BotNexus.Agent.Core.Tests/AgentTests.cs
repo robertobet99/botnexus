@@ -1,6 +1,10 @@
 using BotNexus.Agent.Core.Configuration;
+using BotNexus.Agent.Core.ExtensionPoints.Messages;
+using BotNexus.Agent.Core.ExtensionPoints.RunCompletion;
+using BotNexus.Agent.Core.Loop;
 using BotNexus.Agent.Core.Tests.TestUtils;
 using BotNexus.Agent.Core.Types;
+using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Streaming;
 using System.Reflection;
 
@@ -58,6 +62,103 @@ public class AgentTests
         agent.State.StreamingMessage.ShouldBeNull();
         agent.State.PendingToolCalls.ShouldBeEmpty();
         agent.Status.ShouldBe(AgentStatus.Idle);
+    }
+
+    [Fact]
+    public async Task PromptAsync_WhenCredentialResolverReturnsBlank_PreservesDeclaredSentinelInProviderOptions()
+    {
+        SimpleStreamOptions? capturedOptions = null;
+        const string api = "declared-blank-api";
+        using var provider = TestHelpers.RegisterProvider(
+            new TestApiProvider(
+                api,
+                simpleStreamFactory: (_, _, options) =>
+                {
+                    capturedOptions = options;
+                    return TestStreamFactory.CreateTextResponse("assistant");
+                }));
+        var options = TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel(api)) with
+        {
+            ProviderExecutionOptionsProvider = (_, _) => Task.FromResult<ProviderExecutionOptions?>(new ProviderExecutionOptions { ApiKey = string.Empty })
+        };
+        var agent = new BotNexus.Agent.Core.Agent(options);
+
+        await agent.PromptAsync("hello");
+
+        capturedOptions.ShouldNotBeNull();
+        capturedOptions.ApiKey.ShouldBe(string.Empty);
+    }
+
+    [Fact]
+    public async Task PromptWithoutToolsAsync_ToolShapedOutput_ExecutesExactlyOneProviderTurnWithoutLoopServices()
+    {
+        var providerCalls = 0;
+        var steeringPolls = 0;
+        var followUpPolls = 0;
+        var compactions = 0;
+        var completionEvaluations = 0;
+        using var provider = TestHelpers.RegisterProvider(
+            new TestApiProvider(
+                "single-turn-api",
+                simpleStreamFactory: (_, context, _) =>
+                {
+                    Interlocked.Increment(ref providerCalls);
+                    context.Tools.ShouldBeEmpty();
+                    return TestStreamFactory.CreateToolCallResponse(
+                        ("call-1", "calculate", new Dictionary<string, object?> { ["expression"] = "1+1" }));
+                }));
+        var initial = new AgentInitialState(
+            SystemPrompt: "Be concise",
+            Model: TestHelpers.CreateTestModel("single-turn-api"),
+            Tools: [new CalculateTool()],
+            Messages: []);
+        var options = TestHelpers.CreateTestOptions(initial, initial.Model) with
+        {
+            SteeringMessageProvider = _ =>
+            {
+                Interlocked.Increment(ref steeringPolls);
+                return Task.FromResult<IReadOnlyList<AgentMessage>>([new UserMessage("steer")]);
+            },
+            FollowUpMessageProvider = _ =>
+            {
+                Interlocked.Increment(ref followUpPolls);
+                return Task.FromResult<IReadOnlyList<AgentMessage>>([new UserMessage("follow up")]);
+            },
+            ContextCompactionService = _ =>
+            {
+                Interlocked.Increment(ref compactions);
+                return Task.FromResult<AgentContext?>(null);
+            },
+            RunCompletionPolicy = _ =>
+            {
+                Interlocked.Increment(ref completionEvaluations);
+                return Task.FromResult(RunCompletionDecision.Continue([], "continue"));
+            }
+        };
+        var agent = new BotNexus.Agent.Core.Agent(options);
+        agent.Steer(new UserMessage("queued steering"));
+        agent.FollowUp(new UserMessage("queued follow-up"));
+        var toolStarts = 0;
+        using var subscription = agent.Subscribe((@event, _) =>
+        {
+            if (@event is ToolExecutionStartEvent)
+                Interlocked.Increment(ref toolStarts);
+            return Task.CompletedTask;
+        });
+
+        var result = await agent.PromptWithoutToolsAsync("finalize");
+
+        providerCalls.ShouldBe(1);
+        steeringPolls.ShouldBe(0);
+        followUpPolls.ShouldBe(0);
+        compactions.ShouldBe(0);
+        completionEvaluations.ShouldBe(0);
+        toolStarts.ShouldBe(0);
+        // The provider emitted a tool-shaped response, but the strict finalization path must not
+        // dispatch it or enter a second model turn. The handle-level response projection is covered
+        // separately; this core test owns the one-call/no-loop/no-tool contract.
+        result.OfType<ToolResultAgentMessage>().ShouldBeEmpty();
+        agent.HasQueuedMessages.ShouldBeTrue();
     }
 
     [Fact]
@@ -186,6 +287,52 @@ public class AgentTests
     }
 
     [Fact]
+    public async Task PromptAsync_WhenProviderReturnsSensitive_CompletesNormallyWithoutToolDispatch()
+    {
+        var message = new BotNexus.Agent.Providers.Core.Models.AssistantMessage(
+            Content: [new BotNexus.Agent.Providers.Core.Models.TextContent("safe prefix")],
+            Api: "test-api",
+            Provider: "test-provider",
+            ModelId: "test-model",
+            Usage: BotNexus.Agent.Providers.Core.Models.Usage.Empty(),
+            StopReason: BotNexus.Agent.Providers.Core.Models.StopReason.Sensitive,
+            ErrorMessage: "Content filtered by provider",
+            ResponseId: "resp-sensitive",
+            Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        using var provider = TestHelpers.RegisterProvider(
+            new TestApiProvider(
+                "test-api",
+                simpleStreamFactory: (_, _, _) =>
+                {
+                    var stream = new LlmStream();
+                    stream.Push(new StartEvent(message));
+                    stream.Push(new DoneEvent(BotNexus.Agent.Providers.Core.Models.StopReason.Sensitive, message));
+                    stream.End(message);
+                    return stream;
+                }));
+        var agent = new BotNexus.Agent.Core.Agent(
+            TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel("test-api")));
+        var events = new List<AgentEvent>();
+        using var subscription = agent.Subscribe((@event, _) =>
+        {
+            events.Add(@event);
+            return Task.CompletedTask;
+        });
+
+        var runResult = await agent.PromptAsync("filter this");
+
+        runResult.OfType<UserMessage>().ShouldHaveSingleItem().Content.ShouldBe("filter this");
+        var completed = runResult.OfType<AssistantAgentMessage>().ShouldHaveSingleItem();
+        completed.FinishReason.ShouldBe(BotNexus.Agent.Providers.Core.Models.StopReason.Sensitive);
+        completed.ErrorMessage.ShouldBe("Content filtered by provider");
+        events.OfType<ToolExecutionStartEvent>().ShouldBeEmpty();
+        events.OfType<TurnEndEvent>().ShouldHaveSingleItem().Message.FinishReason
+            .ShouldBe(BotNexus.Agent.Providers.Core.Models.StopReason.Sensitive);
+        events.OfType<AgentEndEvent>().ShouldHaveSingleItem();
+        agent.State.ErrorMessage.ShouldBe("Content filtered by provider");
+    }
+
+    [Fact]
     public async Task PromptAsync_WhenRunFails_AddsSyntheticErrorAssistantMessageAndEmitsAgentEnd()
     {
         using var provider = TestHelpers.RegisterProvider(
@@ -303,7 +450,7 @@ public class AgentTests
         var steeringPollCount = 0;
         var options = TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel("test-api")) with
         {
-            GetSteeringMessages = _ => Task.FromResult<IReadOnlyList<AgentMessage>>(
+            SteeringMessageProvider = _ => Task.FromResult<IReadOnlyList<AgentMessage>>(
                 Interlocked.Increment(ref steeringPollCount) == 1
                     ? [new UserMessage("steer from delegate")]
                     : [])
@@ -366,7 +513,7 @@ public class AgentTests
         var options = TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel("test-api"))
             with
             {
-                OnDiagnostic = message => diagnostics.Add(message)
+                DiagnosticObserver = message => diagnostics.Add(message)
             };
         var agent = new BotNexus.Agent.Core.Agent(options);
         using var _ = agent.Subscribe((@event, _) =>
@@ -394,7 +541,7 @@ public class AgentTests
         var options = TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel("test-api"))
             with
             {
-                OnDiagnostic = message => diagnostics.Add(message)
+                DiagnosticObserver = message => diagnostics.Add(message)
             };
         var agent = new BotNexus.Agent.Core.Agent(options);
         using var _ = agent.Subscribe((@event, _) =>
@@ -417,13 +564,13 @@ public class AgentTests
     }
 
     [Fact]
-    public async Task PromptAsync_WhenTransformContextIsNull_DoesNotCrash()
+    public async Task PromptAsync_WhenAgentContextTransformerIsNull_DoesNotCrash()
     {
         using var provider = RegisterDefaultProvider();
         var options = TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel("test-api"))
             with
             {
-                TransformContext = null
+                AgentContextTransformer = null
             };
         var agent = new BotNexus.Agent.Core.Agent(options);
 
@@ -433,13 +580,13 @@ public class AgentTests
     }
 
     [Fact]
-    public async Task PromptAsync_WhenConvertToLlmIsNull_UsesDefaultMessageConverter()
+    public async Task PromptAsync_WhenProviderMessageTransformerIsNull_UsesDefaultProviderMessageTransformer()
     {
         using var provider = RegisterDefaultProvider();
         var options = TestHelpers.CreateTestOptions(model: TestHelpers.CreateTestModel("test-api"))
             with
             {
-                ConvertToLlm = null
+                ProviderMessageTransformer = null
             };
         var agent = new BotNexus.Agent.Core.Agent(options);
 

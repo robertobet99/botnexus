@@ -14,7 +14,7 @@ namespace BotNexus.Agent.Providers.Copilot;
 public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
 {
     /// <inheritdoc/>
-    public string ProviderKey => "github-copilot";
+    public string ProviderKey { get; }
 
     private static readonly IReadOnlyDictionary<string, string> CopilotHeaders = new Dictionary<string, string>
     {
@@ -51,14 +51,18 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
     /// Returns (null, null) if credentials are unavailable.
     /// </param>
     /// <param name="logger">Logger.</param>
+    /// <param name="providerKey">Provider-instance key used for discovery and model registration.</param>
     public CopilotModelDiscoveryProvider(
         CopilotDiscoveryClient discoveryClient,
         Func<CancellationToken, Task<(string? SessionToken, string? Endpoint)>> credentialResolver,
-        ILogger<CopilotModelDiscoveryProvider> logger)
+        ILogger<CopilotModelDiscoveryProvider> logger,
+        string providerKey = "github-copilot")
     {
         _discoveryClient = discoveryClient ?? throw new ArgumentNullException(nameof(discoveryClient));
         _credentialResolver = credentialResolver ?? throw new ArgumentNullException(nameof(credentialResolver));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentException.ThrowIfNullOrWhiteSpace(providerKey);
+        ProviderKey = providerKey;
     }
 
     /// <inheritdoc/>
@@ -92,14 +96,27 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
             return null;
         }
 
-        var models = new List<LlmModel>(response.Data.Count);
+        return ProjectModels(response, endpoint, ProviderKey);
+    }
 
-        foreach (var info in response.Data)
+    /// <summary>
+    /// Projects one Copilot discovery response into the effective BotNexus model descriptors used
+    /// by both gateway registration and diagnostics. Keeping this conversion in one place prevents
+    /// the listing and invocation paths from disagreeing about endpoint routing or capabilities.
+    /// </summary>
+    public static IReadOnlyList<LlmModel> ProjectModels(
+        CopilotModelsResponse response,
+        string? baseUrl,
+        string providerKey = "github-copilot")
+    {
+        ArgumentNullException.ThrowIfNull(response);
+        ArgumentException.ThrowIfNullOrWhiteSpace(providerKey);
+
+        var entries = response.Data ?? [];
+        var models = new List<LlmModel>(entries.Count);
+        foreach (var info in entries)
         {
-            if (string.IsNullOrWhiteSpace(info.Id))
-                continue;
-
-            var model = MapToLlmModel(info, endpoint);
+            var model = MapToLlmModel(info, baseUrl, providerKey);
             if (model is not null)
                 models.Add(model);
         }
@@ -124,7 +141,15 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
     /// <param name="info">The Copilot model info.</param>
     /// <param name="baseUrl">The resolved API host to stamp onto the model.</param>
     public static LlmModel? MapToLlmModel(CopilotModelInfo info, string? baseUrl)
+        => MapToLlmModel(info, baseUrl, "github-copilot");
+
+    /// <summary>
+    /// Maps a discovered Copilot model beneath the selected provider-instance identity while
+    /// preserving the wire API selected from the advertised model capabilities.
+    /// </summary>
+    public static LlmModel? MapToLlmModel(CopilotModelInfo info, string? baseUrl, string providerKey)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(providerKey);
         if (string.IsNullOrWhiteSpace(info.Id))
             return null;
 
@@ -139,18 +164,25 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
         var family = info.Capabilities?.Family ?? string.Empty;
         var vendor = info.Vendor ?? string.Empty;
 
-        var api = ResolveApiFormat(id, family, vendor, info.SupportedEndpoints);
+        var api = ResolveAdvertisedApiFormat(info.SupportedEndpoints)
+            ?? (info.SupportedEndpoints is { Count: > 0 }
+                ? null
+                : ResolveApiFormatFromName(id, family, vendor));
+        if (api is null)
+            return null;
+
         var reasoning = IsReasoningModel(id, family);
         var supportsExtraHigh = SupportsExtraHighThinking(id, family);
         var input = ResolveInputModalities(info);
         var (contextWindow, maxTokens) = ResolveLimits(info);
+        var extendedContext = ResolveExtendedContext(info, id);
         var compat = api == "github-copilot-completions" ? CopilotCompletionsCompat : null;
 
         var model = new LlmModel(
             Id: id,
             Name: name,
             Api: api,
-            Provider: "github-copilot",
+            Provider: providerKey,
             BaseUrl: resolvedBaseUrl,
             Reasoning: reasoning,
             Input: input,
@@ -158,6 +190,7 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
             ContextWindow: contextWindow,
             MaxTokens: maxTokens,
             SupportsExtraHighThinking: supportsExtraHigh,
+            SupportsExtendedContextWindow: extendedContext,
             Headers: CopilotHeaders,
             Compat: compat);
         CopilotResolvedModelDescriptors.Set(model, info.SupportedEndpoints);
@@ -178,19 +211,13 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
     /// <param name="supportedEndpoints">
     /// The endpoints Copilot advertises for this model, when present. Preferred over the name heuristic.
     /// </param>
-    public static string ResolveApiFormat(string id, string family, string vendor, IReadOnlyList<string>? supportedEndpoints)
+    public static string? ResolveApiFormat(string id, string family, string vendor, IReadOnlyList<string>? supportedEndpoints)
     {
-        // Prefer the advertised endpoint list when Copilot supplies one (#1762).
+        // An advertised endpoint list is authoritative in both directions. If Copilot names only
+        // contracts BotNexus cannot invoke, the model is not projected as invokable; guessing from
+        // its name would make diagnostics promise a route the provider did not advertise.
         if (supportedEndpoints is { Count: > 0 })
-        {
-            if (ContainsEndpoint(supportedEndpoints, "/v1/messages"))
-                return "github-copilot-messages";
-            if (ContainsEndpoint(supportedEndpoints, "/responses"))
-                return "github-copilot-responses";
-            if (ContainsEndpoint(supportedEndpoints, "/chat/completions"))
-                return "github-copilot-completions";
-            // An advertised-but-unrecognised list falls through to the name heuristic below.
-        }
+            return ResolveAdvertisedApiFormat(supportedEndpoints);
 
         return ResolveApiFormatFromName(id, family, vendor);
     }
@@ -203,12 +230,25 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
     /// <param name="family">The model family (from capabilities).</param>
     /// <param name="vendor">The model vendor.</param>
     public static string ResolveApiFormat(string id, string family, string vendor)
-        => ResolveApiFormat(id, family, vendor, supportedEndpoints: null);
+        => ResolveApiFormatFromName(id, family, vendor);
 
     /// <summary>
     /// The legacy model-name heuristic. Used only when Copilot does not advertise a supported
     /// endpoint list for the model (#1762 fallback).
     /// </summary>
+    private static string? ResolveAdvertisedApiFormat(IReadOnlyList<string>? supportedEndpoints)
+    {
+        if (supportedEndpoints is not { Count: > 0 })
+            return null;
+        if (ContainsEndpoint(supportedEndpoints, "/v1/messages"))
+            return "github-copilot-messages";
+        if (ContainsEndpoint(supportedEndpoints, "/responses"))
+            return "github-copilot-responses";
+        if (ContainsEndpoint(supportedEndpoints, "/chat/completions"))
+            return "github-copilot-completions";
+        return null;
+    }
+
     private static string ResolveApiFormatFromName(string id, string family, string vendor)
     {
         // Claude models use the messages API
@@ -218,6 +258,7 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
 
         // GPT-5+ and o-series use the responses API
         if (id.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("gpt-6", StringComparison.OrdinalIgnoreCase) ||
             id.StartsWith("o3", StringComparison.OrdinalIgnoreCase) ||
             id.StartsWith("o4", StringComparison.OrdinalIgnoreCase))
             return "github-copilot-responses";
@@ -243,61 +284,80 @@ public sealed class CopilotModelDiscoveryProvider : IModelDiscoveryProvider
     /// <summary>
     /// Determines if a model supports reasoning/thinking based on family and id.
     /// </summary>
-    public static bool IsReasoningModel(string id, string family)
-    {
-        // Claude 4+ and Sonnet 4.5+ support thinking
-        if (id.StartsWith("claude-opus-4", StringComparison.OrdinalIgnoreCase) ||
-            id.StartsWith("claude-sonnet-4", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // GPT-5+ supports reasoning
-        if (id.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // o-series models
-        if (id.StartsWith("o3", StringComparison.OrdinalIgnoreCase) ||
-            id.StartsWith("o4", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // Gemini 3+
-        if (id.StartsWith("gemini-3", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // Grok code
-        if (id.StartsWith("grok-code", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        return false;
-    }
+    /// <param name="id">The discovered model id.</param>
+    /// <param name="family">The advertised family (unused; the id carries the version).</param>
+    /// <returns>True when the model supports reasoning.</returns>
+    public static bool IsReasoningModel(string id, string family) =>
+        // #2374: one shared parsed family+version gate, so a discovered model and a config-declared
+        // model of the same generation can never disagree.
+        ModelCapabilityHeuristics.IsReasoningModel(id);
 
     /// <summary>
     /// Determines if a model supports extra-high thinking budget.
     /// </summary>
-    public static bool SupportsExtraHighThinking(string id, string family)
-    {
-        // Claude Opus 4.6+ supports extra high
-        if (id.StartsWith("claude-opus-4.", StringComparison.OrdinalIgnoreCase))
-        {
-            var versionPart = id.AsSpan()["claude-opus-4.".Length..];
-            if (versionPart.Length > 0 && char.IsDigit(versionPart[0]) && versionPart[0] >= '6')
-                return true;
-        }
-
-        // GPT 5.2+
-        if (id.StartsWith("gpt-5.", StringComparison.OrdinalIgnoreCase))
-        {
-            var versionPart = id.AsSpan()["gpt-5.".Length..];
-            if (versionPart.Length > 0 && char.IsDigit(versionPart[0]) && versionPart[0] >= '2')
-                return true;
-        }
-
-        return false;
-    }
+    /// <param name="id">The discovered model id.</param>
+    /// <param name="family">The advertised family (unused; the id carries the version).</param>
+    /// <returns>True when the model supports the ExtraHigh / Max thinking tiers.</returns>
+    public static bool SupportsExtraHighThinking(string id, string family) =>
+        // #2374: the old character-wise prefix parse could not see "claude-opus-5" at all and
+        // mis-ordered "claude-opus-4.50". The shared parser compares numerically.
+        ModelCapabilityHeuristics.SupportsExtraHighThinking(id);
 
     private static IReadOnlyList<string> ResolveInputModalities(CopilotModelInfo info)
     {
         var supportsVision = info.Capabilities?.Supports?.Vision ?? false;
         return supportsVision ? ["text", "image"] : ["text"];
+    }
+
+    /// <summary>
+    /// The context-window size above which a discovered model is treated as extended-context capable
+    /// when Copilot states no <c>long_context</c> capability. Mirrors
+    /// <c>ModelRegistry.StandardContextWindow</c>: a model whose advertised prompt budget already
+    /// exceeds the standard 200K ceiling is by definition serving more than one tier.
+    /// </summary>
+    private const int StandardContextWindow = 200_000;
+
+    /// <summary>
+    /// Resolves <see cref="LlmModel.SupportsExtendedContextWindow"/> for a discovered model (#3364).
+    /// Before this existed the flag was never set at all on the discovery path, so it took the record
+    /// default of <see langword="false"/> and <c>ModelRegistry.GetSupportedContextSizes</c> returned a
+    /// single-element list for EVERY Copilot model - which is what rendered the portal's context-window
+    /// picker unselectable.
+    /// <para>
+    /// Precedence is deliberate and is what keeps acceptance criterion 4 ("must not offer a 1M tier on
+    /// a model that would reject it") true:
+    /// </para>
+    /// <list type="number">
+    /// <item>An explicit <c>capabilities.supports.long_context</c> wins in BOTH directions - a stated
+    /// <see langword="false"/> pins the model to one tier even for a family the heuristic would widen.</item>
+    /// <item>Otherwise an advertised <c>max_prompt_tokens</c> above the standard 200K ceiling is itself
+    /// proof of an extended window.</item>
+    /// <item>Otherwise the shared family heuristic decides, so a discovered model and a config-declared
+    /// model of the same generation can never disagree.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="info">The discovered model info.</param>
+    /// <param name="id">The resolved model id.</param>
+    /// <returns>True when the model should expose the selectable extended context tier.</returns>
+    public static bool ResolveExtendedContext(CopilotModelInfo info, string id)
+    {
+        ArgumentNullException.ThrowIfNull(info);
+
+        // 1. An explicit provider statement is authoritative in both directions.
+        var declared = info.Capabilities?.Supports?.LongContext;
+
+        // 2. Payload silent: an advertised prompt budget beyond the standard ceiling proves it.
+        if (declared is null &&
+            info.Capabilities?.Limits is { } declaredLimits &&
+            declaredLimits.TryGetValue("max_prompt_tokens", out var declaredPromptEl) &&
+            declaredPromptEl.TryGetInt32(out var declaredPromptTokens) &&
+            declaredPromptTokens > StandardContextWindow)
+        {
+            declared = true;
+        }
+
+        // 3. Fall back to the shared family heuristic when the payload says nothing either way.
+        return DynamicModelCapabilities.Infer(id, declaredExtendedContext: declared).SupportsExtendedContextWindow;
     }
 
     private static (int ContextWindow, int MaxTokens) ResolveLimits(CopilotModelInfo info)

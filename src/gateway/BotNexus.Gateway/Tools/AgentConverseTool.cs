@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
@@ -7,6 +8,10 @@ using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Configuration;
 using BotNexus.Agent.Providers.Core.Models;
+using BotNexus.Gateway.Abstractions.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 
 namespace BotNexus.Gateway.Tools;
 
@@ -15,12 +20,28 @@ public sealed class AgentConverseTool(
     ISessionStore sessionStore,
     AgentId initiatorAgentId,
     SessionId sessionId,
-    AgentExchangeOptions? exchangeOptions = null) : IAgentTool
+    AgentExchangeOptions? exchangeOptions = null,
+    IAgentRegistry? agentRegistry = null,
+    IAgentSupervisor? agentSupervisor = null,
+    ILogger? logger = null) : IAgentTool
 {
     private const int DefaultTimeoutSeconds = 600;
     private const int MaxTimeoutSeconds = 1800;
 
+    /// <summary>
+    /// Grace period added to this tool's own linked backstop timer so the turn engine's
+    /// engine-owned deadline expires first (#3515).
+    /// </summary>
+    /// <remarks>
+    /// The backstop is linked from the caller's token, so if it wins the race the resulting
+    /// cancellation is indistinguishable from caller cancellation and the exchange session is left
+    /// unsealed - the defect #3515 fixes. Five seconds is generous relative to the scheduling jitter
+    /// between two timers and negligible relative to the 600s default budget.
+    /// </remarks>
+    private static readonly TimeSpan DeadlineBackstopBuffer = TimeSpan.FromSeconds(5);
+
     private readonly AgentExchangeOptions _exchangeOptions = exchangeOptions ?? new AgentExchangeOptions();
+    private readonly ILogger _logger = logger ?? NullLogger.Instance;
 
     public string Name => "agent_converse";
     public string Label => "Agent Converse";
@@ -30,6 +51,12 @@ public sealed class AgentConverseTool(
     /// </summary>
     public TimeSpan? DefaultTimeout => TimeSpan.FromSeconds(DefaultTimeoutSeconds);
 
+    /// <summary>
+    /// The per-call <c>timeoutSeconds</c> argument is seconds. Declared explicitly because the
+    /// executor no longer infers a unit from the argument name (issue #2955).
+    /// </summary>
+    public ToolTimeoutArgument? TimeoutArgument => new("timeoutSeconds", ToolTimeoutUnit.Seconds);
+
     public Tool Definition => new(
         Name,
         "Start a conversation with another registered agent. Not every agent is reachable: converse is governed by policy. Call list_agents first and only target an agent whose 'canConverse' is true -- targeting an agent with canConverse=false is a deterministic policy denial that wastes the turn and will never succeed on retry.",
@@ -37,7 +64,7 @@ public sealed class AgentConverseTool(
             {
               "type": "object",
               "properties": {
-                "agentId": { "type": "string", "description": "The target agent's ID. Must be an agent whose 'canConverse' is true in list_agents output; otherwise the call is denied by policy." },
+                "agentId": { "type": "string", "description": "The target agent's ID, or its display name when exactly one registered agent has that name (case-insensitive). An exact ID always wins over a display-name match, and a display name shared by two or more agents is rejected as ambiguous rather than guessed. Must be an agent whose 'canConverse' is true in list_agents output; otherwise the call is denied by policy." },
                 "message": { "type": "string", "description": "Opening message to send." },
                 "objective": { "type": "string", "description": "What you want to achieve." },
                 "timeoutSeconds": {
@@ -90,25 +117,278 @@ public sealed class AgentConverseTool(
             ?? throw new ArgumentException("Missing required argument: message.");
 
         var timeoutSeconds = ReadTimeoutSeconds(arguments);
+        // #3515: the exchange budget is now expressed TWICE, deliberately, and the order matters.
+        //   1. `Deadline` below is data. The turn engine arms its own source from it - one the caller
+        //      cannot cancel - which is what lets it tell "budget expired" apart from "caller pressed
+        //      stop" and seal the session on the former.
+        //   2. `timeoutCts` stays, demoted to a backstop for the frames the engine does not own
+        //      (argument prep below, and anything that escapes the loop).
+        // The backstop is armed with a buffer so the engine's deadline reliably fires FIRST. Without
+        // it the two timers race, the linked token wins often enough to matter, and the exchange then
+        // looks like caller cancellation - the exact ambiguity #3515 exists to remove. Same idiom, and
+        // the same reason, as the +10s safety-cap buffer in ToolExecutor.ResolveEffectiveTimeout.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(timeoutSeconds);
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds) + DeadlineBackstopBuffer);
+        var startedAt = Stopwatch.GetTimestamp();
 
-        var result = await conversationService.ConverseAsync(
-            new AgentExchangeRequest
+        try
+        {
+            var result = await conversationService.ConverseAsync(
+                new AgentExchangeRequest
+                {
+                    InitiatorId = initiatorAgentId,
+                    TargetId = AgentId.From(targetAgentId),
+                    Message = message,
+                    Objective = ReadString(arguments, "objective"),
+                    MaxTurns = Math.Clamp(ReadInt(arguments, "maxTurns", 1), 1, _exchangeOptions.EffectiveMaxTurnsCeiling),
+                    Deadline = deadline,
+                    CallChain = await ResolveCallChainAsync(timeoutCts.Token).ConfigureAwait(false),
+                    // #3176: hand the exchange the delegating thread's address so handoff milestones
+                    // can be reported back into it. Resolution failures are non-fatal - progress is
+                    // observability, and losing it must never cost the caller the exchange itself.
+                    InitiatorSessionId = sessionId,
+                    InitiatorConversationId = await ResolveInitiatorConversationIdAsync(timeoutCts.Token).ConfigureAwait(false)
+                },
+                timeoutCts.Token).ConfigureAwait(false);
+
+            return new AgentToolResult(
+                [
+                    new AgentToolContent(AgentToolContentType.Text, JsonSerializer.Serialize(result, JsonOptions))
+                ]);
+        }
+        catch (OperationCanceledException ex)
+        {
+            // #3577: a cancellation must never reach ToolExecutor's generic
+            // `catch (Exception ex) => ex.Message` handler, because the .NET default text there is
+            // the bare "A task was canceled." - the exact opaque result that issue was filed for.
+            // Everything the caller needs to choose between retrying, waiting and giving up is
+            // knowable here and nowhere further up the stack: the budget, the elapsed time against
+            // it, and which token actually fired.
+            //
+            // #3698: this catch was previously guarded by `when (!cancellationToken.IsCancellation
+            // Requested)`, which excluded the caller's own ambient turn token by construction and so
+            // let the majority class of real cancellations (56% of the measured corpus - parallel
+            // fan-outs abandoned when their turn ended) fall through to that generic handler. The
+            // guard's intent was right - an abandoned turn is not a peer failure and must not be
+            // reported as one - but "not a peer failure" was implemented as "no report at all".
+            // A third cause now covers it, so no cancellation path is unlabelled.
+            //
+            // The ambient token is tested FIRST because timeoutCts is linked to it: once the caller
+            // aborts, the linked source also reports cancellation, and testing it first would
+            // misattribute an abandoned turn as an exhausted budget. The typed engine deadline
+            // also proves timeout before the later backstop fires; elapsed time is not evidence.
+            var elapsed = Stopwatch.GetElapsedTime(startedAt);
+            var report = cancellationToken.IsCancellationRequested
+                ? BuildCallerAbortedReport(targetAgentId, timeoutSeconds, elapsed)
+                : ex is AgentExchangeDeadlineExceededException || timeoutCts.IsCancellationRequested
+                    ? BuildTimeoutReport(targetAgentId, timeoutSeconds, elapsed)
+                    : BuildTargetUnavailableReport(targetAgentId, timeoutSeconds, elapsed);
+
+            // Only observed local progress is authoritative. No evidence is an honest unknown,
+            // not proof that dispatch never happened. Never encourage replay of possible mutations.
+            var evidence = (ex as AgentExchangeCancelledException)?.Evidence
+                ?? ex.Data[nameof(AgentExchangeCancellationEvidence)] as AgentExchangeCancellationEvidence;
+            report = report with
             {
-                InitiatorId = initiatorAgentId,
-                TargetId = AgentId.From(targetAgentId),
-                Message = message,
-                Objective = ReadString(arguments, "objective"),
-                MaxTurns = Math.Clamp(ReadInt(arguments, "maxTurns", 1), 1, _exchangeOptions.EffectiveMaxTurnsCeiling),
-                CallChain = await ResolveCallChainAsync(timeoutCts.Token).ConfigureAwait(false)
-            },
-            timeoutCts.Token).ConfigureAwait(false);
+                Evidence = evidence,
+                RetryAdvised = evidence?.Phase == "neverDispatched" && report.RetryAdvised,
+                Message = report.Message + " Before retrying, reconcile retained tool receipts and side effects " +
+                    "in the child session; missing results do not prove that a mutation did not happen."
+            };
+            LogCancellation(toolCallId, targetAgentId, report);
+            return new AgentToolResult(
+                [
+                    new AgentToolContent(AgentToolContentType.Text, JsonSerializer.Serialize(report, JsonOptions))
+                ]);
+        }
+    }
 
-        return new AgentToolResult(
-            [
-                new AgentToolContent(AgentToolContentType.Text, JsonSerializer.Serialize(result, JsonOptions))
-            ]);
+    /// <summary>
+    /// Builds the #3577 AC3 report for the caller's own wall-clock budget being exhausted. This is
+    /// a budget the caller can adjust, but possible side effects must be reconciled before replay.
+    /// </summary>
+    private static AgentConverseCancellationReport BuildTimeoutReport(
+        string targetAgentId,
+        int timeoutSeconds,
+        TimeSpan elapsed)
+        => new()
+        {
+            CancellationCause = "timeout",
+            CancelledBy = "caller",
+            TargetAgentId = targetAgentId,
+            TargetState = "unknown",
+            TimeoutSeconds = timeoutSeconds,
+            ElapsedSeconds = Math.Round(elapsed.TotalSeconds, 3),
+            RetryAdvised = true,
+            Message =
+                $"The exchange with agent '{targetAgentId}' timed out: the caller's {timeoutSeconds}s " +
+                $"timeoutSeconds budget was exhausted after {elapsed.TotalSeconds:0.###}s and this side " +
+                "cancelled the call. The target's current state is unknown; increasing the budget alone " +
+                "does not establish that replaying the work is safe."
+        };
+
+    /// <summary>
+    /// Builds the #3698 report for the caller's own ambient turn token firing - a turn abort, a
+    /// session seal, or a cron run hitting its wall-clock limit while this exchange was in flight.
+    /// </summary>
+    /// <remarks>
+    /// <c>retryAdvised</c> is <c>false</c> and is not a judgement about the target: the calling turn
+    /// no longer exists, so there is nothing left to retry into. The target's state is deliberately
+    /// NOT probed here - the peer was never established to be at fault, and reporting a state for it
+    /// would invite exactly the caller/peer confusion this cause exists to remove.
+    /// </remarks>
+    private static AgentConverseCancellationReport BuildCallerAbortedReport(
+        string targetAgentId,
+        int timeoutSeconds,
+        TimeSpan elapsed)
+        => new()
+        {
+            CancellationCause = "callerAborted",
+            CancelledBy = "caller",
+            TargetAgentId = targetAgentId,
+            TargetState = "unknown",
+            TimeoutSeconds = timeoutSeconds,
+            ElapsedSeconds = Math.Round(elapsed.TotalSeconds, 3),
+            RetryAdvised = false,
+            Message =
+                $"The exchange with agent '{targetAgentId}' was abandoned after " +
+                $"{elapsed.TotalSeconds:0.###}s of its {timeoutSeconds}s budget because the calling " +
+                "turn itself was cancelled - a turn abort, session seal or cron wall-clock limit - " +
+                "not because the target failed or the budget ran out. The target may still be " +
+                "working. An immediate retry will not help: the turn that issued this call is gone."
+        };
+
+    /// <summary>
+    /// Builds the #3577 AC4 report for a cancellation the caller's budget did NOT cause, naming the
+    /// target's observable state. The distinction matters operationally: <c>unregistered</c> is
+    /// deterministic and will never succeed on retry, whereas <c>busy</c> is transient and will.
+    /// State is resolved best-effort - an absent registry or supervisor yields <c>unknown</c>, which
+    /// is still strictly more actionable than the bare cancellation text it replaces.
+    /// </summary>
+    private AgentConverseCancellationReport BuildTargetUnavailableReport(
+        string targetAgentId,
+        int timeoutSeconds,
+        TimeSpan elapsed)
+    {
+        var targetState = ResolveTargetState(targetAgentId);
+        var (retryAdvised, explanation) = targetState switch
+        {
+            "unregistered" => (false,
+                $"agent '{targetAgentId}' is unregistered, so this call is a deterministic failure and " +
+                "will not succeed on retry"),
+            "busy" => (true,
+                $"agent '{targetAgentId}' is currently busy; this catch-time observation does not " +
+                "establish whether it accepted the exchange or already performed side effects"),
+            "idle" => (true,
+                $"agent '{targetAgentId}' is registered and idle, so the exchange was cancelled by the " +
+                "target side or the runtime rather than by this call's budget; prior effects remain unknown"),
+            _ => (true,
+                $"agent '{targetAgentId}' is unreachable and its state could not be established; the " +
+                "cancellation did not come from this call's timeoutSeconds budget")
+        };
+
+        return new AgentConverseCancellationReport
+        {
+            CancellationCause = "targetUnavailable",
+            CancelledBy = "target",
+            TargetAgentId = targetAgentId,
+            TargetState = targetState,
+            TimeoutSeconds = timeoutSeconds,
+            ElapsedSeconds = Math.Round(elapsed.TotalSeconds, 3),
+            RetryAdvised = retryAdvised,
+            Message =
+                $"The exchange with agent '{targetAgentId}' was cancelled after " +
+                $"{elapsed.TotalSeconds:0.###}s of its {timeoutSeconds}s budget, which was NOT exhausted: " +
+                explanation + "."
+        };
+    }
+
+    /// <summary>
+    /// Resolves the target's observable state for #3577 AC4. Registration is authoritative and is
+    /// checked first, because an unregistered target is the one non-retryable case. Beyond that the
+    /// supervisor's live instances distinguish a busy peer from an idle one.
+    /// </summary>
+    /// <remarks>
+    /// Returns <c>unknown</c> rather than guessing when no registry or supervisor is wired: a
+    /// fabricated state would be indistinguishable from a measured one at the call site, and this
+    /// report exists precisely to stop callers acting on information that was never established.
+    /// </remarks>
+    private string ResolveTargetState(string targetAgentId)
+    {
+        AgentId target;
+        try
+        {
+            target = AgentId.From(targetAgentId);
+        }
+        catch (ArgumentException)
+        {
+            return "unregistered";
+        }
+
+        if (agentRegistry is not null && !agentRegistry.Contains(target))
+            return "unregistered";
+
+        if (agentSupervisor is null)
+            return agentRegistry is null ? "unknown" : "unreachable";
+
+        var instances = agentSupervisor.GetAllInstances()
+            .Where(instance => instance.AgentId == target)
+            .ToArray();
+
+        if (instances.Length == 0)
+            return "unreachable";
+
+        return instances.Any(instance => instance.Status is AgentInstanceStatus.Running or AgentInstanceStatus.Starting)
+            ? "busy"
+            : "idle";
+    }
+
+    /// <summary>
+    /// Emits the #3577 AC5 correlation record. One occurrence must be enough to diagnose the
+    /// trigger, so the caller session id, the target agent id and the tool call id that ties this
+    /// line to its transcript row all appear in a single entry.
+    /// </summary>
+    private void LogCancellation(string toolCallId, string targetAgentId, AgentConverseCancellationReport report)
+        => _logger.LogWarning(
+            "agent_converse cancelled: cause={CancellationCause} cancelledBy={CancelledBy} " +
+            "targetState={TargetState} elapsed={ElapsedSeconds}s of budget={TimeoutSeconds}s " +
+            "callerAgentId={CallerAgentId} callerSessionId={CallerSessionId} " +
+            "targetAgentId={TargetAgentId} toolCallId={ToolCallId}",
+            report.CancellationCause,
+            report.CancelledBy,
+            report.TargetState,
+            report.ElapsedSeconds,
+            report.TimeoutSeconds,
+            initiatorAgentId.Value,
+            sessionId.Value,
+            targetAgentId,
+            toolCallId);
+
+    /// <summary>
+    /// Reads the conversation the calling session is pinned to, for progress delivery (#3176).
+    /// </summary>
+    /// <remarks>
+    /// Returns <c>null</c> rather than throwing when the session is missing or unpinned: the only
+    /// consequence is that a stale-binding self-heal cannot name the conversation, and that is not
+    /// worth failing a handoff over.
+    /// </remarks>
+    private async Task<ConversationId?> ResolveInitiatorConversationIdAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var currentSession = await sessionStore.GetAsync(sessionId, cancellationToken).ConfigureAwait(false);
+            // Read through the GatewaySession proxy, not the inner record (F-9 / Phase 7 fence).
+            return currentSession is { } s && s.ConversationId.IsInitialized() ? s.ConversationId : null;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task<IReadOnlyList<AgentId>> ResolveCallChainAsync(CancellationToken cancellationToken)
@@ -154,14 +434,8 @@ public sealed class AgentConverseTool(
         if (!arguments.TryGetValue("timeoutSeconds", out var rawTimeout) || rawTimeout is null)
             return DefaultTimeoutSeconds;
 
-        var parsed = rawTimeout switch
-        {
-            JsonElement { ValueKind: JsonValueKind.Number } element when element.TryGetInt32(out var value) => value,
-            JsonElement { ValueKind: JsonValueKind.String } element when int.TryParse(element.GetString(), out var value) => value,
-            int value => value,
-            string text when int.TryParse(text, out var value) => value,
-            _ => throw new ArgumentException("timeoutSeconds must be an integer.", nameof(arguments))
-        };
+        if (!TryReadInt32(rawTimeout, out var parsed))
+            throw new ArgumentException("timeoutSeconds must be an integer.", nameof(arguments));
 
         if (parsed < 1)
             throw new ArgumentOutOfRangeException(nameof(arguments), "timeoutSeconds must be at least 1 second.");
@@ -170,22 +444,121 @@ public sealed class AgentConverseTool(
     }
 
     private static int ReadInt(IReadOnlyDictionary<string, object?> args, string key, int defaultValue)
-    {
-        if (!args.TryGetValue(key, out var value) || value is null)
-            return defaultValue;
+        => args.TryGetValue(key, out var value) && value is not null && TryReadInt32(value, out var parsed)
+            ? parsed
+            : defaultValue;
 
-        return value switch
+    /// <summary>
+    /// Reads a losslessly-safe <see cref="int"/> from a tool argument value regardless of how the
+    /// provider boxed the underlying JSON number. Streaming tool-call parsing boxes JSON integers as
+    /// CLR <see cref="long"/> and non-integers as <see cref="double"/>, so a switch that only handled
+    /// <see cref="JsonElement"/>/<see cref="int"/>/<see cref="string"/> rejected a valid boxed
+    /// <c>timeoutSeconds</c> (issue #2415). A value is accepted only when it round-trips to
+    /// <see cref="int"/> without loss.
+    /// </summary>
+    private static bool TryReadInt32(object value, out int result)
+    {
+        switch (value)
         {
-            JsonElement { ValueKind: JsonValueKind.Number } element when element.TryGetInt32(out var parsed) => parsed,
-            JsonElement { ValueKind: JsonValueKind.String } element when int.TryParse(element.GetString(), out var parsed) => parsed,
-            int parsed => parsed,
-            string text when int.TryParse(text, out var parsed) => parsed,
-            _ => defaultValue
-        };
+            case int i:
+                result = i;
+                return true;
+            case long l when l is >= int.MinValue and <= int.MaxValue:
+                result = (int)l;
+                return true;
+            case double d when IsIntegralInt32(d):
+                result = (int)d;
+                return true;
+            case JsonElement { ValueKind: JsonValueKind.Number } element:
+                return TryReadJsonNumber(element, out result);
+            case JsonElement { ValueKind: JsonValueKind.String } element:
+                return TryParseInt32(element.GetString(), out result);
+            case string text:
+                return TryParseInt32(text, out result);
+            default:
+                result = 0;
+                return false;
+        }
     }
+
+    private static bool TryReadJsonNumber(JsonElement element, out int result)
+    {
+        if (element.TryGetInt32(out result))
+            return true;
+
+        if (element.TryGetInt64(out var l) && l is >= int.MinValue and <= int.MaxValue)
+        {
+            result = (int)l;
+            return true;
+        }
+
+        if (element.TryGetDouble(out var d) && IsIntegralInt32(d))
+        {
+            result = (int)d;
+            return true;
+        }
+
+        result = 0;
+        return false;
+    }
+
+    private static bool IsIntegralInt32(double value)
+        => double.IsFinite(value)
+           && value % 1d == 0d
+           && value is >= int.MinValue and <= int.MaxValue;
+
+    private static bool TryParseInt32(string? text, out int result)
+        => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out result);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
+}
+
+/// <summary>
+/// The structured result an <c>agent_converse</c> cancellation returns instead of the bare .NET
+/// <c>A task was canceled.</c> text (issue #3577).
+/// </summary>
+/// <remarks>
+/// Every field exists to answer one question the old message could not: which side gave up, how much
+/// of the budget was actually used, what state the peer was in, and whether retrying is worth the
+/// turn. <see cref="Cancelled"/> is always <c>true</c> and is deliberately redundant so a consumer
+/// can discriminate this payload from a successful <c>AgentExchangeResult</c> on a single field
+/// without parsing prose.
+/// </remarks>
+public sealed record AgentConverseCancellationReport
+{
+    /// <summary>Always <c>true</c>; the discriminator against a successful exchange result.</summary>
+    public bool Cancelled { get; init; } = true;
+
+    /// <summary>
+    /// <c>timeout</c> when the caller's budget was exhausted, <c>callerAborted</c> when the caller's
+    /// ambient turn token fired (#3698), otherwise <c>targetUnavailable</c>.
+    /// </summary>
+    public required string CancellationCause { get; init; }
+
+    /// <summary>Which side cancelled: <c>caller</c> or <c>target</c>.</summary>
+    public required string CancelledBy { get; init; }
+
+    /// <summary>The agent id this exchange was addressed to.</summary>
+    public required string TargetAgentId { get; init; }
+
+    /// <summary><c>idle</c>, <c>busy</c>, <c>unreachable</c>, <c>unregistered</c>, or <c>unknown</c>.</summary>
+    public required string TargetState { get; init; }
+
+    /// <summary>The wall-clock budget this call was given, in seconds.</summary>
+    public required int TimeoutSeconds { get; init; }
+
+    /// <summary>How much of <see cref="TimeoutSeconds"/> was consumed before cancellation.</summary>
+    public required double ElapsedSeconds { get; init; }
+
+    /// <summary>Whether a retry has any prospect of succeeding.</summary>
+    public required bool RetryAdvised { get; init; }
+
+    /// <summary>Observed child progress and retained counts; null means unknown, not never dispatched.</summary>
+    public AgentExchangeCancellationEvidence? Evidence { get; init; }
+
+    /// <summary>Human-readable explanation naming the cause, the side and the budget.</summary>
+    public required string Message { get; init; }
 }

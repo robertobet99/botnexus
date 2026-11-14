@@ -1,0 +1,162 @@
+using BotNexus.Domain.Primitives;
+using BotNexus.Gateway.Abstractions.Models;
+using BotNexus.Gateway.Api.Export;
+
+namespace BotNexus.Gateway.Api.Controllers;
+
+/// <summary>
+/// The single projection from stored <see cref="GatewaySession"/> history onto the chronological
+/// <see cref="ConversationHistoryEntry"/> view rendered by the portal and by every export.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Extracted verbatim out of <see cref="ConversationHistoryAssembler"/> for issue #3278. The export
+/// document model needs the same boundary-marker / <c>NO_REPLY</c> / crash-sentinel / compaction
+/// state machine that the history endpoint uses, and re-deriving it in an exporter is exactly the
+/// drift the issue's anti-drift clause forbids. Both callers now share this method, so there is one
+/// transcript assembly path in the codebase and a change to the filtering rules cannot apply to the
+/// portal but not to a downloaded transcript.
+/// </para>
+/// <para>
+/// Session-scoped export passes a single-element list; conversation-scoped export and the history
+/// endpoint pass the conversation's linked sessions in ascending <c>CreatedAt</c> order.
+/// </para>
+/// </remarks>
+public static class ConversationHistoryProjection
+{
+    /// <summary>
+    /// Flattens the ordered session list into a single chronological entry list, inserting a
+    /// <c>boundary</c> marker between sessions, dropping <c>NO_REPLY</c> assistant turns (#773),
+    /// crash sentinels and contentless assistant ghost rows (#2921), and projecting compaction
+    /// summaries as distinct <c>compaction</c> markers. Folded (<c>IsHistory</c>) entries are
+    /// retained and flagged <see cref="ConversationHistoryEntry.IsFolded"/> (#2936) so the
+    /// pre-compaction transcript stays reachable and can be rendered collapsed.
+    /// </summary>
+    /// <param name="linkedSessions">Sessions to project, in the order they should appear.</param>
+    /// <returns>The chronological entry list.</returns>
+    public static List<ConversationHistoryEntry> Project(IReadOnlyList<GatewaySession> linkedSessions)
+    {
+        ArgumentNullException.ThrowIfNull(linkedSessions);
+
+        var allEntries = new List<ConversationHistoryEntry>();
+
+        // Per-session emission ordinal backing ConversationHistoryEntry.EntryId (#3279). Keyed by
+        // session id rather than a single running counter so an entry's id does not change when an
+        // EARLIER session in the same conversation gains or loses turns - a shared partial-range
+        // link must keep naming the same exchange.
+        var ordinals = new Dictionary<string, int>(StringComparer.Ordinal);
+        string NextEntryId(SessionId sessionId)
+        {
+            ordinals.TryGetValue(sessionId.Value, out var next);
+            ordinals[sessionId.Value] = next + 1;
+            return ExportEntryId.Build(sessionId, next);
+        }
+
+        for (var i = 0; i < linkedSessions.Count; i++)
+        {
+            var session = linkedSessions[i];
+
+            // Insert boundary marker before each session except the first.
+            if (i > 0)
+            {
+                var previousSession = linkedSessions[i - 1];
+                allEntries.Add(new ConversationHistoryEntry
+                {
+                    Kind = "boundary",
+                    EntryId = NextEntryId(previousSession.SessionId),
+                    SessionId = previousSession.SessionId.Value,
+                    AgentId = previousSession.AgentId.Value,
+                    Timestamp = previousSession.UpdatedAt,
+                    Reason = "session_end"
+                });
+            }
+
+            // Keep stored-entry visibility independent of API projection so durable read-history
+            // queries can reuse the same exclusions without loading or constructing portal DTOs.
+            // Folded history remains reachable (#2936); visibility is not an unread-count policy.
+            var snapshot = session.GetHistorySnapshot();
+            foreach (var entry in snapshot)
+            {
+                if (!SessionEntryHistoryVisibility.IsVisible(entry))
+                    continue;
+
+                // Emit compaction summaries as distinct boundary markers so the portal
+                // can render them as separators rather than normal system messages.
+                if (entry.IsCompactionSummary)
+                {
+                    allEntries.Add(new ConversationHistoryEntry
+                    {
+                        Kind = "compaction",
+                        EntryId = NextEntryId(session.SessionId),
+                        SessionId = session.SessionId.Value,
+                        AgentId = session.AgentId.Value,
+                        Timestamp = entry.Timestamp,
+                        Reason = "compaction",
+                        Content = entry.Content,
+                        IsFolded = entry.IsHistory
+                    });
+                    continue;
+                }
+
+                allEntries.Add(new ConversationHistoryEntry
+                {
+                    Kind = "message",
+                    EntryId = NextEntryId(session.SessionId),
+                    SessionId = session.SessionId.Value,
+                    AgentId = session.AgentId.Value,
+                    AgentRunId = entry.AgentRunId?.Value,
+                    Role = entry.Role.ToString().ToLowerInvariant(),
+                    Content = entry.Content,
+                    Attachments = ProjectAttachments(entry.OriginalContentParts),
+                    Timestamp = entry.Timestamp,
+                    ToolName = entry.ToolName,
+                    ToolCallId = entry.ToolCallId,
+                    ToolArgs = entry.ToolArgs,
+                    ToolIsError = entry.ToolIsError,
+                    ThinkingContent = entry.ThinkingContent,
+                    // #2840: surface the entry's origin attribution so a script-posted message is
+                    // distinguishable from a human turn by a history reader. Null for ordinary turns.
+                    SenderId = entry.SenderId,
+                    IsFolded = entry.IsHistory,
+                    // #2149: project the orthogonal typed kind so live delivery and history replay
+                    // agree; ResolveKind maps legacy/unstamped entries to "message".
+                    MessageKind = entry.ResolveKind().Value
+                });
+            }
+        }
+
+        return allEntries;
+    }
+
+    private static IReadOnlyList<ConversationHistoryAttachment>? ProjectAttachments(
+        IReadOnlyList<MessageContentPart>? contentParts)
+    {
+        if (contentParts is not { Count: > 0 })
+            return null;
+
+        var attachments = new List<ConversationHistoryAttachment>();
+        foreach (var part in contentParts)
+        {
+            switch (part)
+            {
+                case BinaryContentPart binary:
+                    attachments.Add(new ConversationHistoryAttachment(
+                        binary.FileName ?? "attachment",
+                        binary.MimeType,
+                        binary.Data.LongLength,
+                        Convert.ToBase64String(binary.Data)));
+                    break;
+                case TextContentPart text:
+                    var bytes = System.Text.Encoding.UTF8.GetBytes(text.Text);
+                    attachments.Add(new ConversationHistoryAttachment(
+                        text.FileName ?? "attachment.txt",
+                        text.MimeType,
+                        bytes.LongLength,
+                        Convert.ToBase64String(bytes)));
+                    break;
+            }
+        }
+
+        return attachments.Count == 0 ? null : attachments;
+    }
+}

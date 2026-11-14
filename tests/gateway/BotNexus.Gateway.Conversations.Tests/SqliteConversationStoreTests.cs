@@ -66,6 +66,38 @@ public sealed class SqliteConversationStoreTests
     }
 
     [Fact]
+    public async Task ListAsync_ReturnsAllRows_WhenCountExceedsCacheCapacity()
+    {
+        // Regression for #2226: the list materialiser must NOT gate result membership on the
+        // bounded LRU cache surviving the warm pass. With more conversations than the cache
+        // capacity, warming id N can evict id N-cap; a rebuild that re-reads from the cache then
+        // silently drops the evicted ids and conversations flicker in and out of the list. The
+        // returned list must contain EVERY row regardless of cache capacity.
+        using var fixture = new StoreFixture();
+        const int cap = 8;
+        const int total = 40;
+        var store = fixture.CreateStore(cacheCapacity: cap);
+
+        var expected = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < total; i++)
+        {
+            var conversation = CreateConversation(Agent("agent-a"), $"conv-{i}", CreateBinding("telegram", $"{i}"));
+            await store.CreateAsync(conversation);
+            expected.Add(conversation.ConversationId.Value);
+        }
+
+        // Fresh store instance => cold cache, so materialisation must load + hydrate all rows and
+        // survive its own LRU eviction while doing so.
+        var list = await fixture.CreateStore(cacheCapacity: cap).ListAsync();
+
+        list.Count.ShouldBe(total);
+        var returnedIds = list.Select(c => c.ConversationId.Value).ToHashSet(StringComparer.Ordinal);
+        returnedIds.SetEquals(expected).ShouldBeTrue();
+        // Bindings must survive the batched hydrate too (not just the id set).
+        list.ShouldAllBe(c => c.ChannelBindings.Count == 1);
+    }
+
+    [Fact]
     public async Task ListAsync_FiltersByAgentId()
     {
         using var fixture = new StoreFixture();
@@ -125,6 +157,45 @@ public sealed class SqliteConversationStoreTests
         var loaded = await fixture.CreateStore().GetAsync(conversation.ConversationId);
         loaded.ShouldNotBeNull();
         loaded!.Status.ShouldBe(ConversationStatus.Archived);
+    }
+
+    [Fact]
+    public async Task ArchiveAsync_WithProvenance_WritesCentralAuditEntry()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var conversation = await store.CreateAsync(CreateConversation(Agent("agent-a"), "Audited"));
+
+        await store.ArchiveAsync(conversation.ConversationId, "retention", "job-2167", "system");
+
+        using var audit = new SqliteConversationAuditLog(fixture.ConnectionString);
+        ConversationAuditEntry entry = (await audit.GetAsync(conversation.ConversationId.Value)).ShouldHaveSingleItem();
+        entry.Action.ShouldBe("archived");
+        entry.Source.ShouldBe("retention");
+        entry.CorrelationId.ShouldBe("job-2167");
+        entry.Actor.ShouldBe("system");
+    }
+
+    [Fact]
+    public async Task TryArchiveAsync_ConcurrentCallers_CommitOneTransitionAndOneAudit()
+    {
+        using var fixture = new StoreFixture();
+        var firstStore = fixture.CreateStore();
+        var secondStore = fixture.CreateStore();
+        var conversation = await firstStore.CreateAsync(CreateConversation(Agent("agent-a"), "Concurrent retention"));
+
+        var results = await Task.WhenAll(
+            firstStore.TryArchiveAsync(conversation.ConversationId, "retention", "core", "system"),
+            secondStore.TryArchiveAsync(conversation.ConversationId, "webhook-retention", "webhook", "system"));
+
+        results.Count(result => result).ShouldBe(1);
+        using var audit = new SqliteConversationAuditLog(fixture.ConnectionString);
+        (await audit.GetAsync(conversation.ConversationId.Value)).Count.ShouldBe(1);
+
+        var archived = await fixture.CreateStore().GetAsync(conversation.ConversationId);
+        archived.ShouldNotBeNull();
+        archived.Status.ShouldBe(ConversationStatus.Archived);
+        archived.Version.ShouldBe(conversation.Version + 1);
     }
 
     [Fact]
@@ -443,10 +514,8 @@ public sealed class SqliteConversationStoreTests
         var helper = CitizenId.Of(Agent("helper"));
 
         var noInit = CreateConversation(Agent("agent-a"), "no-init");
-        var userInit = CreateConversation(Agent("agent-a"), "user-init");
-        userInit.Initiator = alice;
-        var agentInit = CreateConversation(Agent("agent-b"), "agent-init");
-        agentInit.Initiator = helper;
+        var userInit = CreateConversation(Agent("agent-a"), "user-init") with { Initiator = alice };
+        var agentInit = CreateConversation(Agent("agent-b"), "agent-init") with { Initiator = helper };
 
         await store.CreateAsync(noInit);
         await store.CreateAsync(userInit);
@@ -468,12 +537,9 @@ public sealed class SqliteConversationStoreTests
         using var fixture = new StoreFixture();
         var store = fixture.CreateStore();
 
-        var human = CreateConversation(Agent("agent-a"), "human");
-        human.Kind = ConversationKind.HumanAgent;
-        var agentAgent = CreateConversation(Agent("agent-b"), "agent-agent");
-        agentAgent.Kind = ConversationKind.AgentAgent;
-        var subAgent = CreateConversation(Agent("agent-c"), "sub-agent");
-        subAgent.Kind = ConversationKind.AgentSubAgent;
+        var human = CreateConversation(Agent("agent-a"), "human") with { Kind = ConversationKind.HumanAgent };
+        var agentAgent = CreateConversation(Agent("agent-b"), "agent-agent") with { Kind = ConversationKind.AgentAgent };
+        var subAgent = CreateConversation(Agent("agent-c"), "sub-agent") with { Kind = ConversationKind.AgentSubAgent };
 
         await store.CreateAsync(human);
         await store.CreateAsync(agentAgent);
@@ -511,10 +577,8 @@ public sealed class SqliteConversationStoreTests
         var alice = CitizenId.Of(UserId.From("alice"));
         var bob = CitizenId.Of(UserId.From("bob"));
 
-        var aliceConv = CreateConversation(Agent("a1"), "alice-conv");
-        aliceConv.Initiator = alice;
-        var bobConv = CreateConversation(Agent("a1"), "bob-conv");
-        bobConv.Initiator = bob;
+        var aliceConv = CreateConversation(Agent("a1"), "alice-conv") with { Initiator = alice };
+        var bobConv = CreateConversation(Agent("a1"), "bob-conv") with { Initiator = bob };
         var noInit = CreateConversation(Agent("a1"), "no-init");
 
         await store.CreateAsync(aliceConv);
@@ -536,12 +600,9 @@ public sealed class SqliteConversationStoreTests
         var alice = CitizenId.Of(UserId.From("alice"));
         var helperCitizen = CitizenId.Of(helper);
 
-        var owned = CreateConversation(helper, "owned-by-helper");
-        owned.Initiator = alice;
-        var initiatedByHelper = CreateConversation(other, "initiated-by-helper");
-        initiatedByHelper.Initiator = helperCitizen;
-        var unrelated = CreateConversation(other, "unrelated");
-        unrelated.Initiator = alice;
+        var owned = CreateConversation(helper, "owned-by-helper") with { Initiator = alice };
+        var initiatedByHelper = CreateConversation(other, "initiated-by-helper") with { Initiator = helperCitizen };
+        var unrelated = CreateConversation(other, "unrelated") with { Initiator = alice };
 
         await store.CreateAsync(owned);
         await store.CreateAsync(initiatedByHelper);
@@ -562,8 +623,7 @@ public sealed class SqliteConversationStoreTests
         var store = fixture.CreateStore();
         var alice = CitizenId.Of(UserId.From("alice"));
 
-        var conv = CreateConversation(Agent("a1"), "archived");
-        conv.Initiator = alice;
+        var conv = CreateConversation(Agent("a1"), "archived") with { Initiator = alice };
         await store.CreateAsync(conv);
         await store.ArchiveAsync(conv.ConversationId);
 
@@ -630,7 +690,7 @@ public sealed class SqliteConversationStoreTests
 
         // Save with an Initiator to prove the new column is writable + readable end-to-end.
         var alice = CitizenId.Of(UserId.From("alice"));
-        loaded.Initiator = alice;
+        loaded = loaded with { Initiator = alice };
         await store.SaveAsync(loaded);
 
         var roundTrip = await fixture.CreateStore().GetAsync(ConversationId.From("legacy-1"));
@@ -810,7 +870,7 @@ public sealed class SqliteConversationStoreTests
             corrupt.Parameters.AddWithValue("$id", conv.ConversationId.Value);
             (await corrupt.ExecuteNonQueryAsync()).ShouldBe(1);
         }
-        SqliteConnection.ClearAllPools();
+        SqlitePoolCleanup.ClearPoolForConnectionString(fixture.ConnectionString);
 
         // Fresh store (empty cache) forces a real column read + hydrate. Must NOT throw.
         var loaded = await fixture.CreateStore().GetAsync(conv.ConversationId);
@@ -841,7 +901,7 @@ public sealed class SqliteConversationStoreTests
             corrupt.Parameters.AddWithValue("$id", bad.ConversationId.Value);
             (await corrupt.ExecuteNonQueryAsync()).ShouldBe(1);
         }
-        SqliteConnection.ClearAllPools();
+        SqlitePoolCleanup.ClearPoolForConnectionString(fixture.ConnectionString);
 
         var all = await fixture.CreateStore().ListAsync(Agent("agent-a"));
 
@@ -907,7 +967,7 @@ public sealed class SqliteConversationStoreTests
             cmd.CommandText = "DROP TABLE IF EXISTS race_probe; CREATE TABLE race_probe(x);";
             await cmd.ExecuteNonQueryAsync();
         }
-        SqliteConnection.ClearAllPools();
+        SqlitePoolCleanup.ClearPoolForConnectionString(fixture.ConnectionString);
 
         // Directly exercise the helper's tolerance: attempt to add a column that already exists
         // on the conversations table. The store's migration pass runs on open and must swallow
@@ -931,7 +991,7 @@ public sealed class SqliteConversationStoreTests
             }
             threw.ShouldBeTrue("Pre-condition: re-adding an existing column must raise SQLite duplicate-column error.");
         }
-        SqliteConnection.ClearAllPools();
+        SqlitePoolCleanup.ClearPoolForConnectionString(fixture.ConnectionString);
 
         // A fresh store open re-runs the full migration pass over the already-migrated schema.
         // With the race-tolerant helper this must not throw for ANY column.

@@ -7,7 +7,7 @@ namespace BotNexus.Extensions.Skills.Security;
 /// after symlink resolution. Prevents symlink-based path traversal attacks where a symlink
 /// inside the skill directory points to a location outside the trusted root.
 /// </summary>
-internal static class SkillPathValidator
+public static class SkillPathValidator
 {
     private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
         ? StringComparison.OrdinalIgnoreCase
@@ -17,39 +17,64 @@ internal static class SkillPathValidator
     /// Validates that the given target path resolves to a location within the allowed root
     /// after following any symlinks in the path. Returns the resolved path on success.
     /// </summary>
-    /// <param name="targetPath">The absolute path to validate.</param>
-    /// <param name="allowedRoot">The root directory that must contain the resolved path.</param>
+    /// <remarks>
+    /// This is the sole boundary crossing in the skill sandbox: <paramref name="targetPath"/> stays a
+    /// <see cref="string"/> because it is untrusted input, and the validated <see cref="SkillPath"/>
+    /// only comes into existence on the success path. A caller that skips this method now has no way
+    /// to obtain a <see cref="SkillPath"/> at all, so the omission is a compile error rather than a
+    /// silent sandbox escape.
+    /// </remarks>
+    /// <param name="targetPath">The absolute candidate path to validate. Untrusted.</param>
+    /// <param name="allowedRoot">The trusted root that must contain the resolved path.</param>
     /// <param name="fileSystem">File system abstraction for testability.</param>
-    /// <param name="resolvedPath">The fully resolved path (symlinks followed).</param>
+    /// <param name="resolvedPath">The fully resolved, contained path (symlinks followed); <c>default</c> on failure.</param>
     /// <param name="error">Error message if validation fails; null on success.</param>
     /// <returns>True if the path is safe; false if it escapes the allowed root.</returns>
     public static bool TryValidate(
         string targetPath,
-        string allowedRoot,
+        SkillPath allowedRoot,
         IFileSystem fileSystem,
-        out string resolvedPath,
+        out SkillPath resolvedPath,
         out string? error)
     {
-        resolvedPath = targetPath;
+        resolvedPath = default;
         error = null;
 
         // Normalize the allowed root (ensure trailing separator for prefix comparison)
-        var normalizedRoot = NormalizePath(allowedRoot, fileSystem);
+        var rootValue = allowedRoot.Value;
+        var normalizedRoot = NormalizePath(rootValue, fileSystem);
 
         // Resolve symlinks by walking each path component
-        var resolved = ResolvePath(targetPath, fileSystem);
+        string resolved;
+        try
+        {
+            resolved = ResolvePath(targetPath, fileSystem);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            error = "Path could not be resolved safely within the skill directory boundary.";
+            return false;
+        }
         var normalizedResolved = NormalizePath(resolved, fileSystem);
 
         // Check containment: resolved path must be under (or equal to) the allowed root
         if (!IsUnderOrEqual(normalizedResolved, normalizedRoot, fileSystem))
         {
             error = $"Path escapes skill directory boundary after symlink resolution. " +
-                    $"Resolved '{resolved}' is not within '{allowedRoot}'.";
+                    $"Resolved '{resolved}' is not within '{rootValue}'.";
             return false;
         }
 
-        resolvedPath = resolved;
+        // The only construction of a contained SkillPath in the codebase. Everything above is the
+        // proof obligation that this line discharges.
+        resolvedPath = SkillPath.FromResolved(resolved);
         return true;
+    }
+
+    internal static string ResolvePath(string path, IFileSystem fileSystem)
+    {
+        var remainingLinkResolutions = 256;
+        return ResolvePath(path, fileSystem, ref remainingLinkResolutions);
     }
 
     /// <summary>
@@ -57,8 +82,10 @@ internal static class SkillPathValidator
     /// from root to leaf. If any component is a symlink, resolves it and continues
     /// from the resolved location.
     /// </summary>
-    private static string ResolvePath(string fullPath, IFileSystem fileSystem)
+    private static string ResolvePath(string fullPath, IFileSystem fileSystem, ref int remainingLinkResolutions, int linkDepth = 0)
     {
+        if (linkDepth > 40)
+            throw new InvalidDataException("Skill path contains a link cycle or exceeds the link resolution limit.");
         var normalized = fileSystem.Path.GetFullPath(fullPath);
         var root = fileSystem.Path.GetPathRoot(normalized);
         if (string.IsNullOrWhiteSpace(root))
@@ -69,29 +96,29 @@ internal static class SkillPathValidator
                 [fileSystem.Path.DirectorySeparatorChar, fileSystem.Path.AltDirectorySeparatorChar],
                 StringSplitOptions.RemoveEmptyEntries);
 
-        var current = root.TrimEnd(fileSystem.Path.DirectorySeparatorChar, fileSystem.Path.AltDirectorySeparatorChar);
+        // Seed the walk with the path root exactly as GetPathRoot returned it. Trimming the
+        // separator off turns "/" into "" on Unix, and every Path.Combine below then builds a
+        // *relative* path — so GetFullPath re-roots the whole walk at the process working
+        // directory and no absolute path is ever contained in its own root. Path.Combine already
+        // collapses the duplicate separator, so there is nothing to trim.
+        var current = root;
 
         foreach (var segment in segments)
         {
             current = fileSystem.Path.Combine(current, segment);
 
-            if (fileSystem.Directory.Exists(current))
+            // Inspect link metadata even for dangling/cyclic links (Exists may be false).
+            var linkTarget = fileSystem.DirectoryInfo.New(current).LinkTarget
+                ?? fileSystem.FileInfo.New(current).LinkTarget;
+            if (linkTarget is not null)
             {
-                var dirInfo = fileSystem.DirectoryInfo.New(current);
-                if (dirInfo.LinkTarget is not null)
-                {
-                    var target = ResolveLink(current, dirInfo.LinkTarget, fileSystem);
-                    current = target;
-                }
-            }
-            else if (fileSystem.File.Exists(current))
-            {
-                var fileInfo = fileSystem.FileInfo.New(current);
-                if (fileInfo.LinkTarget is not null)
-                {
-                    var target = ResolveLink(current, fileInfo.LinkTarget, fileSystem);
-                    current = target;
-                }
+                // Share one work budget across sibling branches as well as nested chains.
+                if (--remainingLinkResolutions < 0)
+                    throw new InvalidDataException("Skill path exceeds the total link resolution limit.");
+                var target = ResolveLink(current, linkTarget, fileSystem);
+                // Resolve the target's components too: a contained first hop is not proof
+                // that a chain's final target is contained.
+                current = ResolvePath(target, fileSystem, ref remainingLinkResolutions, linkDepth + 1);
             }
             // If path component doesn't exist yet (write to new file), stop resolution
             // and just use the normalized form from here forward

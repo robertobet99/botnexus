@@ -165,6 +165,20 @@ public sealed class TelegramBotConfig
     public bool ShowToolActivity { get; set; } = true;
 
     /// <summary>
+    /// When true (default), user messages persisted from another surface are echoed to this bot's
+    /// applicable chats with a literal <c>User said:</c> label. Messages originating from the same
+    /// Telegram binding are always suppressed to prevent a native-message duplicate.
+    /// </summary>
+    [Display(
+        Name = "Echo foreign user messages",
+        Description = "When on (default), user messages sent from another conversation surface are echoed to this Telegram chat.",
+        GroupName = "Telegram bot",
+        Order = 10)]
+    [DefaultValue(true)]
+    [ConfigField(Widget = ConfigFieldWidget.Toggle, Group = "telegram-bot", Order = 10)]
+    public bool EchoForeignUserMessages { get; set; } = true;
+
+    /// <summary>
     /// Gets or sets the maximum Rich Message length before payload splitting. Rich Messages allow up
     /// to 32768 characters (vs 4096 for plain), so the default (32000) stays safely below that limit.
     /// Only used when <see cref="RichMessages"/> is enabled; the legacy fallback path uses
@@ -191,4 +205,64 @@ public sealed class TelegramBotConfig
     [DefaultValue(60_000)]
     [ConfigField(Widget = ConfigFieldWidget.Number, Group = "telegram-bot", Order = 11)]
     public int ErrorCooldownMs { get; set; } = 60_000;
+
+    /// <summary>
+    /// Gets or sets the hard ceiling, in bytes, on any single inbound media attachment the adapter
+    /// will pull from the Telegram CDN.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why 20 MB:</b> the Telegram Bot API itself documents 20 MB as the maximum size a bot can
+    /// download via <c>getFile</c>, so anything larger cannot legitimately arrive through this path.
+    /// Matching the upstream ceiling means the bound never rejects traffic a well-behaved Telegram
+    /// server would send, while still capping the memory a single authorized sender can make the
+    /// gateway allocate. Before this bound existed, one authorized chat could force an unbounded
+    /// in-memory buffer per message (issue #2724).
+    /// </para>
+    /// <para>
+    /// <b>Why it is enforced twice:</b> the advertised <c>file_size</c> is supplied by the remote
+    /// server and is therefore not authoritative. The cap is checked once up front (so an obviously
+    /// oversize attachment costs zero network calls) and again while the response body is being read,
+    /// so a server that under-reports its size still cannot stream past the ceiling.
+    /// </para>
+    /// <para>
+    /// <b>Fail-safe direction:</b> exceeding this bound skips the <i>media</i> only. The message is
+    /// still dispatched with its caption text. Losing an attachment is recoverable; silently dropping
+    /// a user's message is not.
+    /// </para>
+    /// </remarks>
+    [Display(
+        Name = "Max media bytes",
+        Description = "Hard ceiling, in bytes, on any single inbound media attachment. Default 20 MB matches the Telegram Bot API download limit. Oversize media is skipped; the caption is still delivered.",
+        GroupName = "Telegram bot",
+        Order = 12)]
+    [DefaultValue(20L * 1024 * 1024)]
+    [ConfigField(Widget = ConfigFieldWidget.Number, Group = "telegram-bot", Order = 12)]
+    public long MaxMediaBytes { get; set; } = 20L * 1024 * 1024;
+
+    /// <summary>
+    /// Gets or sets the wall-clock budget, in seconds, for downloading a single inbound media
+    /// attachment.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why 30 seconds:</b> a size cap alone does not bound a slow-drip ("slowloris") response - a
+    /// server can stay under the byte ceiling indefinitely by trickling a byte at a time, pinning the
+    /// update-handling path forever. 30 seconds is generous enough to fetch a full 20 MB attachment
+    /// over a poor mobile link, and short enough that a stalled transfer cannot wedge the poller. It
+    /// is applied through a linked cancellation token, so host shutdown still wins.
+    /// </para>
+    /// <para>
+    /// <b>Fail-safe direction:</b> a timeout skips the media only; the caption text is still
+    /// dispatched.
+    /// </para>
+    /// </remarks>
+    [Display(
+        Name = "Media download timeout (seconds)",
+        Description = "Wall-clock budget, in seconds, for downloading a single inbound media attachment. A timeout skips the media; the caption is still delivered.",
+        GroupName = "Telegram bot",
+        Order = 13)]
+    [DefaultValue(30)]
+    [ConfigField(Widget = ConfigFieldWidget.Number, Group = "telegram-bot", Order = 13)]
+    public int MediaDownloadTimeoutSeconds { get; set; } = 30;
 }

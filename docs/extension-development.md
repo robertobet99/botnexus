@@ -3,19 +3,21 @@
 ## Table of Contents
 
 1. [What is a BotNexus Extension?](#what-is-a-botnexus-extension)
-2. [Extension Project Structure & Conventions](#extension-project-structure--conventions)
-3. [Creating a Channel Extension](#creating-a-channel-extension)
-4. [Creating a Provider Extension](#creating-a-provider-extension)
-5. [Creating a Tool Extension](#creating-a-tool-extension)
-6. [Dependency Injection Patterns](#dependency-injection-patterns)
-7. [Extension Metadata with BotNexusExtensionAttribute](#extension-metadata-with-botnexusextensionattribute)
-8. [Accessing Configuration](#accessing-configuration)
-9. [World-Level Extension Defaults](#world-level-extension-defaults)
-10. [OAuth Providers](#oauth-providers)
-11. [Webhook Handlers](#webhook-handlers)
-12. [Testing Extensions in Isolation](#testing-extensions-in-isolation)
-13. [Build Pipeline & Output](#build-pipeline--output)
-14. [Troubleshooting](#troubleshooting)
+2. [The `botnexus-extension.json` manifest](#the-botnexus-extensionjson-manifest)
+3. [Extension Project Structure & Conventions](#extension-project-structure--conventions)
+4. [Creating a Channel Extension](#creating-a-channel-extension)
+5. [Provider Extensions](#provider-extensions)
+6. [Creating a Tool Extension](#creating-a-tool-extension)
+7. [Dependency Injection Patterns](#dependency-injection-patterns)
+8. [Extension Metadata with BotNexusExtensionAttribute](#extension-metadata-with-botnexusextensionattribute)
+9. [Accessing Configuration](#accessing-configuration)
+10. [World-Level Extension Defaults](#world-level-extension-defaults)
+11. [OAuth Providers](#oauth-providers)
+12. [Webhook Handlers](#webhook-handlers)
+13. [Testing Extensions in Isolation](#testing-extensions-in-isolation)
+14. [Build Pipeline & Output](#build-pipeline--output)
+15. [Out-of-tree extension repositories](#out-of-tree-extension-repositories)
+16. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -27,95 +29,238 @@ A **BotNexus extension** is a standalone .NET class library that plugs into the 
 - **Providers**: Add LLM backends (OpenAI, Anthropic, Copilot, local models, etc.)
 - **Tools**: Add agent capabilities (GitHub integration, web search, custom APIs, etc.)
 
-The extension system is built on **dynamic assembly loading** with folder conventions. Extensions are loaded at runtime from the `extensions/` folder, discovered via configuration, and registered into the dependency injection container using either:
-- **Convention-based registration** (automatic type discovery)
-- **Custom registration** (via `IExtensionRegistrar`)
+The extension system is built on **dynamic assembly loading** driven by a manifest. Each extension is a
+**flat folder** under the extensions root containing its assemblies and a `botnexus-extension.json`
+manifest. `AssemblyLoadContextExtensionLoader.DiscoverAsync` enumerates the immediate subdirectories of
+that root, and a directory without a `botnexus-extension.json` is skipped silently. There is no
+`{type}/{name}` nesting: the extension *type* is declared **inside** the manifest, not encoded in the
+path.
 
 **Key principles:**
-- Extensions are isolated in their own `AssemblyLoadContext` for future hot-reload capability
-- No default loading — extensions must be explicitly enabled in configuration (`~/.botnexus/config.json` or `appsettings.json`)
-- Folder structure follows the pattern: `extensions/{type}/{name}/`
-- Build artifacts are automatically copied to the extensions folder by the build pipeline
+- The manifest is the contract. No manifest, no extension — see [The `botnexus-extension.json` manifest](#the-botnexus-extensionjson-manifest).
+- Extensions are loaded into their own `AssemblyLoadContext`. Extensions declaring `endpoint-contributor` or `api-contributor` are loaded **non-collectible** (ASP.NET uses `Reflection.Emit` for typed hub proxies).
+- Discovery is one level deep: `<extensions root>/<extension-folder>/botnexus-extension.json`.
+- Extension **configuration** is keyed by manifest `id` in the concrete scope declared by `configurationScopes`.
+
+---
+
+## The `botnexus-extension.json` manifest
+
+This is the single most important file in an extension. It is deserialized into `ExtensionManifest`
+(`src/gateway/BotNexus.Gateway.Contracts/ExtensionModels.cs`) with case-insensitive property matching,
+then validated by `ValidateManifest` before the entry assembly is loaded. A manifest that fails
+validation causes the extension to be **skipped with a warning** — the gateway still starts.
+
+### Fields
+
+| Field | Type | Required | Rule |
+|-------|------|----------|------|
+| `id` | string | **yes** | Non-empty. Unique across all extensions; a duplicate id is treated as already-loaded. Convention: `botnexus-{kebab-name}`. This is the key operators use in config. |
+| `name` | string | **yes** | Non-empty human-readable display name. |
+| `description` | string | no | One-line summary. Not validated. |
+| `version` | string | **yes** | Non-empty. SemVer by convention. |
+| `entryAssembly` | string | **yes** | Bare DLL filename, relative to the extension folder. Must exist. Rejected if it contains invalid filename characters, is an absolute path, or resolves outside the extension directory. |
+| `extensionTypes` | string[] | **yes** | At least one value, each from the allowed set below. Matched case-insensitively. |
+| `dependencies` | string[] | no | Extension ids that must already be loaded. An unresolved dependency fails the load. |
+| `enabled` | bool | no | Defaults to `true`. |
+| `configSchema` | object[] | no | Declared config fields. Defaults to `[]`. See [configSchema](#configschema). |
+
+### `extensionTypes`
+
+The values are **singular**, and each corresponds to a service contract the loader discovers in the
+entry assembly. The allowed set is the `allowedTypes` list in `ValidateManifest`; an unlisted value is
+a hard validation failure.
+
+| Value | Contract |
+|-------|----------|
+| `channel` | `IChannelAdapter` |
+| `tool` | `IAgentTool` / `IAgentToolContributor` |
+| `command` | `ICommandContributor` |
+| `media-handler` | `IMediaHandler` |
+| `endpoint-contributor` | `IEndpointContributor` |
+| `api-contributor` | `IApiContributor` |
+| `hook-handler` | hook handler types |
+| `isolation` | `IIsolationStrategy` |
+| `session-store` | `ISessionStore` |
+| `auth-handler` | `IGatewayAuthHandler` |
+| `router` | `IMessageRouter` |
+| `agent-registry` | `IAgentRegistry` |
+| `agent-supervisor` | `IAgentSupervisor` |
+| `agent-communicator` | agent change/notifier contracts |
+| `activity-broadcaster` | `IActivityBroadcaster` |
+
+Two values carry behaviour beyond documentation:
+
+- `channel` — an `IHostedService` contributed by a channel extension is registered behind
+  `ChannelFaultBarrierHostedService`, so a misconfigured channel costs that channel and not the process.
+- `endpoint-contributor` / `api-contributor` — force a non-collectible load context.
+
+### `configSchema`
+
+Each entry declares one **top-level** config field for this extension
+(`ExtensionConfigFieldSchema`). `ExtensionConfigValidator` uses it for exactly two things: warn when a
+`required` field is absent, and apply `default` when an optional field is absent. It does **not**
+type-check values and does **not** descend into nested objects.
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `id` | string | Key in the extension's config object. |
+| `type` | string | `string`, `integer`, `bool`, `object`, `array`. Declarative only — not enforced. |
+| `default` | string | Applied when the field is absent and not required. Always a string in the manifest. |
+| `required` | bool | A missing required field produces a startup warning, not a failure. |
+| `sensitive` | bool | Masked in logs and in the portal. |
+| `description` | string | Shown in the portal's extension view. |
+
+An empty `configSchema: []` is legal and means the extension's config is not manifest-validated.
+
+### Worked example
+
+The smallest real manifest in the tree —
+`src/extensions/BotNexus.Extensions.ExecTool/botnexus-extension.json`, deployed verbatim to
+`~/.botnexus/extensions/botnexus-exec/botnexus-extension.json`:
+
+```json
+{
+  "id": "botnexus-exec",
+  "name": "Exec Tool",
+  "description": "Shell command execution tool for agents",
+  "version": "1.0.0",
+  "entryAssembly": "BotNexus.Extensions.ExecTool.dll",
+  "extensionTypes": ["tool"],
+  "enabled": true,
+  "configSchema": []
+}
+```
+
+A channel extension declaring config fields —
+`src/extensions/BotNexus.Extensions.Channels.Telegram/botnexus-extension.json` (schema abridged; the
+file declares seven fields):
+
+```json
+{
+  "id": "botnexus-telegram",
+  "name": "Telegram Channel",
+  "description": "Telegram Bot API channel adapter - long polling or secure webhook, DMs and group topics",
+  "version": "1.1.0",
+  "entryAssembly": "BotNexus.Extensions.Channels.Telegram.dll",
+  "extensionTypes": ["channel"],
+  "enabled": true,
+  "configSchema": [
+    {
+      "id": "botToken",
+      "type": "string",
+      "required": true,
+      "sensitive": true,
+      "description": "Telegram Bot API token from @BotFather. Required for all operations."
+    },
+    {
+      "id": "pollingTimeoutSeconds",
+      "type": "integer",
+      "required": false,
+      "default": "30",
+      "sensitive": false,
+      "description": "Long polling timeout in seconds."
+    }
+  ]
+}
+```
 
 ---
 
 ## Extension Project Structure & Conventions
 
-### Project Layout
+### On-disk layout
+
+One flat folder per extension, named by the manifest `id`. An actual
+`~/.botnexus/extensions/` listing:
 
 ```text
-extensions/
-├── channels/
-│   ├── discord/
-│   │   ├── BotNexus.Channels.Discord.dll
-│   │   ├── Discord.Net.dll
-│   │   └── ...dependencies
-│   ├── slack/
-│   └── telegram/
-├── providers/
-│   ├── openai/
-│   │   ├── BotNexus.Agent.Providers.OpenAI.dll
-│   │   ├── OpenAI.dll
-│   │   └── ...dependencies
-│   ├── copilot/
-│   └── anthropic/
-└── tools/
-    ├── github/
-    │   ├── BotNexus.Tools.GitHub.dll
-    │   └── ...dependencies
-    └── web-search/
+~/.botnexus/extensions/
+├── botnexus-agent365/
+├── botnexus-audio-transcription/
+├── botnexus-data-store/
+├── botnexus-debug-tool/
+├── botnexus-exec/
+│   ├── botnexus-extension.json
+│   ├── BotNexus.Extensions.ExecTool.dll
+│   ├── BotNexus.Extensions.ExecTool.deps.json
+│   ├── BotNexus.Agent.Core.dll
+│   ├── BotNexus.Domain.dll
+│   └── runtimes/
+├── botnexus-mcp/
+├── botnexus-mcp-invoke/
+├── botnexus-process/
+├── botnexus-qmd/
+├── botnexus-servicebus/
+├── botnexus-signalr/
+├── botnexus-skills/
+├── botnexus-telegram/
+└── botnexus-web/
 ```
+
+The extensions root is `gateway.extensionLoader.path` in `config.json`, defaulting to
+`~/.botnexus/extensions`. Set `gateway.extensionLoader.enabled` to `false` to disable dynamic loading
+entirely.
+
+### Source layout
+
+In the repository, each extension is a project directly under `src/extensions/` — no extra nesting —
+with the manifest in the project root:
+
+```text
+src/extensions/
+├── BotNexus.Extensions.ExecTool/
+│   ├── BotNexus.Extensions.ExecTool.csproj
+│   ├── botnexus-extension.json
+│   └── ...sources
+└── BotNexus.Extensions.Channels.Telegram/
+```
+
+See `src/extensions/AGENTS.md` for the naming and manifest-formatting rules enforced on this tree.
 
 ### Project File (.csproj)
 
-Every extension must include metadata properties and import the shared build targets:
+There is no `Extension.targets` and no `ExtensionType`/`ExtensionName` MSBuild property. An extension
+project sets `CopyLocalLockFileAssemblies` and declares its own copy target. The real
+`BotNexus.Extensions.ExecTool.csproj`, abridged:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    
-    <!-- Extension metadata - REQUIRED for build pipeline -->
-    <ExtensionType>channels</ExtensionType>
-    <ExtensionName>discord</ExtensionName>
-    
-    <!-- Optional for NuGet packages -->
-    <Description>Discord channel integration for BotNexus</Description>
-    <Version>1.0.0</Version>
-    <Author>Your Name</Author>
+    <!--
+      Extension assemblies load into an isolated AssemblyLoadContext, so their managed NuGet
+      dependency closure must ship in the extension output directory. Library projects do not copy
+      transitive managed dependencies by default, and the ALC cannot resolve one the host has not
+      already loaded - it fails with FileNotFoundException at load/dispose time and can crash the
+      host. See issues #2184 and #2001.
+    -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <RootNamespace>BotNexus.Extensions.ExecTool</RootNamespace>
+    <Description>Enhanced shell execution tool with timeout, background mode, and Windows command resolution.</Description>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\BotNexus.Core\BotNexus.Core.csproj" />
-    <ProjectReference Include="..\BotNexus.Channels.Base\BotNexus.Channels.Base.csproj" />
+    <ProjectReference Include="..\..\agent\BotNexus.Agent.Core\BotNexus.Agent.Core.csproj" />
+    <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Abstractions\BotNexus.Gateway.Abstractions.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Discord.Net" Version="3.19.1" />
-  </ItemGroup>
-
-  <!-- Import build targets to copy binaries to extensions/ folder -->
-  <Import Project="..\Extension.targets" />
+  <!-- Copy extension output + manifest to artifacts/extensions/ for dev-time discovery -->
+  <Target Name="CopyExtensionToArtifacts" AfterTargets="Build">
+    <PropertyGroup>
+      <ExtensionArtifactDir>$(MSBuildThisFileDirectory)..\..\..\artifacts\extensions\botnexus-exec\</ExtensionArtifactDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(ExtensionArtifactDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ExtensionArtifactDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)botnexus-extension.json" DestinationFolder="$(ExtensionArtifactDir)" SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>
 ```
 
-**Key properties:**
-- `ExtensionType`: `channels`, `providers`, or `tools`
-- `ExtensionName`: Folder name (snake-case recommended)
-- `CopyLocalLockFileAssemblies`: Set to `true` if dependencies must be bundled
-
-### Extension.targets Build Behavior
-
-The `Extension.targets` file automatically:
-1. After `Build`: Copies all compiled binaries to `extensions/{type}/{name}/` in the repository root (for development)
-2. After `Publish`: Copies binaries to `{BOTNEXUS_HOME}/extensions/{type}/{name}/` (for deployment)
-3. Excludes reference assemblies (`ref/`, `refint/`)
-
-This means you never manually copy DLLs — they appear in the extension folder when you build.
+The manifest must also be copied next to the assembly — the `CopyExtensionToArtifacts` target above
+does it for dev-time discovery, and `botnexus serve` re-deploys each project's manifest into
+`<extensions root>/<id>/botnexus-extension.json` when it stages extensions.
 
 ---
 
@@ -286,288 +431,47 @@ public sealed class DiscordExtensionRegistrar : IExtensionRegistrar
 }
 ```
 
-### Step 4: Build and Deploy
+### Step 4: Add the manifest, build and deploy
+
+Add a `botnexus-extension.json` next to the `.csproj`:
+
+```json
+{
+  "id": "botnexus-discord",
+  "name": "Discord Channel",
+  "description": "Discord messaging platform integration",
+  "version": "1.0.0",
+  "entryAssembly": "BotNexus.Extensions.Channels.Discord.dll",
+  "extensionTypes": ["channel"],
+  "enabled": true,
+  "configSchema": [
+    {
+      "id": "botToken",
+      "type": "string",
+      "required": true,
+      "sensitive": true,
+      "description": "Discord bot token."
+    }
+  ]
+}
+```
 
 ```bash
 # Build the extension
 dotnet build src/extensions/BotNexus.Extensions.Channels.Discord
 
-# Binaries automatically appear in:
-# extensions/channels/discord/
+# Output (assembly closure + manifest) lands in one flat folder:
+# artifacts/extensions/botnexus-discord/
 ```
 
-Enable the extension in `~/.botnexus/config.json` (or `appsettings.json`):
-```json
-{
-  "BotNexus": {
-    "Extensions": {
-      "channels:discord": { "enabled": true }
-    }
-  }
-}
-```
-
----
-
-## Creating a Provider Extension
-
-> **Note:** LLM providers are currently **not** loaded through the extension pipeline. They live in `src/agent/BotNexus.Agent.Providers.*/` projects and implement
-> `IApiProvider` (from `BotNexus.Agent.Providers.Core.Registry`). Registration is wired directly in
-> `src/gateway/BotNexus.Gateway.Api/Program.cs` rather than discovered from the `extensions/providers/` folder. The historical pattern below is kept for reference and as a target for a future provider-extension host; until that lands, ship new providers as agent projects following the convention in `src/agent/AGENTS.md`.
-
-**Providers** are LLM backends that agents use for intelligence. Examples: OpenAI, Anthropic, GitHub Copilot, local models.
-
-### Step 1: Create a Provider Class
-
-Implement `IApiProvider` from `BotNexus.Agent.Providers.Core.Registry`. The interface exposes an `Api` string (the wire-contract identifier, e.g. `"openai-completions"`) and a `Stream`/`StreamSimple` pair that returns an `LlmStream`. See `src/agent/BotNexus.Agent.Providers.OpenAICompat/` for a working reference implementation, and `src/agent/BotNexus.Agent.Providers.IntegrationMock/` for a deterministic test-only provider.
-
-The (legacy, non-functional) `LlmProviderBase` example below is preserved only to illustrate the historical extension shape — do **not** copy it verbatim.
-
-```csharp
-using System.Runtime.CompilerServices;
-using BotNexus.Core.Models;
-using BotNexus.Agent.Providers.Core;
-using Microsoft.Extensions.Logging;
-using OpenAI;
-using OpenAI.Chat;
-
-namespace BotNexus.Agent.Providers.OpenAI;
-
-/// <summary>
-/// OpenAI-compatible LLM provider.
-/// Supports OpenAI, Azure OpenAI, and any OpenAI-compatible endpoint.
-/// </summary>
-public sealed class OpenAiProvider : LlmProviderBase
-{
-    private readonly ChatClient _chatClient;
-    private readonly string _defaultModel;
-
-    public OpenAiProvider(
-        string apiKey,
-        string model = "gpt-4o",
-        string? apiBase = null,
-        ILogger<OpenAiProvider>? logger = null,
-        int maxRetries = 3)
-        : base(logger ?? NullLogger<OpenAiProvider>.Instance, maxRetries)
-    {
-        _defaultModel = model;
-        Generation = new GenerationSettings { Model = model };
-
-        var options = apiBase is not null
-            ? new OpenAIClientOptions { Endpoint = new Uri(apiBase) }
-            : null;
-
-        var openAiClient = options is not null
-            ? new OpenAIClient(new ApiKeyCredential(apiKey), options)
-            : new OpenAIClient(new ApiKeyCredential(apiKey));
-
-        _chatClient = openAiClient.GetChatClient(model);
-    }
-
-    public override string DefaultModel => _defaultModel;
-
-    protected override async Task<LlmResponse> ChatCoreAsync(ChatRequest request, CancellationToken cancellationToken)
-    {
-        var messages = BuildMessages(request);
-        var options = BuildChatCompletionOptions(request);
-
-        var completion = await _chatClient.CompleteChatAsync(messages, options, cancellationToken).ConfigureAwait(false);
-        var result = completion.Value;
-
-        var content = result.Content.Count > 0 ? result.Content[0].Text : string.Empty;
-        var finishReason = MapFinishReason(result.FinishReason);
-        var toolCalls = MapToolCalls(result.ToolCalls);
-
-        return new LlmResponse(
-            content,
-            finishReason,
-            toolCalls,
-            result.Usage?.InputTokenCount,
-            result.Usage?.OutputTokenCount);
-    }
-
-    /// <summary>Stream chat completions (yields tokens as they arrive).</summary>
-    public override async IAsyncEnumerable<string> ChatStreamAsync(
-        ChatRequest request,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        var messages = BuildMessages(request);
-        var options = BuildChatCompletionOptions(request);
-
-        await foreach (var update in _chatClient.CompleteChatStreamingAsync(messages, options, cancellationToken).ConfigureAwait(false))
-        {
-            foreach (var part in update.ContentUpdate)
-            {
-                if (!string.IsNullOrEmpty(part.Text))
-                    yield return part.Text;
-            }
-        }
-    }
-
-    private List<ChatMessage> BuildMessages(ChatRequest request)
-    {
-        var messages = new List<ChatMessage>();
-
-        if (request.SystemPrompt is not null)
-            messages.Add(new SystemChatMessage(request.SystemPrompt));
-
-        foreach (var msg in request.Messages)
-        {
-            messages.Add(msg.Role switch
-            {
-                "system" => new SystemChatMessage(msg.Content),
-                "assistant" => new AssistantChatMessage(msg.Content),
-                "tool" => new ToolChatMessage(msg.Content, msg.Content),
-                _ => (ChatMessage)new UserChatMessage(msg.Content)
-            });
-        }
-
-        return messages;
-    }
-
-    private ChatCompletionOptions BuildChatCompletionOptions(ChatRequest request)
-    {
-        var settings = request.Settings;
-        var options = new ChatCompletionOptions
-        {
-            MaxOutputTokenCount = settings.MaxTokens,
-            Temperature = (float)settings.Temperature,
-        };
-
-        if (request.Tools is { Count: > 0 })
-        {
-            foreach (var tool in request.Tools)
-            {
-                var toolDef = ChatTool.CreateFunctionTool(
-                    tool.Name,
-                    tool.Description,
-                    BuildParameterSchema(tool));
-                options.Tools.Add(toolDef);
-            }
-        }
-
-        return options;
-    }
-
-    private static BinaryData BuildParameterSchema(ToolDefinition tool)
-    {
-        var required = tool.Parameters
-            .Where(p => p.Value.Required)
-            .Select(p => p.Key)
-            .ToList();
-
-        var properties = tool.Parameters.ToDictionary(
-            p => p.Key,
-            p => (object)new Dictionary<string, object>
-            {
-                ["type"] = p.Value.Type,
-                ["description"] = p.Value.Description
-            });
-
-        var schema = new Dictionary<string, object>
-        {
-            ["type"] = "object",
-            ["properties"] = properties,
-            ["required"] = required
-        };
-
-        return BinaryData.FromObjectAsJson(schema);
-    }
-
-    private static FinishReason MapFinishReason(ChatFinishReason? reason) => reason switch
-    {
-        ChatFinishReason.Stop => FinishReason.Stop,
-        ChatFinishReason.ToolCalls => FinishReason.ToolCalls,
-        ChatFinishReason.Length => FinishReason.Length,
-        ChatFinishReason.ContentFilter => FinishReason.ContentFilter,
-        _ => FinishReason.Other
-    };
-
-    private static IReadOnlyList<ToolCallRequest>? MapToolCalls(IReadOnlyList<ChatToolCall> toolCalls)
-    {
-        if (toolCalls is not { Count: > 0 }) return null;
-
-        return toolCalls.Select(tc =>
-        {
-            var args = new Dictionary<string, object?>();
-            if (tc.FunctionArguments.ToString() is { } json && !string.IsNullOrWhiteSpace(json))
-            {
-                try
-                {
-                    args = JsonSerializer.Deserialize<Dictionary<string, object?>>(json) ?? [];
-                }
-                catch { /* Ignore malformed tool args */ }
-            }
-            return new ToolCallRequest(tc.Id, tc.FunctionName, args);
-        }).ToList();
-    }
-}
-```
-
-### Step 2: Define Provider Configuration
-
-```csharp
-namespace BotNexus.Agent.Providers.OpenAI;
-
-public class OpenAiProviderConfig
-{
-    public string? ApiKey { get; set; }
-    public string? DefaultModel { get; set; }
-    public string? ApiBase { get; set; }
-    public int MaxRetries { get; set; } = 3;
-}
-```
-
-### Step 3: Create Extension Registrar
-
-```csharp
-using BotNexus.Core.Abstractions;
-using BotNexus.Core.Configuration;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-
-namespace BotNexus.Agent.Providers.OpenAI;
-
-public sealed class OpenAiExtensionRegistrar : IExtensionRegistrar
-{
-    public void Register(IServiceCollection services, IConfiguration configuration)
-    {
-        services.AddSingleton<IApiProvider>(sp =>
-        {
-            var botConfig = sp.GetRequiredService<IOptions<BotNexusConfig>>().Value;
-            var providerConfig = configuration.Get<OpenAiProviderConfig>() ?? new OpenAiProviderConfig();
-            var logger = sp.GetRequiredService<ILogger<OpenAiProvider>>();
-
-            if (string.IsNullOrWhiteSpace(providerConfig.ApiKey))
-                throw new InvalidOperationException("OpenAI provider requires ApiKey configuration.");
-
-            return new OpenAiProvider(
-                apiKey: providerConfig.ApiKey,
-                model: providerConfig.DefaultModel ?? botConfig.Agents.Model,
-                apiBase: providerConfig.ApiBase,
-                logger: logger,
-                maxRetries: providerConfig.MaxRetries);
-        });
-    }
-}
-```
-
-### Step 4: Configuration
+Configure the extension by its manifest `id` in `~/.botnexus/config.json`:
 
 ```json
 {
-  "BotNexus": {
-    "Extensions": {
-      "providers:openai": { "enabled": true }
-    },
-    "Providers": {
-      "openai": {
-        "apiKey": "sk-...",
-        "defaultModel": "gpt-4o",
-        "apiBase": null,
-        "maxRetries": 3
+  "gateway": {
+    "extensions": {
+      "defaults": {
+        "botnexus-discord": { "enabled": true, "botToken": "..." }
       }
     }
   }
@@ -575,6 +479,23 @@ public sealed class OpenAiExtensionRegistrar : IExtensionRegistrar
 ```
 
 ---
+
+## Provider Extensions
+
+**LLM providers are not extensions and are not loaded through the extension pipeline.** They live in
+`src/agent/BotNexus.Agent.Providers.*/` projects, implement `IApiProvider` from
+`BotNexus.Agent.Providers.Core.Registry`, and are wired directly in
+`src/gateway/BotNexus.Gateway.Api/Program.cs`. There is no `provider` value in the manifest's
+`extensionTypes` allow-list, so a provider cannot be manifest-loaded at all.
+
+**Authoring a provider is documented in exactly one place:**
+[Provider Development Guide](internals/11-provider-development-guide.md). This page does not restate it.
+
+Reference implementations:
+
+- `src/agent/BotNexus.Agent.Providers.OpenAICompat/` — working `IApiProvider` implementation.
+- `src/agent/BotNexus.Agent.Providers.IntegrationMock/` — deterministic test-only provider.
+
 
 ## Creating a Tool Extension
 
@@ -859,19 +780,32 @@ public sealed class GitHubExtensionRegistrar : IExtensionRegistrar
 }
 ```
 
-### Step 4: Configuration
+### Step 4: Manifest and configuration
 
 ```json
 {
-  "BotNexus": {
-    "Extensions": {
-      "tools:github": { "enabled": true }
-    },
-    "Tools": {
-      "github": {
-        "apiBase": "https://api.github.com",
-        "token": "ghp_...",
-        "defaultOwner": "your-org"
+  "id": "botnexus-github",
+  "name": "GitHub Tools",
+  "description": "GitHub API tools for agents",
+  "version": "1.0.0",
+  "entryAssembly": "BotNexus.Extensions.GitHub.dll",
+  "extensionTypes": ["tool"],
+  "enabled": true,
+  "configSchema": [
+    { "id": "token", "type": "string", "required": true, "sensitive": true, "description": "GitHub PAT." },
+    { "id": "defaultOwner", "type": "string", "required": false, "sensitive": false, "description": "Default repository owner." }
+  ]
+}
+```
+
+Operator config, keyed by the manifest `id`:
+
+```json
+{
+  "gateway": {
+    "extensions": {
+      "defaults": {
+        "botnexus-github": { "enabled": true, "token": "ghp_...", "defaultOwner": "your-org" }
       }
     }
   }
@@ -886,7 +820,7 @@ public sealed class GitHubExtensionRegistrar : IExtensionRegistrar
 
 ### Convention-Based Registration (Automatic)
 
-If your extension assembly contains **exactly one** type implementing `IChannel` or `ITool`, the loader will automatically register it without requiring an `IExtensionRegistrar`. (LLM providers are not currently extension-loaded — see the [Creating a Provider Extension](#creating-a-provider-extension) note.)
+If your extension assembly contains **exactly one** type implementing `IChannel` or `ITool`, the loader will automatically register it without requiring an `IExtensionRegistrar`. (LLM providers are not extension-loaded at all — see [Provider Extensions](#provider-extensions).)
 
 ```csharp
 // Extension loader discovers this automatically
@@ -996,8 +930,8 @@ Extensions receive configuration scoped to their own section (from `~/.botnexus/
 ```csharp
 public void Register(IServiceCollection services, IConfiguration configuration)
 {
-    // configuration is already scoped to this extension's section
-    // (e.g., "BotNexus:Providers:openai" for the OpenAI provider)
+    // configuration is already scoped to this extension's section,
+    // keyed by the manifest id (e.g. "botnexus-web")
     
     var config = configuration.Get<MyExtensionConfig>() ?? new MyExtensionConfig();
     
@@ -1009,39 +943,18 @@ public void Register(IServiceCollection services, IConfiguration configuration)
 
 ### Configuration Shape in config.json
 
+Runtime settings are keyed by manifest `id`. Loader settings are separate from extension-owned settings:
+
 ```json
 {
-  "BotNexus": {
-    "ExtensionsPath": "~/.botnexus/extensions",
-    "Extensions": {
-      "channels:discord": { "enabled": true },
-      "providers:openai": { "enabled": true },
-      "tools:github": { "enabled": true }
-    },
-    "Channels": {
-      "Instances": {
-        "discord": {
-          "enabled": true,
-          "botToken": "your-token",
-          "allowFrom": ["user-id"]
-        }
-      }
-    },
-    "Providers": {
-      "openai": {
-        "apiKey": "sk-...",
-        "defaultModel": "gpt-4o",
-        "apiBase": null
-      }
-    },
-    "Tools": {
-      "Extensions": {
-        "github": {
-          "token": "ghp_...",
-          "defaultOwner": "your-org"
-        }
-      }
-    }
+  "world": { "extensions": { "example-policy": { "mode": "restricted" } } },
+  "gateway": {
+    "extensionLoader": { "path": "~/.botnexus/extensions", "enabled": true },
+    "extensions": { "example-transport": { "listen": true } }
+  },
+  "agents": {
+    "defaults": { "extensions": { "botnexus-web": { "search": { "provider": "brave", "apiKey": "${env:WEB_KEY}" } } } },
+    "my-agent": { "extensions": { "botnexus-web": { "search": { "maxResults": 10 } } } }
   }
 }
 ```
@@ -1063,104 +976,9 @@ public sealed class MyTool
 
 ---
 
-## World-Level Extension Defaults
+## Agent extension defaults
 
-To avoid repeating extension configuration across multiple agents, operators can define shared extension defaults at the gateway level. This is particularly useful when many agents need identical extension settings.
-
-### Configuration Structure
-
-Extension defaults are defined in the `gateway.extensions.defaults` section of `config.json`:
-
-```json
-{
-  "gateway": {
-    "extensions": {
-      "defaults": {
-        "botnexus-skills": { "enabled": true, "maxLoadedSkills": 20 },
-        "botnexus-exec": { "enabled": true }
-      }
-    }
-  },
-  "agents": {
-    "my-agent": {
-      "extensions": {
-        "botnexus-skills": { "maxLoadedSkills": 30 }
-      }
-    },
-    "assistant": {}
-  }
-}
-```
-
-### Before and After Example
-
-**Before (duplicated per agent):**
-```json
-{
-  "agents": {
-    "my-agent": {
-      "extensions": {
-        "botnexus-skills": { "enabled": true, "maxLoadedSkills": 20 },
-        "botnexus-exec": { "enabled": true }
-      }
-    },
-    "assistant": {
-      "extensions": {
-        "botnexus-skills": { "enabled": true, "maxLoadedSkills": 20 },
-        "botnexus-exec": { "enabled": true }
-      }
-    }
-  }
-}
-```
-
-**After (DRY with world defaults):**
-```json
-{
-  "gateway": {
-    "extensions": {
-      "defaults": {
-        "botnexus-skills": { "enabled": true, "maxLoadedSkills": 20 },
-        "botnexus-exec": { "enabled": true }
-      }
-    }
-  },
-  "agents": {
-    "my-agent": {
-      "extensions": {
-        "botnexus-skills": { "maxLoadedSkills": 30 }
-      }
-    },
-    "assistant": {}
-  }
-}
-```
-
-### Merge Semantics
-
-When an agent's extension configuration is merged with world defaults:
-
-- **Objects merge recursively** — Keys from both default and agent are combined, with agent values taking precedence on conflicts
-- **Scalars and arrays are replaced wholesale** — If an agent provides a scalar or array value, it completely replaces the default (no partial merging)
-- **Missing agent config inherits defaults** — Agents without an `extensions` block receive all world defaults unchanged
-- **Explicit disabling** — An agent can disable a world-default extension by setting `"enabled": false`
-- **Null overrides** — An explicit `null` from an agent removes a value from the merged result
-
-### Merge Examples
-
-| World Default | Agent Override | Effective Config |
-|---|---|---|
-| `{ "a": 1, "b": 2 }` | `{ "b": 3, "c": 4 }` | `{ "a": 1, "b": 3, "c": 4 }` |
-| `{ "a": 1 }` | (absent) | `{ "a": 1 }` |
-| (absent) | `{ "b": 2 }` | `{ "b": 2 }` |
-| `{ "nested": { "x": 1 } }` | `{ "nested": { "y": 2 } }` | `{ "nested": { "x": 1, "y": 2 } }` |
-| `[1, 2]` | `[3, 4]` | `[3, 4]` (arrays replace) |
-
-### Backward Compatibility
-
-Existing configurations without a `gateway.extensions.defaults` section continue to work unchanged. World-level defaults are entirely optional and do not affect deployments that don't use them.
-
----
+`agents.defaults.extensions.<id>` stores shared agent values. A consumer binds that entry and the named `agents.<agentId>.extensions.<id>` entry separately, then chooses named-agent, agent-default, and code fallback for each property. This intentionally is not a deep merge: world and gateway settings never flow into agent settings.
 
 ## OAuth Providers
 
@@ -1495,44 +1313,157 @@ public sealed class GitHubExtensionTests
 
 ## Build Pipeline & Output
 
-### How Extension.targets Works
+### How the copy target works
 
-When you build an extension project:
+Each extension project declares its own `AfterTargets="Build"` copy target (there is no shared
+`Extension.targets`). When you build an extension project:
 
-1. **Compile**: Normal MSBuild compilation to `bin/Release/net10.0/`
-2. **Copy**: `Extension.targets` fires an `AfterTargets="Build"` target that copies all binaries to `extensions/{type}/{name}/`
-3. **Deploy**: On `Publish`, binaries are copied to the published output
+1. **Compile**: normal MSBuild compilation to `bin/<Config>/net10.0/`, including the transitive managed
+   dependency closure because `CopyLocalLockFileAssemblies` is `true`.
+2. **Copy**: the project's `CopyExtensionToArtifacts` target copies the entry assembly and the
+   `botnexus-extension.json` manifest into `artifacts/extensions/<manifest-id>/`.
+3. **Deploy**: `botnexus serve` stages each extension project's output plus its manifest into
+   `<extensions root>/<manifest-id>/`, pruning stale files from earlier generations.
 
 Example:
 ```bash
-# Build discord extension
-dotnet build src/extensions/BotNexus.Extensions.Channels.Discord
+# Build the exec tool extension
+dotnet build src/extensions/BotNexus.Extensions.ExecTool
 
-# Output appears in:
-# extensions/channels/discord/
-# ├── BotNexus.Channels.Discord.dll
-# ├── Discord.Net.dll
-# ├── ...dependencies
+# Output appears in one flat folder named by the manifest id:
+# artifacts/extensions/botnexus-exec/
+# ├── botnexus-extension.json
+# ├── BotNexus.Extensions.ExecTool.dll
+# └── ...dependency closure
 ```
 
 ### Build All Extensions
 
 ```bash
 # Build the entire solution (includes all extensions)
-dotnet build BotNexus.slnx
-
-# All extension DLLs are now in extensions/{type}/{name}/
+dotnet build dirs.proj
 ```
 
-### Publishing
+### Deploying
 
 ```bash
-# Publish the Gateway (includes extensions)
-dotnet publish src/BotNexus.Gateway -o ./publish
+# Stage extensions into the gateway's extensions root
+botnexus serve
 
-# Extensions are copied to:
-# publish/extensions/{type}/{name}/
+# Extensions land in:
+# ~/.botnexus/extensions/<manifest-id>/
 ```
+
+---
+
+## Out-of-tree extension repositories
+
+Use the public [BotNexus extension template](https://github.com/Sytone/botnexus-extension-template) when the extension belongs in its own Git repository. The template contains a manifest, one deterministic `IAgentTool`, tests, packaging scripts, `CopyLocalLockFileAssemblies=true`, and both supported checkout reference shapes.
+
+### Repository layout
+
+```text
+src/BotNexus.Extensions.Reference/
+  BotNexus.Extensions.Reference.csproj
+  ReferenceEchoTool.cs
+  botnexus-extension.json
+tests/BotNexus.Extensions.Reference.Tests/
+scripts/
+```
+
+Keep the manifest beside the extension project. Packaged output remains one flat folder named by the manifest `id`; the repository may contain source, tests, automation and documentation around that folder.
+
+### Reference the BotNexus checkout
+
+Pass the local checkout as the `BotNexusRepoRoot` MSBuild property. The template also reads the `BOTNEXUS_REPO_ROOT` environment variable.
+
+The default source shape uses `ProjectReference` entries below `$(BotNexusRepoRoot)`. Use it for normal development because contract changes compile with the extension. The binary shape uses `Reference` and `HintPath` entries for BotNexus assemblies already built from the same checkout. Select it with `-p:BotNexusReferenceShape=binary`; build the required BotNexus projects first and use `BotNexusBinaryConfiguration` when they were not built in `Release`.
+
+Both shapes must fail with the resolved missing path. Neither shape may search another machine path, download an unversioned DLL, or commit BotNexus contract assemblies to the extension repository. Pin the BotNexus revision in continuous integration and release automation.
+
+### Register the repository
+
+**Main branch:** the lifecycle below is implemented on `main` at `a753ffe23` (including [#4505](https://github.com/Sytone/botnexus/pull/4505)). Check that your installed version includes it before using these commands.
+
+> [!WARNING]
+> A compiled extension runs inside the gateway with full gateway trust and the gateway process's operating-system permissions. Its build can also execute repository-defined MSBuild tasks with the build process's permissions. Registration is not a sandbox or code-signing decision. Review the repository, dependencies and requested revision before enabling it. Enabled registrations participate in later lifecycle operations, not only an explicit sync.
+
+#### Before you start
+
+- Install Git and the .NET SDK required by the BotNexus checkout and the extension project. The reconciler invokes `git` and `dotnet` on the host and passes the resolved BotNexus checkout as `BotNexusRepoRoot` to extension builds.
+- Make the repository reachable from that host. For a private repository, configure Git credentials or SSH authentication for the operating-system account that runs the CLI or gateway. Git operations set `GIT_TERMINAL_PROMPT=0`; arrange noninteractive authentication, including any SSH host-key trust, before syncing. A portal session or an agent's GitHub tool credentials do not configure host Git authentication. Do not put credentials in the repository URL.
+- Use a compatible extension revision and keep a record of the requested ref and resolved commit. The registration ID identifies a source repository; each deployed extension uses its own manifest `id`.
+
+#### CLI method
+
+The URL below is fictional. Replace it with a repository you have reviewed and can access. Run these commands on the BotNexus host, using the same BotNexus home as the gateway:
+
+```powershell
+# Save repository metadata; this does not fetch or execute repository content.
+botnexus extensions add --id reference-extension --url https://git.example.com/extensions/reference-extension.git --ref main
+botnexus extensions list
+
+# Clone/update, resolve the ref, build and deploy all enabled registrations.
+botnexus extensions sync
+
+# Restart interrupts active gateway work and loads the deployed assemblies.
+botnexus gateway restart
+```
+
+`extensions reconcile` is an alias for `extensions sync`. Adding, updating, enabling, disabling or removing a registration changes metadata only; synchronization is a separate operation. To review a registration before it participates in lifecycle work, add it with `--disabled` and enable it later with `botnexus extensions enable --id reference-extension`.
+
+`--ref` accepts a branch, tag or commit. A commit gives the most reproducible registration; a tag is readable but can be moved by a repository owner; a branch follows future commits. Use `--no-updates` on `add` or `update` to stop fetching an existing clone; it does not disable builds or deployment, and a missing clone is still cloned. Use `update --updates` to restore fetching. For example:
+
+```powershell
+botnexus extensions update --id reference-extension --ref v1.0.0
+botnexus extensions sync
+botnexus gateway restart
+```
+
+#### UI method
+
+The Configuration page exposes the same registry and requires an explicit trust acknowledgement when adding a repository. **Sync Now** is available for enabled registrations and runs the shared clone/ref/build/deploy pipeline for the selected repository. Deployment still reconciles all enabled repository sources and in-tree sources, using previous staged output for repositories not rebuilt by that request. Sync does not restart the running gateway or grant tools to an agent.
+
+### Lifecycle, failure and removal
+
+#### What synchronization does
+
+`ExtensionLifecycleReconciler` performs these steps under a lock scoped to the BotNexus home. A process-local semaphore and an exclusive file lock serialize overlapping CLI and API passes across processes.
+
+1. **Materialize source.** Clone a missing repository under `<BotNexus home>/extension-repositories/<registration-id>/repository`. For an existing clean clone, fetch when updates are enabled, resolve the requested branch, tag or commit to an exact SHA, and check out that commit detached.
+2. **Discover and build.** Recursively find every `.csproj` with a `botnexus-extension.json` in the same directory. A repository can contain multiple extension projects; test or helper projects without an adjacent manifest are not selected. Build each selected project in `Release`, with `BotNexusRepoRoot` and a separate output directory inside a candidate generation. No selected projects is a named failure.
+3. **Validate and deploy.** Once all selected projects build, validate their outputs and reconcile them with in-tree outputs and other enabled registered sources into `<BotNexus home>/extensions/<manifest-id>`. Deployment checks manifests, entry assemblies and extension-ID collisions before activation. Each extension directory uses atomic replacement with retry/rollback handling; this is not an all-repositories atomic switch.
+4. **Record the result.** Promote the candidate to the repository's `staged` directory and record lifecycle success only after deployment is accepted for that repository. The registry also stores the clone path, attempt time, resolved commit and bounded named failure details.
+
+The same pipeline runs from `botnexus build`, `botnexus update`, `botnexus serve`, and gateway start/restart. Where those paths build BotNexus, reconciliation follows a successful platform build. Repository failures are reported but do not by themselves fail the platform build or prevent update/startup from continuing. Explicit `extensions sync` returns a non-zero exit code if an enabled repository fails; the API reports a failed selected sync to the caller.
+
+#### Failure and last-known-good output
+
+Source reconciliation never resets, cleans or deletes the managed clone. A dirty clone, a current commit that is not an ancestor of the requested commit, a missing or mismatched `origin`, or an invalid ref produces a named failure. With `--no-updates`, an existing clone resolves refs from locally available Git objects without fetching. Preserve local work and resolve the reported condition explicitly rather than expecting sync to discard it.
+
+A clone or build failure does not promote a partial candidate generation: the previous staged generation remains a deployment source for an enabled registration. Registered-source validation failures preserve source-owned last-known-good live directories when available. Activation failures attempt to restore the previous live directory; rollback can also fail, so inspect the named diagnostic before relying on that deployment. Other repositories can continue. A first-time failure has no previous deployment to fall back to, and a successful pass can remove obsolete output. Last-known-good handling is not a guarantee of extension compatibility or a backup of operator data.
+
+Registered output is included in normal deployment reconciliation; it is not treated as an unrelated manual installation and blindly pruned on the next serve or update. Unregistered manual package installations can still be pruned as stale. Keep the source and package if using the template's local-install scripts for development.
+
+#### Disable or remove
+
+```powershell
+# Retain metadata but exclude this repository from future builds/deployment sources.
+botnexus extensions disable --id reference-extension
+botnexus extensions sync
+botnexus gateway restart
+
+# Alternatively, remove its registration metadata.
+botnexus extensions remove --id reference-extension
+```
+
+Disable/remove does not immediately unload code, delete the managed clone, or delete its staged files. A later deployment pass excludes disabled or removed registrations and can prune their live extension directories. When at least one registration remains (even if all are disabled), maintenance sync runs that deployment pass. If removing the final registration leaves the registry empty, `extensions sync` and `botnexus build` perform no deployment work. Host-startup reconciliation used by serve, update and gateway start/restart still refreshes in-tree deployment and prunes stale live output with an empty registry. Restart is required to stop using assemblies already loaded in a running gateway. Delete preserved clone/staging data only as a separate explicit action after checking for local work.
+
+#### Configure, grant and verify
+
+Registration, deployment, loading, extension configuration and an agent's tool grants are separate decisions. Configure values by each manifest `id` in its declared [configuration scopes](#explicit-extension-configuration-scopes), and grant the intended tool IDs through the agent's [tool configuration](user-guide/agents.md). A successful sync does not supply extension secrets, change tool grants, or hot-reload assemblies in the running gateway.
+
+After deployment and gateway restart, verify `GET /api/extensions`, the intended agent's available tools, and one fresh conversation. Check the persisted reconciliation status and gateway logs when something is missing. A directory on disk proves only that files were copied; a resolved SHA alone does not prove the latest build and deployment succeeded.
 
 ---
 
@@ -1543,26 +1474,28 @@ dotnet publish src/BotNexus.Gateway -o ./publish
 **Symptom:** Extension folder exists but the extension doesn't register.
 
 **Checks:**
-1. Is the extension enabled in configuration (`~/.botnexus/config.json` or `appsettings.json`)?
+1. Does `<extensions root>/<folder>/botnexus-extension.json` exist? A directory without a manifest is
+   skipped silently at Debug level — this is the single most common cause.
+
+2. Is `enabled` `true` in the manifest, and is the extension enabled in config by its manifest `id`?
    ```json
-   "Extensions": {
-     "channels:discord": { "enabled": true }
-   }
+   "agents": { "defaults": { "extensions": { "botnexus-discord": { "enabled": true } } } }
    ```
 
-2. Do the DLLs exist in the correct folder?
+3. Does the file named by `entryAssembly` exist in that same folder? A missing entry assembly logs a
+   manifest-validation warning and skips the extension.
+
+4. Are the `extensionTypes` values valid and **singular** (`"tool"`, `"channel"`, not `"tools"`)? An
+   unrecognised value fails validation outright.
+
+5. Check the Gateway logs for loading errors:
    ```
-   extensions/channels/discord/BotNexus.Channels.Discord.dll
+   Skipping '~/.botnexus/extensions/foo' because botnexus-extension.json is missing.
+   Skipping extension in '...' due to manifest or assembly validation failure.
+   Extension 'botnexus-exec' from '...': discovered 1 implementation(s): IAgentTool->ExecTool
    ```
 
-3. Check the Gateway logs for loading errors:
-   ```
-   Extension loader root: ~/.botnexus/extensions
-   Scanning extension folder: ~/.botnexus/extensions/channels/discord
-   Rejected extension 'channels/discord': Assembly version mismatch
-   ```
-
-4. Verify assembly compatibility:
+6. Verify assembly compatibility:
    - All extensions must target `net10.0`
    - Core dependencies must have matching versions
 
@@ -1570,11 +1503,11 @@ dotnet publish src/BotNexus.Gateway -o ./publish
 
 **Cause:** Extension DLLs weren't copied during build.
 
-**Fix:** 
-1. Ensure `.csproj` has `ExtensionType` and `ExtensionName` properties
-2. Ensure `.csproj` imports `Extension.targets`
+**Fix:**
+1. Ensure `.csproj` sets `CopyLocalLockFileAssemblies=true`
+2. Ensure `.csproj` has a copy target that also copies `botnexus-extension.json`
 3. Rebuild: `dotnet clean && dotnet build`
-4. Verify output: `ls extensions/{type}/{name}/`
+4. Verify output: `ls artifacts/extensions/<manifest-id>/`
 
 ### "IExtensionRegistrar not found"
 
@@ -1587,18 +1520,16 @@ dotnet publish src/BotNexus.Gateway -o ./publish
 
 ### "Configuration section not found"
 
-**Cause:** Extension config is missing from `~/.botnexus/config.json` (or `appsettings.json`).
+**Cause:** Extension config is missing from `~/.botnexus/config.json`, or is keyed by something other
+than the manifest `id`.
 
 **Fix:**
 ```json
 {
-  "BotNexus": {
-    "Channels": {
-      "Instances": {
-        "discord": {
-          "enabled": true,
-          "botToken": "your-token"
-        }
+  "gateway": {
+    "extensions": {
+      "defaults": {
+        "botnexus-discord": { "enabled": true, "botToken": "your-token" }
       }
     }
   }
@@ -1630,7 +1561,7 @@ dotnet publish src/BotNexus.Gateway -o ./publish
 **Symptom:** `IWebhookHandler` is registered but webhook events aren't arriving.
 
 **Checks:**
-1. Is the Gateway listening on the correct port (default 18790)?
+1. Is the Gateway listening on the correct port (default 5005)?
 2. Is the webhook route registered? Check Gateway logs:
    ```
    Registered webhook handler: /webhooks/slack
@@ -1644,13 +1575,19 @@ dotnet publish src/BotNexus.Gateway -o ./publish
 
 To create a BotNexus extension:
 
-1. **Create a class library** targeting `net10.0`
-2. **Add `ExtensionType` and `ExtensionName`** to `.csproj`
-3. **Import `Extension.targets`** to auto-copy binaries
-4. **Implement the interface** (`IChannel` or `ITool`; LLM providers ship as `src/agent/` projects implementing `IApiProvider`)
+1. **Create a class library** targeting `net10.0` under `src/extensions/`
+2. **Add a `botnexus-extension.json`** declaring `id`, `name`, `version`, `entryAssembly` and singular `extensionTypes`
+3. **Set `CopyLocalLockFileAssemblies=true`** and add a copy target that also copies the manifest
+4. **Implement the contract** for your declared type (`IChannelAdapter`, `IAgentTool`, …; LLM providers are **not** extensions — see [Provider Extensions](#provider-extensions))
 5. **Optionally implement `IExtensionRegistrar`** for advanced DI
-6. **Add configuration** to `~/.botnexus/config.json` (or `appsettings.json`)
-7. **Build** and binaries appear in `extensions/{type}/{name}/`
+6. **Add configuration** keyed by the manifest `id` in `~/.botnexus/config.json`
+7. **Build** and the flat extension folder appears in `artifacts/extensions/<manifest-id>/`
 8. **Enable in config** and the Gateway loads it at startup
 
 Happy extending!
+
+## Explicit extension configuration scopes
+
+A manifest with `configSchema` must declare `configurationScopes` using only `world`, `gateway`, and `agent`. Values are stored independently at `world.extensions.<id>`, `gateway.extensions.<id>`, `agents.defaults.extensions.<id>`, and `agents.<agentId>.extensions.<id>`. Gateway loader settings live at `gateway.extensionLoader`; the former `gateway.extensions.defaults` shape is rejected with migration guidance.
+
+Binding reads one raw scope at a time. Agent consumers may read both agent-default and named-agent bags, but must choose precedence explicitly for each property: named agent first, agent default second, then the code default. World and gateway values never flow into agent configuration implicitly.

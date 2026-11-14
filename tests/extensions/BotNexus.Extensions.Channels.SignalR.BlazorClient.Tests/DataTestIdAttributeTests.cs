@@ -48,6 +48,10 @@ public sealed class DataTestIdAttributeTests : IDisposable
         _ctx.Services.AddSingleton(http);
         _ctx.Services.AddSingleton(new ExtensionFeatureService(restClient));
         _ctx.Services.AddSingleton(new CronApiClient(http));
+        _ctx.Services.AddSingleton(new SectionsApiClient(http));
+        _ctx.Services.AddSingleton(sp => new ConversationSectionsState(sp.GetRequiredService<SectionsApiClient>()));
+        _ctx.Services.AddSingleton(new ToolsApiClient(http));
+        _ctx.Services.AddStubNavOrderApiClient();
         _ctx.JSInterop.Mode = JSRuntimeMode.Loose;
     }
 
@@ -85,7 +89,7 @@ public sealed class DataTestIdAttributeTests : IDisposable
             AgentId = "test-agent",
             DisplayName = "Test Agent"
         });
-        _store.ActiveAgentId = "test-agent";
+        _store.SelectView("test-agent", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
         cut.Find("[data-testid='agent-select']");
@@ -101,7 +105,7 @@ public sealed class DataTestIdAttributeTests : IDisposable
             DisplayName = "Test Agent"
         };
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = "test-agent";
+        _store.SelectView("test-agent", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
         cut.Find("[data-testid='new-conversation-btn']");
@@ -123,12 +127,12 @@ public sealed class DataTestIdAttributeTests : IDisposable
             IsDefault = false,
             UpdatedAt = DateTimeOffset.UtcNow
         };
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = "test-agent";
+        _store.SelectView("test-agent", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
-        cut.Find("[data-testid='conversation-archive-btn']");
+        cut.Find("[data-testid='conversation-actions-trigger']");
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -145,9 +149,9 @@ public sealed class DataTestIdAttributeTests : IDisposable
             IsStreaming = isStreaming
         };
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = agentId;
+        _store.SelectView(agentId, string.Empty, SelectionSource.UserClick);
 
-        return _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, agentId));
+        return _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, agentId).Add(c => c.ConversationId, null));
     }
 
     [Fact]
@@ -194,15 +198,15 @@ public sealed class DataTestIdAttributeTests : IDisposable
             Title = "Active",
             IsDefault = true
         };
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = "stream-agent";
+        _store.SelectView("stream-agent", string.Empty, SelectionSource.UserClick);
 
         // Mark the conversation as streaming via IsStreaming (IsTurnActive is computed)
         var streamState = _store.GetStreamState("conv-1");
         streamState.IsStreaming = true;
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent").Add(c => c.ConversationId, "conv-1"));
         cut.Find("[data-testid='chat-abort-btn']");
     }
 
@@ -221,14 +225,14 @@ public sealed class DataTestIdAttributeTests : IDisposable
             Title = "Active",
             IsDefault = true
         };
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = "stream-agent";
+        _store.SelectView("stream-agent", string.Empty, SelectionSource.UserClick);
 
         var streamState = _store.GetStreamState("conv-1");
         streamState.IsStreaming = true;
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent").Add(c => c.ConversationId, "conv-1"));
         cut.Find("[data-testid='chat-steer-btn']");
     }
 
@@ -247,15 +251,52 @@ public sealed class DataTestIdAttributeTests : IDisposable
             Title = "Active",
             IsDefault = true
         };
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = "stream-agent";
+        _store.SelectView("stream-agent", string.Empty, SelectionSource.UserClick);
 
         var streamState = _store.GetStreamState("conv-1");
         streamState.IsStreaming = true;
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent").Add(c => c.ConversationId, "conv-1"));
         cut.Find("[data-testid='chat-followup-btn']");
+    }
+
+    [Fact]
+    public void ChatPanel_run_controls_are_compact_accessible_icon_buttons()
+    {
+        var agent = new AgentState
+        {
+            AgentId = "stream-agent",
+            DisplayName = "Stream Agent",
+            IsConnected = true
+        };
+        agent.Conversations["conv-1"] = new ConversationState
+        {
+            ConversationId = "conv-1",
+            Title = "Active",
+            IsDefault = true
+        };
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
+        _store.UpsertAgent(agent);
+        _store.SelectView("stream-agent", string.Empty, SelectionSource.UserClick);
+        _store.GetStreamState("conv-1").IsRunActive = true;
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent").Add(c => c.ConversationId, "conv-1"));
+        var toolbar = cut.Find("[data-testid='chat-composer-toolbar']");
+
+        Assert.Equal("toolbar", toolbar.GetAttribute("role"));
+        Assert.Equal("Conversation actions", toolbar.GetAttribute("aria-label"));
+
+        var attach = cut.Find("[data-testid='chat-attach']");
+        Assert.Equal("Attach files", attach.GetAttribute("aria-label"));
+        Assert.Contains("📎", attach.TextContent);
+        Assert.Empty(attach.QuerySelectorAll("svg"));
+
+        AssertIconButton(cut, "chat-steer-btn", "Steer at next turn boundary");
+        AssertIconButton(cut, "chat-redirect-btn", "Redirect immediately");
+        AssertIconButton(cut, "chat-followup-btn", "Queue follow-up after completion");
+        AssertIconButton(cut, "chat-abort-btn", "Stop agent");
     }
 
     [Fact]
@@ -276,19 +317,24 @@ public sealed class DataTestIdAttributeTests : IDisposable
             Title = "Active",
             IsDefault = true
         };
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = "stream-agent";
+        _store.SelectView("stream-agent", string.Empty, SelectionSource.UserClick);
 
         var streamState = _store.GetStreamState("conv-1");
         streamState.IsRunActive = true;   // RunStarted seen, RunEnded not yet
         streamState.IsStreaming = false;  // between an LLM generation and the next
         // ActiveToolCalls empty -- between two sequential tools
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent").Add(c => c.ConversationId, "conv-1"));
 
         // Run controls present, Send absent.
+        var composer = cut.Find("[data-testid='chat-composer']");
+        composer.ClassList.ShouldContain("composer-active");
+        composer.GetAttribute("aria-busy").ShouldBe("true");
+        cut.Find("[data-testid='chat-composer-status']").TextContent.ShouldContain("Agent is working");
         cut.Find("[data-testid='chat-steer-btn']");
+        cut.Find("[data-testid='chat-redirect-btn']");
         cut.Find("[data-testid='chat-followup-btn']");
         cut.Find("[data-testid='chat-abort-btn']");
         Assert.Empty(cut.FindAll("[data-testid='chat-send']"));
@@ -309,14 +355,14 @@ public sealed class DataTestIdAttributeTests : IDisposable
             Title = "Active",
             IsDefault = true
         };
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         _store.UpsertAgent(agent);
-        _store.ActiveAgentId = "stream-agent";
+        _store.SelectView("stream-agent", string.Empty, SelectionSource.UserClick);
 
         var streamState = _store.GetStreamState("conv-1");
         streamState.IsStreaming = true;
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "stream-agent").Add(c => c.ConversationId, "conv-1"));
         cut.Find("[data-testid='streaming-badge']");
     }
 
@@ -394,7 +440,7 @@ public sealed class DataTestIdAttributeTests : IDisposable
             DisplayName = "Tab Agent",
             IsConnected = true
         });
-        _store.ActiveAgentId = "tab-agent";
+        _store.SelectView("tab-agent", string.Empty, SelectionSource.UserClick);
 
         var cut = _ctx.Render<AgentPanel>(p => p.Add(c => c.AgentId, "tab-agent"));
 
@@ -440,6 +486,18 @@ public sealed class DataTestIdAttributeTests : IDisposable
     // ───────────────────────────────────────────────────────────────────────
     // Helpers
     // ───────────────────────────────────────────────────────────────────────
+
+    private static void AssertIconButton(
+        IRenderedComponent<ChatPanel> cut,
+        string testId,
+        string accessibleName)
+    {
+        var button = cut.Find($"[data-testid='{testId}']");
+        Assert.Equal(accessibleName, button.GetAttribute("aria-label"));
+        Assert.False(string.IsNullOrWhiteSpace(button.GetAttribute("title")));
+        Assert.Single(button.QuerySelectorAll("svg"));
+        Assert.Equal(string.Empty, button.TextContent.Trim());
+    }
 
     private static string GetComponentFileContent(string fileName)
     {

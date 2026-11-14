@@ -5,16 +5,41 @@
   "additionalProperties": false,
   "properties": {
     "$schema": {
+      "title": "Schema",
       "type": [
         "null",
         "string"
-      ]
+      ],
+      "description": "Optional JSON schema reference for editor IntelliSense/validation."
     },
     "version": {
+      "title": "Config schema version",
       "type": "integer",
-      "format": "int32"
+      "description": "Configuration schema version for forward compatibility. Bumped only when the config shape changes incompatibly.",
+      "format": "int32",
+      "default": 1
+    },
+    "worldId": {
+      "title": "World ID",
+      "type": [
+        "null",
+        "string"
+      ],
+      "description": "Stable GUID identifying this BotNexus world. Generated automatically on first start; do not copy it between installations."
+    },
+    "world": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/definitions/WorldSettingsConfig"
+        }
+      ]
     },
     "gateway": {
+      "title": "Gateway",
+      "description": "Gateway-specific settings.",
       "oneOf": [
         {
           "type": "null"
@@ -25,39 +50,60 @@
       ]
     },
     "agents": {
+      "title": "Agents",
       "type": [
         "null",
         "object"
       ],
+      "description": "Agent definitions keyed by agent ID.",
       "additionalProperties": {
         "$ref": "#/definitions/AgentDefinitionConfig"
       }
     },
     "providers": {
+      "title": "Providers",
       "type": [
         "null",
         "object"
       ],
+      "description": "Provider configurations keyed by provider name.",
       "additionalProperties": {
         "$ref": "#/definitions/ProviderConfig"
       }
     },
-    "channels": {
+    "extensionRepositories": {
+      "title": "Extension repositories",
       "type": [
         "null",
         "object"
       ],
+      "description": "Source repositories registered for extension discovery and updates.",
+      "additionalProperties": {
+        "$ref": "#/definitions/ExtensionRepositoryRegistration"
+      }
+    },
+    "channels": {
+      "title": "Channels",
+      "type": [
+        "null",
+        "object"
+      ],
+      "description": "Channel settings keyed by channel name.",
       "additionalProperties": {
         "$ref": "#/definitions/ChannelConfig"
       }
     },
     "apiKey": {
+      "title": "API key",
       "type": [
         "null",
         "string"
-      ]
+      ],
+      "description": "API key for gateway authentication. Null runs the gateway in dev mode with no auth. Sensitive: stored and shown masked."
     },
     "cron": {
+      "title": "Cron",
+      "description": "Cron scheduler settings and optional seed jobs.",
       "oneOf": [
         {
           "type": "null"
@@ -66,38 +112,108 @@
           "$ref": "#/definitions/CronConfig"
         }
       ]
+    },
+    "promptTemplates": {
+      "title": "Prompt templates",
+      "type": [
+        "null",
+        "object"
+      ],
+      "description": "Named prompt templates for CLI rendering and cron template resolution.",
+      "additionalProperties": {
+        "$ref": "#/definitions/PromptTemplateConfig"
+      }
+    },
+    "workspace": {
+      "title": "Workspace",
+      "description": "Workspace and portal display settings (reports, file viewer limits).",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/definitions/WorkspacePortalConfig"
+        }
+      ]
+    },
+    "FeatureManagement": {
+      "title": "Feature flags",
+      "type": [
+        "null",
+        "object"
+      ],
+      "description": "Feature flags keyed by name. Each declared flag should carry an explicit true/false; run 'botnexus doctor config' to report any that are absent.",
+      "additionalProperties": {}
     }
   },
   "definitions": {
+    "WorldSettingsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "extensions": {
+          "type": [
+            "null",
+            "object"
+          ],
+          "additionalProperties": {}
+        }
+      }
+    },
     "GatewaySettingsConfig": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "extensions": {
+          "type": [
+            "null",
+            "object"
+          ],
+          "additionalProperties": {}
+        },
         "listenUrl": {
+          "title": "Listen URL",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "HTTP(S) URL the gateway binds to (for example http://localhost:5005). Supports Kestrel wildcards such as http://+:5000."
+        },
+        "publicBaseUrl": {
+          "title": "Public base URL",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "External base URL the portal is reached on (for example https://portal.example.com). Used to build canvas deep links. Leave unset on a purely local install."
         },
         "defaultAgentId": {
+          "title": "Default agent",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Agent ID to route to when an incoming message does not specify one."
         },
         "agentsDirectory": {
+          "title": "Agents directory",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Directory holding per-agent workspaces and configuration. Relative paths resolve against the BotNexus home directory."
         },
         "sessionsDirectory": {
+          "title": "Sessions directory",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Directory holding session transcripts and the session store database."
         },
         "sessionStore": {
+          "title": "Session store",
+          "description": "Backend used to persist sessions and conversation history.",
           "oneOf": [
             {
               "type": "null"
@@ -107,7 +223,30 @@
             }
           ]
         },
+        "walCheckpointIntervalMinutes": {
+          "title": "WAL checkpoint interval (min)",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Minutes between periodic PASSIVE SQLite WAL checkpoints. A TRUNCATE checkpoint also runs on graceful shutdown. Default 30.",
+          "format": "int32"
+        },
+        "subAgents": {
+          "title": "Sub-agents",
+          "description": "Limits on sub-agent spawning, including per-parent turn and timeout budgets.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/SubAgentOptions"
+            }
+          ]
+        },
         "compaction": {
+          "title": "Compaction",
+          "description": "Controls when a long session is summarised to stay within the model context window.",
           "oneOf": [
             {
               "type": "null"
@@ -117,7 +256,69 @@
             }
           ]
         },
+        "toolResultPersistence": {
+          "title": "Tool result persistence",
+          "description": "Write-time cap on the size of individual tool results persisted to session history.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ToolResultPersistenceConfig"
+            }
+          ]
+        },
+        "toolOutputBudget": {
+          "title": "Tool output budget",
+          "description": "Limits on how much output a single tool result may contribute before it is truncated.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ToolOutputBudgetConfig"
+            }
+          ]
+        },
+        "readTool": {
+          "title": "Read tool",
+          "description": "Settings governing the built-in file read tool, including paging limits.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ReadToolConfig"
+            }
+          ]
+        },
+        "claimAudit": {
+          "title": "Claim audit",
+          "description": "Post-turn auditor that checks an agent's stated outcomes against the tool calls it actually made.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ClaimAuditConfig"
+            }
+          ]
+        },
+        "memoryEmbeddings": {
+          "title": "Memory embeddings",
+          "description": "Embedding backend supplying vectors for hybrid memory retrieval. Absent or disabled keeps retrieval lexical-only.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/MemoryEmbeddingsConfig"
+            }
+          ]
+        },
         "cors": {
+          "title": "CORS",
+          "description": "Cross-origin request rules for browser-based clients reaching the gateway API.",
           "oneOf": [
             {
               "type": "null"
@@ -128,6 +329,8 @@
           ]
         },
         "rateLimit": {
+          "title": "Rate limiting",
+          "description": "Per-client request rate limits applied to gateway API calls.",
           "oneOf": [
             {
               "type": "null"
@@ -137,32 +340,64 @@
             }
           ]
         },
-        "logLevel": {
-          "type": [
-            "null",
-            "string"
-          ]
-        },
-        "apiKeys": {
-          "type": [
-            "null",
-            "object"
-          ],
-          "additionalProperties": {
-            "$ref": "#/definitions/ApiKeyConfig"
-          }
-        },
-        "extensions": {
+        "signalR": {
+          "title": "SignalR transport",
+          "description": "Hub transport limits: maximum frame size, parallel invocations, and stream buffer capacity.",
           "oneOf": [
             {
               "type": "null"
             },
             {
-              "$ref": "#/definitions/ExtensionsConfig"
+              "$ref": "#/definitions/SignalRConfig"
+            }
+          ]
+        },
+        "secretRedaction": {
+          "title": "Secret redaction",
+          "description": "Settings controlling how secrets are detected and masked in logs and tool output.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/SecretRedactionConfig"
+            }
+          ]
+        },
+        "logLevel": {
+          "title": "Log level",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Minimum log level override. One of Trace, Debug, Information, Warning, Error, Critical."
+        },
+        "apiKeys": {
+          "title": "API keys",
+          "type": [
+            "null",
+            "object"
+          ],
+          "description": "Multi-tenant API keys keyed by key ID. Each entry authorises a caller and scopes what it may reach.",
+          "additionalProperties": {
+            "$ref": "#/definitions/ApiKeyConfig"
+          }
+        },
+        "extensionLoader": {
+          "title": "Extension loader",
+          "description": "Dynamic extension loading settings.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ExtensionLoaderConfig"
             }
           ]
         },
         "world": {
+          "title": "World identity",
+          "description": "Name and identity of this world as shown by gateway clients and used in cross-world federation.",
           "oneOf": [
             {
               "type": "null"
@@ -173,24 +408,30 @@
           ]
         },
         "locations": {
+          "title": "Locations",
           "type": [
             "null",
             "object"
           ],
+          "description": "Named locations registry used for resource management and path resolution.",
           "additionalProperties": {
             "$ref": "#/definitions/LocationConfig"
           }
         },
         "crossWorldPermissions": {
+          "title": "Cross-world permissions",
           "type": [
             "array",
             "null"
           ],
+          "description": "Explicit grants controlling which remote worlds may communicate with this one.",
           "items": {
             "$ref": "#/definitions/CrossWorldPermissionConfig"
           }
         },
         "crossWorld": {
+          "title": "Cross-world federation",
+          "description": "Gateway-to-gateway federation settings enabling communication between worlds.",
           "oneOf": [
             {
               "type": "null"
@@ -201,6 +442,8 @@
           ]
         },
         "fileAccess": {
+          "title": "File access policy",
+          "description": "Default read, write and deny path rules applied to every agent unless the agent overrides them.",
           "oneOf": [
             {
               "type": "null"
@@ -211,12 +454,84 @@
           ]
         },
         "shellPreference": {
+          "title": "Shell preference",
           "type": [
             "null",
             "string"
           ],
-          "enum": [null, "auto", "pwsh", "bash"],
-          "description": "Preferred shell for command execution on Windows. 'auto' (default) prefers bash when available; 'pwsh' always uses PowerShell; 'bash' always uses bash. Ignored on non-Windows."
+          "description": "Preferred shell on Windows: auto (bash when available, PowerShell otherwise), pwsh, or bash. Ignored on non-Windows platforms."
+        },
+        "shellCommand": {
+          "title": "Shell command",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Explicit shell argv array. Element 0 is the executable; the command string is appended last. Overrides Shell preference entirely when set.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "autoUpdate": {
+          "title": "Auto-update",
+          "description": "Settings for the gateway updating itself via the BotNexus CLI.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/AutoUpdateConfig"
+            }
+          ]
+        },
+        "auxiliary": {
+          "title": "Auxiliary model",
+          "description": "Cheap, fast model used for background gateway tasks such as conversation title generation.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/AuxiliaryConfig"
+            }
+          ]
+        },
+        "defaultTimezone": {
+          "title": "Default timezone",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Server-wide default IANA timezone ID used when an agent has no timezone configured. Falls back to UTC when blank or invalid."
+        },
+        "enableProviderRequestLogging": {
+          "title": "Log provider requests",
+          "type": "boolean",
+          "description": "When on, all provider HTTP requests and responses are logged at Debug level. Auth headers are always redacted. For debugging only.",
+          "default": false
+        },
+        "dateTimeInjection": {
+          "title": "Datetime injection",
+          "description": "World default for prepending the current datetime to user messages. Per-agent settings take precedence.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/DateTimeInjectionConfig"
+            }
+          ]
+        },
+        "satellites": {
+          "title": "Satellites",
+          "type": [
+            "null",
+            "object"
+          ],
+          "description": "Registered satellite nodes keyed by satellite ID. Satellites connect for notifications, canvas rendering and optional remote execution.",
+          "additionalProperties": {
+            "$ref": "#/definitions/SatelliteConfig"
+          }
         }
       }
     },
@@ -225,22 +540,195 @@
       "additionalProperties": false,
       "properties": {
         "type": {
+          "title": "Type",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Store type. Supported values: InMemory, File, or Sqlite."
         },
         "filePath": {
+          "title": "File path",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Path used by file-based session store implementation."
         },
         "connectionString": {
+          "title": "Connection string",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Connection string for the session store. Sensitive: contains credentials and is stored and shown masked."
+        }
+      }
+    },
+    "SubAgentOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxConcurrentPerSession": {
+          "title": "Max concurrent per session",
+          "type": "integer",
+          "description": "Maximum number of concurrent sub-agents allowed per parent session.",
+          "format": "int32",
+          "default": 5,
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "defaultMaxTurns": {
+          "title": "Default max turns",
+          "type": "integer",
+          "description": "Default maximum turn budget applied to sub-agent runs when a spawn request does not specify one.",
+          "format": "int32",
+          "default": 30,
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "maxTurnsCeiling": {
+          "title": "Max turns ceiling",
+          "type": "integer",
+          "description": "Hard upper bound for an agent-supplied maxTurns on a spawn request. A value of zero or less disables the ceiling.",
+          "format": "int32",
+          "default": 30
+        },
+        "advisoryMaxTurns": {
+          "title": "Advisory max turns",
+          "type": "integer",
+          "description": "Advisory turn threshold for staging guidance. A value of zero disables the advisory.",
+          "format": "int32",
+          "default": 30,
+          "maximum": 2147483647.0,
+          "minimum": 0.0
+        },
+        "defaultTimeoutSeconds": {
+          "title": "Default timeout (seconds)",
+          "type": "integer",
+          "description": "Default timeout, in seconds, applied to sub-agent runs when a spawn request does not specify one.",
+          "format": "int32",
+          "default": 600,
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "maxTimeoutSeconds": {
+          "title": "Max timeout (seconds)",
+          "type": "integer",
+          "description": "Hard upper bound, in seconds, for an agent-supplied timeoutSeconds on a spawn request. A value of zero or less disables the ceiling.",
+          "format": "int32",
+          "default": 1800
+        },
+        "advisoryTimeoutSeconds": {
+          "title": "Advisory timeout (seconds)",
+          "type": "integer",
+          "description": "Advisory timeout threshold for staging guidance. A value of zero disables the advisory.",
+          "format": "int32",
+          "default": 1500,
+          "maximum": 2147483647.0,
+          "minimum": 0.0
+        },
+        "maxDepth": {
+          "title": "Max depth",
+          "type": "integer",
+          "description": "Maximum allowed nested sub-agent depth.",
+          "format": "int32",
+          "default": 1,
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "defaultModel": {
+          "title": "Default model",
+          "type": "string",
+          "description": "Default model for sub-agent runs. Empty uses the parent agent's model."
+        },
+        "completedRecordRetentionMinutes": {
+          "title": "Completed record retention (minutes)",
+          "type": "integer",
+          "description": "How long, in minutes, a finished sub-agent record is retained in memory for status queries. A value of zero or less disables time-based eviction.",
+          "format": "int32",
+          "default": 15
+        },
+        "maxRetainedCompletedRecords": {
+          "title": "Max retained completed records",
+          "type": "integer",
+          "description": "Maximum number of completed sub-agent records to retain regardless of age. A value of zero or less disables the cap.",
+          "format": "int32",
+          "default": 200
+        },
+        "workspaceRoot": {
+          "title": "Workspace root",
+          "type": "string",
+          "description": "Temporary root directory for sub-agent workspaces. Empty uses <OS temp>/botnexus-subagent-workspaces. Supports ~ and environment-variable expansion."
+        },
+        "parentOverrides": {
+          "title": "Parent budget overrides",
+          "type": "object",
+          "description": "Trusted sub-agent budget overrides keyed by spawning parent agent ID.",
+          "additionalProperties": {
+            "$ref": "#/definitions/SubAgentParentOverrideOptions"
+          }
+        }
+      }
+    },
+    "SubAgentParentOverrideOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "defaultTimeoutSeconds": {
+          "title": "Default timeout seconds",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Gets or sets the default timeout in seconds.",
+          "format": "int32",
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "maxTimeoutSeconds": {
+          "title": "Max timeout seconds",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Gets or sets the timeout ceiling in seconds.",
+          "format": "int32",
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "defaultMaxTurns": {
+          "title": "Default max turns",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Default turn budget applied to a spawned sub-agent when the caller does not specify one.",
+          "format": "int32",
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "maxTurnsCeiling": {
+          "title": "Max turns ceiling",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Hard upper bound on a sub-agent's turn budget. A caller requesting more is clamped to this value.",
+          "format": "int32",
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "maxConcurrentPerSession": {
+          "title": "Max concurrent per session",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Gets or sets the maximum concurrent sub-agents per parent session.",
+          "format": "int32",
+          "maximum": 2147483647.0,
+          "minimum": 1.0
         }
       }
     },
@@ -249,32 +737,235 @@
       "additionalProperties": false,
       "properties": {
         "preservedTurns": {
+          "title": "Preserved turns",
           "type": "integer",
+          "description": "Number of most recent user turns to preserve verbatim (default: 3).",
           "format": "int32"
         },
         "maxSummaryChars": {
+          "title": "Max summary chars",
           "type": "integer",
+          "description": "Maximum characters for the compaction summary (default: 16000).",
           "format": "int32"
         },
         "tokenThresholdRatio": {
+          "title": "Token threshold ratio",
           "type": "number",
+          "description": "Token threshold as a fraction of context window (0.0-1.0) at which auto-compaction triggers (default: 0.6).",
           "format": "double"
         },
         "contextWindowTokens": {
+          "title": "Context window tokens",
           "type": "integer",
+          "description": "Approximate context window size in tokens for the model (default: 128000).",
+          "format": "int32"
+        },
+        "largestEntryBytesThreshold": {
+          "title": "Largest entry bytes threshold",
+          "type": "integer",
+          "description": "Per-entry size (in UTF-8 bytes) at or above which a single visible history entry makes the session eligible for compaction, independently of the token-count threshold (#1599 — bloat-aware trigger). A session can accumulate a small number of enormous low-value entries (e.g. a raw transcript dump or a directory listing) whose total still sits under TokenThresholdRatio while the visible tail is dominated by dead weight. This signal is additive: whichever of the token-count threshold or this per-entry byte threshold trips first triggers compaction. Only LLM-visible entries are considered (historical / already-summarised entries are excluded, exactly like the token trigger). Default: 65536 (64 KiB). Values &lt;= 0 disable the byte-based trigger, restoring the pre-#1599 token-count-only behaviour.",
           "format": "int32"
         },
         "summarizationModel": {
+          "title": "Summarization model",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Model to use for summarization. If null, uses the session's model."
         },
         "summarizationProvider": {
+          "title": "Summarization provider",
           "type": [
             "null",
             "string"
+          ],
+          "description": "Provider to use for summarization (e.g., \"github-copilot\"). If null, auto-detected from registered providers."
+        },
+        "timeoutSeconds": {
+          "title": "Timeout seconds",
+          "type": "integer",
+          "description": "Maximum seconds to wait for the LLM summarization call to complete before aborting compaction (default: 90). Prevents hung provider calls from blocking the session indefinitely. The timeout is enforced via a linked CancellationToken that cancels the wait on the provider response.",
+          "format": "int32"
+        },
+        "circuitBreakerCooldownSeconds": {
+          "title": "Circuit breaker cooldown seconds",
+          "type": "integer",
+          "description": "How long (seconds) the per-session compaction circuit breaker stays open after MaxConsecutiveFailures consecutive failures, before it auto-resets and compaction is attempted again (default: 600 = 10 minutes). The previous behaviour kept the breaker open until the gateway restarted, which let a transient provider outage permanently wedge a session (it could no longer shed context). A bounded cooldown lets the session recover on its own once the provider issue clears. Values &lt;= 0 fall back to the default.",
+          "format": "int32"
+        },
+        "cronLlmIdleTimeoutMs": {
+          "title": "Cron llm idle timeout ms",
+          "type": "integer",
+          "description": "Stream-setup idle cap (milliseconds) applied to the compaction summarization model call when the resolved candidate is a CLOUD provider (default: 60000 = 60s, mirroring OpenClaw's CRON_LLM_IDLE_TIMEOUT_MS). This wires the otherwise-inert StreamOptions.StreamSetupTimeoutMs first-token watchdog so a cloud model that stalls mid-stream (or never emits a first token) is aborted early. Compaction is a background (non-interactive) call that already has an outer per-attempt watchdog (TimeoutSeconds); the stream stall must fail well INSIDE that window so the model fallback chain still has time to try the next candidate rather than the whole attempt timing out. The cap is intentionally NOT applied to LOCAL/self-hosted providers (localhost / 127.0.0.1 - e.g. ollama, vllm, lmstudio, sglang) because those endpoints are legitimately slow to warm up; the cloud-vs-local decision is made via ProviderEndpointClassifier.IsLocalProviderBaseUrl from the resolved model BaseUrl. Values &lt;= 0 disable the cap entirely (restores the pre-#1652 behaviour where no setup-phase timeout is enforced).",
+          "format": "int32"
+        },
+        "memoryFlush": {
+          "title": "Memory flush",
+          "description": "Pre-compaction memory flush configuration.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/MemoryFlushOptions"
+            }
           ]
+        }
+      }
+    },
+    "MemoryFlushOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether memory flush is enabled (default: true)."
+        },
+        "promptText": {
+          "title": "Prompt text",
+          "type": "string",
+          "description": "The prompt sent to the agent during the pre-compaction flush turn."
+        },
+        "sessionEndPromptText": {
+          "title": "Session end prompt text",
+          "type": "string",
+          "description": "The prompt sent to the agent during the session-end flush turn (on /reset or explicit session close)."
+        },
+        "timeoutSeconds": {
+          "title": "Timeout seconds",
+          "type": "integer",
+          "description": "Maximum seconds to wait for the flush turn to complete (default: 60).",
+          "format": "int32"
+        }
+      }
+    },
+    "ToolResultPersistenceConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether the write-time tool-result cap is enabled. Defaults to ."
+        },
+        "maxBytes": {
+          "title": "Max bytes",
+          "type": "integer",
+          "description": "Maximum UTF-8 byte size of a single persisted tool result. Results larger than this are truncated at write time with a [truncated N bytes] marker. Defaults to 16384 (16 KiB). A value of 0 or less disables truncation even when Enabled is true.",
+          "format": "int32"
+        }
+      }
+    },
+    "ToolOutputBudgetConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enable tool output budget",
+          "type": "boolean",
+          "description": "Bounds every tool result returned to the model, regardless of which tool produced it. Defaults to enabled.",
+          "default": true
+        },
+        "maxBytes": {
+          "title": "Max tool output bytes",
+          "type": "integer",
+          "description": "Maximum UTF-8 byte size of a single tool result returned to the model. Defaults to 262144 (256 KiB). Zero or less disables the backstop.",
+          "format": "int32",
+          "default": 262144
+        }
+      }
+    },
+    "ReadToolConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "largeReadThresholdBytes": {
+          "title": "Large read threshold bytes",
+          "type": "integer",
+          "description": "UTF-8 byte size above which a read result carries a size indicator naming offset and limit. Defaults to 20480 (20 KiB). Zero or less disables it.",
+          "format": "int32",
+          "default": 20480
+        },
+        "elideUnchangedRereads": {
+          "title": "Elide unchanged re-reads",
+          "type": "boolean",
+          "description": "Return a short marker instead of the full body when the same slice of an unchanged file is re-read in one session. A changed file always returns fresh content.",
+          "default": true
+        }
+      }
+    },
+    "ClaimAuditConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether the post-turn claim auditor runs. Defaults to ."
+        },
+        "mode": {
+          "title": "Mode",
+          "type": "string",
+          "description": "Reaction on detecting an unbacked claim: \"warn\" (emit an observable signal only, the safe default) or \"block\" (also mark the turn as one that should be blocked). Unrecognised values fall back to \"warn\"."
+        }
+      }
+    },
+    "MemoryEmbeddingsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "title": "Backend",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Embedding backend: 'none' for lexical-only retrieval, 'local' for on-box inference, or 'provider' to reuse a configured provider's embeddings endpoint. Defaults to 'none'."
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether memory entries are embedded for hybrid (lexical + vector) retrieval. Off by default; enabling it sends memory content to the configured embeddings endpoint.",
+          "default": false
+        },
+        "provider": {
+          "title": "Provider",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Provider key whose embeddings endpoint supplies vectors (for example 'ollama' or 'openai')."
+        },
+        "model": {
+          "title": "Model",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Embedding model identifier as the endpoint expects it (for example 'nomic-embed-text' or 'text-embedding-3-small')."
+        },
+        "dimensions": {
+          "title": "Dimensions",
+          "type": "integer",
+          "description": "Number of components in each vector the model emits. A response of a different width is discarded and the entry falls back to lexical-only.",
+          "format": "int32",
+          "maximum": 65536.0,
+          "minimum": 1.0
+        },
+        "baseUrl": {
+          "title": "Base URL",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Base URL of the OpenAI-compatible embeddings endpoint (the '/embeddings' path is appended)."
+        },
+        "apiKey": {
+          "title": "API key",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Bearer token for the embeddings endpoint. Optional for a local endpoint. Sensitive: stored and shown masked."
         }
       }
     },
@@ -283,10 +974,12 @@
       "additionalProperties": false,
       "properties": {
         "allowedOrigins": {
+          "title": "Allowed origins",
           "type": [
             "array",
             "null"
           ],
+          "description": "Explicit origins allowed to access the gateway from browsers.",
           "items": {
             "type": "string"
           }
@@ -298,14 +991,107 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "title": "Enable rate limiting",
+          "type": "boolean",
+          "description": "Whether per-client request rate limiting is active.",
+          "default": false
         },
         "requestsPerMinute": {
+          "title": "Requests per minute",
           "type": "integer",
-          "format": "int32"
+          "description": "Maximum requests allowed within a window for a single client.",
+          "format": "int32",
+          "default": 300,
+          "maximum": 2147483647.0,
+          "minimum": 1.0
         },
         "windowSeconds": {
+          "title": "Window seconds",
           "type": "integer",
+          "description": "Window size in seconds used for request counting.",
+          "format": "int32"
+        },
+        "maxEntries": {
+          "title": "Max entries",
+          "type": "integer",
+          "description": "Maximum number of distinct client windows retained in memory. Bounds the per-client tracking dictionary so a flood of distinct client keys cannot drive the gateway to memory exhaustion (a DoS against the DoS-protection itself). When the cap is reached, stale entries are pruned first, then a window that is not actively rate-limiting a client is evicted; if none can be freed, the new request is rejected with 429 rather than inserting. Windows actively counting toward a 429 are never evicted, so a flood cannot clear an attacker's own throttle. A non-positive value disables the cap.",
+          "format": "int32"
+        }
+      }
+    },
+    "SignalRConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximumReceiveMessageSizeBytes": {
+          "title": "Maximum receive message size bytes",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum size, in bytes, of a single inbound hub message. Must accommodate base64-encoded inline media (which exceeds the framework's 32 KB default) while bounding runaway frames. Non-positive values fall back to the secure default.",
+          "format": "int64"
+        },
+        "maximumParallelInvocationsPerClient": {
+          "title": "Maximum parallel invocations per client",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum number of hub method invocations a single connection may run in parallel. Bounds concurrent work a client can force on the server. Non-positive values fall back to the secure default.",
+          "format": "int32"
+        },
+        "streamBufferCapacity": {
+          "title": "Stream buffer capacity",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum number of items buffered for client upload streams before processing blocks. Non-positive values fall back to the secure default.",
+          "format": "int32"
+        },
+        "keepAliveIntervalSeconds": {
+          "title": "Keep alive interval seconds",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Interval, in seconds, at which the server sends keep-alive pings to idle clients (#1840). Chosen to sit comfortably under the netbird tunnel idle-cutoff so a quiet mobile connection never idles the tunnel out mid-session. Non-positive values fall back to the mobile-tuned default. The server timeout (ClientTimeoutIntervalSeconds) is always coerced to at least twice this value so a single dropped ping cannot terminate the connection.",
+          "format": "int32"
+        },
+        "clientTimeoutIntervalSeconds": {
+          "title": "Client timeout interval seconds",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Interval, in seconds, after which the server considers a client dead if no message or ping has arrived (#1840). Widened over the framework's 30s default to tolerate the jitter and brief stalls of a mobile link tunnelled through netbird. Must be at least twice KeepAliveIntervalSeconds; smaller (or non-positive) values are coerced up to the mobile-tuned default so a misconfig cannot make the server hang up prematurely.",
+          "format": "int32"
+        }
+      }
+    },
+    "SecretRedactionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "patterns": {
+          "title": "Additional redaction patterns",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Extra .NET regular expressions whose matches are replaced with [REDACTED]. Applied in addition to the built-in credential patterns, never instead of them.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "matchTimeoutMilliseconds": {
+          "title": "Redaction match timeout (ms)",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Per-pattern match timeout for operator redaction patterns. Defaults to 100ms.",
           "format": "int32"
         }
       }
@@ -315,71 +1101,82 @@
       "additionalProperties": false,
       "properties": {
         "apiKey": {
+          "title": "API key",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "The raw API key value used for gateway authentication. Sensitive: stored and shown masked."
         },
         "tenantId": {
+          "title": "Tenant ID",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Tenant identifier for multi-tenant isolation."
         },
         "callerId": {
+          "title": "Caller ID",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Caller identifier used in audit logs."
         },
         "displayName": {
+          "title": "Display name",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Human-readable name for this key."
         },
         "allowedAgents": {
+          "title": "Allowed agents",
           "type": [
             "array",
             "null"
           ],
+          "description": "Agent IDs this key is allowed to access. Empty means all.",
           "items": {
             "type": "string"
           }
         },
         "permissions": {
+          "title": "Permissions",
           "type": [
             "array",
             "null"
           ],
+          "description": "Permissions granted to this key (e.g. 'chat:send', 'sessions:read').",
           "items": {
             "type": "string"
           }
         },
         "isAdmin": {
-          "type": "boolean"
+          "title": "Is admin",
+          "type": "boolean",
+          "description": "Whether this key has administrative privileges."
         }
       }
     },
-    "ExtensionsConfig": {
+    "ExtensionLoaderConfig": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "path": {
+          "title": "Path",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Root directory containing extension folders with botnexus-extension.json manifests."
         },
         "enabled": {
-          "type": "boolean"
-        },
-        "defaults": {
-          "type": [
-            "null",
-            "object"
-          ],
-          "additionalProperties": {}
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Enables or disables dynamic extension loading."
         }
       }
     },
@@ -388,22 +1185,30 @@
       "additionalProperties": false,
       "properties": {
         "id": {
-          "type": "string"
+          "title": "ID",
+          "type": "string",
+          "description": "Stable identifier for this world. Used to scope agents, conversations and cross-world federation; do not change it after first start."
         },
         "name": {
-          "type": "string"
+          "title": "Name",
+          "type": "string",
+          "description": "Human-readable display name for this world, shown in the portal and in cross-world peer listings."
         },
         "description": {
+          "title": "Description",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Short description of what this world is for. Presentation only; has no runtime effect."
         },
         "emoji": {
+          "title": "Emoji",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Emoji used to visually identify this world in the portal and in peer listings."
         }
       }
     },
@@ -412,37 +1217,81 @@
       "additionalProperties": false,
       "properties": {
         "type": {
-          "type": "string"
+          "title": "Type",
+          "type": "string",
+          "description": "What kind of resource this is: filesystem, api, mcp-server, database or remote-node. Determines which of the fields below are required."
         },
         "path": {
+          "title": "Path",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Filesystem path. Required for filesystem locations. A leading ~ expands to the user's home directory."
         },
         "endpoint": {
+          "title": "Endpoint",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Absolute http or https URL. Required for api, mcp-server and remote-node locations."
         },
         "connectionString": {
+          "title": "Connection string",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Database connection string. Required for database locations. Held in full in config.json, so prefer credentialRef where the target supports it."
+        },
+        "username": {
+          "title": "Username",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Account to authenticate as, for example automation@pve. Stored in the clear - it is an identity, not a credential."
+        },
+        "credentialRef": {
+          "title": "Credential reference",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Where to find this location's credential, as scheme:identifier - for example env:PROXMOX_TOKEN or file:~/.botnexus/secrets/proxmox. This field holds a reference, never the credential itself."
+        },
+        "verifyTls": {
+          "title": "Verify TLS",
+          "type": "boolean",
+          "description": "Verify the endpoint's TLS certificate. Turn off only for a target using a self-signed certificate, and only for that target."
         },
         "description": {
+          "title": "Description",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "What this location is, in a few words. Shown wherever the location is listed."
+        },
+        "tags": {
+          "title": "Tags",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Free-form labels for grouping and filtering, for example homelab or hypervisor.",
+          "items": {
+            "type": "string"
+          }
         },
         "properties": {
+          "title": "Properties",
           "type": [
             "null",
             "object"
           ],
+          "description": "Extra key/value settings a consumer of this location understands, for example a Proxmox node name.",
           "additionalProperties": {
             "type": "string"
           }
@@ -454,25 +1303,33 @@
       "additionalProperties": false,
       "properties": {
         "targetWorldId": {
+          "title": "Target world ID",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Identifier of the target world this permission applies to."
         },
         "allowedAgents": {
+          "title": "Allowed agents",
           "type": [
             "array",
             "null"
           ],
+          "description": "Specific agents allowed to communicate. Null means all hosted agents.",
           "items": {
             "type": "string"
           }
         },
         "allowInbound": {
-          "type": "boolean"
+          "title": "Allow inbound",
+          "type": "boolean",
+          "description": "Whether inbound communication from the target world is allowed."
         },
         "allowOutbound": {
-          "type": "boolean"
+          "title": "Allow outbound",
+          "type": "boolean",
+          "description": "Whether outbound communication to the target world is allowed."
         }
       }
     },
@@ -481,15 +1338,19 @@
       "additionalProperties": false,
       "properties": {
         "peers": {
+          "title": "Peers",
           "type": [
             "null",
             "object"
           ],
+          "description": "Known peer gateways keyed by world ID or alias.",
           "additionalProperties": {
             "$ref": "#/definitions/CrossWorldPeerConfig"
           }
         },
         "inbound": {
+          "title": "Inbound",
+          "description": "Inbound cross-world relay policy.",
           "oneOf": [
             {
               "type": "null"
@@ -500,10 +1361,12 @@
           ]
         },
         "agents": {
+          "title": "Agents",
           "type": [
             "null",
             "object"
           ],
+          "description": "Optional explicit cross-world agent discovery map.",
           "additionalProperties": {
             "$ref": "#/definitions/CrossWorldAgentConfig"
           }
@@ -515,25 +1378,33 @@
       "additionalProperties": false,
       "properties": {
         "worldId": {
+          "title": "World ID",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Canonical world ID for this peer (defaults to dictionary key)."
         },
         "endpoint": {
+          "title": "Endpoint",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Peer gateway endpoint URL."
         },
         "apiKey": {
+          "title": "API key",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "API key used to authenticate to this peer world. Sensitive: stored and shown masked."
         },
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether this peer is enabled for outbound calls."
         }
       }
     },
@@ -542,22 +1413,28 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether inbound relay endpoint is enabled."
         },
         "allowedWorlds": {
+          "title": "Allowed worlds",
           "type": [
             "array",
             "null"
           ],
+          "description": "Allowed source world IDs. Empty means no source worlds are allowed.",
           "items": {
             "type": "string"
           }
         },
         "apiKeys": {
+          "title": "Inbound API keys",
           "type": [
             "null",
             "object"
           ],
+          "description": "API keys accepted from peer worlds, keyed by peer name. Sensitive: stored and shown masked.",
           "additionalProperties": {
             "type": "string"
           }
@@ -569,22 +1446,28 @@
       "additionalProperties": false,
       "properties": {
         "worldId": {
+          "title": "World ID",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Target world hosting the agent."
         },
         "agentId": {
+          "title": "Agent ID",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Remote agent ID within the target world."
         },
         "description": {
+          "title": "Description",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Optional operator-facing description."
         }
       }
     },
@@ -593,31 +1476,242 @@
       "additionalProperties": false,
       "properties": {
         "allowedReadPaths": {
+          "title": "Allowed read paths",
           "type": [
             "array",
             "null"
           ],
+          "description": "Paths the agent can read (exact paths or glob patterns).",
           "items": {
             "type": "string"
           }
         },
         "allowedWritePaths": {
+          "title": "Allowed write paths",
           "type": [
             "array",
             "null"
           ],
+          "description": "Paths the agent can write (exact paths or glob patterns).",
           "items": {
             "type": "string"
           }
         },
         "deniedPaths": {
+          "title": "Denied paths",
           "type": [
             "array",
             "null"
           ],
+          "description": "Paths explicitly denied even if otherwise allowed.",
           "items": {
             "type": "string"
           }
+        }
+      }
+    },
+    "AutoUpdateConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enable auto-update",
+          "type": "boolean",
+          "description": "Enables background GitHub polling and the self-update endpoint.",
+          "default": false
+        },
+        "checkIntervalMinutes": {
+          "title": "Check interval (minutes)",
+          "type": "integer",
+          "description": "How often to poll GitHub for a new commit, in minutes. Minimum 5.",
+          "format": "int32",
+          "default": 60,
+          "maximum": 2147483647.0,
+          "minimum": 5.0
+        },
+        "repositoryOwner": {
+          "title": "Repository owner",
+          "type": "string",
+          "description": "GitHub repository owner. Defaults to sytone."
+        },
+        "repositoryName": {
+          "title": "Repository name",
+          "type": "string",
+          "description": "GitHub repository name. Defaults to botnexus."
+        },
+        "branch": {
+          "title": "Branch",
+          "type": "string",
+          "description": "Branch to track. Defaults to main."
+        },
+        "cliPath": {
+          "title": "Cli path",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Absolute path to the BotNexus CLI entry point used to run the update. Required when Enabled is true. If the path ends with .dll it is launched via dotnet; otherwise it is run directly."
+        },
+        "sourcePath": {
+          "title": "Source path",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Absolute path to the BotNexus source tree. Passed to the CLI update command as --source. Required when Enabled is true."
+        },
+        "channel": {
+          "title": "Channel",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Update channel to forward to the CLI update command. Typical values: stable, beta, dev. When null or empty the CLI default channel is used."
+        },
+        "shutdownDelaySeconds": {
+          "title": "Shutdown delay seconds",
+          "type": "integer",
+          "description": "Seconds to wait after returning 202 before calling StopApplication(). Minimum 1. Defaults to 2.",
+          "format": "int32"
+        }
+      }
+    },
+    "AuxiliaryConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "titling": {
+          "title": "Titling",
+          "description": "Conversation title generation settings. Hydrated by AuxiliarySchemaContributor as a nested object ({ model, timeoutSeconds }); this property must remain an object so the bound config matches the on-disk shape.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/TitlingConfig"
+            }
+          ]
+        },
+        "compression": {
+          "title": "Compression",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Model ID to use for session compaction summarisation (cheap/fast auxiliary model). Supports any registered provider model ID (e.g. \"gpt-4o-mini\", \"claude-haiku-3-5\"). When null or empty the primary SummarizationModel or the compactor's default waterfall is used. If the resolved auxiliary model has a smaller context window than the compaction threshold, a startup warning is emitted but the gateway continues to run."
+        }
+      }
+    },
+    "TitlingConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Master switch for conversation auto-titling. When false the gateway never schedules a title-generation call and conversations keep their default title until a user or agent renames them. Defaults to true. Surfaced as config because the only prior way to disable auto-titling was to leave no models registered, which is a poor proxy for intent."
+        },
+        "model": {
+          "title": "Model",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Model ID to use for auto-generating conversation titles after the first user+assistant exchange. Supports any registered provider model ID (e.g. \"gpt-4o-mini\", \"claude-haiku-3-5\", \"gemini-2.0-flash-lite\"). When null or empty the primary session model is used as fallback."
+        },
+        "timeoutSeconds": {
+          "title": "Timeout seconds",
+          "type": "integer",
+          "description": "Maximum time in seconds allowed for the best-effort title generation call before it is abandoned. Defaults to 30 seconds. A non-positive value falls back to the 30s default so a mis-set zero never produces a zero-timeout that cancels every call instantly.",
+          "format": "int32"
+        }
+      }
+    },
+    "DateTimeInjectionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enable datetime injection",
+          "type": "boolean",
+          "description": "When on, the current datetime is prepended to every user message so the agent always has reliable temporal context.",
+          "default": false
+        },
+        "timezone": {
+          "title": "Timezone",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "IANA timezone ID used when formatting the injected datetime (for example UTC or America/Los_Angeles). Falls back to the gateway default timezone, then UTC, when blank."
+        },
+        "format": {
+          "title": "Datetime format",
+          "type": "string",
+          "description": "Output format for the injected datetime. Only iso8601 is supported today; rfc2822 and custom patterns are reserved for future use.",
+          "default": "iso8601"
+        }
+      }
+    },
+    "SatelliteConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "displayName": {
+          "title": "Display name",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Human-readable display name for this satellite."
+        },
+        "platform": {
+          "title": "Platform",
+          "type": "string",
+          "description": "Platform the satellite runs on. One of windows, macos, or linux.",
+          "default": "windows"
+        },
+        "apiKey": {
+          "title": "API key",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "API key the satellite uses to authenticate with the gateway. Sensitive: stored and shown masked."
+        },
+        "capabilities": {
+          "title": "Capabilities",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Capabilities this satellite advertises. Valid values: notify, canvas, exec. DISPLAY-ONLY - this is NOT an authorization control (#2606). Setting a narrow list here does NOT restrict what the satellite may be asked to do: nothing in the gateway reads this list to permit or refuse an operation, and there is no satellite dispatch surface for it to gate. An empty list means \"no capabilities declared\" and behaves identically to a fully populated one. Use Enabled to actually stop a satellite connecting.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ownerUserId": {
+          "title": "Owner user ID",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "User ID of the satellite's owner. Events are filtered server-side to this user's conversations."
+        },
+        "staleTimeoutSeconds": {
+          "title": "Stale timeout (seconds)",
+          "type": "integer",
+          "description": "Seconds without a heartbeat before the satellite is marked stale.",
+          "format": "int32",
+          "default": 120,
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether this satellite is enabled. Disabled satellites are rejected on connect.",
+          "default": true
         }
       }
     },
@@ -626,91 +1720,155 @@
       "additionalProperties": false,
       "properties": {
         "provider": {
+          "title": "Provider",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Provider name (e.g. 'copilot')."
         },
         "displayName": {
+          "title": "Display name",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Human-readable display name shown for this agent in clients."
         },
         "emoji": {
+          "title": "Emoji",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Optional emoji shown alongside the agent name in clients."
         },
         "description": {
+          "title": "Description",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Description of the agent's purpose."
+        },
+        "summary": {
+          "title": "Summary",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Agent-maintained summary of what this agent is currently doing. Written by the agent itself; the static description stays human-owned."
         },
         "model": {
+          "title": "Model",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Model identifier this agent uses (for example gpt-4.1)."
         },
         "allowedModels": {
+          "title": "Allowed models",
           "type": [
             "array",
             "null"
           ],
+          "description": "Model IDs this agent is allowed to use. Null means unrestricted within provider allowlist.",
           "items": {
             "type": "string"
           }
-        },
-        "systemPromptFiles": {
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          }
-        },
-        "systemPromptFile": {
-          "type": [
-            "null",
-            "string"
-          ]
         },
         "toolIds": {
+          "title": "Tool ids",
           "type": [
             "array",
             "null"
           ],
+          "description": "Tool identifiers this agent has access to.",
           "items": {
             "type": "string"
           }
         },
+        "toolTimeoutSeconds": {
+          "title": "Tool timeout seconds",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Per-tool timeout in seconds for runtime tool execution safety caps.",
+          "format": "int32"
+        },
         "subAgents": {
+          "title": "Sub agents",
           "type": [
             "array",
             "null"
           ],
+          "description": "Agent IDs this agent can call as sub-agents.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "subAgentRoles": {
+          "title": "Sub agent roles",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Role names this agent can converse with (role-based grants for agent_converse).",
           "items": {
             "type": "string"
           }
         },
         "isolationStrategy": {
+          "title": "Isolation strategy",
           "type": [
             "null",
             "string"
+          ],
+          "description": "Isolation strategy name (e.g. 'in-process')."
+        },
+        "cacheRetention": {
+          "title": "Cache retention",
+          "description": "Prompt caching retention policy for this agent. Null means provider default (short) is used.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/CacheRetention"
+            }
           ]
         },
-        "maxConcurrentSessions": {
+        "thinking": {
+          "title": "Thinking level",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Default reasoning effort this agent requests (validated against the model's capabilities)."
+        },
+        "contextWindow": {
+          "title": "Context window",
           "type": [
             "integer",
             "null"
           ],
+          "description": "Default context-window size (tokens) this agent requests (validated against the model's capabilities).",
+          "format": "int32"
+        },
+        "maxConcurrentSessions": {
+          "title": "Max concurrent sessions",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum concurrent sessions for this agent.",
           "format": "int32"
         },
         "metadata": {
+          "title": "Metadata",
+          "description": "Agent-level metadata.",
           "oneOf": [
             {},
             {
@@ -719,6 +1877,8 @@
           ]
         },
         "isolationOptions": {
+          "title": "Isolation options",
+          "description": "Strategy-specific isolation options.",
           "oneOf": [
             {},
             {
@@ -727,9 +1887,14 @@
           ]
         },
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether this agent is enabled and available for routing.",
+          "default": true
         },
         "memory": {
+          "title": "Memory",
+          "description": "Memory system configuration for this agent.",
           "oneOf": [
             {
               "type": "null"
@@ -740,6 +1905,8 @@
           ]
         },
         "soul": {
+          "title": "Soul",
+          "description": "Soul session lifecycle configuration for this agent.",
           "oneOf": [
             {
               "type": "null"
@@ -749,7 +1916,33 @@
             }
           ]
         },
+        "heartbeat": {
+          "title": "Heartbeat",
+          "description": "Heartbeat polling configuration.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/HeartbeatAgentConfig"
+            }
+          ]
+        },
+        "dateTimeInjection": {
+          "title": "Date time injection",
+          "description": "Datetime injection configuration override for this agent. Overrides world default when set.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/DateTimeInjectionConfig"
+            }
+          ]
+        },
         "sessionAccess": {
+          "title": "Session access",
+          "description": "Session access configuration for this agent's session tool.",
           "oneOf": [
             {
               "type": "null"
@@ -760,16 +1953,20 @@
           ]
         },
         "conversationAccess": {
+          "title": "Conversation access",
+          "description": "Conversation access configuration for this agent's conversation tool.",
           "oneOf": [
             {
               "type": "null"
             },
             {
-              "$ref": "#/definitions/SessionAccessConfig"
+              "$ref": "#/definitions/ConversationAccessConfig"
             }
           ]
         },
         "fileAccess": {
+          "title": "File access",
+          "description": "File access policy for this agent's file tools.",
           "oneOf": [
             {
               "type": "null"
@@ -779,14 +1976,29 @@
             }
           ]
         },
+        "shellCommand": {
+          "title": "Shell command",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Custom shell command array for this agent. Overrides the gateway-level ShellCommand. Element [0] is the executable, remaining elements are base arguments. The agent's command string is appended as the final argument.",
+          "items": {
+            "type": "string"
+          }
+        },
         "extensions": {
+          "title": "Extensions",
           "type": [
             "null",
             "object"
           ],
+          "description": "Extension-specific configuration keyed by extension ID. Each extension reads its own section (e.g., \"botnexus-skills\", \"botnexus-exec\").",
           "additionalProperties": {}
         },
         "toolPolicy": {
+          "title": "Tool policy",
+          "description": "Tool policy overrides for this agent.",
           "oneOf": [
             {
               "type": "null"
@@ -795,28 +2007,80 @@
               "$ref": "#/definitions/ToolPolicyConfig"
             }
           ]
+        },
+        "kind": {
+          "title": "Kind",
+          "description": "Optional. Kind of agent — currently only Named is accepted from config. SubAgent is rejected by AgentDescriptorValidator.ValidateForConfig; sub-agents are runtime-only and produced exclusively by DefaultSubAgentManager.SpawnAsync. Omit the field entirely on existing configs; the default is Named.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/AgentKind"
+            }
+          ]
         }
       }
+    },
+    "CacheRetention": {
+      "type": "string",
+      "description": "",
+      "x-enum-names": [
+        "None",
+        "Short",
+        "Long"
+      ],
+      "x-enum-varnames": [
+        "None",
+        "Short",
+        "Long"
+      ],
+      "x-enumNames": [
+        "None",
+        "Short",
+        "Long"
+      ],
+      "x-enum-descriptions": [
+        null,
+        null,
+        null
+      ],
+      "x-enumDescriptions": [
+        null,
+        null,
+        null
+      ],
+      "enum": [
+        "none",
+        "short",
+        "long"
+      ]
     },
     "MemoryAgentConfig": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether persistent memory is enabled for this agent. When false, no memories are written or retrieved."
+        },
+        "path": {
+          "title": "Path",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Gets or sets the optional memory root or file override path."
         },
         "indexing": {
-          "type": "string"
-        },
-        "promptInjection": {
+          "title": "Indexing",
           "type": "string",
-          "enum": [
-            "full",
-            "summary",
-            "none"
-          ]
+          "description": "Settings controlling how new memories are embedded and indexed for later retrieval."
         },
         "search": {
+          "title": "Search",
+          "description": "Settings controlling how stored memories are searched and ranked at retrieval time.",
           "oneOf": [
             {
               "type": "null"
@@ -825,6 +2089,14 @@
               "$ref": "#/definitions/MemorySearchAgentConfig"
             }
           ]
+        },
+        "promptInjection": {
+          "title": "Prompt injection",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Gets or sets prompt-memory injection mode: full, summary, or none."
         }
       }
     },
@@ -833,10 +2105,26 @@
       "additionalProperties": false,
       "properties": {
         "defaultTopK": {
+          "title": "Default top k",
           "type": "integer",
+          "description": "Default number of memory results returned when a search does not request an explicit count.",
+          "format": "int32"
+        },
+        "maxTopK": {
+          "title": "Max top k",
+          "type": "integer",
+          "description": "Gets or sets the maximum number of results an agent-supplied topK can request. Caller-provided values above this ceiling are clamped so a single search cannot fan out over the entire store; protects against runaway embedding fetches and oversized tool results.",
+          "format": "int32"
+        },
+        "maxLimit": {
+          "title": "Max limit",
+          "type": "integer",
+          "description": "Gets or sets the maximum number of entries a memory_get session listing can return. Caller-provided limit values above this ceiling are clamped to bound the fetch and the resulting serialized payload.",
           "format": "int32"
         },
         "temporalDecay": {
+          "title": "Temporal decay",
+          "description": "Settings that down-rank older memories so recent context scores higher.",
           "oneOf": [
             {
               "type": "null"
@@ -853,11 +2141,17 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether temporal decay is applied to memory search scores. When false, age does not affect ranking."
         },
         "halfLifeDays": {
+          "title": "Half life days",
           "type": "integer",
-          "format": "int32"
+          "description": "Age in days at which a memory's relevance score is halved. Lower values forget faster.",
+          "format": "int32",
+          "maximum": 2147483647.0,
+          "minimum": 1.0
         }
       }
     },
@@ -866,22 +2160,140 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether soul journalling is enabled for this agent, giving it a daily note and reflection cycle."
         },
         "timezone": {
-          "type": "string"
+          "title": "Timezone",
+          "type": "string",
+          "description": "IANA timezone used to decide when the agent's day starts and ends (for example Europe/London)."
         },
         "dayBoundary": {
-          "type": "string"
+          "title": "Day boundary",
+          "type": "string",
+          "description": "Local time of day at which one journal day rolls over to the next, in HH:mm format."
         },
         "reflectionOnSeal": {
-          "type": "boolean"
+          "title": "Reflection on seal",
+          "type": "boolean",
+          "description": "Whether the agent writes a reflection when a day's journal is sealed."
         },
         "reflectionPrompt": {
+          "title": "Reflection prompt",
           "type": [
             "null",
             "string"
+          ],
+          "description": "Custom prompt used to generate the end-of-day reflection. When unset, the built-in prompt is used."
+        }
+      }
+    },
+    "HeartbeatAgentConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether heartbeat polling is enabled."
+        },
+        "intervalMinutes": {
+          "title": "Interval minutes",
+          "type": "integer",
+          "description": "Minutes between heartbeat polls. Default: 30.",
+          "format": "int32"
+        },
+        "prompt": {
+          "title": "Prompt",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Custom heartbeat prompt. If null, uses the default: \"Read HEARTBEAT.md if it exists and execute any pending tasks. If nothing needs attention, reply HEARTBEAT_OK.\"."
+        },
+        "quietHours": {
+          "title": "Quiet hours",
+          "description": "Quiet hours configuration -- skip heartbeats during these hours.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/QuietHoursConfig"
+            }
           ]
+        },
+        "activeHours": {
+          "title": "Active hours",
+          "description": "Active hours configuration -- restrict heartbeats to a time window. When set, the cron expression is generated to only fire within the specified window. Takes precedence over QuietHours for schedule generation.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ActiveHoursConfig"
+            }
+          ]
+        },
+        "ackMaxChars": {
+          "title": "Ack max chars",
+          "type": "integer",
+          "description": "Maximum character length of an assistant response that can be classified as a heartbeat acknowledgement. Responses that contain \"HEARTBEAT_OK\" but are longer than this threshold are treated as substantive replies (not pruned). Default: 300.",
+          "format": "int32"
+        }
+      }
+    },
+    "QuietHoursConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether quiet hours are enabled."
+        },
+        "start": {
+          "title": "Start",
+          "type": "string",
+          "description": "Start of quiet period (local time, format \"HH:mm\"). Default: \"23:00\"."
+        },
+        "end": {
+          "title": "End",
+          "type": "string",
+          "description": "End of quiet period (local time, format \"HH:mm\"). Default: \"07:00\"."
+        },
+        "timezone": {
+          "title": "Timezone",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Timezone for quiet hours. Falls back to agent's soul timezone or \"UTC\"."
+        }
+      }
+    },
+    "ActiveHoursConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start": {
+          "title": "Start",
+          "type": "string",
+          "description": "Start of active window (local time, \"HH:mm\"). Default: \"08:00\"."
+        },
+        "end": {
+          "title": "End",
+          "type": "string",
+          "description": "End of active window (local time, \"HH:mm\"). Default: \"23:00\". Must be strictly later than Start; midnight-spanning ranges are not supported."
+        },
+        "timezone": {
+          "title": "Timezone",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "IANA timezone for the active window. Falls back to agent soul timezone or UTC."
         }
       }
     },
@@ -890,13 +2302,39 @@
       "additionalProperties": false,
       "properties": {
         "level": {
-          "type": "string"
+          "title": "Level",
+          "type": "string",
+          "description": "Access level: \"own\" (default), \"allowlist\", or \"all\"."
         },
         "allowedAgents": {
+          "title": "Allowed agents",
           "type": [
             "array",
             "null"
           ],
+          "description": "Agent IDs this agent can view sessions for (when level is \"allowlist\").",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ConversationAccessConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "title": "Level",
+          "type": "string",
+          "description": "Access level: \"own\" (default), \"allowlist\", or \"all\"."
+        },
+        "allowedAgents": {
+          "title": "Allowed agents",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Agent IDs this agent can view conversations for (when level is \"allowlist\").",
           "items": {
             "type": "string"
           }
@@ -908,91 +2346,441 @@
       "additionalProperties": false,
       "properties": {
         "alwaysApprove": {
+          "title": "Always approve",
           "type": [
             "array",
             "null"
           ],
+          "description": "Tools that always require approval regardless of default classification.",
           "items": {
             "type": "string"
           }
         },
         "neverApprove": {
+          "title": "Never approve",
           "type": [
             "array",
             "null"
           ],
+          "description": "Tools that skip approval even if classified as dangerous (trusted).",
           "items": {
             "type": "string"
           }
         },
         "denied": {
+          "title": "Denied",
           "type": [
             "array",
             "null"
           ],
+          "description": "Tools completely blocked for this agent.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "askFallback": {
+          "title": "Ask fallback",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Posture applied when a tool requires approval but no approval workflow can service the request (issue #2391). Accepted values are allow (default, historical behaviour -- execution proceeds with an audit record) and deny (fail closed -- the call is refused with an ask-fallback-deny reason)."
+        },
+        "askFallbackAllow": {
+          "title": "Ask fallback allow",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Tools exempted from AskFallback when it is deny. An approval-required tool named here falls back to allow instead of being refused, so a fail-closed agent can still keep a narrow set of tools working.",
           "items": {
             "type": "string"
           }
         }
       }
+    },
+    "AgentKind": {
+      "type": "string",
+      "description": "",
+      "x-enum-names": [
+        "Named",
+        "SubAgent"
+      ],
+      "x-enum-varnames": [
+        "Named",
+        "SubAgent"
+      ],
+      "x-enumNames": [
+        "Named",
+        "SubAgent"
+      ],
+      "x-enum-descriptions": [
+        null,
+        null
+      ],
+      "x-enumDescriptions": [
+        null,
+        null
+      ],
+      "enum": [
+        "Named",
+        "SubAgent"
+      ]
     },
     "ProviderConfig": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "type": {
+          "title": "Type",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Optional built-in provider type for this named provider instance (for example, github-copilot)."
+        },
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether this provider is enabled. Disabled providers are hidden from the API.",
+          "default": true
         },
         "apiKey": {
+          "title": "API key",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "API key for this provider, or a reference to an auth.json entry. Sensitive: stored and shown masked."
         },
         "baseUrl": {
+          "title": "Base URL",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Optional base URL override for this provider's API endpoint."
+        },
+        "streamIdleTimeoutMs": {
+          "title": "Stream idle timeout",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum milliseconds between streaming response chunks. Leave empty for 30000; set 0 to disable.",
+          "format": "int32",
+          "maximum": 2147483647.0,
+          "minimum": 0.0
         },
         "defaultModel": {
+          "title": "Default model",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Default model identifier used for this provider when an agent does not specify one."
         },
         "models": {
+          "title": "Models",
           "type": [
             "array",
             "null"
           ],
+          "description": "Allowed model IDs for this provider. Null means all models, empty means none.",
           "items": {
             "type": "string"
           }
+        },
+        "input": {
+          "title": "Input",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Explicit input modalities (for example [\"text\",\"image\"]) for models registered from this provider's Models list. When null or empty the modalities are inferred from each model's family; an explicit declaration always wins. Previously these models were hardcoded to text-only, so a vision-capable local model silently discarded every image it was handed (#2485).",
+          "items": {
+            "type": "string"
+          }
+        },
+        "api": {
+          "title": "API",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Optional API identifier used when registering models from this provider's Models list. Defaults to \"openai-completions\" for backward compatibility with config-driven OpenAI-compatible endpoints (Ollama, LM Studio, etc.). Set to \"integration-mock\" or another registered provider's API name to register models against a different IApiProvider."
+        },
+        "reasoning": {
+          "title": "Reasoning",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "PBI6 (#1707): explicit reasoning/thinking capability for models registered from this provider's Models list. When null (the default) the capability is inferred from each model's family so a known reasoning family (Claude 4+, GPT-5+, o3/o4, Gemini 3+, Grok-code) is picked up automatically; set it explicitly for a local model whose id the family heuristic does not recognise."
+        },
+        "supportsExtraHighThinking": {
+          "title": "Supports extra high thinking",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "PBI6 (#1707): explicit extra-high (ExtraHigh / Max) thinking-tier capability for this provider's dynamic models. When null the value is inferred from the model family. Ignored (clamped off) for a model that does not support reasoning."
+        },
+        "supportsExtendedContextWindow": {
+          "title": "Supports extended context window",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "PBI6 (#1707): explicit extended (1M) context-window capability for this provider's dynamic models. When null the value is inferred from the model family (Anthropic-direct Claude Sonnet 4/4.5 and Opus 4.5). Drives the context-size picker's second (1M) tier."
+        },
+        "contextWindow": {
+          "title": "Context window",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "PBI6 (#1707): default context-window size (in tokens) for this provider's dynamic models. When null a conservative 128000-token default is used. Sets the standard tier the context-size picker offers for a config-declared model.",
+          "format": "int32"
+        },
+        "chat": {
+          "title": "Chat",
+          "description": "Chat-capability settings for this provider (model, allowlist, API and reasoning declarations). Presence of this object declares the provider serves chat.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ProviderChatConfig"
+            }
+          ]
+        },
+        "embeddings": {
+          "title": "Embeddings",
+          "description": "Embeddings-capability settings for this provider (embedding model, API and vector dimensions). Presence of this object declares the provider serves embeddings.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/ProviderEmbeddingsConfig"
+            }
+          ]
+        }
+      }
+    },
+    "ProviderChatConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api": {
+          "title": "API",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "API identifier used when registering this provider's chat models (for example 'openai-completions'). Defaults to 'openai-completions' when omitted."
+        },
+        "defaultModel": {
+          "title": "Default model",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Default chat model identifier used for this provider when an agent does not specify one."
+        },
+        "models": {
+          "title": "Models",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Allowed chat model IDs for this provider. Null means all models, empty means none.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "input": {
+          "title": "Input",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Explicit input modalities (for example [\"text\",\"image\"]) for this provider's chat models. When null or empty the modalities are inferred from each model's family.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reasoning": {
+          "title": "Reasoning",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Explicit reasoning/thinking capability for this provider's chat models. When null the capability is inferred from each model's family."
+        },
+        "supportsExtraHighThinking": {
+          "title": "Supports extra high thinking",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Explicit extra-high (ExtraHigh / Max) thinking-tier capability for this provider's chat models. When null the value is inferred from the model family."
+        },
+        "supportsExtendedContextWindow": {
+          "title": "Supports extended context window",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Explicit extended (1M) context-window capability for this provider's chat models. When null the value is inferred from the model family."
+        },
+        "contextWindow": {
+          "title": "Context window",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Default context-window size (in tokens) for this provider's chat models. When null a conservative 128000-token default is used.",
+          "format": "int32"
+        }
+      }
+    },
+    "ProviderEmbeddingsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api": {
+          "title": "API",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "API identifier used for this provider's embeddings endpoint (for example 'openai-embeddings')."
+        },
+        "model": {
+          "title": "Model",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Embedding model identifier served by this provider (for example 'nomic-embed-text'). Required when an embeddings capability is configured."
+        },
+        "dimensions": {
+          "title": "Dimensions",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Vector dimensionality produced by the embedding model (for example 768). Must be greater than zero when specified.",
+          "format": "int32"
+        }
+      }
+    },
+    "ExtensionRepositoryRegistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repositoryUrl": {
+          "title": "Repository URL",
+          "type": "string",
+          "description": "Absolute HTTP, HTTPS, or SSH URL of the repository that supplies the extension."
+        },
+        "requestedRef": {
+          "title": "Requested ref",
+          "type": "string",
+          "description": "Branch, tag, or commit to resolve when this repository is reconciled."
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether this repository is eligible for later extension reconciliation.",
+          "default": true
+        },
+        "updatesEnabled": {
+          "title": "Updates enabled",
+          "type": "boolean",
+          "description": "Whether later reconciliation may refresh this repository to its requested ref.",
+          "default": true
+        },
+        "reconciliationStatus": {
+          "title": "Reconciliation status",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Latest repository reconciliation outcome recorded by the CLI."
+        },
+        "resolvedCommit": {
+          "title": "Resolved commit",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Exact Git commit selected by the most recent successful reconciliation."
+        },
+        "clonePath": {
+          "title": "Clone path",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Managed local path where BotNexus materializes this repository."
+        },
+        "lastAttemptUtc": {
+          "title": "Last attempt",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "UTC timestamp of the most recent repository reconciliation attempt.",
+          "format": "date-time"
+        },
+        "lastSuccessUtc": {
+          "title": "Last success",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "UTC timestamp of the most recent successful repository reconciliation.",
+          "format": "date-time"
+        },
+        "latestFailure": {
+          "title": "Latest failure",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Named failure and bounded diagnostic from the most recent failed reconciliation."
         }
       }
     },
     "ChannelConfig": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": {},
       "properties": {
         "type": {
+          "title": "Type",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Channel type (e.g. 'signalr', 'slack')."
         },
         "enabled": {
-          "type": "boolean"
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether this channel is enabled.",
+          "default": true
         },
         "settings": {
+          "title": "Settings",
           "type": [
             "null",
             "object"
           ],
-          "additionalProperties": {
-            "type": "string"
-          }
+          "description": "Adapter-specific settings.",
+          "additionalProperties": {}
         }
       }
     },
@@ -1001,17 +2789,38 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "title": "Enable cron",
+          "type": "boolean",
+          "description": "Whether the cron scheduler runs scheduled jobs.",
+          "default": true
         },
         "tickIntervalSeconds": {
+          "title": "Tick interval (seconds)",
           "type": "integer",
-          "format": "int32"
+          "description": "How often the scheduler wakes to evaluate due jobs, in seconds.",
+          "format": "int32",
+          "default": 60,
+          "maximum": 2147483647.0,
+          "minimum": 1.0
+        },
+        "webhookBlockedHosts": {
+          "title": "Webhook blocked hosts",
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Hostnames refused as cron webhook targets, in addition to the always-blocked loopback, private, link-local and cloud-metadata address ranges. Use for internal services on publicly-resolving names. Exact, case-insensitive host match.",
+          "items": {
+            "type": "string"
+          }
         },
         "jobs": {
+          "title": "Jobs",
           "type": [
             "null",
             "object"
           ],
+          "description": "Optional job definitions keyed by stable job ID.",
           "additionalProperties": {
             "$ref": "#/definitions/CronJobConfig"
           }
@@ -1023,64 +2832,203 @@
       "additionalProperties": false,
       "properties": {
         "name": {
+          "title": "Job name",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Human-readable name shown for this job in schedules and run reports."
         },
         "schedule": {
+          "title": "Schedule",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Five-field cron expression (minute hour day month weekday) controlling when the job fires."
         },
         "actionType": {
+          "title": "Action type",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "What the job does when it fires: agent-prompt sends a prompt to an agent; command runs a shell command."
         },
         "agentId": {
+          "title": "Target agent",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Agent that receives the prompt. Required for agent-prompt jobs."
         },
         "message": {
+          "title": "Prompt message",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Prompt text sent to the agent. Required for agent-prompt jobs unless a template is named."
         },
-        "webhookUrl": {
+        "templateName": {
+          "title": "Prompt template",
           "type": [
             "null",
             "string"
-          ]
+          ],
+          "description": "Named prompt template rendered instead of a literal message."
         },
-        "shellCommand": {
-          "type": [
-            "null",
-            "string"
-          ]
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "createdBy": {
-          "type": [
-            "null",
-            "string"
-          ]
-        },
-        "metadata": {
+        "templateParameters": {
+          "title": "Template parameters",
           "type": [
             "null",
             "object"
           ],
+          "description": "Values substituted into the named prompt template's placeholders.",
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "model": {
+          "title": "Model override",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Model this job runs on, overriding the agent's configured model."
+        },
+        "webhookUrl": {
+          "title": "Webhook URL",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Destination URL called when the job fires. Used by webhook jobs."
+        },
+        "shellCommand": {
+          "title": "Shell command",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Command or script executed when the job fires. Runs with the gateway's privileges - treat as a dangerous operation."
+        },
+        "preconditionCommand": {
+          "title": "Precondition command",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Agent-prompt probe: exit 0 runs the model, exit 10 records no_work with no model request; other exits fail closed. Runs with gateway privileges."
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean",
+          "description": "Whether this job fires on its schedule. A disabled job stays defined but never runs.",
+          "default": true
+        },
+        "createdBy": {
+          "title": "Created by",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Label recording who or what created this job. Used for auditing only."
+        },
+        "metadata": {
+          "title": "Metadata",
+          "type": [
+            "null",
+            "object"
+          ],
+          "description": "Free-form key/value entries persisted alongside the job, such as a timeout override.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PromptTemplateConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prompt": {
+          "title": "Prompt",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Template body with {{parameter}} placeholders."
+        },
+        "description": {
+          "title": "Description",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Optional human-friendly description."
+        },
+        "defaults": {
+          "title": "Defaults",
+          "type": [
+            "null",
+            "object"
+          ],
+          "description": "Default values for template parameters.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "parameters": {
+          "title": "Parameters",
+          "type": [
+            "null",
+            "object"
+          ],
+          "description": "Optional per-parameter metadata and defaults.",
+          "additionalProperties": {
+            "$ref": "#/definitions/PromptTemplateParameterConfig"
+          }
+        }
+      }
+    },
+    "PromptTemplateParameterConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "title": "Description",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Optional parameter description."
+        },
+        "default": {
+          "title": "Default",
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Optional default value."
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean",
+          "description": "Whether the parameter must be supplied if no default exists."
+        }
+      }
+    },
+    "WorkspacePortalConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxReportFileSizeBytes": {
+          "title": "Max report file size bytes",
+          "type": "integer",
+          "description": "Maximum number of bytes read from a report file for portal preview. Files larger than this are truncated server-side and flagged in the UI. Defaults to 524288 (512 KB). Set to 0 for no server-side limit.",
+          "format": "int32"
         }
       }
     }

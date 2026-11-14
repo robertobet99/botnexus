@@ -33,7 +33,6 @@ Agents are defined in `config.json` under the `agents` section:
       "description": "Multi-purpose AI helper",
       "provider": "copilot",
       "model": "gpt-4.1",
-      "systemPromptFiles": ["SOUL.md", "IDENTITY.md"],
       "toolIds": ["web_search", "read_file"],
       "enabled": true
     }
@@ -52,7 +51,6 @@ Agents are defined in `config.json` under the `agents` section:
   "description": "Multi-purpose AI helper",
   "modelId": "gpt-4.1",
   "apiProvider": "copilot",
-  "systemPromptFiles": ["SOUL.md", "IDENTITY.md"],
   "toolIds": ["web_search", "read_file"]
 }
 ```
@@ -162,7 +160,7 @@ curl -X POST http://localhost:5005/api/chat \
 - **`displayName`** (required): Name shown in UI and logs
 - **`description`** (optional): Purpose and capabilities
 - **`provider`** (required): Provider key (`copilot`, `anthropic`, `openai`)
-- **`model`** (required): Model ID (e.g., `gpt-4.1`, `claude-opus-4.6`)
+- **`model`** (required): Model ID (e.g., `gpt-4.1`, `claude-opus-4-6`)
 - **`enabled`** (default: `true`): Enable/disable this agent
 
 ### Model Selection
@@ -172,7 +170,7 @@ Restrict which models an agent can use:
 ```json
 {
   "model": "gpt-4.1",
-  "allowedModels": ["gpt-4.1", "gpt-4o", "claude-sonnet-4-20250514"]
+  "allowedModels": ["gpt-4.1", "gpt-4o", "claude-sonnet-5"]
 }
 ```
 
@@ -181,9 +179,9 @@ If `allowedModels` is:
 - **Specified list**: Agent restricted to these models
 - Users can switch models in the WebUI or via API (if in allowed list)
 
-### System Prompts
+### System prompts
 
-**Option 1: Inline System Prompt (Simple)**
+For short configuration-owned instructions, use an inline system prompt:
 
 ```json
 {
@@ -191,25 +189,8 @@ If `allowedModels` is:
 }
 ```
 
-**Option 2: Single File (Legacy)**
-
-```json
-{
-  "systemPromptFile": "prompts/assistant.md"
-}
-```
-
-**Option 3: Multiple Files (Recommended)**
-
-```json
-{
-  "systemPromptFiles": ["SOUL.md", "IDENTITY.md", "TOOLS.md", "custom.md"]
-}
-```
-
-Files are concatenated in the order specified. Paths are relative to `~/.botnexus/agents/<agentId>/`.
-
-**Default Load Order** (if `systemPromptFiles` is empty):
+For per-agent file-based instructions, edit the standard files under
+`~/.botnexus/agents/<agentId>/`. BotNexus loads them in this order when present:
 
 1. `AGENTS.md` — Multi-agent patterns and memory guidance
 2. `SOUL.md` — Personality and values
@@ -219,7 +200,32 @@ Files are concatenated in the order specified. Paths are relative to `~/.botnexu
 6. `USER.md` — User preferences
 7. `MEMORY.md` — Long-term distilled memory
 
-Recent daily memory notes (`memory/{today}.md` and `memory/{yesterday}.md`) are also auto-loaded when using the default prompt file list.
+Recent daily memory notes (`memory/{today}.md` and `memory/{yesterday}.md`) are loaded automatically. To suppress daily notes and `MEMORY.md`, set `memory.promptInjection` to `"none"`. Use conversation instructions for one conversation and model-specific instruction-file variants when instructions depend on the selected model.
+
+#### World-level instructions
+
+`WORLD.md` is the one instruction file that does **not** live in the agent's own
+directory. Put it at `~/.botnexus/WORLD.md` and it is prepended to the context of
+*every* agent, ahead of that agent's own files:
+
+```text
+~/.botnexus/WORLD.md          <- shared by every agent
+~/.botnexus/agents/<id>/...   <- that agent's own files
+```
+
+Use it for rules that hold across the whole installation - house conventions, standing
+prohibitions, facts about the environment the agents run in - rather than repeating
+them in each agent's `AGENTS.md`.
+
+Two things to know:
+
+- **Placement is the whole trick.** A `WORLD.md` inside an agent's directory is not
+  loaded. It is not in the default list above, so nothing reads it and nothing warns
+  you - the agent simply never sees the file.
+- **It is separate from the per-agent workspace files.** `WORLD.md` is injected independently and always applies.
+
+Like the other instruction files it supports model and provider variants, so
+`WORLD.gpt.md` can carry rules that only apply when a GPT model is serving the turn.
 
 ### Tool Assignment
 
@@ -263,6 +269,16 @@ Control tool approval and access:
 - **`alwaysApprove`**: Tools requiring user approval before execution
 - **`neverApprove`**: Trusted tools that skip approval
 - **`denied`**: Tools completely blocked (even if in `toolIds`)
+- **`askFallback`**: What to do when a tool requires approval but no approval workflow can service
+  the request. `allow` (default) permits execution and records an audited approval event; `deny`
+  fails closed and refuses the call with an `ask-fallback-deny` reason.
+- **`askFallbackAllow`**: Tools exempted from `askFallback: "deny"`, so a fail-closed agent can
+  keep a narrow set of tools working.
+
+> **Set `askFallback: "deny"` deliberately.** There is no interactive tool-approval workflow at the
+> gateway's `BeforeToolCall` seam yet, so `deny` makes every approval-required tool
+> (`exec`, `write`, `edit`, `process`, `bash` by default) unusable for that agent. Leave it unset
+> for unattended agents, cron jobs, and sub-agents.
 
 ### Sub-Agents
 
@@ -326,7 +342,7 @@ When enabled, agents get a `memory_save` tool that writes plain Markdown notes:
 - **Specific files**: Call `memory_save(content, file_path="topic.md")` to append to a named file under the memory root
 - **Durable memory** (`MEMORY.md`): Consolidated long-term facts, loaded into every session
 
-The `path` setting overrides the default memory directory (default: `memory/` under the agent workspace). Today's and yesterday's daily notes are automatically included in the system prompt.
+The `path` setting overrides the default memory directory (default: `memory/` under the agent workspace). Today's and yesterday's daily notes are automatically included in the system prompt. Set `promptInjection` to `"none"` to stop `MEMORY.md` and the daily notes being added automatically.
 
 ### Soul Sessions
 
@@ -380,14 +396,19 @@ System prompts define agent behavior. BotNexus supports a structured approach:
 ### File Structure
 
 ```text
-~/.botnexus/agents/<agentId>/
-├── SOUL.md          # Personality, values, tone
-├── IDENTITY.md      # Role, expertise, boundaries
-├── TOOLS.md         # Tool usage guidelines
-├── BOOTSTRAP.md     # Initialization instructions
-├── AGENTS.md        # Multi-agent coordination
-└── USER.md          # User-specific preferences
+~/.botnexus/
+├── WORLD.md             # Shared by every agent (optional)
+└── agents/<agentId>/
+    ├── SOUL.md          # Personality, values, tone
+    ├── IDENTITY.md      # Role, expertise, boundaries
+    ├── TOOLS.md         # Tool usage guidelines
+    ├── BOOTSTRAP.md     # Initialization instructions
+    ├── AGENTS.md        # Multi-agent coordination
+    └── USER.md          # User-specific preferences
 ```
+
+`WORLD.md` sits at the home root, not inside the agent directory - see
+[World-level instructions](#world-level-instructions).
 
 ### Example: SOUL.md
 
@@ -491,10 +512,9 @@ Create a multi-agent system for code development:
     "displayName": "Developer",
     "description": "Code generation and implementation",
     "provider": "copilot",
-    "model": "claude-opus-4.6",
+    "model": "claude-opus-4-6",
     "toolIds": ["read_file", "write_file", "grep", "glob", "bash"],
-    "subAgents": ["reviewer"],
-    "systemPromptFiles": ["SOUL.md", "IDENTITY.md", "coding-standards.md"]
+    "subAgents": ["reviewer"]
   }
 }
 ```
@@ -506,9 +526,8 @@ Create a multi-agent system for code development:
     "displayName": "Code Reviewer",
     "description": "Code review and quality assurance",
     "provider": "anthropic",
-    "model": "claude-sonnet-4-20250514",
-    "toolIds": ["read_file", "grep"],
-    "systemPromptFiles": ["SOUL.md", "review-checklist.md"]
+    "model": "claude-sonnet-5",
+    "toolIds": ["read_file", "grep"]
   }
 }
 ```
@@ -567,13 +586,164 @@ curl http://localhost:5005/api/agents
       "agentId": "coder",
       "displayName": "Coding Agent",
       "description": "Code generation specialist",
-      "modelId": "claude-opus-4.6",
+      "modelId": "claude-opus-4-6",
       "provider": "copilot",
       "enabled": true
     }
   ]
 }
 ```
+
+---
+
+## Bundled Agents
+
+BotNexus ships a small catalog of **bundled agents** and adds missing entries to your
+canonical configuration at gateway startup when an eligible provider and model are available.
+If `config.sqlite` exists, SQLite is authoritative; do not hand-edit a generated `config.json`
+projection. Today the catalog contains one entry: **Nexus Trailguide**
+(`nexus-trailguide`), a guided onboarding agent that explains the platform, its concepts and
+how to get started.
+
+Reconciliation exists because neither `install` (clone and build) nor `update` (pull and
+restart) is a migration point, so an *existing* installation would otherwise never receive a
+newly shipped agent.
+
+### What Trailguide is — and is not
+
+Trailguide is an **ordinary config-defined agent**, not a code-owned built-in. Its complete
+definition lives in your configuration under `agents.nexus-trailguide`, and you can read,
+edit, disable or re-point it with exactly the same keys as any agent you wrote yourself.
+Nothing about it is immutable.
+
+The entry the gateway inserts is deliberately minimal. It carries only:
+
+| Key | Source |
+| --- | --- |
+| `displayName` | shipped template (`Nexus Trailguide`) |
+| `emoji` | shipped template |
+| `description` | shipped template |
+| `provider`, `model` | adopted from your configuration — see below |
+| `enabled` | `true` for a newly inserted complete entry; existing values are preserved |
+| `definitionVersion` | stamped by the reconciler |
+| `extensions.botnexus-skills` | enables and auto-loads the two bundled Trailguide skills |
+
+The shipped template declares no `toolIds`. If you want Trailguide constrained, set `toolIds`
+on it yourself — it is your entry to edit. Omission does not merge `agents.defaults` into
+an agent's configuration.
+
+Trailguide ships with a curated workspace corpus. BotNexus writes Trailguide-specific `SOUL.md`
+and `AGENTS.md` files. Together they define its voice, require answers to be grounded in the
+locally available repository documentation, treat Labs as optional supplemental material, and
+help the user operate BotNexus and discover relevant capabilities. Trailguide does not receive the
+generic `BOOTSTRAP.md` or `IDENTITY.md`; its curated files already define its identity and
+first-turn behavior.
+
+BotNexus manages five files in the Trailguide workspace: `AGENTS.md`, `SOUL.md`,
+`skills/trailguide-documentation/SKILL.md`, `skills/trailguide-troubleshooting/SKILL.md`,
+and `DOCUMENTATION_ROOT.md`. It refreshes them whenever it resolves the workspace.
+Trailguide is instructed never to edit the canonical instruction files. This lets an update
+improve the default agent without maintaining a chain of historical content hashes.
+
+Unchanged files are not rewritten. For each changed file, BotNexus writes and closes a
+complete temporary file in the same folder, then atomically publishes it: readers see
+complete old or new contents, not a partly written file. Files are updated individually,
+not as one transaction across all five files. Sharing or file-lock conflicts receive up
+to five publication attempts with bounded waits. Waiting for another in-process refresh
+is also bounded. If contention persists, Reports returns a temporary unavailable result
+(HTTP 503). Close the program holding the file open, then try Reports again later.
+
+Put installation-specific or user-requested standing customization in
+`TRAILGUIDE.custom.md` in the Trailguide workspace. The prompt loader includes that file after the
+canonical files when it exists. BotNexus never creates, replaces, or deletes it, and Trailguide is
+instructed to write persistent customization only there. Existing edits made directly to the old
+canonical files before this contract shipped will be replaced on the next update; move any content
+you want to retain into `TRAILGUIDE.custom.md`.
+
+Because the reconciler is insert-only, any key you add is permanent: the gateway will never
+come back and rewrite it.
+
+### Insert-only, never overwrite
+
+The contract is deliberately narrow:
+
+- **Insert-only.** If `agents.nexus-trailguide` already exists in any form — enabled,
+  disabled, edited or half-filled — the gateway performs **no write at all**. It does not
+  merge, top up missing fields or "repair" the entry. From the moment the key exists it is
+  yours, and disabling the agent keeps it disabled across restarts.
+- **Non-fatal.** Unparseable JSON or a read-only config file produces a single bounded
+  warning and startup continues. A bundled onboarding agent is never worth failing a boot
+  over.
+- **Ordered before agent registration**, so an inserted entry is live in the same startup
+  rather than only after a further restart.
+
+A `definitionVersion` field records the shipped template version. It does not prove that
+BotNexus owns an existing entry or permit automatic repair of user configuration.
+
+### Which provider and model it adopts
+
+A newly inserted entry copies provider and model from your own configuration, in order:
+
+1. The `gateway.defaultAgentId` agent, when it declares a valid provider and model — this is
+   the installation's own answer to "which model do I use".
+2. Otherwise, the first **enabled** config agent with a valid provider and model.
+3. Otherwise insertion is **deferred**: the entry stays absent, and startup logs explain
+   that a provider and model are needed. Configure an eligible agent with both fields, then
+   restart the gateway to retry. BotNexus does not create an incomplete disabled placeholder.
+
+A complete entry is inserted enabled. An existing entry is never changed, including one you
+have disabled or customized.
+
+### Recovering an older incomplete entry
+
+Older versions could persist a disabled Trailguide entry without a provider and model.
+Startup leaves that entry unchanged and logs recovery guidance. Disabled agents still require
+both fields, so unrelated configuration changes can fail until you correct the entry.
+
+**CLI:** Do not use two separate `config set` commands to repair two missing fields: each
+save validates the whole configuration. There is no dedicated CLI partial-edit command for
+this recovery.
+
+**Web interface:** For an existing object entry, open `/agents/nexus-trailguide` in your
+BotNexus web interface. Under **Identity & Model**, select **Provider instance** and **Model**,
+then choose **Save Changes** once. Leave the enabled setting and other fields unchanged to
+preserve your opt-out and customizations. Both prerequisites must be saved together in one
+validated configuration edit; saving only one can still fail.
+
+If the editor cannot load the entry or rejects the save, contact installation support. A
+`null`, text, or numeric entry is not an editable agent object and needs explicit review of
+the canonical configuration; startup does not delete or replace it. Do not repair any of these
+states by hand-editing a generated JSON projection.
+
+### Disabling versus deleting
+
+These two look similar and behave completely differently. Pick deliberately:
+
+| Action | Effect |
+| --- | --- |
+| `"enabled": false` on `agents.nexus-trailguide` | **Persistent opt-out.** The agent is not registered and does not appear in the UI. The key still exists, so the insert-only rule guarantees the gateway never overwrites your choice — it survives every restart and update. |
+| Delete the `agents.nexus-trailguide` key | **Temporary.** A later startup can insert a fresh enabled entry once an eligible provider/model pair is available. Until then, the entry stays absent with a setup diagnostic. |
+
+For a persistent opt-out, keep a complete entry and disable it. Deleting the entry is not a
+persistent opt-out: an eligible startup can create it again. Disabling an incomplete entry
+does not remove its provider/model requirements.
+
+Disabling an agent changes only whether it is registered. It does **not** delete its
+workspace directory under `~/.botnexus/agents/nexus-trailguide/`, its memory files, or any
+skills stored there — that content is left untouched on disk, and re-enabling the agent picks
+it back up unchanged.
+
+::: warning Review orphan cleanup before approving it
+`botnexus doctor agents` compares workspace directories with every agent declaration in the
+effective configuration. This includes disabled agents. When `config.sqlite` exists, its SQLite
+values are authoritative; otherwise BotNexus uses `config.json`.
+
+A disabled agent's workspace is reported as `declared` and is not deleted. A workspace is
+`orphaned` only when its agent id is absent from the effective configuration. Without
+`--cleanup-orphans`, the command prints the plan and deletes nothing. Before approving cleanup,
+check that each listed workspace belongs to an agent you intended to remove from the effective
+configuration.
+:::
 
 ---
 
@@ -602,15 +772,61 @@ Disabled agents:
 - Do not appear in the WebUI dropdown
 - Cannot receive messages
 - Retain their configuration for later re-enabling
+- **Keep their workspace directory.** `botnexus doctor agents --cleanup-orphans` deletes only
+  workspaces whose agent id is absent from the effective configuration. This includes authoritative
+  SQLite declarations in `config.sqlite`, not only entries in `config.json`. A disabled agent is still
+  declared and is reported as `declared`, never `orphaned`.
 
 ### Removal
 
-Remove an agent by:
-1. Deleting it from `config.json`
-2. Removing its JSON file from `~/.botnexus/agents/`
-3. Configuration reload applies changes
+Remove an agent from the effective configuration. If `config.sqlite` exists, update the agent through
+a supported configuration command or disable the store before editing `config.json`; deleting only
+the JSON mirror does not remove an authoritative SQLite declaration. If you also created a separate
+agent JSON file under `~/.botnexus/agents/`, remove that declaration too. Configuration reload then
+applies the change.
 
 Session history is preserved in `~/.botnexus/sessions.sqlite` (session data only — agent memory is stored as workspace Markdown files).
+
+### Updating an agent with the `update_agent` tool
+
+Registration and removal are file-driven, but an agent that holds the `update_agent` tool
+can amend a **registered** agent's descriptor in place. Only the fields you pass are
+changed; everything omitted is preserved.
+
+| Parameter | Type | Notes |
+|-----------|------|-------|
+| `id` | string | **Required.** The agent to update. |
+| `displayName` | string | New human-readable display name. |
+| `description` | string | New description. |
+| `summary` | string | Agent-maintained account of what the agent is currently doing. Self-only — see below. Empty string clears it. |
+| `emoji` | string | New emoji. |
+| `modelId` | string | Persisted as `model`. Must be registered for the agent's provider. |
+| `apiProvider` | string | Provider **instance key** (`github-copilot`, `anthropic`), not an API contract name. Persisted as `provider`. |
+| `systemPrompt` | string | New system prompt. |
+| `toolIds` | string | A JSON array string; **replaces** the existing list rather than merging into it. |
+| `thinking` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or an empty string to clear. |
+| `contextWindow` | int | New default window in tokens, or `0` to clear. |
+
+Four rules are worth knowing before you call it:
+
+- **Reserved archetype ids are refused.** The [sub-agent archetypes](../features/built-in-agents.md)
+  are implementation-only roles, not named agents, so updating one is rejected outright.
+- **`summary` is self-only.** An agent may write the summary of its own id and no other;
+  a caller with a different id — or no id at all, as when the host rather than an agent
+  invokes the tool — is refused. The denial applies to that *argument*, so every other
+  field keeps its normal reach. An over-long summary is **refused, never truncated**,
+  because a silently cut summary reads as a complete statement. The bound is
+  `gateway.agentSummary.maxLength`.
+- **The merged descriptor is validated, not just your edit.** Model/provider resolvability
+  and the thinking and context-window capabilities are checked against the descriptor
+  *after* your changes are applied, so a provider-only or model-only edit that breaks the
+  pair is caught rather than persisted.
+- **Config is written before runtime state changes.** If persisting to disk fails, the
+  agent is left untouched and the tool reports the failure — the runtime registry can
+  never end up ahead of `config.json`.
+
+Use `create_agent` to register a new agent; `update_agent` only amends one that already
+exists and reports an error otherwise.
 
 ---
 
@@ -629,9 +845,9 @@ custom.md      # Project-specific rules (frequent updates)
 ### 2. Model Selection
 
 **Match model to task:**
-- **Complex reasoning**: `claude-opus-4.6`, `gpt-5.4`
-- **General purpose**: `gpt-4.1`, `claude-sonnet-4-20250514`
-- **Fast/cheap**: `gpt-4o-mini`, `claude-haiku-4.5`
+- **Complex reasoning**: `claude-opus-4-6`, `gpt-5.4`
+- **General purpose**: `gpt-4.1`, `claude-sonnet-5`
+- **Fast/cheap**: `gpt-4o-mini`, `claude-haiku-4-5-20251001`
 
 ### 3. Tool Access
 
@@ -732,12 +948,12 @@ curl http://localhost:5005/api/agents
 curl http://localhost:5005/api/agents/my-agent
 ```
 
-### System Prompt Not Loading
+### System prompt not loading
 
 **Check:**
-1. Files exist in `~/.botnexus/agents/<agentId>/`
-2. Paths in `systemPromptFiles` are correct (relative to agent directory)
-3. Files are readable (permissions)
+1. Standard instruction files exist in `~/.botnexus/agents/<agentId>/`.
+2. Files use supported names such as `AGENTS.md`, `SOUL.md`, or a valid model-specific variant.
+3. Files are readable.
 
 **Verify:**
 ```bash

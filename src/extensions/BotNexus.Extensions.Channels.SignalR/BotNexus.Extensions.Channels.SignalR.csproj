@@ -12,6 +12,17 @@
   <ItemGroup>
     <InternalsVisibleTo Include="BotNexus.Gateway.Tests" />
   </ItemGroup>
+  <!--
+    The hub event inventory (HubEvents.All) is GENERATED from IGatewayHubClient (#3318), not
+    hand-written. The generator is referenced as an Analyzer rather than as an assembly so this
+    project takes no runtime dependency on it; ReferenceOutputAssembly="false" is what keeps the
+    netstandard2.0 analyzer out of the net10.0 reference closure.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\tools\BotNexus.SourceGenerators\BotNexus.SourceGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Abstractions\BotNexus.Gateway.Abstractions.csproj" />
@@ -61,6 +72,27 @@
       <MobileBlazorPublishFiles Include="$(IntermediateOutputPath)blazor-mobile-publish\wwwroot\**" />
     </ItemGroup>
     <Copy SourceFiles="@(MobileBlazorPublishFiles)" DestinationFolder="$(OutputPath)blazor-mobile\%(RecursiveDir)" />
+  </Target>
+
+  <!-- Carry the bundled Blazor clients into the PUBLISH output as well (#2376).
+       The targets above copy into $(OutputPath), which serves `dotnet build` (and therefore
+       the local `botnexus gateway start` deploy, which copies from bin/). `dotnet publish`
+       computes its own file list and does NOT sweep arbitrary $(OutputPath) subdirectories,
+       so the container image — which publishes each extension — shipped the SignalR hub but
+       no blazor/ directory. SignalREndpointContributor probes for {extensionDir}/blazor and
+       silently skips portal registration when it is absent, giving a published image with a
+       working /hub/gateway and a 404 portal. Registering the files as ResolvedFileToPublish
+       keeps build and publish layouts identical. -->
+  <Target Name="PublishBundledBlazorClients" BeforeTargets="ComputeResolvedFilesToPublishList" DependsOnTargets="CopyBlazorClient;CopyMobileBlazorClient">
+    <ItemGroup>
+      <_BundledBlazorPublishFile Include="$(IntermediateOutputPath)blazor-publish\wwwroot\**" BundleFolder="blazor" />
+      <_BundledBlazorPublishFile Include="$(IntermediateOutputPath)blazor-mobile-publish\wwwroot\**" BundleFolder="blazor-mobile" />
+
+      <ResolvedFileToPublish Include="@(_BundledBlazorPublishFile)">
+        <RelativePath>%(_BundledBlazorPublishFile.BundleFolder)\%(_BundledBlazorPublishFile.RecursiveDir)%(_BundledBlazorPublishFile.Filename)%(_BundledBlazorPublishFile.Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
   </Target>
 
   </Project>

@@ -52,6 +52,12 @@ public sealed class IntegrationMockProvider : IApiProvider
                 await StreamCoreAsync(model, context, options, stream);
                 activity?.SetStatus(ActivityStatusCode.Ok);
             }
+            catch (OperationCanceledException ex) when (options?.CancellationToken.IsCancellationRequested == true)
+            {
+                var abortedMessage = CreateErrorMessage(model, ex.Message, StopReason.Aborted);
+                stream.Push(new ErrorEvent(StopReason.Aborted, abortedMessage));
+                stream.End(abortedMessage);
+            }
             catch (Exception ex)
             {
                 var errorMessage = CreateErrorMessage(model, ex.Message);
@@ -71,6 +77,7 @@ public sealed class IntegrationMockProvider : IApiProvider
     private async Task StreamCoreAsync(LlmModel model, Context context, StreamOptions? options, LlmStream stream)
     {
         var ct = options?.CancellationToken ?? CancellationToken.None;
+        ct.ThrowIfCancellationRequested();
         var catalog = _loader.Resolve(string.IsNullOrWhiteSpace(model.BaseUrl) ? null : model.BaseUrl);
         var key = ExtractKey(context);
 
@@ -163,7 +170,8 @@ public sealed class IntegrationMockProvider : IApiProvider
                         var toolCall = new ToolCallContent(toolCallId, toolName, args);
                         contentBlocks.Add(toolCall);
                         var index = contentBlocks.Count - 1;
-                        stream.Push(new ToolCallStartEvent(index, Snapshot(StopReason.ToolUse)));
+                        stream.Push(new ToolCallStartEvent(
+                            index, Snapshot(StopReason.ToolUse), toolCallId, toolName));
                         stream.Push(new ToolCallEndEvent(index, toolCall, Snapshot(StopReason.ToolUse)));
                         currentIndex = -1;
                         break;
@@ -267,14 +275,14 @@ public sealed class IntegrationMockProvider : IApiProvider
 
     /// <summary>
     /// Extract the lookup key from <paramref name="context"/>. The key is the trimmed text of
-    /// the final <see cref="UserMessage"/>; multi-block user messages concatenate their
+    /// the final conversational <see cref="UserMessage"/>, excluding request-only host context; multi-block user messages concatenate their
     /// <see cref="TextContent"/> blocks. Returns an empty string when no user message is found.
     /// </summary>
     public static string ExtractKey(Context context)
     {
         for (var i = context.Messages.Count - 1; i >= 0; i--)
         {
-            if (context.Messages[i] is not UserMessage user)
+            if (context.Messages[i].IsRequestOnlyContext || context.Messages[i] is not UserMessage user)
                 continue;
 
             if (user.Content.IsText)
@@ -292,14 +300,14 @@ public sealed class IntegrationMockProvider : IApiProvider
         return string.Empty;
     }
 
-    private AssistantMessage CreateErrorMessage(LlmModel model, string error)
+    private AssistantMessage CreateErrorMessage(LlmModel model, string error, StopReason stopReason = StopReason.Error)
         => new(
             Content: [new TextContent(error)],
             Api: Api,
             Provider: model.Provider,
             ModelId: model.Id,
             Usage: Usage.Empty(),
-            StopReason: StopReason.Error,
+            StopReason: stopReason,
             ErrorMessage: error,
             ResponseId: null,
             Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());

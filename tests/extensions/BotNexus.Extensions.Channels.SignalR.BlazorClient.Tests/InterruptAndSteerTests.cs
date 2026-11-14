@@ -23,15 +23,14 @@ public sealed class InterruptAndSteerTests
     }
 
     [Fact]
-    public void IAgentInteractionService_HasInterruptAndSteerAsync_Method()
+    public void IAgentInteractionService_ExposesInterruptIntentOnTheUnifiedDeliveryMethod()
     {
-        // Assert the method exists on the interface (contract guard)
-        var method = typeof(IAgentInteractionService).GetMethod("InterruptAndSteerAsync");
+        var method = typeof(IAgentInteractionService).GetMethod(nameof(IAgentInteractionService.DeliverMessageAsync));
         Assert.NotNull(method);
         var parameters = method!.GetParameters();
-        Assert.Equal(2, parameters.Length);
-        Assert.Equal("agentId", parameters[0].Name);
-        Assert.Equal("message", parameters[1].Name);
+        Assert.Contains(parameters, parameter => parameter.Name == "conversationId");
+        Assert.Contains(parameters, parameter => parameter.ParameterType == typeof(InboundDeliveryMode));
+        Assert.Contains(parameters, parameter => parameter.ParameterType == typeof(IReadOnlyList<DraftAttachment>));
     }
 
     [Theory]
@@ -42,14 +41,14 @@ public sealed class InterruptAndSteerTests
     {
         // Arrange - wire up session so we know the no-op is due to blank message, not missing session
         var agent = _store.GetAgent("agent-1")!;
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         agent.Conversations["conv-1"] = new ConversationState { ConversationId = "conv-1", Title = "T", HistoryLoaded = true };
         agent.Conversations["conv-1"].ActiveSessionId = "session-1";
 
         var messagesBefore = agent.Conversations["conv-1"].Messages.Count;
 
         // Act
-        await _service.InterruptAndSteerAsync("agent-1", message!);
+        await _service.InterruptAndSteerAsync("agent-1", "conv-1", message!);
 
         // Assert - no messages appended, no hub call attempted
         Assert.Equal(messagesBefore, agent.Conversations["conv-1"].Messages.Count);
@@ -60,7 +59,7 @@ public sealed class InterruptAndSteerTests
     {
         // Agent has no active conversation session -- method should not throw
         var exception = await Record.ExceptionAsync(() =>
-            _service.InterruptAndSteerAsync("agent-1", "redirect me please"));
+            _service.InterruptAndSteerAsync("agent-1", "conv-1", "redirect me please"));
 
         Assert.Null(exception);
     }
@@ -70,14 +69,14 @@ public sealed class InterruptAndSteerTests
     {
         // Arrange - set up session so the hub call path is reached
         var agent = _store.GetAgent("agent-1")!;
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         agent.Conversations["conv-1"] = new ConversationState { ConversationId = "conv-1", Title = "T", HistoryLoaded = true };
         agent.Conversations["conv-1"].ActiveSessionId = "session-1";
 
         // Act - the GatewayHubConnection has a null _connection so InvokeAsync will throw
         // This exercises the catch block -> AppendError path
         // We use a try here because the exception propagates from the hub invocation
-        await _service.InterruptAndSteerAsync("agent-1", "please redirect");
+        await _service.InterruptAndSteerAsync("agent-1", "conv-1", "please redirect");
 
         // Assert: the user message or error should be appended
         // AppendUserMessage is called BEFORE the hub invocation, so we should have the redirect msg

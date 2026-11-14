@@ -105,11 +105,16 @@ internal static class CopilotMessagesMessageConverter
             if (string.IsNullOrWhiteSpace(msg.Content.Text))
                 return null;
 
-            content = UnicodeSanitizer.SanitizeSurrogates(msg.Content.Text);
+            content = msg.Content.Text.SanitizeSurrogates();
         }
         else
         {
             var blocks = new List<object>();
+            var droppedImageCount = msg.Content.Blocks!.Count(b => b is ImageContent);
+            var supportsImages = ImageModalityGuard.AllowImages(
+                model,
+                droppedImageCount,
+                "copilot-messages.user");
             foreach (var block in msg.Content.Blocks!)
             {
                 switch (block)
@@ -121,11 +126,11 @@ internal static class CopilotMessagesMessageConverter
                         blocks.Add(new Dictionary<string, object?>
                         {
                             ["type"] = "text",
-                            ["text"] = UnicodeSanitizer.SanitizeSurrogates(text.Text)
+                            ["text"] = text.Text.SanitizeSurrogates()
                         });
                         break;
                     case ImageContent image:
-                        if (!model.Input.Contains("image"))
+                        if (!supportsImages)
                             break;
                         blocks.Add(new Dictionary<string, object?>
                         {
@@ -140,6 +145,16 @@ internal static class CopilotMessagesMessageConverter
                         break;
                 }
             }
+
+            // #2485 AC4: substitute an in-band notice for the removed images so the user learns
+            // the attachment could not be delivered, rather than only an operator reading the log.
+            if (!supportsImages)
+            {
+                var notice = ImageModalityGuard.BuildDropNotice(model, droppedImageCount);
+                if (notice is not null)
+                    blocks.Add(new Dictionary<string, object?> { ["type"] = "text", ["text"] = notice });
+            }
+
             if (blocks.Count == 0)
                 return null;
 
@@ -168,7 +183,7 @@ internal static class CopilotMessagesMessageConverter
                     var textBlock = new Dictionary<string, object?>
                     {
                         ["type"] = "text",
-                        ["text"] = UnicodeSanitizer.SanitizeSurrogates(text.Text)
+                        ["text"] = text.Text.SanitizeSurrogates()
                     };
                     if (text.TextSignature is not null)
                         textBlock["signature"] = text.TextSignature;
@@ -197,7 +212,7 @@ internal static class CopilotMessagesMessageConverter
                             blocks.Add(new Dictionary<string, object?>
                             {
                                 ["type"] = "text",
-                                ["text"] = UnicodeSanitizer.SanitizeSurrogates(thinking.Thinking)
+                                ["text"] = thinking.Thinking.SanitizeSurrogates()
                             });
                             break;
                         }
@@ -205,7 +220,7 @@ internal static class CopilotMessagesMessageConverter
                         blocks.Add(new Dictionary<string, object?>
                         {
                             ["type"] = "thinking",
-                            ["thinking"] = UnicodeSanitizer.SanitizeSurrogates(thinking.Thinking),
+                            ["thinking"] = thinking.Thinking.SanitizeSurrogates(),
                             ["signature"] = thinking.ThinkingSignature
                         });
                     }
@@ -240,7 +255,7 @@ internal static class CopilotMessagesMessageConverter
     {
         object content;
         var textBlocks = toolResult.Content.OfType<TextContent>()
-            .Select(t => UnicodeSanitizer.SanitizeSurrogates(t.Text))
+            .Select(t => t.Text.SanitizeSurrogates())
             .Where(t => !string.IsNullOrWhiteSpace(t))
             .ToList();
         var hasImages = toolResult.Content.Any(c => c is ImageContent);

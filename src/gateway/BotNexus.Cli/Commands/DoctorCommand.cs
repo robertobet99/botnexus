@@ -1,16 +1,84 @@
 using System.CommandLine;
+using System.Globalization;
+using BotNexus.Cli.Commands.Doctor;
 using BotNexus.Domain.World;
 using BotNexus.Gateway.Configuration;
-using Microsoft.Data.Sqlite;
 using Spectre.Console;
+using BotNexus.Cli.Services;
 
 namespace BotNexus.Cli.Commands;
 
+/// <summary>
+/// <c>botnexus doctor</c> - CLI diagnostics. Running the bare command executes every registered
+/// <see cref="IDoctorCheck"/> in a deterministic order and prints a section per check plus a final
+/// healthy/warning/error summary with a script-friendly aggregate exit code (issue #2041). Focused
+/// subcommands (<c>doctor locations</c>, <c>doctor config</c>, <c>doctor agents</c>) remain for
+/// targeted runs. The read-only reconciliation check runs as part of the aggregate suite; the
+/// destructive orphan cleanup is opt-in via <c>--cleanup-orphans</c> (issue #2039) and, in a
+/// non-interactive terminal, never deletes without that explicit flag. New checks are added only to
+/// <see cref="DoctorCheckRegistry"/>, so the aggregate suite can never silently omit one.
+/// </summary>
 internal sealed class DoctorCommand
 {
     public Command Build(Option<bool> verboseOption, Option<string?> targetOption)
     {
-        var command = new Command("doctor", "Run CLI diagnostics.");
+        var command = new Command("doctor", "Run the complete CLI diagnostic suite (or a focused check).");
+
+        // Opt-in destructive reconciliation of orphaned persistent agent workspaces (issue #2039).
+        // Absent this flag the bare run stays non-destructive: the read-only check still reports drift.
+        var cleanupOption = new Option<bool>(
+            "--cleanup-orphans",
+            "After the diagnostic suite, reconcile persistent agent workspaces and delete orphaned directories (prompts when interactive).");
+        command.AddOption(cleanupOption);
+
+        // Bare `doctor`: run every registered check and return an aggregate exit code.
+        command.SetHandler(async context =>
+        {
+            var verbose = context.ParseResult.GetValueForOption(verboseOption);
+            var target = context.ParseResult.GetValueForOption(targetOption);
+            var cleanup = context.ParseResult.GetValueForOption(cleanupOption);
+            var home = CliPaths.ResolveTarget(target);
+            var configPath = Path.Combine(home, "config.json");
+            var exitCode = await RunAggregateAsync(
+                DoctorCheckRegistry.CreateDefault(),
+                new DoctorCheckContext(configPath, home, verbose),
+                CancellationToken.None);
+
+            if (cleanup)
+            {
+                AnsiConsole.WriteLine();
+                var reconcileExit = await ExecuteAgentsAsync(
+                    home,
+                    cleanupOrphans: true,
+                    AnsiConsole.Profile.Capabilities.Interactive,
+                    CancellationToken.None);
+                exitCode = Math.Max(exitCode, reconcileExit);
+            }
+
+            context.ExitCode = exitCode;
+        });
+
+        // Dedicated `doctor agents` subcommand for a focused reconciliation run.
+        var agentsCleanupOption = new Option<bool>(
+            "--cleanup-orphans",
+            "Delete orphaned persistent agent workspaces (prompts when interactive, no-op without this flag when non-interactive).");
+        var agentsCommand = new Command("agents", "Reconcile persistent agent workspaces with configured agents.")
+        {
+            agentsCleanupOption
+        };
+        agentsCommand.SetHandler(async context =>
+        {
+            var target = context.ParseResult.GetValueForOption(targetOption);
+            var cleanup = context.ParseResult.GetValueForOption(agentsCleanupOption);
+            var home = CliPaths.ResolveTarget(target);
+            context.ExitCode = await ExecuteAgentsAsync(
+                home,
+                cleanup,
+                AnsiConsole.Profile.Capabilities.Interactive,
+                CancellationToken.None);
+        });
+        command.AddCommand(agentsCommand);
+
         var locationsCommand = new Command("locations", "Check location accessibility.");
         locationsCommand.SetHandler(async context =>
         {
@@ -24,6 +92,195 @@ internal sealed class DoctorCommand
         command.AddCommand(locationsCommand);
         command.AddCommand(new DoctorConfigCommand().Build(verboseOption, targetOption));
         return command;
+    }
+
+    /// <summary>
+    /// Reconciles the persistent agent workspaces under the resolved agents root against all agents
+    /// declared in effective configuration, prints the plan, and (only when approved) deletes
+    /// orphaned directories. Approval comes either from <paramref name="cleanupOrphans"/> (the explicit
+    /// opt-in flag) or, in an interactive terminal, from the <paramref name="confirm"/> prompt. In a
+    /// non-interactive terminal without the flag the method is strictly non-destructive. Returns 0 when
+    /// no orphans remain (nothing found, or all deleted), 1 when orphans remain unresolved (findings),
+    /// and 2 for an execution error (missing/unreadable config, unsafe symlink, or a failed deletion) -
+    /// distinguishing findings from errors as the issue requires.
+    /// </summary>
+    /// <param name="home">The resolved BotNexus home whose effective configuration and agents root are used.</param>
+    /// <param name="cleanupOrphans">Explicit opt-in to delete orphaned directories without prompting.</param>
+    /// <param name="interactive">Whether the current terminal can prompt the user.</param>
+    /// <param name="cancellationToken">Cancellation for config loading.</param>
+    /// <param name="confirm">Test/override seam for the interactive confirmation prompt.</param>
+    /// <returns>0 = healthy/resolved, 1 = orphans remain, 2 = execution error.</returns>
+    internal async Task<int> ExecuteAgentsAsync(
+        string home,
+        bool cleanupOrphans,
+        bool interactive,
+        CancellationToken cancellationToken,
+        Func<string, bool>? confirm = null)
+    {
+        var configPath = Path.Combine(home, "config.json");
+        var config = await LoadConfigRequiredAsync(configPath, cancellationToken);
+        if (config is null)
+            return 2;
+
+        var reconciler = new PersistentAgentWorkspaceReconciler();
+        var agentsRoot = PersistentAgentWorkspaceReconciler.ResolveAgentsRoot(home, config.Gateway?.AgentsDirectory);
+        IReadOnlyList<PersistentAgentWorkspaceEntry> plan;
+        try
+        {
+            plan = reconciler.BuildPlan(agentsRoot, config);
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to inspect agent workspaces: {CliText.SafeDisplay(ex.Message)}");
+            return 2;
+        }
+
+        AnsiConsole.MarkupLine($"Agent workspace reconciliation plan for [dim]{CliText.SafeDisplay(agentsRoot)}[/]:");
+        foreach (var entry in plan)
+        {
+            var state = entry.IsOrphaned
+                ? (entry.IsUnsafeLink ? "[red]unsafe orphan[/]" : "[yellow]orphaned[/]")
+                : "[green]declared[/]";
+            // #3845: size and newest-content age are what an operator needs to judge an orphan -
+            // a name alone gives them nothing to decide with.
+            var newest = entry.NewestContentUtc is { } stamp
+                ? stamp.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+                : "empty";
+            AnsiConsole.MarkupLine(
+                $"  {state}  {CliText.SafeDisplay(entry.DirectoryName)}  [dim]{DebugDbCommand.FormatSize(entry.SizeBytes)}, newest {newest}[/]");
+        }
+
+        var orphans = plan.Where(entry => entry.IsOrphaned).ToArray();
+        if (orphans.Length == 0)
+        {
+            AnsiConsole.MarkupLine("[green]No orphaned persistent agent workspaces found.[/]");
+            return 0;
+        }
+
+        AnsiConsole.MarkupLine(
+            $"[yellow]{orphans.Length} orphaned workspace(s) holding {DebugDbCommand.FormatSize(orphans.Sum(entry => entry.SizeBytes))}.[/]");
+
+        if (orphans.Any(entry => entry.IsUnsafeLink))
+        {
+            AnsiConsole.MarkupLine("[red]Unsafe symlink/reparse-point orphan detected; no directories were deleted.[/]");
+            return 2;
+        }
+
+        var approved = cleanupOrphans;
+        if (!approved && interactive)
+        {
+            approved = (confirm ?? (message => AnsiConsole.Confirm(message, defaultValue: false)))(
+                $"Delete the {orphans.Length} enumerated orphaned workspace(s)? Effective agent configuration does not declare them.");
+        }
+
+        if (!approved)
+        {
+            AnsiConsole.MarkupLine(interactive
+                ? "[yellow]Cleanup declined; orphaned workspaces remain.[/]"
+                : "[yellow]Non-interactive mode is non-destructive. Re-run with --cleanup-orphans to delete the listed workspaces.[/]");
+            return 1;
+        }
+
+        try
+        {
+            // Pass config so the reconciler re-derives registration immediately before deleting,
+            // rather than trusting flags computed before the print/prompt round trip (#3845).
+            var deleted = reconciler.DeleteOrphans(agentsRoot, orphans, config);
+            AnsiConsole.MarkupLine($"[green]Deleted {deleted} orphaned persistent agent workspace(s).[/]");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] Cleanup failed: {CliText.SafeDisplay(ex.Message)}");
+            return 2;
+        }
+    }
+
+    /// <summary>
+    /// Runs the supplied checks in order, printing a section per check and a final summary, and returns
+    /// a deterministic aggregate exit code: 0 when every check is healthy, 1 when any check reports a
+    /// warning, 2 when any check reports an error. Independent checks always run to completion even
+    /// after one reports a finding; an unexpected exception from a check is contained and surfaced as
+    /// an error section so the remaining checks still run. Exposed for tests to drive with an isolated
+    /// check set and an injected non-interactive <see cref="AnsiConsole"/>.
+    /// </summary>
+    /// <param name="checks">The ordered checks to run (typically <see cref="DoctorCheckRegistry.CreateDefault"/>).</param>
+    /// <param name="context">Ambient inputs (config path, home, verbosity) shared by every check.</param>
+    /// <param name="cancellationToken">Cancellation for the whole suite.</param>
+    /// <returns>0 = all healthy, 1 = at least one warning, 2 = at least one error.</returns>
+    internal static async Task<int> RunAggregateAsync(
+        IReadOnlyList<IDoctorCheck> checks,
+        DoctorCheckContext context,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(checks);
+        ArgumentNullException.ThrowIfNull(context);
+
+        AnsiConsole.MarkupLine($"[bold]BotNexus doctor[/] - running {checks.Count} check(s)\n");
+
+        var healthy = 0;
+        var warning = 0;
+        var error = 0;
+
+        foreach (var check in checks)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            DoctorCheckResult result;
+            try
+            {
+                result = await check.RunAsync(context, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Contain an unexpected failure so the remaining independent checks still run.
+                result = DoctorCheckResult.Error($"check '{check.Id}' threw unexpectedly", ex.Message);
+            }
+
+            switch (result.Outcome)
+            {
+                case DoctorOutcome.Healthy:
+                    healthy++;
+                    break;
+                case DoctorOutcome.Warning:
+                    warning++;
+                    break;
+                default:
+                    error++;
+                    break;
+            }
+
+            RenderSection(check, result);
+        }
+
+        AnsiConsole.WriteLine();
+        var summaryColor = error > 0 ? "red" : warning > 0 ? "yellow" : "green";
+        var summaryIcon = error > 0 ? "x" : warning > 0 ? "!" : "\u221a";
+        AnsiConsole.Write(new Rule(
+            $"[{summaryColor}]{summaryIcon}[/] [green]{healthy} healthy[/]  [yellow]{warning} warning[/]  [red]{error} error[/]")
+        { Justification = Justify.Left });
+
+        // Deterministic aggregate exit code: error dominates warning dominates healthy.
+        return error > 0 ? 2 : warning > 0 ? 1 : 0;
+    }
+
+    private static void RenderSection(IDoctorCheck check, DoctorCheckResult result)
+    {
+        var (icon, color) = result.Outcome switch
+        {
+            DoctorOutcome.Healthy => ("\u221a", "green"),
+            DoctorOutcome.Warning => ("!", "yellow"),
+            _ => ("x", "red")
+        };
+
+        AnsiConsole.MarkupLine(
+            $"[{color}]{icon}[/] [bold]{CliText.SafeDisplay(check.Title)}[/] - {CliText.SafeDisplay(result.Summary)}");
+        foreach (var detail in result.Details)
+            AnsiConsole.MarkupLine($"[dim]{CliText.SafeDisplay(detail)}[/]");
     }
 
     public async Task<int> ExecuteLocationsAsync(bool verbose, CancellationToken cancellationToken)
@@ -65,6 +322,20 @@ internal sealed class DoctorCommand
             .AddColumn("Target")
             .AddColumn("Message");
 
+        void Accumulate(LocationHealthResult result, Location location)
+        {
+            var icon = result.Status switch
+            {
+                LocationHealthStatus.Healthy => "[green]\u221a[/]",
+                LocationHealthStatus.Warning => "[yellow]![/]",
+                _ => "[red]x[/]"
+            };
+            healthyCount += result.Status == LocationHealthStatus.Healthy ? 1 : 0;
+            warningCount += result.Status == LocationHealthStatus.Warning ? 1 : 0;
+            errorCount += result.Status == LocationHealthStatus.Error ? 1 : 0;
+            table.AddRow(icon, CliText.SafeDisplay(location.Name), CliText.SafeDisplay(result.Target), CliText.SafeDisplay(result.Message));
+        }
+
         if (interactive)
         {
             await AnsiConsole.Status()
@@ -74,255 +345,49 @@ internal sealed class DoctorCommand
                 {
                     foreach (var location in locations)
                     {
-                        ctx.Status($"Checking [dim]{Markup.Escape(location.Name)}[/]...");
-                        var result = await CheckLocationAsync(location, httpClient, cancellationToken);
-                        var icon = result.Status switch
-                        {
-                            HealthStatus.Healthy => "[green]✓[/]",
-                            HealthStatus.Warning => "[yellow]⚠[/]",
-                            _ => "[red]✗[/]"
-                        };
-                        healthyCount += result.Status == HealthStatus.Healthy ? 1 : 0;
-                        warningCount += result.Status == HealthStatus.Warning ? 1 : 0;
-                        errorCount += result.Status == HealthStatus.Error ? 1 : 0;
-                        table.AddRow(icon, Markup.Escape(location.Name), Markup.Escape(result.Target), Markup.Escape(result.Message));
+                        ctx.Status($"Checking [dim]{CliText.SafeDisplay(location.Name)}[/]...");
+                        Accumulate(await LocationProbe.CheckLocationAsync(location, httpClient, cancellationToken), location);
                     }
                 });
         }
         else
         {
             foreach (var location in locations)
-            {
-                var result = await CheckLocationAsync(location, httpClient, cancellationToken);
-                var icon = result.Status switch
-                {
-                    HealthStatus.Healthy => "[green]✓[/]",
-                    HealthStatus.Warning => "[yellow]⚠[/]",
-                    _ => "[red]✗[/]"
-                };
-                healthyCount += result.Status == HealthStatus.Healthy ? 1 : 0;
-                warningCount += result.Status == HealthStatus.Warning ? 1 : 0;
-                errorCount += result.Status == HealthStatus.Error ? 1 : 0;
-                table.AddRow(icon, Markup.Escape(location.Name), Markup.Escape(result.Target), Markup.Escape(result.Message));
-            }
+                Accumulate(await LocationProbe.CheckLocationAsync(location, httpClient, cancellationToken), location);
         }
 
         AnsiConsole.Write(table);
         AnsiConsole.WriteLine();
 
-        // Summary Rule with colour-coded result
         var summaryColor = errorCount > 0 ? "red" : warningCount > 0 ? "yellow" : "green";
-        var summaryIcon = errorCount > 0 ? "✗" : warningCount > 0 ? "⚠" : "✓";
+        var summaryIcon = errorCount > 0 ? "x" : warningCount > 0 ? "!" : "\u221a";
         AnsiConsole.Write(new Rule(
             $"[{summaryColor}]{summaryIcon}[/] [green]{healthyCount} healthy[/]  [yellow]{warningCount} warning[/]  [red]{errorCount} error[/]")
         { Justification = Justify.Left });
 
         if (verbose)
-            AnsiConsole.MarkupLine($"[dim]Loaded from: {Markup.Escape(configPath)}[/]");
+            AnsiConsole.MarkupLine($"[dim]Loaded from: {CliText.SafeDisplay(configPath)}[/]");
 
         return errorCount == 0 ? 0 : 1;
     }
 
-    private static async Task<LocationHealthResult> CheckLocationAsync(Location location, HttpClient httpClient, CancellationToken cancellationToken)
-    {
-        var target = location.Path ?? "(unset)";
-        if (location.Type == LocationType.FileSystem)
-        {
-            if (string.IsNullOrWhiteSpace(location.Path))
-                return new LocationHealthResult(target, HealthStatus.Error, "not found (path missing)");
-
-            return Directory.Exists(location.Path) || File.Exists(location.Path)
-                ? new LocationHealthResult(target, HealthStatus.Healthy, "accessible")
-                : new LocationHealthResult(target, HealthStatus.Error, "not found");
-        }
-
-        if (location.Type == LocationType.Api || location.Type == LocationType.RemoteNode)
-            return await ProbeHttpEndpointAsync(target, httpClient, cancellationToken);
-
-        if (location.Type == LocationType.McpServer)
-        {
-            if (Uri.TryCreate(target, UriKind.Absolute, out var endpointUri)
-                && (endpointUri.Scheme == Uri.UriSchemeHttp || endpointUri.Scheme == Uri.UriSchemeHttps))
-            {
-                return await ProbeHttpEndpointAsync(target, httpClient, cancellationToken);
-            }
-
-            var command = ParseCommand(target);
-            if (string.IsNullOrWhiteSpace(command))
-                return new LocationHealthResult(target, HealthStatus.Warning, "unreachable (endpoint missing)");
-
-            return IsCommandAvailable(command)
-                ? new LocationHealthResult(target, HealthStatus.Healthy, "reachable")
-                : new LocationHealthResult(target, HealthStatus.Warning, "unreachable (command not found)");
-        }
-
-        if (location.Type == LocationType.Database)
-            return await ProbeDatabaseAsync(target, cancellationToken);
-
-        return new LocationHealthResult(target, HealthStatus.Warning, $"unreachable (unsupported type '{location.Type.Value}')");
-    }
-
-    private static async Task<LocationHealthResult> ProbeHttpEndpointAsync(string target, HttpClient httpClient, CancellationToken cancellationToken)
-    {
-        if (!Uri.TryCreate(target, UriKind.Absolute, out var endpointUri)
-            || (endpointUri.Scheme != Uri.UriSchemeHttp && endpointUri.Scheme != Uri.UriSchemeHttps))
-        {
-            return new LocationHealthResult(target, HealthStatus.Warning, "unreachable (invalid endpoint)");
-        }
-
-        try
-        {
-            using var response = await httpClient.GetAsync(endpointUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-            if (response.IsSuccessStatusCode)
-                return new LocationHealthResult(target, HealthStatus.Healthy, $"accessible (HTTP {(int)response.StatusCode})");
-
-            if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized
-                or System.Net.HttpStatusCode.Forbidden)
-            {
-                return new LocationHealthResult(target, HealthStatus.Warning, $"unreachable (HTTP {(int)response.StatusCode})");
-            }
-
-            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
-                return new LocationHealthResult(target, HealthStatus.Error, "not found (HTTP 404)");
-
-            return new LocationHealthResult(target, HealthStatus.Warning, $"unreachable (HTTP {(int)response.StatusCode})");
-        }
-        catch (TaskCanceledException)
-        {
-            return new LocationHealthResult(target, HealthStatus.Warning, "unreachable (timeout)");
-        }
-        catch (Exception ex)
-        {
-            return new LocationHealthResult(target, HealthStatus.Warning, $"unreachable ({ex.GetType().Name})");
-        }
-    }
-
-    private static async Task<LocationHealthResult> ProbeDatabaseAsync(string connectionString, CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(connectionString))
-            return new LocationHealthResult("(unset)", HealthStatus.Error, "not found (connection string missing)");
-
-        try
-        {
-            var builder = new SqliteConnectionStringBuilder(connectionString);
-            var dataSource = builder.DataSource?.Trim();
-            if (!string.IsNullOrWhiteSpace(dataSource) && !dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
-            {
-                var expandedPath = ExpandUserHome(dataSource);
-                if (!Path.IsPathRooted(expandedPath))
-                    expandedPath = Path.GetFullPath(expandedPath);
-                if (!File.Exists(expandedPath))
-                    return new LocationHealthResult(connectionString, HealthStatus.Error, "not found");
-            }
-
-            await using var connection = new SqliteConnection(connectionString);
-            await connection.OpenAsync(cancellationToken);
-            return new LocationHealthResult(connectionString, HealthStatus.Healthy, "accessible");
-        }
-        catch (Exception ex)
-        {
-            return new LocationHealthResult(connectionString, HealthStatus.Warning, $"unreachable ({ex.GetType().Name})");
-        }
-    }
-
-    private static string ParseCommand(string endpoint)
-    {
-        if (string.IsNullOrWhiteSpace(endpoint))
-            return string.Empty;
-
-        var trimmed = endpoint.Trim();
-        if (trimmed.StartsWith('"'))
-        {
-            var closingQuote = trimmed.IndexOf('"', 1);
-            return closingQuote > 1 ? trimmed[1..closingQuote] : string.Empty;
-        }
-
-        var separatorIndex = trimmed.IndexOf(' ');
-        return separatorIndex > 0 ? trimmed[..separatorIndex] : trimmed;
-    }
-
-    private static bool IsCommandAvailable(string command)
-    {
-        if (Path.IsPathRooted(command))
-            return File.Exists(command);
-
-        var pathValue = Environment.GetEnvironmentVariable("PATH");
-        if (string.IsNullOrWhiteSpace(pathValue))
-            return false;
-
-        var commandName = command.Trim();
-        var isWindows = OperatingSystem.IsWindows();
-        var extensions = isWindows
-            ? (Environment.GetEnvironmentVariable("PATHEXT")?.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-               ?? [".EXE", ".CMD", ".BAT"])
-            : [string.Empty];
-
-        foreach (var path in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var candidateBasePath = Path.Combine(path, commandName);
-            if (File.Exists(candidateBasePath))
-                return true;
-
-            if (isWindows)
-            {
-                foreach (var extension in extensions)
-                {
-                    var candidatePath = candidateBasePath.EndsWith(extension, StringComparison.OrdinalIgnoreCase)
-                        ? candidateBasePath
-                        : candidateBasePath + extension;
-                    if (File.Exists(candidatePath))
-                        return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private static string ExpandUserHome(string path)
-    {
-        if (!path.StartsWith('~'))
-            return path;
-
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (path.Length == 1)
-            return home;
-
-        var first = path[1];
-        if (first == Path.DirectorySeparatorChar || first == Path.AltDirectorySeparatorChar)
-            return Path.Combine(home, path[2..]);
-
-        return path;
-    }
-
     private static async Task<PlatformConfig?> LoadConfigRequiredAsync(string configPath, CancellationToken cancellationToken)
     {
-        if (!File.Exists(configPath))
+        if (!ConfigPresence.Exists(configPath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Config file not found at [dim]{Markup.Escape(configPath)}[/]. Run [green]botnexus init[/] first.");
+            AnsiConsole.MarkupLine(configPath.NotFoundMessage());
             return null;
         }
 
         try
         {
-            return await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
+            return PlatformConfigAccessor.Shared.Get(configPath);
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {CliText.SafeDisplay(ex.Message)}");
             return null;
         }
     }
-
-    private static string PadRight(string value, int width)
-        => value.Length >= width ? value : value.PadRight(width);
-
-    private enum HealthStatus
-    {
-        Healthy,
-        Warning,
-        Error
-    }
-
-    private sealed record LocationHealthResult(string Target, HealthStatus Status, string Message);
 }
+

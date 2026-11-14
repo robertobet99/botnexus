@@ -32,9 +32,22 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
 
     public string Api => "openai-compat";
 
+    /// <summary>
+    /// The OpenAI-compatible endpoint prepends a <c>system</c>-role message to the message list
+    /// (see <c>BuildMessages</c> in this file). This is also the api that serves GitHub Models
+    /// (<c>GitHubModelsProvider</c> registers every model with <c>Api: "openai-compat"</c> rather
+    /// than registering a provider of its own), so this declaration is GitHub Models' declaration
+    /// too. No leaked-tool-call recovery: the #1709 markup leak was observed on the Copilot
+    /// transports, not here (#2432).
+    /// </summary>
+    public ProviderCapabilities Capabilities { get; } = new(
+        RecoversLeakedToolCallMarkup: false,
+        SystemPromptPlacement: SystemPromptPlacement.FirstMessage);
+
     public LlmStream Stream(LlmModel model, Context context, StreamOptions? options = null)
     {
         var stream = new LlmStream();
+        var ct = options?.CancellationToken ?? CancellationToken.None;
 
         _ = Task.Run(async () =>
         {
@@ -47,6 +60,25 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
             {
                 await StreamCoreAsync(model, context, options, stream);
                 activity?.SetStatus(ActivityStatusCode.Ok);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Cancellation is normalized as ErrorEvent(StopReason.Aborted) across every producer
+                // (#3292). This provider had NO cancellation arm at all, so a user cancellation fell
+                // through to the general catch below and was reported as StopReason.Error - the same
+                // reason a 500 or a malformed body produces. That collapse was found by the
+                // conformance assertion added in #3292, not by the original audit.
+                var abortedMessage = CreateAbortedMessage(model);
+                stream.Push(new ErrorEvent(StopReason.Aborted, abortedMessage));
+                stream.End(abortedMessage);
+                activity?.SetStatus(ActivityStatusCode.Error, "Operation canceled");
+            }
+            catch (ProviderTransientFinishReasonException ex)
+            {
+                // #3567: same reasoning as the Completions engine -- a transport-level finish reason
+                // has to arrive at AgentLoopRunner as an exception, or the retry lane never sees it.
+                stream.EndFaulted(ex);
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             }
             catch (Exception ex)
             {
@@ -62,7 +94,8 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
 
     public LlmStream StreamSimple(LlmModel model, Context context, SimpleStreamOptions? options = null)
     {
-        var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+        var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, null);
+        var apiKey = credential.Value;
         var baseOptions = SimpleOptionsHelper.BuildBaseOptions(model, options, apiKey);
 
         // Apply reasoning effort if supported
@@ -74,6 +107,7 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
                 var compatOptions = new OpenAICompatOptions
                 {
                     Temperature = baseOptions.Temperature,
+                    ToolChoiceMode = baseOptions.ToolChoiceMode,
                     MaxTokens = baseOptions.MaxTokens,
                     CancellationToken = baseOptions.CancellationToken,
                     ApiKey = baseOptions.ApiKey,
@@ -99,7 +133,8 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
         LlmModel model, Context context, StreamOptions? options, LlmStream stream)
     {
         var compat = CompatDetector.Detect(model);
-        var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+        var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, null);
+        var apiKey = credential.Value;
         var ct = options?.CancellationToken ?? CancellationToken.None;
 
         var requestBody = BuildRequestBody(model, context, options, compat);
@@ -111,6 +146,8 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
             if (modified is JsonObject modifiedObject)
                 requestBody = modifiedObject;
         }
+
+        requestBody.EnforceToolFree(options?.ToolChoiceMode, compat.SupportsTools != false);
 
         var requestJson = requestBody.ToJsonString();
         var url = $"{model.BaseUrl.TrimEnd('/')}/chat/completions";
@@ -152,7 +189,9 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
             {
                 errorBody = $"<error body exceeded {ErrorBodyLimitBytes} bytes and was discarded>";
             }
-            var errorMessage = CreateErrorMessage(model, $"HTTP {(int)response.StatusCode}: {errorBody}");
+            var errorMessage = CreateErrorMessage(
+                model,
+                OpenAICompatErrorText.DescribeHttpFailure((int)response.StatusCode, errorBody));
             stream.Push(new ErrorEvent(StopReason.Error, errorMessage));
             stream.End(errorMessage);
             return;
@@ -162,7 +201,12 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
         // Bound the untrusted SSE body before a byte reaches the parser: every byte the StreamReader
         // consumes flows through the ByteCountingStream, so an unbounded body or a never-terminating
         // data: line trips the cap regardless of buffering (#1685). Caller owns the inner stream.
-        using var boundedStream = new ByteCountingStream(responseStream, MaxResponseBytes, MaxFrameBytes, leaveOpen: true);
+        using var boundedStream = new ByteCountingStream(
+            responseStream,
+            MaxResponseBytes,
+            MaxFrameBytes,
+            leaveOpen: true,
+            idleTimeout: StreamIdleTimeout.Resolve(options));
         using var reader = new StreamReader(boundedStream, Encoding.UTF8);
 
         await StreamProcessor.ParseCompatAsync(
@@ -239,6 +283,15 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
             body["tools"] = ToNode(Array.Empty<object>());
         }
 
+        if (options?.ToolChoiceMode == BotNexus.Agent.Providers.Core.ToolChoice.None)
+        {
+            body.Remove("tools");
+            if (compat.SupportsTools != false)
+                body["tool_choice"] = "none";
+            else
+                body.Remove("tool_choice");
+        }
+
         return body;
     }
 
@@ -265,25 +318,38 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
         return JsonNode.Parse(element.GetRawText());
     }
 
+    /// <summary>
+    /// Maps this transport's <c>finish_reason</c> to a <see cref="StopReason"/>.
+    /// </summary>
+    /// <remarks>
+    /// <c>network_error</c> THROWS <see cref="ProviderTransientFinishReasonException"/> rather than
+    /// returning a terminal tuple (#3567): it is a transport failure, and the agent loop's retry lane
+    /// only ever inspects exceptions, so the previous <c>(StopReason.Error, ...)</c> mapping ended the
+    /// run without spending a single retry attempt. Every other failure-style reason is unchanged and
+    /// still terminal on the first occurrence.
+    /// </remarks>
     private static (StopReason StopReason, string? ErrorMessage) MapStopReason(string? reason, bool hasToolCalls)
-        => reason switch
+    {
+        TransientFinishReasons.ThrowIfTransient(reason);
+
+        return reason switch
         {
             "stop" => (StopReason.Stop, null),
             "end" => (StopReason.Stop, null),
             "length" => (StopReason.Length, null),
             "function_call" => (StopReason.ToolUse, null),
             "tool_calls" => (StopReason.ToolUse, null),
-            "content_filter" => (StopReason.Error, "Provider finish_reason: content_filter"),
-            "network_error" => (StopReason.Error, "Provider finish_reason: network_error"),
+            "content_filter" => (StopReason.Sensitive, "Content filtered by provider"),
             null => hasToolCalls ? (StopReason.ToolUse, null) : (StopReason.Stop, null),
             _ => (StopReason.Error, $"Provider finish_reason: {reason}")
         };
+    }
 
     private static List<Dictionary<string, object?>> BuildMessages(
         Context context, OpenAICompletionsCompat compat, LlmModel model)
     {
         var messages = new List<Dictionary<string, object?>>();
-        var supportsImages = model.Input.Contains("image");
+        var supportsImages = ImageModalityGuard.SupportsImages(model);
 
         // System prompt
         if (!string.IsNullOrEmpty(context.SystemPrompt))
@@ -303,15 +369,15 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
             switch (msg)
             {
                 case UserMessage user:
-                    messages.Add(BuildUserMessage(user, supportsImages));
+                    messages.Add(BuildUserMessage(user, model, supportsImages));
                     break;
 
                 case AssistantMessage assistant:
-                    messages.Add(BuildAssistantMessage(assistant, compat));
+                    messages.Add(BuildAssistantMessage(assistant, compat, model));
                     break;
 
                 case ToolResultMessage toolResult:
-                    messages.Add(BuildToolResultMessage(toolResult, compat));
+                    messages.Add(BuildToolResultMessage(toolResult, compat, model));
 
                     // Insert synthetic assistant message after tool result if required
                     if (compat.RequiresAssistantAfterToolResult == true)
@@ -334,7 +400,7 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
         return messages;
     }
 
-    private static Dictionary<string, object?> BuildUserMessage(UserMessage user, bool supportsImages)
+    private static Dictionary<string, object?> BuildUserMessage(UserMessage user, LlmModel model, bool supportsImages)
     {
         if (user.Content.IsText)
         {
@@ -349,6 +415,15 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
         var parts = new List<object>();
         if (user.Content.Blocks is not null)
         {
+            var droppedImageCount = user.Content.Blocks.Count(b => b is ImageContent);
+            if (!supportsImages)
+            {
+                ImageModalityGuard.ReportDropped(
+                    model,
+                    droppedImageCount,
+                    "openai-compat.user");
+            }
+
             foreach (var block in user.Content.Blocks)
             {
                 switch (block)
@@ -369,9 +444,18 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
                         break;
 
                     case ImageContent:
-                        // Server doesn't support images — skip
+                        // Server doesn't declare the image modality — dropped, reported above (#2485).
                         break;
                 }
+            }
+
+            // #2485 AC4: substitute an in-band notice for the removed images so the drop reaches
+            // the user through the conversation, not only an operator reading the log.
+            if (!supportsImages)
+            {
+                var notice = ImageModalityGuard.BuildDropNotice(model, droppedImageCount);
+                if (notice is not null)
+                    parts.Add(new Dictionary<string, object?> { ["type"] = "text", ["text"] = notice });
             }
         }
 
@@ -383,7 +467,7 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
     }
 
     private static Dictionary<string, object?> BuildAssistantMessage(
-        AssistantMessage assistant, OpenAICompletionsCompat compat)
+        AssistantMessage assistant, OpenAICompletionsCompat compat, LlmModel model)
     {
         var msg = new Dictionary<string, object?> { ["role"] = "assistant" };
 
@@ -405,7 +489,9 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
                 case ToolCallContent toolCall:
                     toolCalls.Add(new Dictionary<string, object?>
                     {
-                        ["id"] = toolCall.Id,
+                        ["id"] = model.IsMistralFamily()
+                            ? toolCall.Id.NormalizeMistralToolCallId()
+                            : toolCall.Id,
                         ["type"] = "function",
                         ["function"] = new Dictionary<string, object?>
                         {
@@ -432,7 +518,7 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
     }
 
     private static Dictionary<string, object?> BuildToolResultMessage(
-        ToolResultMessage toolResult, OpenAICompletionsCompat compat)
+        ToolResultMessage toolResult, OpenAICompletionsCompat compat, LlmModel model)
     {
         var contentText = string.Join("\n", toolResult.Content
             .OfType<TextContent>()
@@ -441,7 +527,9 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
         var msg = new Dictionary<string, object?>
         {
             ["role"] = "tool",
-            ["tool_call_id"] = toolResult.ToolCallId,
+            ["tool_call_id"] = model.IsMistralFamily()
+                ? toolResult.ToolCallId.NormalizeMistralToolCallId()
+                : toolResult.ToolCallId,
             ["content"] = contentText,
         };
 
@@ -464,16 +552,46 @@ public sealed class OpenAICompatProvider(HttpClient httpClient) : IApiProvider
         return updated with { Cost = ModelRegistry.CalculateCost(model, updated) };
     }
 
-    private static AssistantMessage CreateErrorMessage(LlmModel model, string error)
+    /// <summary>
+    /// The canonical cancelled-turn message for this provider (#3292). Separate from
+    /// <see cref="CreateErrorMessage"/> because a cancelled turn is not a failed one: it carries
+    /// <see cref="StopReason.Aborted"/>, and its text is the fixed "Request was cancelled" wording
+    /// the shared engines use rather than a transport exception message.
+    /// </summary>
+    private static AssistantMessage CreateAbortedMessage(LlmModel model)
     {
         return new AssistantMessage(
-            Content: [new TextContent(error)],
+            Content: [],
+            Api: "openai-compat",
+            Provider: model.Provider,
+            ModelId: model.Id,
+            Usage: Usage.Empty(),
+            StopReason: StopReason.Aborted,
+            ErrorMessage: "Request was cancelled",
+            ResponseId: null,
+            Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        );
+    }
+
+    /// <summary>
+    /// Builds the failure message for a turn, naming the provider and the transmitted model id.
+    /// </summary>
+    /// <remarks>
+    /// #3758: the augmentation lives here, not at the call sites, so BOTH the exception path and the
+    /// non-success HTTP path are covered and neither can regress independently. The structured
+    /// <c>Provider</c>/<c>ModelId</c> fields are untouched - this adds to the rendered text only.
+    /// </remarks>
+    private static AssistantMessage CreateErrorMessage(LlmModel model, string error)
+    {
+        var described = OpenAICompatErrorText.Describe(model, error);
+        return new AssistantMessage(
+            Content: [new TextContent(described)],
             Api: "openai-compat",
             Provider: model.Provider,
             ModelId: model.Id,
             Usage: Usage.Empty(),
             StopReason: StopReason.Error,
-            ErrorMessage: error,
+            ErrorMessage: described,
             ResponseId: null,
             Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         );

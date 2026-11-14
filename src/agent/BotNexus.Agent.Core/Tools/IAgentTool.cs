@@ -104,6 +104,48 @@ public interface IAgentTool
     TimeSpan? DefaultTimeout => null;
 
     /// <summary>
+    /// Optional declaration of the invocation argument that carries a caller-requested timeout,
+    /// together with the unit that argument is expressed in.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>ToolExecutor</c> consults this - and only this - when deciding whether to widen its
+    /// per-tool cancellation budget for an explicitly requested longer run. Returning <c>null</c>
+    /// (the default) means the tool opts out: the executor inspects no arguments at all.
+    /// </para>
+    /// <para>
+    /// The executor must never infer a unit from an argument's name. <c>timeout</c> means seconds
+    /// in <c>ShellTool</c> and milliseconds in <c>ProcessTool</c>, so name-based inference inflated
+    /// millisecond budgets by 1000x and silently disabled the safety cap (issue #2955).
+    /// </para>
+    /// </remarks>
+    ToolTimeoutArgument? TimeoutArgument => null;
+
+    /// <summary>
+    /// Declares where the content this tool returns originates, from the closed
+    /// <see cref="ToolContentSource"/> vocabulary. Consumed by <c>ToolExecutor</c> to accumulate
+    /// turn-level taint, which in turn quarantines memory writes made on a turn that read foreign
+    /// content (issue #2519).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Defaults to <see cref="ToolContentSource.Unknown"/>, which taints.</b> This is the
+    /// fail-closed posture required by the issue: a tool that has not been classified - including
+    /// one contributed by an extension written after this shipped - must not silently count as
+    /// trusted. The cost of the default is over-quarantining until a tool is classified, which is
+    /// recoverable; the cost of defaulting to <see cref="ToolContentSource.Local"/> would be a
+    /// silent laundering path, which is not.
+    /// </para>
+    /// <para>
+    /// Classify by the <i>origin of the returned bytes</i>, never by the tool's power or blast
+    /// radius. <c>shell</c> can do far more damage than <c>web_fetch</c> and is nonetheless
+    /// <see cref="ToolContentSource.Local"/>, because its output is produced inside the trust
+    /// domain the agent already occupies.
+    /// </para>
+    /// </remarks>
+    string ContentSource => ToolContentSource.Unknown;
+
+    /// <summary>
     /// Optional one-line snippet for system prompt tool listing.
     /// </summary>
     string? GetPromptSnippet() => null;

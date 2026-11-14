@@ -26,11 +26,21 @@ public sealed class HomePageTests : IDisposable
         _portalLoad.InitializeAsync(Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
         _store.Agents.Returns(new Dictionary<string, AgentState>().AsReadOnly());
         _store.ActiveAgentId.Returns((string?)null);
+        // The real store derives ActiveAgentId from the single ViewSelection SelectView writes.
+        // Mirror that on the substitute so route/bootstrap assertions observe the selected agent.
+        _store.When(s => s.SelectView(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<SelectionSource>()))
+            .Do(ci =>
+            {
+                var agentId = ci.ArgAt<string>(0);
+                _store.ActiveAgentId.Returns(string.IsNullOrEmpty(agentId) ? null : agentId);
+            });
         _store.GetStreamState(Arg.Any<string>()).Returns(new ConversationStreamState());
 
         _ctx.Services.AddSingleton(_store);
         _ctx.Services.AddSingleton(_portalLoad);
         _ctx.Services.AddSingleton(_interaction);
+        // #3064: Home injects the per-agent conversation MRU at the route seam.
+        _ctx.Services.AddSingleton<IConversationMruService, ConversationMruService>();
         _ctx.Services.AddSingleton<ISlashCommandDispatcher>(sp => new SlashCommandDispatcher(sp.GetRequiredService<IAgentInteractionService>()));
         _ctx.JSInterop.Mode = JSRuntimeMode.Loose;
     }
@@ -188,7 +198,6 @@ public sealed class HomePageTests : IDisposable
         {
             AgentId = "agent-2",
             DisplayName = "Beta",
-            ActiveConversationId = "c-1"
         };
         targetAgent.Conversations["c-1"] = new ConversationState { ConversationId = "c-1", Title = "One" };
         targetAgent.Conversations["c-2"] = new ConversationState { ConversationId = "c-2", Title = "Two" };
@@ -253,7 +262,6 @@ public sealed class HomePageTests : IDisposable
         {
             AgentId = decodedAgentId,
             DisplayName = "Encoded Agent",
-            ActiveConversationId = "fallback"
         };
         targetAgent.Conversations[decodedConversationId] = new ConversationState
         {
@@ -282,13 +290,12 @@ public sealed class HomePageTests : IDisposable
     public void Direct_route_with_stale_ids_falls_back_without_crashing()
     {
         _portalLoad.IsReady.Returns(true);
-        _store.ActiveAgentId = "agent-1";
+        _store.SelectView("agent-1", string.Empty, SelectionSource.UserClick);
 
         var knownAgent = new AgentState
         {
             AgentId = "agent-1",
             DisplayName = "Alpha",
-            ActiveConversationId = "known-conversation"
         };
         knownAgent.Conversations["known-conversation"] = new ConversationState
         {
@@ -327,7 +334,6 @@ public sealed class HomePageTests : IDisposable
         {
             AgentId = "agent-1",
             DisplayName = "Alpha",
-            ActiveConversationId = "known-conversation"
         };
         fallbackAgent.Conversations["known-conversation"] = new ConversationState
         {
@@ -355,5 +361,113 @@ public sealed class HomePageTests : IDisposable
         Assert.Equal("agent-1", _store.ActiveAgentId);
         _store.Received(1).NotifyChanged();
         _interaction.DidNotReceive().SelectConversationAsync(Arg.Any<string>(), Arg.Any<string>());
+    }
+
+    // ── #2247: route-owned view via the canonical /agent/{id}/conversation/{id} shape ──────────
+
+    [Fact]
+    public void Canonical_agent_conversation_route_restores_agent_and_selects_conversation()
+    {
+        // #2247: a deep-link / refresh onto the canonical route-owned shape must restore exactly that
+        // view. Home binds the SAME AgentId/ConversationId parameters for the /agent/{id}/conversation/{id}
+        // route as for the legacy /chat route, so the restore path is identical - proving the new shape
+        // drives SelectView(RouteNavigation) and conversation selection.
+        _portalLoad.IsReady.Returns(true);
+
+        var targetAgent = new AgentState
+        {
+            AgentId = "farnsworth",
+            DisplayName = "Farnsworth",
+        };
+        targetAgent.Conversations["c-1"] = new ConversationState { ConversationId = "c-1", Title = "One" };
+        targetAgent.Conversations["c-99"] = new ConversationState { ConversationId = "c-99", Title = "Deep" };
+        var agents = new Dictionary<string, AgentState> { ["farnsworth"] = targetAgent };
+
+        _store.Agents.Returns(agents.AsReadOnly());
+        _store.GetAgent(Arg.Any<string>()).Returns(ci => agents.GetValueOrDefault(ci.ArgAt<string>(0)));
+
+        _ctx.Services.AddSingleton(Substitute.For<IGatewayRestClient>());
+        _ctx.Services.AddSingleton(new HttpClient());
+        _ctx.Services.AddSingleton(Substitute.For<IPortalPreferencesService>());
+
+        _ctx.Render<Home>(p => p
+            .Add(c => c.AgentId, "farnsworth")
+            .Add(c => c.ConversationId, "c-99"));
+
+        Assert.Equal("farnsworth", _store.ActiveAgentId);
+        _store.Received().SelectView("farnsworth", string.Empty, SelectionSource.RouteNavigation);
+        _interaction.Received(1).SelectConversationAsync("farnsworth", "c-99");
+    }
+
+    [Fact]
+    public void Route_restore_only_ever_uses_RouteNavigation_source_never_UserClick_or_SubAgentView()
+    {
+        // #2247 seam guard: the route-restore path must tag its selection as RouteNavigation. It must
+        // never impersonate a UserClick or a SubAgentView, since those carry different authority in the
+        // store's anti-hijack guard. This pins the intent-source contract for deep-link/refresh/back.
+        _portalLoad.IsReady.Returns(true);
+
+        var agent = new AgentState { AgentId = "farnsworth", DisplayName = "Farnsworth" };
+        var agents = new Dictionary<string, AgentState> { ["farnsworth"] = agent };
+        _store.Agents.Returns(agents.AsReadOnly());
+        _store.GetAgent(Arg.Any<string>()).Returns(ci => agents.GetValueOrDefault(ci.ArgAt<string>(0)));
+
+        _ctx.Services.AddSingleton(Substitute.For<IGatewayRestClient>());
+        _ctx.Services.AddSingleton(new HttpClient());
+        _ctx.Services.AddSingleton(Substitute.For<IPortalPreferencesService>());
+
+        _ctx.Render<Home>(p => p.Add(c => c.AgentId, "farnsworth"));
+
+        _store.Received().SelectView("farnsworth", string.Empty, SelectionSource.RouteNavigation);
+        _store.DidNotReceive().SelectView("farnsworth", Arg.Any<string>(), SelectionSource.UserClick);
+        _store.DidNotReceive().SelectView("farnsworth", Arg.Any<string>(), SelectionSource.SubAgentView);
+    }
+
+    // ── #2293: route to an agent absent from the store must not recurse ──────────────────────────
+
+    [Fact]
+    public void Route_to_agent_absent_from_store_with_fallback_present_does_not_recurse_unbounded()
+    {
+        // #2293 regression: deep-link/refresh onto a route AgentId that is not (yet) in Store.Agents,
+        // with a non-null fallback agent present. The previous fallback branch called
+        // Store.SelectView(fallback, ..., RouteNavigation) + Store.NotifyChanged() and returned WITHOUT
+        // latching _appliedRouteKey. Store.NotifyChanged() raises Store.OnChanged -> HandleStateChanged
+        // -> ApplyRouteSelectionAsync, which re-entered the same un-guarded fallback forever. Use the
+        // REAL ClientStateStore (not a substitute) so the OnChanged/NotifyChanged loop is genuinely
+        // exercised, and assert OnChanged fires a small BOUNDED number of times.
+        var realStore = new ClientStateStore();
+        realStore.SeedAgents(new[]
+        {
+            new AgentSummary("agent-1", "Alpha")
+        });
+
+        var onChangedCount = 0;
+        realStore.OnChanged += () => onChangedCount++;
+
+        _portalLoad.IsReady.Returns(true);
+
+        using var ctx = new BunitContext();
+        ctx.Services.AddSingleton<IClientStateStore>(realStore);
+        ctx.Services.AddSingleton(_portalLoad);
+        ctx.Services.AddSingleton(_interaction);
+        ctx.Services.AddSingleton<IConversationMruService, ConversationMruService>();
+        ctx.Services.AddSingleton<ISlashCommandDispatcher>(sp => new SlashCommandDispatcher(sp.GetRequiredService<IAgentInteractionService>()));
+        ctx.Services.AddSingleton(Substitute.For<IGatewayRestClient>());
+        ctx.Services.AddSingleton(new HttpClient());
+        ctx.Services.AddSingleton(Substitute.For<IPortalPreferencesService>());
+        ctx.JSInterop.Mode = JSRuntimeMode.Loose;
+
+        // Navigate to an AgentId ABSENT from the store; a non-null fallback ("agent-1") is present.
+        // Without the fix this render never completes (unbounded recursion / stack overflow).
+        ctx.Render<Home>(p => p.Add(c => c.AgentId, "missing-agent"));
+
+        // Render completed => no unbounded recursion. The fallback was applied and latched.
+        Assert.Equal("agent-1", realStore.ActiveAgentId);
+
+        // OnChanged must fire only a small fixed number of times, NOT unboundedly. The route
+        // application raises exactly one NotifyChanged for the fallback selection; the guard then
+        // short-circuits every re-raised OnChanged. Allow generous headroom for framework-driven
+        // re-renders while still proving the loop is bounded (the pre-fix behaviour was unbounded).
+        Assert.InRange(onChangedCount, 1, 10);
     }
 }

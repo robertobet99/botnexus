@@ -17,40 +17,40 @@ The script itself runs on a short interval (e.g. every minute). Each check type 
 - **Windows** 10/11 or Windows Server 2016+, **or Linux** (any distro with pwsh support)
 - [PowerShell 7+](https://github.com/PowerShell/PowerShell/releases) (`pwsh`)
 - [.NET SDK](https://dotnet.microsoft.com/download) installed
-- BotNexus CLI installed (`dotnet tool install -g BotNexus.Cli`)
+- BotNexus CLI installed (`dotnet tool install -g BotNexus.Cli`; if nuget.org is blocked on your network, see [Installing Without nuget.org Access](offline-install.md))
 - Git installed and on PATH (only if using repo sync)
 - A running BotNexus gateway (`botnexus gateway start`)
 
 ## Quick Start
 
-=== "Windows"
+::: code-group
 
-    ```powershell
-    # 1. Test the script manually first
-    .\scripts\botnexus-watchdog.ps1
+```powershell [Windows]
+# 1. Test the script manually first
+.\scripts\botnexus-watchdog.ps1
 
-    # 2. Register a Windows Scheduled Task (runs every 1 minute)
-    .\scripts\Install-WatchdogTask.ps1
+# 2. Register a Windows Scheduled Task (runs every 1 minute)
+.\scripts\Install-WatchdogTask.ps1
 
-    # 3. Check the logs
-    Get-Content "$HOME\.botnexus\logs\watchdog-*.log" -Tail 50
-    ```
+# 3. Check the logs
+Get-Content "$HOME\.botnexus\logs\watchdog-*.log" -Tail 50
+```
 
-=== "Linux"
+```bash [Linux]
+# 1. Test the script manually first
+pwsh ./scripts/botnexus-watchdog.ps1
 
-    ```bash
-    # 1. Test the script manually first
-    pwsh ./scripts/botnexus-watchdog.ps1
+# 2a. Install using cron (default)
+pwsh ./scripts/Install-WatchdogTask.ps1
 
-    # 2a. Install using cron (default)
-    pwsh ./scripts/Install-WatchdogTask.ps1
+# 2b. Or install using a systemd timer (preferred on systemd-based distros)
+pwsh ./scripts/Install-WatchdogTask.ps1 -Method systemd
 
-    # 2b. Or install using a systemd timer (preferred on systemd-based distros)
-    pwsh ./scripts/Install-WatchdogTask.ps1 -Method systemd
+# 3. Check the logs
+tail -50 ~/.botnexus/logs/watchdog-*.log
+```
 
-    # 3. Check the logs
-    tail -50 ~/.botnexus/logs/watchdog-*.log
-    ```
+:::
 
 ## Parameters
 

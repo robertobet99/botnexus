@@ -1,5 +1,7 @@
 using BotNexus.Cron;
+using BotNexus.Gateway.Api.Models;
 using BotNexus.Domain.Primitives;
+using BotNexus.Gateway.Abstractions.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 
@@ -17,7 +19,9 @@ public sealed class CronController(
     ICronStore store,
     CronScheduler scheduler,
     IOptionsMonitor<CronOptions> cronOptions,
-    ILogger<CronController> logger) : ControllerBase
+    ILogger<CronController> logger,
+    ICronAlertTargetResolver? alertTargetResolver = null,
+    BotNexus.Agent.Providers.Core.Registry.ModelRegistry? modelRegistry = null) : ControllerBase
 {
     // The year 9000 is chosen as a practical "absurdly far future" ceiling.
     // DateTimeOffset.MaxValue is year 9999, but any NextRunAt beyond year 9000
@@ -27,6 +31,22 @@ public sealed class CronController(
     // run queue or causing overflow in downstream arithmetic.
     private static readonly DateTimeOffset MinAllowedTimestamp = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private static readonly DateTimeOffset MaxAllowedTimestamp = new(9000, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    /// <summary>
+    /// #3575: the denial body for an unauthorized cron mutation. Emitted as an explicit 403
+    /// <see cref="StatusCodeResult"/> rather than <c>Forbid()</c> because this gateway authenticates
+    /// through its own middleware and registers no ASP.NET authentication scheme - <c>Forbid()</c>
+    /// would throw looking for one, turning a denial into a 500.
+    /// </summary>
+    private const string ForbiddenMessage = "You can only manage cron jobs created by or targeting an agent you are authorized for.";
+
+    /// <summary>
+    /// #3779: the operator-configured webhook blocked-host list, read live from
+    /// <see cref="CronOptions"/> so a config reload takes effect without a restart, and read from
+    /// the SAME options instance the scheduler uses so the imperative and declarative seams cannot
+    /// enforce different policies.
+    /// </summary>
+    private IReadOnlyList<string>? ConfiguredWebhookBlockedHosts => cronOptions.CurrentValue?.WebhookBlockedHosts;
 
     /// <summary>Lists cron jobs.</summary>
     /// <summary>
@@ -67,6 +87,7 @@ public sealed class CronController(
                     Model = configured.Model,
                     WebhookUrl = configured.WebhookUrl,
                     ShellCommand = configured.ShellCommand,
+                    PreconditionCommand = configured.PreconditionCommand,
                     Enabled = configured.Enabled,
                     System = configured.System,
                     TimeZone = configured.TimeZone,
@@ -77,7 +98,11 @@ public sealed class CronController(
             }
         }
 
-        return Ok(merged.Values.OrderByDescending(job => job.CreatedAt).ToList());
+        return Ok(merged.Values
+            .Where(IsCallerAuthorizedFor)
+            .OrderByDescending(job => job.CreatedAt)
+            .Select(job => CronModelRouting.Project(job, cronOptions.CurrentValue?.DefaultModel))
+            .ToList());
     }
 
     /// <summary>Gets a cron job by identifier.</summary>
@@ -91,7 +116,19 @@ public sealed class CronController(
     public async Task<ActionResult<CronJob>> Get(string jobId, CancellationToken cancellationToken)
     {
         var job = await store.GetAsync(JobId.From(jobId), cancellationToken);
-        return job is null ? NotFound() : Ok(job);
+        if (job is null)
+            return NotFound();
+
+        // #3778: the read seams apply the SAME ownership rule as update (:199) and delete, through
+        // the same helper - a scoped caller could otherwise read every job definition on the
+        // platform, including ShellCommand and WebhookUrl. 403 and not 404 for the reason the
+        // update path states: the caller has already been told 404 only when the job truly does
+        // not exist, so collapsing the two would trade a truthful authorization answer for an
+        // existence-oracle defence this endpoint does not need.
+        if (!IsCallerAuthorizedFor(job))
+            return StatusCode(StatusCodes.Status403Forbidden, new { error = ForbiddenMessage });
+
+        return Ok(CronModelRouting.Project(job, cronOptions.CurrentValue?.DefaultModel));
     }
 
     /// <summary>Creates a cron job.</summary>
@@ -102,7 +139,7 @@ public sealed class CronController(
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>The create result.</returns>
     [HttpPost]
-    public async Task<ActionResult<CronJob>> Create([FromBody] CronJob request, CancellationToken cancellationToken)
+    public async Task<ActionResult<CronJob>> Create([FromBody] CronJobCreateRequest request, CancellationToken cancellationToken)
     {
         if (request.NextRunAt.HasValue && !IsTimestampInRange(request.NextRunAt.Value))
             return BadRequest("NextRunAt timestamp is out of the valid range (1970-01-01 to 9000-01-01).");
@@ -110,11 +147,48 @@ public sealed class CronController(
         if (request.CreatedAt != default && !IsTimestampInRange(request.CreatedAt))
             return BadRequest("CreatedAt timestamp is out of the valid range (1970-01-01 to 9000-01-01).");
 
-        var toCreate = request with
+        if (string.IsNullOrWhiteSpace(request.Name))
+            return BadRequest("Name is required.");
+
+        if (string.IsNullOrWhiteSpace(request.Schedule))
+            return BadRequest("Schedule is required.");
+
+        // #2552: validate at the shared boundary BEFORE anything reaches the store, so a rejected
+        // webhook target leaves no row behind.
+        // #2745: return the rule-specific reason so the caller can tell a blocked address class
+        // apart from a scheme/credentials rejection.
+        // #3779: pass the operator-configured blocked-host list. Omitting it left every configured
+        // hostname block inert on this seam while web_fetch and BrowserTools enforced theirs.
+        if (!CronWebhookUrl.TryNormalize(request.WebhookUrl, ConfiguredWebhookBlockedHosts, out var normalizedWebhookUrl, out var webhookRejectionReason))
+            return BadRequest(webhookRejectionReason);
+
+        // #2671: validate the failure-alert target at the authoring seam, through the SAME shared
+        // validator the update path uses, so the two seams cannot drift. This does not replace the
+        // fire-time guard in the scheduler - a conversation can be deleted after the job is stored.
+        var createAlertTarget = await CronAlertTarget.ValidateAsync(
+            alertTargetResolver,
+            string.IsNullOrWhiteSpace(request.FailureAlertConversationId)
+                ? null
+                : ConversationId.From(request.FailureAlertConversationId),
+            cancellationToken);
+        if (!createAlertTarget.IsValid)
+            return BadRequest(createAlertTarget.Error);
+
+        // #2389: the id is generated here when the caller omits one (see CronJobCreateRequest),
+        // matching the existing server-side defaulting of CreatedAt and normalization of ActionType.
+        var toCreate = request.ToCronJob() with
         {
             ActionType = NormalizeActionType(request.ActionType),
+            WebhookUrl = normalizedWebhookUrl,
             CreatedAt = request.CreatedAt == default ? DateTimeOffset.UtcNow : request.CreatedAt
         };
+
+        if (toCreate.PreconditionCommand is not null && toCreate.ActionType != "agent-prompt")
+            return BadRequest("preconditionCommand is only supported for agent-prompt jobs.");
+
+        if (CronModelRouting.UsesModel(toCreate.ActionType)
+            && CronModelPreflight.ClassifyRejection(modelRegistry, toCreate.Model) is { } modelError)
+            return BadRequest(modelError);
 
         var created = await store.CreateAsync(toCreate, cancellationToken);
         logger.LogInformation("Cron job created via API: {JobId} ({ActionType})", created.Id.Value, created.ActionType);
@@ -125,29 +199,145 @@ public sealed class CronController(
     /// <summary>
     /// Executes update.
     /// </summary>
+    /// <remarks>
+    /// #3808: the body binds <see cref="CronJobUpdateRequest"/>, not the domain record. Binding
+    /// <see cref="CronJob"/> directly made absence indistinguishable from a default, so a caller
+    /// editing one field silently cleared the five other columns it never mentioned - failure
+    /// alerting, both delete dispositions, expiry and execution class. The DTO makes "unmentioned"
+    /// representable, and the default for an unmentioned field is now "preserve", which is the rule
+    /// the tool seam has applied since #2634. That direction matters: the previous shape's default
+    /// was to overwrite, so every column added to <see cref="CronJob"/> was silently clearable until
+    /// someone remembered to name it here - which is exactly how #2554 and #3575 each came to patch
+    /// this one expression.
+    /// </remarks>
     /// <param name="jobId">The job id.</param>
     /// <param name="request">The request.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>The update result.</returns>
     [HttpPut("{jobId}")]
-    public async Task<ActionResult<CronJob>> Update(string jobId, [FromBody] CronJob request, CancellationToken cancellationToken)
+    public async Task<ActionResult<CronJob>> Update(string jobId, [FromBody] CronJobUpdateRequest request, CancellationToken cancellationToken)
     {
-        if (request.NextRunAt.HasValue && !IsTimestampInRange(request.NextRunAt.Value))
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (request.NextRunAt.IsSet
+            && request.NextRunAt.Value.HasValue
+            && !IsTimestampInRange(request.NextRunAt.Value.Value))
+        {
             return BadRequest("NextRunAt timestamp is out of the valid range (1970-01-01 to 9000-01-01).");
+        }
 
         var typedJobId = JobId.From(jobId);
         var existing = await store.GetAsync(typedJobId, cancellationToken);
         if (existing is null)
             return NotFound();
 
-        var updated = request with
+        // #3575: the REST seam applies the SAME ownership rule as the tool seam, via the shared
+        // CronJobOwnership predicate. Forbidden, NOT NotFound: the caller already proved the job
+        // exists by being told 404 only when it does not, and collapsing the two would trade a
+        // truthful authorization answer for a existence-oracle defence this endpoint does not need.
+        if (!IsCallerAuthorizedFor(existing))
+            return StatusCode(StatusCodes.Status403Forbidden, new { error = ForbiddenMessage });
+
+        // #2552: same shared boundary on the update path.
+        // #2745: return the rule-specific reason so the caller can tell a blocked address class
+        // apart from a scheme/credentials rejection.
+        // #3779: same configured blocked-host list as the create seam - AC3 requires refusal at
+        // update as well, or a job could be created clean and then repointed at a blocked host.
+        // #3808: the URL validated is the EFFECTIVE one - the supplied value, or the stored value
+        // when the caller omitted the field - so an unrelated edit is neither rejected by nor able
+        // to erase a webhook target it never mentioned.
+        var effectiveWebhookUrl = request.WebhookUrl.Or(existing.WebhookUrl);
+        if (!CronWebhookUrl.TryNormalize(effectiveWebhookUrl, ConfiguredWebhookBlockedHosts, out var normalizedWebhookUrl, out var webhookRejectionReason))
+            return BadRequest(webhookRejectionReason);
+
+        // #2671: same shared validator on the update seam (clause 2).
+        // #3808: only a caller-SUPPLIED target is preflighted, matching CronTool. Re-validating a
+        // retained one would make a job whose alert conversation was later deleted permanently
+        // uneditable - the caller would be blocked by a field they did not touch.
+        if (request.FailureAlertConversationId.IsSet)
+        {
+            var updateAlertTarget = await CronAlertTarget.ValidateAsync(
+                alertTargetResolver, request.ResolveAlertConversationId(existing), cancellationToken);
+            if (!updateAlertTarget.IsValid)
+                return BadRequest(updateAlertTarget.Error);
+        }
+
+        var updated = request.ApplyTo(existing) with
         {
             Id = typedJobId,
-            ActionType = NormalizeActionType(request.ActionType),
-            CreatedAt = existing.CreatedAt
+            ActionType = NormalizeActionType(request.ActionType.Or(existing.ActionType)),
+            WebhookUrl = normalizedWebhookUrl,
+            CreatedAt = existing.CreatedAt,
+
+            // #3575, mirroring the #2554 shape below: AgentId and CreatedBy would otherwise arrive
+            // from the request body and SqliteCronStore writes both under WHERE id = $id.
+            // CreatedBy is provenance the server stamps at creation and no REST caller authors it,
+            // so it is always taken from the stored row. AgentId may only move to an agent the
+            // authenticated caller is itself scoped to - otherwise a single body field would let an
+            // owner hand their job to an agent they cannot act as, which is the ownership-capture
+            // half of that issue.
+            CreatedBy = existing.CreatedBy,
+            AgentId = ResolveUpdatedAgentId(
+                request.AgentId.IsSet ? ParseOptionalAgentId(request.AgentId.Value) : existing.AgentId,
+                existing.AgentId),
+
+            // #2554: PUT binds the domain record directly, so a caller can put a
+            // ScheduleActivatedAt in the body. Strip it explicitly here (the store also refuses
+            // to bind it, so this is belt-and-braces) - honouring it would let a crafted request
+            // or an import spoof catch-up ownership and force an immediate agent-prompt or shell
+            // execution on the next gateway start. The store re-stamps it iff Schedule/TimeZone
+            // actually changed.
+            ScheduleActivatedAt = existing.ScheduleActivatedAt
         };
 
-        var saved = await store.UpdateAsync(updated, cancellationToken);
+        if (request.Model.IsSet && CronModelRouting.UsesModel(updated.ActionType)
+            && CronModelPreflight.ClassifyRejection(modelRegistry, updated.Model) is { } modelError)
+            return BadRequest(modelError);
+
+        // #2133: a controller definition update is a narrow write that never touches
+        // scheduler-owned runtime bookkeeping (LastRun*/NextRunAt) or the CAS-pinned
+        // conversation. If the caller changed the schedule, recompute NextRunAt via the
+        // separate narrow SetNextRunAtAsync write so a paused/racing edit cannot regress a
+        // concurrent run's status, timestamps, next run, or conversation pin.
+        // #3573: the 403 above was decided against `existing`, and an awaited alert-target
+        // validation has already run. Carry that ownership snapshot into the store's WHERE clause
+        // so a transfer landing in the window rejects the commit rather than letting it rewrite
+        // created_by/agent_id under a stale authorization. 409, not 403: the caller WAS authorized
+        // and the correct remedy is to re-read and retry, which is a different answer from "you
+        // may not touch this job".
+        CronJob? saved;
+        try
+        {
+            saved = await store.UpdateDefinitionAsync(
+                updated,
+                CronJobOwnershipExpectation.From(existing),
+                cancellationToken);
+        }
+        catch (CronJobOwnershipChangedException ex)
+        {
+            logger.LogWarning(
+                "Cron job update rejected via API: {JobId} changed ownership mid-request.",
+                typedJobId.Value);
+            return Conflict(new { error = ex.Message });
+        }
+
+        if (saved is null)
+            return NotFound();
+
+        // #3160: disabling a job through the API must abort its in-flight run too. Gated on the
+        // enabled -> disabled TRANSITION so an unrelated PUT is not a silent kill switch, and
+        // routed through the same scheduler seam the tool and the delete path use.
+        if (existing.Enabled && !saved.Enabled)
+            await scheduler.CancelActiveRunAsync(typedJobId, cancellationToken);
+
+        if (!string.Equals(updated.Schedule, existing.Schedule, StringComparison.Ordinal)
+            || !string.Equals(updated.TimeZone ?? string.Empty, existing.TimeZone ?? string.Empty, StringComparison.Ordinal))
+        {
+            var nextRunAt = ComputeNextRunAt(updated.Schedule, updated.TimeZone, updated.Id);
+            await store.SetNextRunAtAsync(typedJobId, nextRunAt, cancellationToken);
+            saved = await store.GetAsync(typedJobId, cancellationToken) ?? saved;
+        }
+
         logger.LogInformation("Cron job updated via API: {JobId} ({ActionType})", saved.Id.Value, saved.ActionType);
         return Ok(saved);
     }
@@ -162,13 +352,68 @@ public sealed class CronController(
     [HttpDelete("{jobId}")]
     public async Task<IActionResult> Delete(string jobId, CancellationToken cancellationToken)
     {
+        var typedJobId = JobId.From(jobId);
+
+        // #3575: read before delete so the ownership rule can be applied. An absent job is still a
+        // no-op NoContent (the pre-existing contract - Delete never 404'd), but a job that exists
+        // and is not the caller's is a 403 rather than a silent removal of another agent's work.
+        var existing = await store.GetAsync(typedJobId, cancellationToken);
+        if (existing is not null && !IsCallerAuthorizedFor(existing))
+            return StatusCode(StatusCodes.Status403Forbidden, new { error = ForbiddenMessage });
+
         // Route through the scheduler so the job's pinned conversation is archived
         // alongside the job record (P9-D directive G-5: the conversation lives until
         // the cron job is deleted).
-        await scheduler.DeleteJobAsync(JobId.From(jobId), cancellationToken);
+        await scheduler.DeleteJobAsync(typedJobId, cancellationToken);
         logger.LogInformation("Cron job deleted via API: {JobId}", jobId);
         return NoContent();
     }
+
+    /// <summary>
+    /// Applies the shared <see cref="CronJobOwnership"/> rule to the authenticated caller (#3575).
+    /// </summary>
+    /// <remarks>
+    /// The gateway authenticates a CALLER, not an agent, and a caller carries a set of permitted
+    /// agent ids. An unscoped or admin caller (<c>AllowedAgents</c> empty, matching
+    /// <c>GatewayAuthMiddleware.IsAgentAuthorized</c>) is already trusted platform-wide, so it stays
+    /// permitted - this guard closes the per-agent gap, it is not a second authentication layer.
+    /// A request with no identity in <c>HttpContext.Items</c> has not passed the auth middleware at
+    /// all (unit-test construction, or an endpoint on the skip list); denying there would break
+    /// callers the middleware itself allows, so the decision is deferred to it exactly as every
+    /// other controller does.
+    /// </remarks>
+    private bool IsCallerAuthorizedFor(CronJob job)
+    {
+        var identity = CallerIdentity;
+        if (identity is null || identity.IsAdmin || identity.AllowedAgents.Count == 0)
+            return true;
+
+        return CronJobOwnership.CanManageAsAny(job, identity.AllowedAgents);
+    }
+
+    /// <summary>
+    /// Resolves the <c>AgentId</c> an update may write: the requested one when the caller is scoped
+    /// to it, otherwise the stored one (#3575).
+    /// </summary>
+    private AgentId? ResolveUpdatedAgentId(AgentId? requested, AgentId? existing)
+    {
+        if (!requested.HasValue || requested == existing)
+            return existing;
+
+        var identity = CallerIdentity;
+        if (identity is null || identity.IsAdmin || identity.AllowedAgents.Count == 0)
+            return requested;
+
+        var scoped = identity.AllowedAgents.Any(agent =>
+            string.Equals(agent, requested.Value.Value, StringComparison.OrdinalIgnoreCase));
+        return scoped ? requested : existing;
+    }
+
+    /// <summary>The identity stamped by <c>GatewayAuthMiddleware</c>, or null when unauthenticated.</summary>
+    private GatewayCallerIdentity? CallerIdentity
+        => HttpContext?.Items.TryGetValue(GatewayAuthMiddleware.CallerIdentityItemKey, out var value) == true
+            ? value as GatewayCallerIdentity
+            : null;
 
     /// <summary>Triggers immediate execution for a cron job.</summary>
     /// <summary>
@@ -205,8 +450,59 @@ public sealed class CronController(
         if (existing is null)
             return NotFound();
 
-        return Ok(await store.GetRunHistoryAsync(typedJobId, limit, cancellationToken));
+        // #3778: ownership is checked BEFORE the history read, not after. Every run carries the
+        // SessionId that is the key into the owning agent's transcript, so an unscoped read here
+        // discloses more than the job definition does.
+        if (!IsCallerAuthorizedFor(existing))
+            return StatusCode(StatusCodes.Status403Forbidden, new { error = ForbiddenMessage });
+
+        var runs = await store.GetRunHistoryAsync(typedJobId, limit, cancellationToken);
+        return Ok(await scheduler.GetRunHealthAsync(runs, cancellationToken));
     }
+
+    /// <summary>
+    /// Per-job cost rollup over a bounded window, ordered by TOTAL spend descending (#2641).
+    /// </summary>
+    /// <remarks>
+    /// Total, not per-run average, is the ranking that matters: a job costing a quarter as much per
+    /// run but firing 24x more often is the larger consumer, and a per-run figure alone reports it
+    /// as the cheaper one. The response echoes the effective window and a
+    /// <c>windowTruncatedByRetention</c> flag so a caller asking for more days than run retention
+    /// holds learns the total is bounded rather than silently reading a truncated number as a
+    /// complete one.
+    /// </remarks>
+    /// <param name="windowDays">Requested window in days; clamped to the configured run retention.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>Cost rollups, most expensive total first.</returns>
+    [HttpGet("costs")]
+    public async Task<ActionResult<IReadOnlyList<CronJobCostRollup>>> Costs(
+        [FromQuery] int windowDays = 7,
+        CancellationToken cancellationToken = default)
+    {
+        var jobs = await store.ListAsync(ct: cancellationToken);
+
+        // #3778: the rollup scope is the OWNERSHIP-FILTERED job set, not every job in the store.
+        // Costs are per-job spend for jobs the caller may manage; an unfiltered set handed a scoped
+        // caller a platform-wide spend report.
+        var jobIds = jobs.Where(IsCallerAuthorizedFor).Select(job => job.Id).ToArray();
+
+        // An empty job set short-circuits to an empty result rather than an unscoped query - the
+        // #2838 rule, restated here because this controller builds the scope itself. #3778: this
+        // now also covers a scoped caller who owns nothing, which is exactly the case where a
+        // fall-through would query the store with no scope at all.
+        if (jobIds.Length == 0)
+            return Ok(Array.Empty<CronJobCostRollup>());
+
+        return Ok(await store.GetJobCostRollupsAsync(jobIds, windowDays, cancellationToken));
+    }
+
+    /// <summary>
+    /// Parses an optional caller-supplied agent id, treating blank as "no agent" (#3808).
+    /// </summary>
+    /// <param name="agentId">The raw value from the request body.</param>
+    /// <returns>The typed agent id, or <c>null</c> when blank.</returns>
+    private static AgentId? ParseOptionalAgentId(string? agentId)
+        => string.IsNullOrWhiteSpace(agentId) ? null : AgentId.From(agentId);
 
     private static string NormalizeActionType(string? actionType)
     {
@@ -218,4 +514,27 @@ public sealed class CronController(
 
     private static bool IsTimestampInRange(DateTimeOffset value)
         => value >= MinAllowedTimestamp && value <= MaxAllowedTimestamp;
+
+    // #2133: recompute NextRunAt for a schedule/timezone change on the definition-update path.
+    // #2810: the computation itself, INCLUDING its DST-transition policy, is delegated to
+    // CronExpressionExtensions so this path cannot drift from the scheduler that will actually fire
+    // the job. A bad schedule yields null - the scheduler's Phase-1 tick re-derives NextRunAt on
+    // the next pass.
+    private DateTimeOffset? ComputeNextRunAt(string schedule, string? timeZone, JobId jobId)
+    {
+        try
+        {
+            // #2748/#2810: the canonical resolver, not a local copy. This controller previously
+            // carried its own FindSystemTimeZoneById cascade, which is the same duplication #2748
+            // removed from the scheduler and the tool - and being outside BotNexus.Cron, it was
+            // invisible to that issue's single-definition fence.
+            var tz = CronTimeZoneResolver.Resolve(timeZone, logger, jobId);
+            var expr = Cronos.CronExpression.Parse(schedule, Cronos.CronFormat.Standard);
+            return expr.NextRun(DateTimeOffset.UtcNow, tz);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }

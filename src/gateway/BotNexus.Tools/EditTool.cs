@@ -1,3 +1,4 @@
+using BotNexus.Domain.Text;
 using System.Text;
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
@@ -11,6 +12,33 @@ using DiffPlex.DiffBuilder.Model;
 using System.IO.Abstractions;
 
 namespace BotNexus.Tools;
+
+/// <summary>
+/// Metadata describing the outcome of an <see cref="EditTool"/> invocation. Exposed via
+/// <see cref="AgentToolResult.Details"/> so callers can distinguish a real mutation from an
+/// idempotent no-op (issue #2100) without parsing the human-readable message.
+/// </summary>
+/// <param name="Changed">
+/// <c>true</c> when at least one edit changed file bytes; <c>false</c> when every requested edit
+/// was already satisfied and the file was left untouched.
+/// </param>
+/// <param name="AlreadySatisfiedIndices">
+/// Zero-based indices (into the requested edits array) of edits whose replacement text was already
+/// present, and so were treated as no-ops.
+/// </param>
+public sealed record EditResultDetails(bool Changed, IReadOnlyList<int> AlreadySatisfiedIndices);
+
+
+/// <summary>
+/// Metadata describing an <see cref="EditTool"/> invocation that was rejected because the file
+/// changed since the caller read it (issue #2101). Exposed via <see cref="AgentToolResult.Details"/>
+/// so a caller can distinguish a stale-content rejection from a real match failure and re-read
+/// deterministically instead of retrying blindly with stale <c>oldText</c>.
+/// </summary>
+/// <param name="ExpectedHash">The concurrency token the caller supplied (from a prior <c>read</c>).</param>
+/// <param name="ActualHash">The current concurrency token of the file on disk.</param>
+public sealed record EditStaleContentDetails(string ExpectedHash, string ActualHash);
+
 
 /// <summary>
 /// Represents edit tool.
@@ -41,6 +69,9 @@ public sealed class EditTool : IAgentTool
 
     public string Label => "Edit File";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Returns a locally generated edit confirmation/diff.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     /// <summary>
     /// Executes new.
     /// </summary>
@@ -60,6 +91,15 @@ public sealed class EditTool : IAgentTool
                 "path": {
                   "type": "string",
                   "description": "Path to the file to edit (relative or absolute)."
+                },
+                "expectedHash": {
+                  "type": "string",
+                  "description": "Optional optimistic-concurrency token from the `read` tool's structured result. When supplied, the edit is rejected with a stale-content outcome if the file changed since it was read. Re-read immediately before editing; never reuse oldText after another edit; never copy oldText from shell output."
+                },
+                "instructionScope": {
+                  "type": "string",
+                  "enum": ["agnostic", "model-specific"],
+                  "description": "Classification required when the target is a base instruction file. Omit for ordinary files and model-variant files."
                 },
                 "edits": {
                   "type": "array",
@@ -96,13 +136,37 @@ public sealed class EditTool : IAgentTool
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        IReadOnlyDictionary<string, object?> prepared = new Dictionary<string, object?>(StringComparer.Ordinal)
+        var prepared = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["path"] = ReadRequiredString(arguments, "path"),
             ["edits"] = ReadEdits(arguments)
         };
 
-        return Task.FromResult(prepared);
+        var expectedHash = ReadOptionalExpectedHash(arguments);
+        if (expectedHash is not null)
+        {
+            prepared["expectedHash"] = expectedHash;
+        }
+
+        CopyInstructionScope(arguments, prepared);
+        return Task.FromResult<IReadOnlyDictionary<string, object?>>(prepared);
+    }
+
+    private static void CopyInstructionScope(
+        IReadOnlyDictionary<string, object?> arguments,
+        IDictionary<string, object?> prepared)
+    {
+        if (!arguments.TryGetValue(InstructionScopeArgument.Name, out var raw) || raw is null)
+            return;
+
+        var value = raw.ToString()?.Trim();
+        if (!InstructionScopeArgument.IsValid(value))
+        {
+            throw new ArgumentException(
+                $"'{InstructionScopeArgument.Name}' must be '{InstructionScopeArgument.Agnostic}' or '{InstructionScopeArgument.ModelSpecific}'.");
+        }
+
+        prepared[InstructionScopeArgument.Name] = value!.ToLowerInvariant();
     }
 
     /// <summary>
@@ -121,6 +185,7 @@ public sealed class EditTool : IAgentTool
         var rawPath = arguments["path"]?.ToString()
                       ?? throw new ArgumentException("Missing required argument: path.");
         var edits = arguments["edits"] as IReadOnlyList<EditEntry> ?? ReadEdits(arguments);
+        var expectedHash = ReadOptionalExpectedHash(arguments);
 
         var fullPath = _validator?.ValidateAndResolve(rawPath, FileAccessMode.Write);
         if (_validator is not null && fullPath is null)
@@ -147,23 +212,79 @@ public sealed class EditTool : IAgentTool
             {
                 original = original[1..];
             }
+            // Issue #2101: if the caller supplied a concurrency token, reject the edit when the file
+            // changed since it was read. This converts a blind stale-content retry (the "found 0"
+            // family) into one deterministic re-read, and never applies edits against changed bytes.
+            if (expectedHash is not null)
+            {
+                var actualHash = ContentToken.Compute(original);
+                if (!string.Equals(actualHash, expectedHash, StringComparison.Ordinal))
+                {
+                    var staleMessage =
+                        "File changed since read; re-read before editing. "
+                        + $"expectedHash '{expectedHash}' but the file is now '{actualHash}'. "
+                        + "No edits were applied.";
+                    return new AgentToolResult(
+                        [new AgentToolContent(AgentToolContentType.Text, staleMessage)],
+                        new EditStaleContentDetails(expectedHash, actualHash));
+                }
+            }
+
             var originalLineEnding = DetectLineEnding(original);
             var normalizedOriginal = original.NormalizeLineEndings();
-            var replacements = ResolveReplacements(normalizedOriginal, edits);
-            var updatedNormalized = ApplyReplacements(normalizedOriginal, replacements);
-            var updatedText = ApplyLineEnding(updatedNormalized, originalLineEnding);
-            if (string.Equals(updatedText, original, StringComparison.Ordinal))
+            var resolved = ResolveReplacements(normalizedOriginal, edits);
+            var relativePath = PathUtils.GetRelativePath(fullPath, _workingDirectory);
+
+            // Issue #2100: an edit whose resolved target text already equals its replacement is an
+            // idempotent no-op. Separate those from the edits that actually change bytes so an
+            // already-satisfied entry never fails the batch and, when every entry is a no-op, the
+            // whole call succeeds without touching the file.
+            var alreadySatisfied = resolved
+                .Where(edit => string.Equals(edit.OldText, edit.NewText, StringComparison.Ordinal))
+                .OrderBy(edit => edit.EditIndex)
+                .Select(edit => edit.EditIndex)
+                .ToList();
+            var effective = resolved
+                .Where(edit => !string.Equals(edit.OldText, edit.NewText, StringComparison.Ordinal))
+                .ToList();
+
+            if (effective.Count == 0)
             {
-                throw new InvalidOperationException("Edit produced no change — the replacement text is identical to the original.");
+                var noOpMessage = "No changes needed - replacement text is already present.";
+                var noOpDetails = new EditResultDetails(false, alreadySatisfied);
+                return new AgentToolResult(
+                    [new AgentToolContent(AgentToolContentType.Text, noOpMessage)],
+                    noOpDetails);
             }
+
+            var updatedNormalized = ApplyReplacements(normalizedOriginal, effective);
+            var updatedText = ApplyLineEnding(updatedNormalized, originalLineEnding);
 
             _fileSystem.File.WriteAllText(fullPath, updatedText, new UTF8Encoding(hasUtf8Bom));
 
-            var relativePath = PathUtils.GetRelativePath(fullPath, _workingDirectory);
             var diff = BuildUnifiedDiff(relativePath, normalizedOriginal, updatedNormalized);
-            var message = $"Successfully replaced {replacements.Count} block(s) in '{relativePath}'.\n{diff}";
+            var message = $"Successfully replaced {effective.Count} block(s) in '{relativePath}'.";
+            if (alreadySatisfied.Count > 0)
+            {
+                // Report which requested edits were already present so a mixed batch is transparent.
+                var indices = string.Join(", ", alreadySatisfied);
+                message += $" {alreadySatisfied.Count} edit(s) were already present (indices: {indices}).";
+            }
 
-            return new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, message)]);
+            // Issue #2690: ANSI escapes in oldText already match via the fuzzy path, but silently.
+            // Saying so turns an invisible rescue into a signal the caller can act on next time.
+            if (edits.Any(edit => edit.OldText.Contains('\u001b')))
+            {
+                message += " oldText carried ANSI escape sequences; they were normalized away"
+                           + " before matching. Send plain text to avoid relying on fuzzy matching.";
+            }
+
+            message += $"\n{diff}";
+
+            var details = new EditResultDetails(true, alreadySatisfied);
+            return new AgentToolResult(
+                [new AgentToolContent(AgentToolContentType.Text, message)],
+                details);
         }).ConfigureAwait(false);
     }
 
@@ -193,20 +314,34 @@ public sealed class EditTool : IAgentTool
     {
         if (value is JsonElement element)
         {
+            if (element.ValueKind == JsonValueKind.String &&
+                TryParseStringifiedEdits(element.GetString(), out var coercedFromElement))
+            {
+                return coercedFromElement;
+            }
+
             if (element.ValueKind != JsonValueKind.Array)
             {
-                throw new ArgumentException("Argument 'edits' must be an array.");
+                throw new ArgumentException(DescribeEditsShapeError(
+                    element.ValueKind == JsonValueKind.String ? element.GetString() : null));
             }
 
             return element.EnumerateArray().Select(ParseEditElement).ToList();
         }
 
+        if (value is string rawString && TryParseStringifiedEdits(rawString, out var coercedFromString))
+        {
+            return coercedFromString;
+        }
+
+        // A string is IEnumerable<char>, not IEnumerable<object?>, so it correctly falls through
+        // to the wrong-shape diagnostic below rather than being enumerated character by character.
         if (value is IEnumerable<object?> enumerable)
         {
             return enumerable.Select(ParseEditObject).ToList();
         }
 
-        throw new ArgumentException("Argument 'edits' must be an array.");
+        throw new ArgumentException(DescribeEditsShapeError(value as string));
     }
 
     private static EditEntry ParseEditObject(object? value)
@@ -265,6 +400,24 @@ public sealed class EditTool : IAgentTool
         return true;
     }
 
+    private static string? ReadOptionalExpectedHash(IReadOnlyDictionary<string, object?> arguments)
+    {
+        if (!arguments.TryGetValue("expectedHash", out var value) || value is null)
+        {
+            return null;
+        }
+
+        var text = value switch
+        {
+            JsonElement { ValueKind: JsonValueKind.Null } => null,
+            JsonElement { ValueKind: JsonValueKind.String } element => element.GetString(),
+            JsonElement element => element.ToString(),
+            _ => value.ToString()
+        };
+
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
     private static string ReadRequiredString(IReadOnlyDictionary<string, object?> arguments, string key)
     {
         if (!arguments.TryGetValue(key, out var value) || value is null)
@@ -285,7 +438,7 @@ public sealed class EditTool : IAgentTool
     {
         var normalizedForFuzzy = NormalizeForFuzzyMatchWithMap(normalizedOriginal);
         var replacements = edits
-            .Select(edit =>
+            .Select((edit, editIndex) =>
             {
                 var normalizedOld = edit.OldText.NormalizeLineEndings();
                 var normalizedNew = edit.NewText.NormalizeLineEndings();
@@ -294,14 +447,16 @@ public sealed class EditTool : IAgentTool
                 {
                     throw new InvalidOperationException(
                         $"Expected exactly one match for edits[].oldText, but found {exactMatchCount}."
-                        + DescribeMatchLines(normalizedOriginal, normalizedOld));
+                        + DescribeMatchLines(normalizedOriginal, normalizedOld)
+                        + DescribeAppendAffordance(normalizedOld, normalizedNew)
+                        + DescribeClosestText(normalizedOriginal, normalizedOld));
                 }
 
                 if (exactMatchCount == 1)
                 {
                     var start = normalizedOriginal.IndexOf(normalizedOld, StringComparison.Ordinal);
                     var end = start + normalizedOld.Length;
-                    return new ResolvedEdit(start, end, normalizedOriginal[start..end], normalizedNew);
+                    return new ResolvedEdit(editIndex, start, end, normalizedOriginal[start..end], normalizedNew);
                 }
 
                 var fuzzyOld = NormalizeForFuzzyMatch(normalizedOld);
@@ -315,7 +470,9 @@ public sealed class EditTool : IAgentTool
                 {
                     throw new InvalidOperationException(
                         $"Expected exactly one match for edits[].oldText, but found {fuzzyMatchCount}."
-                        + DescribeFuzzyMatchLines(normalizedOriginal, normalizedForFuzzy, fuzzyOld));
+                        + DescribeFuzzyMatchLines(normalizedOriginal, normalizedForFuzzy, fuzzyOld)
+                        + DescribeAppendAffordance(normalizedOld, normalizedNew)
+                        + DescribeClosestText(normalizedOriginal, normalizedOld));
                 }
 
                 var fuzzyStart = normalizedForFuzzy.Normalized.IndexOf(fuzzyOld, StringComparison.Ordinal);
@@ -323,6 +480,7 @@ public sealed class EditTool : IAgentTool
                 var endIndex = normalizedForFuzzy.IndexMap[fuzzyStart + fuzzyOld.Length];
 
                 return new ResolvedEdit(
+                    editIndex,
                     startIndex,
                     endIndex,
                     normalizedOriginal[startIndex..endIndex],
@@ -390,6 +548,103 @@ public sealed class EditTool : IAgentTool
         return count;
     }
 
+    /// <summary>
+    /// Builds the wrong-shape message for <c>edits</c> (issue #2690). When the value is a string
+    /// that parses as a JSON array, the caller stringified a payload that was otherwise exactly
+    /// right, so the message names the stringification explicitly instead of restating the type.
+    /// The edit is still rejected either way: per the #2415 precedent, silently unwrapping a
+    /// malformed payload risks fabricating an edit against a user's file.
+    /// </summary>
+    /// <summary>
+    /// Issue #2759 (AC1): applies the #1562 losslessly-safe coercion at the tool boundary as well
+    /// as at the validator seam. When <c>edits</c> arrives as a string whose CONTENT is a
+    /// well-formed JSON array of <c>{oldText,newText}</c> objects, the payload is exactly right and
+    /// only the quoting was wrong, so it is unwrapped rather than rejected. Anything that does not
+    /// parse - or parses to a shape that is not an array of valid edit entries - returns
+    /// <c>false</c> so the caller falls through to the reject path; nothing is ever guessed at.
+    /// </summary>
+    private static bool TryParseStringifiedEdits(string? text, out List<EditEntry> edits)
+    {
+        edits = [];
+
+        if (text is not { Length: > 0 } || !text.AsSpan().TrimStart().StartsWith("["))
+        {
+            return false;
+        }
+
+        // Mirror the seam's DoS cap (#1738): a model-controlled string over the cap is not parsed.
+        if (text.Length > MaxJsonCoerceLength)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(text);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            edits = document.RootElement.EnumerateArray().Select(ParseEditElement).ToList();
+            return edits.Count > 0;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (ArgumentException)
+        {
+            // Parsed as JSON but an entry was not a valid edit: fall through to the reject path so
+            // the caller gets the shape diagnostic rather than a partially-applied batch.
+            edits = [];
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Cap on the synchronous in-process JSON parse of a model-controlled <c>edits</c> string,
+    /// matching <c>ToolCallValidator.MaxJsonCoerceLength</c> (issue #1738).
+    /// </summary>
+    private const int MaxJsonCoerceLength = 64 * 1024;
+
+    private static string DescribeEditsShapeError(string? stringValue)
+    {
+        const string baseMessage = "Argument 'edits' must be an array.";
+
+        if (stringValue is { Length: > 0 } text && text.AsSpan().TrimStart().StartsWith("["))
+        {
+            try
+            {
+                using var probe = JsonDocument.Parse(text);
+                if (probe.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    return baseMessage
+                           + " It arrived as a JSON string containing the array (a stringified"
+                           + " 'edits'), so it was rejected rather than unwrapped - guessing at a"
+                           + " quoted payload risks applying an edit you did not intend."
+                           + " Send 'edits' as a real JSON array."
+                           + ShapeHint;
+                }
+            }
+            catch (JsonException ex)
+            {
+                // Issue #2759 (AC2): the caller stringified 'edits' and the string did NOT parse.
+                // Reporting a truncated preview implies truncation caused the failure; it did not.
+                // State the parse reason, the byte offset, and the FULL value length so the caller
+                // can see the value arrived whole and fix the actual syntax error.
+                return baseMessage
+                       + " It arrived as a JSON string containing the array, but that string is not"
+                       + $" valid JSON: {ex.Message} (position {ex.BytePositionInLine ?? 0},"
+                       + $" line {ex.LineNumber ?? 0}). The full value was {text.Length} characters"
+                       + " and was received complete - it was not truncated."
+                       + ShapeHint;
+            }
+        }
+
+        return baseMessage + ShapeHint;
+    }
+
     // Correct-shape example mirrored in the tool description so a malformed-entry error tells the
     // caller exactly what a valid edits payload looks like instead of leaving them to guess.
     private const string ShapeHint =
@@ -444,6 +699,31 @@ public sealed class EditTool : IAgentTool
         }
 
         return FormatMatchLines(lineNumbers);
+    }
+
+    /// <summary>
+    /// Detects the faked-append shape (issue #3571) and names the real affordance. When an agent wants
+    /// to append to a log it has historically anchored <c>oldText</c> on the file's last line and set
+    /// <c>newText</c> to that same text plus the new entry — so <c>oldText</c> is an exact prefix of
+    /// <c>newText</c>. In an append-only log the anchor is boilerplate that recurs by design, so the
+    /// match count grows with the file and the edit is guaranteed to fail with <c>found N</c>. Rather
+    /// than telling the caller to widen an anchor it should not need at all, point it at
+    /// <c>write</c> with <c>append</c>. Returns an empty string when the shape does not apply so
+    /// callers can concatenate unconditionally.
+    /// </summary>
+    private static string DescribeAppendAffordance(string normalizedOld, string normalizedNew)
+    {
+        if (string.IsNullOrEmpty(normalizedOld)
+            || normalizedNew.Length <= normalizedOld.Length
+            || !normalizedNew.StartsWith(normalizedOld, StringComparison.Ordinal))
+        {
+            return string.Empty;
+        }
+
+        return " This looks like an append: oldText is an exact prefix of newText, so the only new content"
+               + " is the text after it. An append needs no anchor and cannot be ambiguous \u2014 call `write`"
+               + " with `append` set to true and pass only the new text as `content` instead of an anchored"
+               + " replace.";
     }
 
     private static string FormatMatchLines(List<int> lineNumbers)
@@ -549,14 +829,123 @@ public sealed class EditTool : IAgentTool
         var snippet = Truncate(closestLine, 200);
         var message = $"{prefix} The closest text in the file is at line {lineNumber}: \u00AB{snippet}\u00BB.";
 
-        // If the only difference is surrounding whitespace/invisible characters, say so explicitly.
-        if (string.Equals(closestLine.Trim(), anchorTrimmed, StringComparison.Ordinal))
-        {
-            message += " It differs only in leading/trailing whitespace or invisible characters \u2014 " +
-                       "re-read the file with `read` to get clean text (pasted shell output can carry hidden ANSI/whitespace).";
-        }
+        // Issue #2907: the anchor is only the FIRST line of oldText, but oldText may be a
+        // multi-line block. Comparing the anchor alone and then asserting a whitespace-only
+        // difference was an unverified claim - it fired whenever line 1 trimmed-equal, even when
+        // the real drift was on line 2 or later, and sent the caller to the wrong line. Align the
+        // whole block against the candidate window starting at the located line and report the
+        // first line that ACTUALLY differs; only claim a whitespace-only cause when that is true
+        // for every line in the block.
+        message += DescribeFirstDifferingLine(fileLines, bestIndex, normalizedOld);
 
         return message;
+    }
+
+    /// <summary>
+    /// Issue #2907 (clause 2). Aligns <paramref name="normalizedOld"/> line-for-line against the
+    /// candidate window of <paramref name="fileLines"/> beginning at <paramref name="windowStart"/>
+    /// and describes the outcome:
+    /// <list type="bullet">
+    /// <item>every line trim-equal (and none missing) - a defensive fallback that states only what
+    /// is certain; it is unreachable in practice because the fuzzy matcher is strictly more
+    /// permissive than this comparison and would already have matched the block;</item>
+    /// <item>otherwise - names the first line that actually differs, with both variants, and says
+    /// nothing about whitespace because that is not what differs.</item>
+    /// </list>
+    /// </summary>
+    private static string DescribeFirstDifferingLine(string[] fileLines, int anchorFileIndex, string normalizedOld)
+    {
+        var oldLines = normalizedOld.Split('\n');
+
+        // The anchor is the first NON-EMPTY line of oldText, and the located file line corresponds
+        // to it - not to oldText line 1. Shift the window back by the anchor's own offset so any
+        // leading blank lines in oldText do not skew the alignment by that many lines.
+        var anchorOffset = 0;
+        while (anchorOffset < oldLines.Length && string.IsNullOrWhiteSpace(oldLines[anchorOffset]))
+        {
+            anchorOffset++;
+        }
+
+        var windowStart = anchorFileIndex - anchorOffset;
+        if (windowStart < 0)
+        {
+            // oldText starts above the top of the file; there is no aligned window to compare, so
+            // make no claim about the cause at all.
+            return string.Empty;
+        }
+
+        for (var offset = 0; offset < oldLines.Length; offset++)
+        {
+            var fileIndex = windowStart + offset;
+            var expected = oldLines[offset].Trim();
+
+            if (fileIndex >= fileLines.Length)
+            {
+                // The block runs past the end of the file: the first "differing" line is the one
+                // with no counterpart at all. Saying so beats claiming a whitespace difference.
+                return $" oldText line {offset + 1} \u00AB{Truncate(oldLines[offset], 200)}\u00BB"
+                       + " has no counterpart - the block extends past the end of the file."
+                       + " Re-read the file with `read` to confirm the current text.";
+            }
+
+            var actual = fileLines[fileIndex].Trim();
+            if (string.Equals(actual, expected, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return $" The first line that actually differs is oldText line {offset + 1}"
+                   + $" (file line {fileIndex + 1}): expected \u00AB{Truncate(oldLines[offset], 200)}\u00BB"
+                   + $" but the file has \u00AB{Truncate(fileLines[fileIndex], 200)}\u00BB."
+                   + " Re-read the file with `read` to confirm the current text.";
+        }
+
+        // Verified across every line of the block. In practice this is unreachable from
+        // BuildNoMatchDiagnostic: if every line were trim-equal the fuzzy matcher - which trims
+        // each line AND folds invisible characters, so it is strictly more permissive than this
+        // comparison - would have found the block and the edit would have applied. Reaching here
+        // would mean the two comparisons disagree, so say only what is certain rather than
+        // repeating the #2421 whitespace claim this issue exists to stop asserting unverified.
+        return " Every line matches once leading/trailing whitespace is ignored, yet the block did"
+               + " not match \u2014 re-read the file with `read` to get clean text.";
+    }
+
+    /// <summary>
+    /// Issue #2690: the ambiguous (found N&gt;1) cases reported only line numbers, while the
+    /// 0-match diagnostic already gave the caller the closest text. 114 of the 449 measured
+    /// `edit` failures were the bare count form. This appends the same closest-line excerpt so
+    /// every non-unique/zero-match failure carries both the count and an excerpt to anchor on.
+    /// </summary>
+    private static string DescribeClosestText(string normalizedOriginal, string normalizedOld)
+    {
+        var anchor = FirstNonEmptyLine(normalizedOld);
+        if (anchor is null)
+        {
+            return string.Empty;
+        }
+
+        var fileLines = normalizedOriginal.Split('\n');
+        var anchorTrimmed = anchor.Trim();
+
+        var bestIndex = -1;
+        var bestScore = -1.0;
+        for (var i = 0; i < fileLines.Length; i++)
+        {
+            var score = LineSimilarity(anchorTrimmed, fileLines[i].Trim());
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+
+        if (bestIndex < 0 || bestScore <= 0)
+        {
+            return string.Empty;
+        }
+
+        return $" The closest text in the file is at line {bestIndex + 1}:"
+               + $" \u00AB{Truncate(fileLines[bestIndex], 200)}\u00BB.";
     }
 
     private static string? FirstNonEmptyLine(string text)
@@ -627,7 +1016,7 @@ public sealed class EditTool : IAgentTool
 
     private static string Truncate(string value, int maxLength)
     {
-        return value.Length <= maxLength ? value : value[..maxLength] + "\u2026";
+        return TextTruncation.SafeTruncate(value, maxLength, "\u2026")!;
     }
 
     private static string NormalizeForFuzzyMatch(string text)
@@ -653,8 +1042,33 @@ public sealed class EditTool : IAgentTool
                 trimmedEnd--;
             }
 
-            for (var i = lineStart; i < trimmedEnd; i++)
+            // Issue #2421: fold *leading* indentation too, not just trailing whitespace. Indent
+            // drift is the single most common cause of the "found 0" family - the #1555 diagnostic
+            // already proved the tool had located the right line and only indentation differed.
+            // Because the index map records original offsets, the file's own indentation stays
+            // outside the matched span and survives the replacement untouched.
+            var trimmedStart = lineStart;
+            while (trimmedStart < trimmedEnd && char.IsWhiteSpace(text[trimmedStart]) && text[trimmedStart] != '\n')
             {
+                trimmedStart++;
+            }
+
+            for (var i = trimmedStart; i < trimmedEnd; i++)
+            {
+                // Invisible characters that are never intentional in an edit anchor: ANSI escape
+                // sequences (pasted shell output) and zero-width marks (copy/paste artefacts).
+                // Dropping them emits nothing, so they simply do not participate in the match.
+                if (text[i] == '\u001B')
+                {
+                    i = SkipAnsiEscape(text, i, trimmedEnd);
+                    continue;
+                }
+
+                if (IsZeroWidth(text[i]))
+                {
+                    continue;
+                }
+
                 // Surrogate pairs (emoji, supplementary plane chars) must be emitted together.
                 // Processing a lone high surrogate through .Normalize() throws ArgumentException.
                 if (char.IsHighSurrogate(text[i]))
@@ -705,6 +1119,45 @@ public sealed class EditTool : IAgentTool
 
         indexMap.Add(text.Length);
         return new NormalizedFuzzyText(normalized.ToString(), indexMap);
+    }
+
+    /// <summary>
+    /// Returns the index of the final character of the ANSI escape sequence beginning at
+    /// <paramref name="start"/>, so the caller's loop increment lands just past it. Handles the CSI
+    /// form (<c>ESC [ ... final-byte</c>) and degrades to consuming only the ESC itself for anything
+    /// unrecognised, which keeps a stray ESC from swallowing real content.
+    /// </summary>
+    private static int SkipAnsiEscape(string text, int start, int limit)
+    {
+        var index = start + 1;
+        if (index >= limit || text[index] != '[')
+        {
+            return start;
+        }
+
+        index++;
+        // Parameter and intermediate bytes, terminated by a final byte in the range @ to ~.
+        while (index < limit && text[index] is >= '\u0020' and <= '\u003F')
+        {
+            index++;
+        }
+
+        if (index < limit && text[index] is >= '\u0040' and <= '\u007E')
+        {
+            return index;
+        }
+
+        // Unterminated sequence - consume only the ESC so real text is never lost.
+        return start;
+    }
+
+    /// <summary>
+    /// Zero-width and byte-order marks that carry no visible meaning but break exact matching when
+    /// smuggled into an edit anchor by a copy/paste.
+    /// </summary>
+    private static bool IsZeroWidth(char value)
+    {
+        return value is '\u200B' or '\u200C' or '\u200D' or '\u2060' or '\uFEFF';
     }
 
     private static string NormalizeFuzzyText(char value)
@@ -851,7 +1304,7 @@ public sealed class EditTool : IAgentTool
 
     private sealed record EditEntry(string OldText, string NewText);
 
-    private sealed record ResolvedEdit(int StartIndex, int EndIndex, string OldText, string NewText);
+    private sealed record ResolvedEdit(int EditIndex, int StartIndex, int EndIndex, string OldText, string NewText);
 
     private sealed record NormalizedFuzzyText(string Normalized, IReadOnlyList<int> IndexMap);
 }

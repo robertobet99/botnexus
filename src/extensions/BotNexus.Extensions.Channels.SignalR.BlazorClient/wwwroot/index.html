@@ -15,7 +15,27 @@
     <title>BotNexus</title>
     <base href="/" />
     <link rel="preload" id="webassembly" />
-    <link rel="stylesheet" href="css/app.css" />
+    <!-- Preload the latin subset: it is needed for the very first paint, and discovering it
+         only after app.css parses would guarantee a visible swap. latin-ext is deliberately
+         NOT preloaded - it is fetched on demand via unicode-range. -->
+    <link rel="preload" href="fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="_content/BotNexus.Extensions.Channels.SignalR.BlazorClient.Core/css/icons.css" />
+    <link rel="stylesheet" href="css/app.css?v=ds13" />
+    <script>
+        // Applied BEFORE first paint and before Blazor boots. The WASM runtime takes seconds to
+        // start; without this a light-theme user would stare at a fully dark portal until it did,
+        // then watch it flip. Reads the same localStorage blob PortalPreferencesService writes.
+        (function () {
+            try {
+                var raw = localStorage.getItem('botnexus.portal.prefs');
+                if (raw && JSON.parse(raw).Theme === 'light') {
+                    document.documentElement.setAttribute('data-theme', 'light');
+                }
+            } catch (e) {
+                // Unparseable or unavailable storage - dark is the default, so do nothing.
+            }
+        })();
+    </script>
     <script type="importmap"></script>
 </head>
 
@@ -40,6 +60,9 @@
     <script src="js/audio.js"></script>
     <script src="js/splitter.js"></script>
     <script src="js/canvasBridge.js"></script>
+    <script src="js/toolFrame.js"></script>
+    <script src="js/modalFocus.js"></script>
+    <script src="js/conversationActionMenu.js"></script>
     <script>
         // Clipboard helper for copy-to-clipboard via JS interop
         window.BotNexus = window.BotNexus || {};
@@ -49,13 +72,34 @@
             }
             return Promise.resolve(false);
         };
+        window.BotNexus.downloadFile = function (fileName, contentType, base64Content) {
+            var bytes = Uint8Array.from(atob(base64Content), function (c) { return c.charCodeAt(0); });
+            var url = URL.createObjectURL(new Blob([bytes], { type: contentType }));
+            var anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = fileName;
+            anchor.click();
+            URL.revokeObjectURL(url);
+        };
     </script>
-    <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
+    <script src="js/bootDiagnostics.js"></script>
+    <script src="_framework/blazor.webassembly#[.{fingerprint}].js" autostart="false"></script>
+    <script>
+        // #2880: default autostart leaves a failed boot as an unhandled rejection, so the static
+        // .loading-screen above is never torn down and the user sees the spinner forever. Starting
+        // explicitly through BotNexusBoot attaches a rejection handler that replaces #app with an
+        // actionable panel, and distinguishes an auth-proxy login interstitial from a real fault.
+        window.BotNexusBoot.startBlazor();
+    </script>
+    <script src="js/swUpdate.js"></script>
     <script>
         // Register the PWA service worker so Edge/Chromium treats the portal as installable.
-        // The published build swaps service-worker.js -> service-worker.published.js via the
-        // csproj <ServiceWorker> item, so registering 'service-worker.js' is correct for both.
-        if ('serviceWorker' in navigator) { navigator.serviceWorker.register('service-worker.js'); }
+        // #2591: registration alone let a cached worker pin a stale bundle forever, so this goes
+        // through BotNexusSwUpdate -- updateViaCache:'none', a foreground update check, and a
+        // reload on controllerchange. The published build swaps service-worker.js ->
+        // service-worker.published.js via the csproj <ServiceWorker> item, so this URL is correct
+        // for both dev and published.
+        window.BotNexusSwUpdate.register('service-worker.js');
     </script>
 </body>
 

@@ -7,6 +7,7 @@ using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Providers.Core.Compatibility;
 using BotNexus.Agent.Providers.Core.Streaming;
 using BotNexus.Agent.Providers.Core.Utilities;
+using BotNexus.Gateway.Abstractions.Security;
 using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Agent.Providers.Copilot.Completions;
@@ -23,25 +24,46 @@ namespace BotNexus.Agent.Providers.Copilot.Completions;
 /// Completions provider.
 /// </para>
 /// </summary>
+/// <param name="httpClient">The shared provider HTTP client.</param>
+/// <param name="logger">Stream diagnostics logger.</param>
+/// <param name="secretRedactor">
+/// Optional secret redactor applied to a non-2xx error body before it is interpolated into an
+/// exception message that the agent loop persists as the session-visible <c>ErrorMessage</c> (#2881).
+/// </param>
 public sealed class CopilotCompletionsProvider(
     HttpClient httpClient,
-    ILogger<CopilotCompletionsProvider> logger) : IApiProvider
+    ILogger<CopilotCompletionsProvider> logger,
+    ISecretRedactor? secretRedactor = null,
+    ICopilotHeaderSink? headerSink = null) : IApiProvider
 {
     private readonly HttpClient _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
 
     public string Api => "github-copilot-completions";
 
+    /// <summary>
+    /// OpenAI-shaped completions over the Copilot transport: system prompt as the first message.
+    /// Leaked-tool-call recovery is DECLARED because Copilot model discovery routes a given model
+    /// to whichever of the three Copilot transports the account exposes, so the Claude model that
+    /// produced the #1709 capture can arrive here too; #2170 is the precedent for a Copilot fix
+    /// applied to one transport recurring the moment discovery selected another (#2432).
+    /// </summary>
+    public ProviderCapabilities Capabilities { get; } = new(
+        RecoversLeakedToolCallMarkup: true,
+        SystemPromptPlacement: SystemPromptPlacement.FirstMessage);
+
     public LlmStream Stream(LlmModel model, Context context, StreamOptions? options = null)
-        => CompletionsStreamEngine.StreamAsync(BuildProfile(), _httpClient, logger, model, context, options);
+        => CompletionsStreamEngine.StreamAsync(BuildProfile(secretRedactor, CopilotHeaderCapture.Begin(headerSink, model, options)), _httpClient, logger, model, context, options);
 
     public LlmStream StreamSimple(LlmModel model, Context context, SimpleStreamOptions? options = null)
     {
-        var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+        var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, logger);
+        var apiKey = credential.Value;
 
         var completionsOptions = new CopilotCompletionsOptions
         {
             ApiKey = apiKey,
             Temperature = options?.Temperature,
+            ToolChoiceMode = options?.ToolChoiceMode,
             MaxTokens = options?.MaxTokens,
             CancellationToken = options?.CancellationToken ?? CancellationToken.None,
             Transport = options?.Transport ?? Transport.Sse,
@@ -59,7 +81,7 @@ public sealed class CopilotCompletionsProvider(
         return Stream(model, context, completionsOptions);
     }
 
-    private static CompletionsTransportProfile BuildProfile() => new(
+    private static CompletionsTransportProfile BuildProfile(ISecretRedactor? secretRedactor, CopilotHeaderCapture capture) => new(
         Api: "github-copilot-completions",
         ActivityName: "provider.copilot-completions.stream",
         BuildPayload: static (model, systemPrompt, messages, tools, opts, compat) =>
@@ -77,8 +99,14 @@ public sealed class CopilotCompletionsProvider(
             foreach (var (key, value) in CopilotHeaders.BuildDynamicHeaders(messages, hasImages, headerOptions))
                 request.Headers.TryAddWithoutValidation(key, value);
         },
-        ThrowForError: static (response, providerError) =>
-            ProviderHttpErrorHelper.ThrowForFailedResponse(response, providerError, "Copilot Completions"),
-        OnResponseHeaders: static response => CopilotResponseHeaders.EmitToActivity(response, Activity.Current),
-        InspectChunk: static root => CopilotUsageActivity.TryParseAndEmit(root, Activity.Current));
+        ThrowForError: static (response, providerError, redactor) =>
+            ProviderHttpErrorHelper.ThrowForFailedResponse(response, providerError, "Copilot Completions", redactor),
+        OnResponseHeaders: response => { capture.Observe(response); CopilotResponseHeaders.EmitToActivity(response, Activity.Current); },
+        InspectChunk: static root => CopilotUsageActivity.TryParseAndEmit(root, Activity.Current),
+        // No text-delta normalization hook: #3442 established from mitm captures (0 raw CR bytes
+        // across 3,025 provider deltas) that Copilot never frames deltas with CRLF. The corruption
+        // blamed on the wire in #2049/#2119/#2170/#2443/#3336 was injected by our own
+        // string.Join(Environment.NewLine, ...) in MessageConverter.ToAgentMessage, fixed in #3428.
+        // Deltas accumulate byte-identically here, as on every non-Copilot transport.
+        SecretRedactor: secretRedactor);
 }

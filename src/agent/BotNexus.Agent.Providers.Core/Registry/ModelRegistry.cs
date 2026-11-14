@@ -1,15 +1,20 @@
-using System.Collections.Concurrent;
+using BotNexus.Agent.Providers.Core.Diagnostics;
 using BotNexus.Agent.Providers.Core.Models;
+using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Agent.Providers.Core.Registry;
 
 /// <summary>
 /// Model registry. Port of pi-mono's models.ts registry.
-/// Thread-safe via ConcurrentDictionary.
+/// Thread-safe via immutable catalogue snapshots swapped under a short registration lock.
 /// </summary>
 public sealed class ModelRegistry
 {
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, LlmModel>> _registry = new();
+    private readonly Lock _sync = new();
+    private readonly Dictionary<string, Dictionary<string, LlmModel>> _baseRegistrations = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, IReadOnlyList<ModelRegistration>> _ownedRegistrations = new(StringComparer.Ordinal);
+    private volatile IReadOnlyDictionary<string, IReadOnlyDictionary<string, LlmModel>> _registry =
+        new Dictionary<string, IReadOnlyDictionary<string, LlmModel>>(StringComparer.OrdinalIgnoreCase);
 
     // Common aliases so users can write "copilot" instead of "github-copilot" in config
     private static readonly Dictionary<string, string> ProviderAliases = new(StringComparer.OrdinalIgnoreCase)
@@ -24,14 +29,94 @@ public sealed class ModelRegistry
     private const int ExtendedContextWindow = 1_000_000;
 
     /// <summary>
-    /// Executes register.
+    /// The exact warning template emitted when a re-registration narrows a model's declared input
+    /// modalities. Public so tests assert this specific diagnostic rather than "a warning happened".
+    /// </summary>
+    public const string NarrowingWarningTemplate =
+        "Model {ModelId} (provider {Provider}) was re-registered with narrower input modalities: " +
+        "[{PreviousModalities}] -> [{NewModalities}]. Modalities lost: [{LostModalities}]. " +
+        "Content of the lost modality will be discarded before the request is sent.";
+
+    /// <summary>
+    /// Registers (or replaces) a model for a provider.
+    /// <para>
+    /// Re-registration is normal - composition roots register built-ins, then config-declared and
+    /// discovered models over the top. What is <em>not</em> normal is a re-registration that
+    /// silently removes an input modality the previous entry declared: that is how a vision model
+    /// turns into a text-only model at runtime and starts discarding images with nothing anywhere
+    /// to explain it (#2485). The narrowing is still honoured - the later registration wins, as it
+    /// always has - but it is now reported as a warning naming both modality sets.
+    /// </para>
     /// </summary>
     /// <param name="provider">The provider.</param>
     /// <param name="model">The model.</param>
     public void Register(string provider, LlmModel model)
     {
-        var models = _registry.GetOrAdd(provider, _ => new ConcurrentDictionary<string, LlmModel>());
-        models[model.Id] = model;
+        ArgumentException.ThrowIfNullOrWhiteSpace(provider);
+        ArgumentNullException.ThrowIfNull(model);
+
+        lock (_sync)
+        {
+            if (GetModelCore(_registry, provider, model.Id) is { } previous)
+                WarnIfModalitiesNarrowed(provider, previous, model);
+
+            if (!_baseRegistrations.TryGetValue(provider, out var models))
+            {
+                models = new Dictionary<string, LlmModel>(StringComparer.Ordinal);
+                _baseRegistrations[provider] = models;
+            }
+
+            models[model.Id] = model;
+            _registry = BuildSnapshot();
+        }
+    }
+
+    /// <summary>
+    /// Atomically replaces every model registration owned by one runtime source. Registrations
+    /// from other owners and the base catalogue remain intact; removing an override reveals the
+    /// underlying registration rather than deleting it.
+    /// </summary>
+    public void ReplaceOwnedRegistrations(string owner, IReadOnlyList<ModelRegistration> registrations)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(owner);
+        ArgumentNullException.ThrowIfNull(registrations);
+
+        lock (_sync)
+        {
+            var candidate = registrations.ToArray();
+            foreach (var registration in candidate)
+            {
+                ArgumentException.ThrowIfNullOrWhiteSpace(registration.Provider);
+                ArgumentNullException.ThrowIfNull(registration.Model);
+                if (GetModelCore(_registry, registration.Provider, registration.Model.Id) is { } previous)
+                    WarnIfModalitiesNarrowed(registration.Provider, previous, registration.Model);
+            }
+
+            _ownedRegistrations[owner] = candidate;
+            _registry = BuildSnapshot();
+        }
+    }
+
+    /// <summary>
+    /// Emits the narrowing warning when <paramref name="replacement"/> declares strictly fewer input
+    /// modalities than <paramref name="previous"/>. A widening or an unchanged set is silent.
+    /// </summary>
+    private static void WarnIfModalitiesNarrowed(string provider, LlmModel previous, LlmModel replacement)
+    {
+        var lost = previous.Input
+            .Where(m => !replacement.Input.Contains(m, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        if (lost.Count == 0)
+            return;
+
+        ProviderDiagnostics.CreateLogger(nameof(ModelRegistry)).LogWarning(
+            NarrowingWarningTemplate,
+            replacement.Id,
+            provider,
+            string.Join(",", previous.Input),
+            string.Join(",", replacement.Input),
+            string.Join(",", lost));
     }
 
     /// <summary>
@@ -174,7 +259,49 @@ public sealed class ModelRegistry
     /// </summary>
     public void Clear()
     {
-        _registry.Clear();
+        lock (_sync)
+        {
+            _baseRegistrations.Clear();
+            _ownedRegistrations.Clear();
+            _registry = new Dictionary<string, IReadOnlyDictionary<string, LlmModel>>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private IReadOnlyDictionary<string, IReadOnlyDictionary<string, LlmModel>> BuildSnapshot()
+    {
+        var snapshot = new Dictionary<string, Dictionary<string, LlmModel>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (provider, models) in _baseRegistrations)
+            snapshot[provider] = new Dictionary<string, LlmModel>(models, StringComparer.Ordinal);
+
+        foreach (var registrations in _ownedRegistrations.Values)
+        {
+            foreach (var registration in registrations)
+            {
+                if (!snapshot.TryGetValue(registration.Provider, out var models))
+                {
+                    models = new Dictionary<string, LlmModel>(StringComparer.Ordinal);
+                    snapshot[registration.Provider] = models;
+                }
+
+                models[registration.Model.Id] = registration.Model;
+            }
+        }
+
+        return snapshot.ToDictionary(
+            entry => entry.Key,
+            entry => (IReadOnlyDictionary<string, LlmModel>)entry.Value,
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static LlmModel? GetModelCore(
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, LlmModel>> registry,
+        string provider,
+        string modelId)
+    {
+        var resolved = ResolveProvider(provider);
+        return registry.TryGetValue(resolved, out var models) && models.TryGetValue(modelId, out var model)
+            ? model
+            : null;
     }
 
     private static string ResolveProvider(string provider) =>

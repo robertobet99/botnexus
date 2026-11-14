@@ -31,6 +31,8 @@ public sealed class VerticalSliceDataFlowTests : IDisposable
         _prefs.Current.Returns(new PortalPreferences());
 
         _ctx.Services.AddSingleton<IClientStateStore>(_store);
+        // #3064: Home injects the per-agent conversation MRU at the route seam.
+        _ctx.Services.AddSingleton<IConversationMruService, ConversationMruService>();
         _ctx.Services.AddSingleton(_portalLoad);
         _ctx.Services.AddSingleton(_interactionService);
         _ctx.Services.AddSingleton<ISlashCommandDispatcher>(sp => new SlashCommandDispatcher(sp.GetRequiredService<IAgentInteractionService>()));
@@ -73,7 +75,7 @@ public sealed class VerticalSliceDataFlowTests : IDisposable
                 CreatedAt: DateTimeOffset.UtcNow,
                 UpdatedAt: DateTimeOffset.UtcNow),
         ]);
-        _store.ActiveAgentId = "agent-1";
+        _store.SelectView("agent-1", string.Empty, SelectionSource.UserClick);
 
         _interactionService.SelectConversationAsync("agent-1", "conv-2")
             .Returns(Task.CompletedTask);
@@ -108,7 +110,7 @@ public sealed class VerticalSliceDataFlowTests : IDisposable
                 CreatedAt: DateTimeOffset.UtcNow,
                 UpdatedAt: DateTimeOffset.UtcNow),
         ]);
-        _store.ActiveAgentId = "agent-1";
+        _store.SelectView("agent-1", string.Empty, SelectionSource.UserClick);
 
         var cut = _ctx.Render<Home>(p => p
             .Add(c => c.AgentId, "agent-1")
@@ -142,7 +144,7 @@ public sealed class VerticalSliceDataFlowTests : IDisposable
                 CreatedAt: DateTimeOffset.UtcNow,
                 UpdatedAt: DateTimeOffset.UtcNow),
         ]);
-        _store.ActiveAgentId = "agent-1";
+        _store.SelectView("agent-1", string.Empty, SelectionSource.UserClick);
 
         var cut = _ctx.Render<Home>(p => p
             .Add(c => c.AgentId, "agent-1")
@@ -203,7 +205,7 @@ public sealed class VerticalSliceDataFlowTests : IDisposable
                 CreatedAt: DateTimeOffset.UtcNow,
                 UpdatedAt: DateTimeOffset.UtcNow),
         ]);
-        _store.ActiveAgentId = "agent-1";
+        _store.SelectView("agent-1", string.Empty, SelectionSource.UserClick);
 
         var cut = _ctx.Render<Home>(p => p
             .Add(c => c.AgentId, "agent-1"));

@@ -14,7 +14,7 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>ai;agent;botnexus;dotnet;cli</PackageTags>
     <PackageReadmeFile>NUGET_README.md</PackageReadmeFile>
-    <!-- When the CLI invokes 'dotnet build' on the solution, it passes SkipCli=true
+    <!-- When the CLI invokes 'dotnet build' on the deployment traversal, it passes SkipCli=true
          so the CLI project skips rebuilding itself (the DLL is already loaded and locked). -->
     <IsExcludedFromBuild Condition="'$(SkipCli)' == 'true'">true</IsExcludedFromBuild>
   </PropertyGroup>
@@ -32,6 +32,27 @@
   <ItemGroup>
     <ProjectReference Include="..\BotNexus.Gateway\BotNexus.Gateway.csproj" />
     <ProjectReference Include="..\BotNexus.Cron\BotNexus.Cron.csproj" />
+  </ItemGroup>
+
+  <!--
+    The doctor check/advisory registries are GENERATED from the [DoctorCheck] declarations (#3319),
+    not hand-written. Referenced as an Analyzer (not as an assembly) so nothing the generator
+    produces is deployed, matching the #2769 posture. The namespace property must be marked
+    CompilerVisibleProperty - a property the compiler cannot see falls back to the generator's
+    default, which looks like the setting being ignored.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\tools\BotNexus.SourceGenerators\BotNexus.SourceGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <DoctorCheckSourceGenerator_Namespace>BotNexus.Cli.Commands.Doctor</DoctorCheckSourceGenerator_Namespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <CompilerVisibleProperty Include="DoctorCheckSourceGenerator_Namespace" />
   </ItemGroup>
 
   <ItemGroup>

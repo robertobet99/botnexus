@@ -74,6 +74,18 @@ Sessions come and go; the conversation persists. This has practical implications
 
 ---
 
+## When a run reaches its tool-result budget
+
+The desktop and mobile portal show a notice when a run stops at its tool-result budget. A tool result is the outcome of an executed tool call, not a chat message or a model turn.
+
+The notice says that work is incomplete and parked. Review the retained results, then send a new message with direction for what to do next. The notice itself does not resume work or replay tool calls. An optional agent summary may appear separately; the notice does not depend on that summary.
+
+When the run supplies measured counts, the notice shows the limit, executed results, and overshoot. Parallel tool calls that were already dispatched can finish beyond the limit. Older stop evidence may have no counts; the portal does not guess them. A semantic non-progress stop is different and does not produce this budget notice.
+
+The notice is saved in conversation history, so it remains visible after refresh. A repeated delivery of the same identified run does not add another notice. This does not add notices retroactively to older sessions that have no saved notice row.
+
+---
+
 ## Conversations between channels (fan-out)
 
 When an agent responds, the response is delivered to **all active bindings** on that conversation — not just the channel the message came from. This is called **fan-out**.
@@ -277,7 +289,8 @@ Created ──► Active ──► Archived
 
 Archiving is manual. Archived conversations do not appear in fan-out and cannot receive new messages.
 
-- **Desktop portal** — hover a conversation in the sidebar and click the archive (✕) button.
+- **Desktop portal** — hover a conversation in the sidebar; three actions appear on its
+  timestamp line. The rightmost is **Archive conversation** (its tooltip names it).
 - **Mobile portal** — open the overflow menu (the **⋯** button in the top bar) and choose **Archive conversation**, then confirm.
 
 For a virtual cron conversation the action is labelled **Close conversation** instead — closing hides the row from the list, and it reopens automatically when the cron job next fires.
@@ -308,10 +321,10 @@ differ by *when* your message takes effect relative to the running loop:
 
 | Control | When it takes effect | Use it to… |
 |---|---|---|
-| **🔀 Steer** | At the **next turn boundary** — after the current message stream or tool batch finishes. Does not interrupt the in-flight step. | Add guidance the agent should pick up on its next LLM call without throwing away current work. |
+| **Steer** | At the **next turn boundary** — after the current message stream or tool batch finishes. Does not interrupt the in-flight step. | Add guidance the agent should pick up on its next LLM call without throwing away current work. |
 | **Redirect** | **Immediately** — aborts the current step and steers with your message right away. | Change course now when the agent is heading the wrong way and you don't want it to finish the current step. |
-| **➕ Follow Up** | **After the whole loop completes** — queued and delivered once the agent has finished all its turns, tool calls, and any continuations. | Line up the next task as a follow-up without interrupting the current one. |
-| **⏹ Stop** | **Immediately** — aborts the entire loop. | Halt the agent completely. |
+| **Follow Up** | **After the whole loop completes** — queued and delivered once the agent has finished all its turns, tool calls, and any continuations. | Line up the next task as a follow-up without interrupting the current one. |
+| **Stop** | **Immediately** — aborts the entire loop. | Halt the agent completely. |
 
 Steer and Follow Up messages you queue appear in the conversation's queue panel
 with a **Steer** or **Follow Up** badge until they are consumed.

@@ -1,3 +1,5 @@
+using BotNexus.Domain.Primitives;
+using BotNexus.Memory.Embeddings;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Core;
@@ -21,13 +23,17 @@ using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Core.Configuration;
+using BotNexus.Agent.Core.Loop;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.IO.Abstractions;
 using System.Reflection;
 using System.Text.Json;
+using Moq;
 using AgentCoreUserMessage = BotNexus.Agent.Core.Types.UserMessage;
 using BotNexus.Gateway.Tests.TestInfrastructure;
+using BotNexus.Gateway.Api.Controllers;
+using Microsoft.AspNetCore.Mvc;
 
 namespace BotNexus.Gateway.Tests;
 
@@ -43,6 +49,80 @@ public sealed class InProcessIsolationStrategyTests
             new AgentExecutionContext { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-1") });
 
         handle.ShouldNotBeNull();
+    }
+
+    [Theory]
+    [InlineData(null, "model", 8192)]
+    [InlineData(32_000, "agent", 32_000)]
+    public async Task CreateAsync_InspectorCapturesBudgetAndIndependentRegisteredCapacities(
+        int? agentWindow, string expectedSource, int expectedBudget)
+    {
+        var strategy = CreateStrategyWithRegisteredModel();
+        await using var handle = await strategy.CreateAsync(
+            CreateDescriptor() with { ContextWindow = agentWindow },
+            new AgentExecutionContext { SessionId = SessionId.From("session-budget") });
+        var inspector = handle.ShouldBeAssignableTo<IAgentHandleInspector>();
+        var budget = inspector.GetContextBudgetDiagnostics();
+        budget.ShouldNotBeNull();
+        budget.EffectiveWorkingBudgetTokens.ShouldBe(expectedBudget);
+        budget.EffectiveWorkingBudgetSource.ShouldBe(expectedSource);
+        budget.ModelContextWindowTokens.ShouldBe(8192);
+        budget.ModelMaxOutputTokens.ShouldBe(1024);
+        budget.ModelContextWindowSource.ShouldBe("registered");
+        budget.ModelMaxOutputSource.ShouldBe("registered");
+        inspector.GetContextWindowTokens().ShouldBe(expectedBudget);
+        var settings = GetAgentOptions(handle).GenerationSettings;
+        settings.ContextWindow.ShouldBe(agentWindow);
+    }
+
+    [Fact]
+    public async Task GetContext_RealSupervisorAndHandle_ReportConversationBudgetWithoutChangingModelDeclarations()
+    {
+        var agentId = AgentId.From("agent-a");
+        var sessionId = SessionId.From("session-conversation-budget");
+        var conversations = new InMemoryConversationStore();
+        await conversations.CreateAsync(new Conversation
+        {
+            AgentId = agentId, ConversationId = ConversationId.From("conversation-budget"),
+            ActiveSessionId = sessionId, ContextWindowOverride = 64_000
+        });
+        var sessions = new InMemorySessionStore();
+        using var provider = new ServiceCollection()
+            .AddSingleton<IConversationStore>(conversations)
+            .AddSingleton<ISessionStore>(sessions)
+            .BuildServiceProvider();
+        var strategy = CreateStrategyWithRegisteredModel(serviceProvider: provider);
+        var registry = new DefaultAgentRegistry(NullLogger<DefaultAgentRegistry>.Instance);
+        registry.Register(CreateDescriptor() with { ContextWindow = 32_000 });
+        var supervisor = new DefaultAgentSupervisor(registry, [strategy], sessions,
+            NullLogger<DefaultAgentSupervisor>.Instance);
+        var handle = await supervisor.GetOrCreateAsync(agentId, sessionId);
+        try
+        {
+            var inspector = handle.ShouldBeAssignableTo<IAgentHandleInspector>();
+            var budget = inspector.GetContextBudgetDiagnostics();
+            budget.ShouldNotBeNull();
+            budget.EffectiveWorkingBudgetTokens.ShouldBe(64_000);
+            budget.EffectiveWorkingBudgetSource.ShouldBe("conversation");
+            budget.ModelContextWindowTokens.ShouldBe(8192);
+            budget.ModelMaxOutputTokens.ShouldBe(1024);
+            GetAgentOptions(handle).GenerationSettings.ContextWindow.ShouldBe(64_000);
+            var controller = new AgentsController(registry, supervisor, new NoOpAgentConfigurationWriter());
+            var response = controller.GetContext(agentId.Value, sessionId.Value).ShouldBeOfType<OkObjectResult>();
+            using var json = JsonDocument.Parse(JsonSerializer.Serialize(response.Value,
+                new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+            json.RootElement.GetProperty("contextWindowTokens").GetInt32().ShouldBe(64_000);
+            var reported = json.RootElement.GetProperty("contextBudget");
+            reported.GetProperty("effectiveWorkingBudgetSource").GetString().ShouldBe("conversation");
+            reported.GetProperty("modelContextWindowTokens").GetInt32().ShouldBe(8192);
+            reported.GetProperty("modelMaxOutputTokens").GetInt32().ShouldBe(1024);
+            reported.GetProperty("modelContextWindowSource").GetString().ShouldBe("registered");
+            reported.GetProperty("modelMaxOutputSource").GetString().ShouldBe("registered");
+        }
+        finally
+        {
+            await supervisor.StopAsync(agentId, sessionId);
+        }
     }
 
     [Fact]
@@ -377,6 +457,367 @@ public sealed class InProcessIsolationStrategyTests
     }
 
     [Fact]
+    public async Task CreateAsync_MidLoopCompaction_PassesScopedDecisionSnapshotAndKeepsHandle()
+    {
+        var session = new GatewaySession { SessionId = SessionId.From("scoped-midloop"), AgentId = AgentId.From("agent-a") };
+        var store = new Mock<ISessionStore>();
+        store.Setup(value => value.GetAsync(session.SessionId, It.IsAny<CancellationToken>())).ReturnsAsync(session);
+        CompactionOptions? decisionOptions = null;
+        CompactionOptions? executionOptions = null;
+        var compactor = new Mock<ISessionCompactor>();
+        compactor.Setup(value => value.ShouldCompact(session.Session, It.IsAny<CompactionOptions>()))
+            .Callback<Session, CompactionOptions>((_, options) => decisionOptions = options).Returns(true);
+        var coordinator = new Mock<ISessionCompactionCoordinator>();
+        coordinator.Setup(value => value.CompactAsync(session.AgentId, session, It.IsAny<CancellationToken>(),
+                false, CompactionHandlePolicy.KeepCurrent, It.IsAny<CompactionOptions?>()))
+            .Callback<AgentId, GatewaySession, CancellationToken, bool, CompactionHandlePolicy, CompactionOptions?>((_, _, _, _, _, options) => executionOptions = options)
+            .ReturnsAsync(new SessionCompactionOutcome(true, true, HistoryReplaceOutcome.Applied, 1, 0, 100, 10, null));
+        var global = new CompactionOptions { ContextWindowTokens = 200_000, TokenThresholdRatio = 0.6, CompactionTokenCeiling = 50_000 };
+        var services = new ServiceCollection();
+        services.AddSingleton(store.Object);
+        services.AddSingleton(compactor.Object);
+        services.AddSingleton(coordinator.Object);
+        services.AddSingleton<IOptionsMonitor<CompactionOptions>>(new StaticOptionsMonitor<CompactionOptions>(global));
+        using var serviceProvider = services.BuildServiceProvider();
+        var strategy = CreateStrategyWithRegisteredModel(serviceProvider: serviceProvider);
+        var descriptor = CreateDescriptor() with { ContextWindow = 128_000 };
+        await using var handle = await strategy.CreateAsync(descriptor, new AgentExecutionContext { SessionId = session.SessionId });
+        using var cancellation = new CancellationTokenSource();
+        var hook = GetAgentOptions(handle).ContextCompactionService;
+        hook.ShouldNotBeNull();
+
+        var replacement = await hook(cancellation.Token);
+
+        replacement.ShouldNotBeNull();
+        decisionOptions.ShouldNotBeNull();
+        decisionOptions.ContextWindowTokens.ShouldBe(128_000);
+        decisionOptions.TokenThresholdRatio.ShouldBe(0.6);
+        decisionOptions.CompactionTokenCeiling.ShouldBe(50_000);
+        executionOptions.ShouldBeSameAs(decisionOptions);
+        global.ContextWindowTokens.ShouldBe(200_000);
+        coordinator.Verify(value => value.CompactAsync(session.AgentId, session, cancellation.Token,
+            false, CompactionHandlePolicy.KeepCurrent, It.IsAny<CompactionOptions?>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task CreateAsync_CeilingFreshEachLoopAndFailuresAreClosed()
+    {
+        var session = new GatewaySession { SessionId = SessionId.From("ceiling-midloop"), AgentId = AgentId.From("agent-a"), ConversationId = ConversationId.From("ceiling-conversation") };
+        var store = new Mock<ISessionStore>();
+        store.Setup(value => value.GetAsync(session.SessionId, It.IsAny<CancellationToken>())).ReturnsAsync(session);
+        var resolver = new Mock<ISessionCompactionCeilingResolver>();
+        resolver.SetupSequence(value => value.ResolveAsync(session.AgentId, session.ConversationId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ScopedCompactionCeiling(100, "world"))
+            .ReturnsAsync(new ScopedCompactionCeiling(200, "conversation"))
+            .ReturnsAsync(new ScopedCompactionCeiling(null, null))
+            .ThrowsAsync(new IOException("policy unavailable"))
+            .ReturnsAsync(new ScopedCompactionCeiling(0, "conversation"))
+            .ThrowsAsync(new OperationCanceledException());
+        var observed = new List<int?>();
+        var compactor = new Mock<ISessionCompactor>();
+        compactor.Setup(value => value.ShouldCompact(session.Session, It.IsAny<CompactionOptions>()))
+            .Callback<Session, CompactionOptions>((_, options) => observed.Add(options.CompactionTokenCeiling)).Returns(false);
+        var coordinator = new Mock<ISessionCompactionCoordinator>();
+        var services = new ServiceCollection();
+        services.AddSingleton(store.Object);
+        services.AddSingleton(resolver.Object);
+        services.AddSingleton(compactor.Object);
+        services.AddSingleton(coordinator.Object);
+        services.AddSingleton<IOptionsMonitor<CompactionOptions>>(new StaticOptionsMonitor<CompactionOptions>(new CompactionOptions()));
+        using var provider = services.BuildServiceProvider();
+        var strategy = CreateStrategyWithRegisteredModel(serviceProvider: provider);
+        await using var handle = await strategy.CreateAsync(CreateDescriptor(), new AgentExecutionContext { SessionId = session.SessionId });
+        var hook = GetAgentOptions(handle).ContextCompactionService;
+        hook.ShouldNotBeNull();
+        for (var turn = 0; turn < 3; turn++) (await hook(CancellationToken.None)).ShouldBeNull();
+        observed.ShouldBe(new int?[] { 100, 200, null });
+        (await Should.ThrowAsync<ProactiveCompactionException>(async () => await hook(CancellationToken.None))).Message.ShouldContain("policy");
+        (await Should.ThrowAsync<ProactiveCompactionException>(async () => await hook(CancellationToken.None))).Message.ShouldContain("policy");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await Should.ThrowAsync<OperationCanceledException>(async () => await hook(cancellation.Token));
+        observed.Count.ShouldBe(3);
+        coordinator.Verify(value => value.CompactAsync(It.IsAny<AgentId>(), It.IsAny<GatewaySession>(), It.IsAny<CancellationToken>(), false, CompactionHandlePolicy.KeepCurrent, It.IsAny<CompactionOptions?>()), Times.Never);
+    }
+
+    [Fact]
+    public Task CreateAsync_CeilingSessionReadFailure_BlocksFirstCheck()
+        => VerifyCeilingSessionReadFailure("io", retry: false);
+
+    [Fact]
+    public Task CreateAsync_CeilingSessionReadFailure_BlocksConflictRetry()
+        => VerifyCeilingSessionReadFailure("io", retry: true);
+
+    [Fact]
+    public Task CreateAsync_CeilingMissingSession_BlocksFirstCheck()
+        => VerifyCeilingSessionReadFailure("missing", retry: false);
+
+    [Fact]
+    public Task CreateAsync_CeilingMissingSession_BlocksConflictRetry()
+        => VerifyCeilingSessionReadFailure("missing", retry: true);
+
+    [Fact]
+    public Task CreateAsync_CeilingSessionReadCancellation_PreservesCallerCancellation()
+        => VerifyCeilingSessionReadFailure("cancel", retry: false);
+
+    [Fact]
+    public Task CreateAsync_CeilingSessionReadUnexpectedCancellation_FailsClosed()
+        => VerifyCeilingSessionReadFailure("unexpected-cancel", retry: false);
+
+    [Fact]
+    public Task CreateAsync_MissingSessionWithoutCeilingResolver_PreservesLegacyNoOp()
+        => VerifyCeilingSessionReadFailure("legacy-missing", retry: false);
+
+    private static async Task VerifyCeilingSessionReadFailure(string failure, bool retry)
+    {
+        var session = new GatewaySession
+        {
+            SessionId = SessionId.From("ceiling-session-read"), AgentId = AgentId.From("agent-a"),
+            ConversationId = ConversationId.From("ceiling-session-conversation")
+        };
+        var store = new Mock<ISessionStore>();
+        store.Setup(value => value.GetAsync(session.SessionId, It.IsAny<CancellationToken>())).ReturnsAsync(session);
+        var resolver = new Mock<ISessionCompactionCeilingResolver>();
+        resolver.Setup(value => value.ResolveAsync(session.AgentId, session.ConversationId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ScopedCompactionCeiling(100, "conversation"));
+        var compactor = new Mock<ISessionCompactor>();
+        compactor.Setup(value => value.ShouldCompact(It.IsAny<Session>(), It.IsAny<CompactionOptions>())).Returns(true);
+        var coordinator = new Mock<ISessionCompactionCoordinator>();
+        coordinator.Setup(value => value.CompactAsync(session.AgentId, session, It.IsAny<CancellationToken>(),
+                false, CompactionHandlePolicy.KeepCurrent, It.IsAny<CompactionOptions?>()))
+            .ReturnsAsync(new SessionCompactionOutcome(false, false, HistoryReplaceOutcome.Aborted, 0, 0, 100, 100,
+                "concurrent history change", CompactionSkipReason.ConcurrentHistoryChange));
+        var services = new ServiceCollection();
+        services.AddSingleton(store.Object);
+        if (failure != "legacy-missing") services.AddSingleton(resolver.Object);
+        services.AddSingleton(compactor.Object);
+        services.AddSingleton(coordinator.Object);
+        services.AddSingleton<IOptionsMonitor<CompactionOptions>>(new StaticOptionsMonitor<CompactionOptions>(new CompactionOptions()));
+        using var provider = services.BuildServiceProvider();
+        var strategy = CreateStrategyWithRegisteredModel(serviceProvider: provider);
+        await using var handle = await strategy.CreateAsync(CreateDescriptor(), new AgentExecutionContext { SessionId = session.SessionId });
+        var hook = GetAgentOptions(handle).ContextCompactionService;
+        hook.ShouldNotBeNull();
+        using var cancellation = new CancellationTokenSource();
+        if (failure == "cancel") cancellation.Cancel();
+        Exception readFailure = failure == "io" ? new IOException("session store unavailable")
+            : new OperationCanceledException("session read canceled", cancellation.Token);
+        var reads = store.SetupSequence(value => value.GetAsync(session.SessionId, It.IsAny<CancellationToken>()));
+        if (retry) reads.ReturnsAsync(session);
+        if (failure.Contains("missing", StringComparison.Ordinal)) reads.ReturnsAsync((GatewaySession?)null);
+        else reads.ThrowsAsync(readFailure);
+
+        if (failure == "legacy-missing") (await hook(cancellation.Token)).ShouldBeNull();
+        else if (failure == "cancel")
+        {
+            OperationCanceledException? error = null;
+            try { _ = await hook(cancellation.Token); }
+            catch (OperationCanceledException caught) { error = caught; }
+            error.ShouldNotBeNull();
+            error.ShouldBeSameAs(readFailure);
+            error.CancellationToken.ShouldBe(cancellation.Token);
+        }
+        else
+        {
+            var error = await Should.ThrowAsync<ProactiveCompactionException>(async () => await hook(cancellation.Token));
+            error.Retryable.ShouldBeTrue();
+            if (!failure.Contains("missing", StringComparison.Ordinal)) error.InnerException.ShouldBeSameAs(readFailure);
+        }
+        resolver.Verify(value => value.ResolveAsync(It.IsAny<AgentId>(), It.IsAny<ConversationId>(), It.IsAny<CancellationToken>()), Times.Exactly(retry ? 1 : 0));
+        compactor.Verify(value => value.ShouldCompact(It.IsAny<Session>(), It.IsAny<CompactionOptions>()), Times.Exactly(retry ? 1 : 0));
+        coordinator.Verify(value => value.CompactAsync(It.IsAny<AgentId>(), It.IsAny<GatewaySession>(), It.IsAny<CancellationToken>(),
+            false, CompactionHandlePolicy.KeepCurrent, It.IsAny<CompactionOptions?>()), Times.Exactly(retry ? 1 : 0));
+    }
+
+    [Fact]
+    public async Task CreateAsync_MidLoopCompactionConflict_RefreshesOnceAndUsesNewestAppliedContext()
+    {
+        var sessionId = SessionId.From("session-compaction-conflict-retry");
+        var ceilings = new Mock<ISessionCompactionCeilingResolver>();
+        ceilings.SetupSequence(value => value.ResolveAsync(It.IsAny<AgentId>(), It.IsAny<ConversationId>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ScopedCompactionCeiling(100, "world"))
+            .ReturnsAsync(new ScopedCompactionCeiling(200, "conversation"));
+        var observedCeilings = new List<int?>();
+        var agentId = AgentId.From("agent-a");
+        var stale = new GatewaySession { SessionId = sessionId, AgentId = agentId };
+        stale.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "stale history" });
+        var refreshed = new GatewaySession { SessionId = sessionId, AgentId = agentId };
+        refreshed.AddEntries(
+        [
+            new SessionEntry
+            {
+                Role = MessageRole.System,
+                Content = "newest compacted summary",
+                IsCompactionSummary = true
+            },
+            new SessionEntry { Role = MessageRole.User, Content = "newest retained tail" }
+        ]);
+
+        var sessionStore = new Mock<ISessionStore>();
+        sessionStore.SetupSequence(store => store.GetAsync(sessionId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(stale)
+            .ReturnsAsync(stale)
+            .ReturnsAsync(refreshed);
+        var compactor = new Mock<ISessionCompactor>();
+        compactor.Setup(value => value.ShouldCompact(It.IsAny<Session>(), It.IsAny<CompactionOptions>()))
+            .Callback<Session, CompactionOptions>((_, options) => observedCeilings.Add(options.CompactionTokenCeiling))
+            .Returns(true);
+        var coordinator = new Mock<ISessionCompactionCoordinator>();
+        coordinator.SetupSequence(value => value.CompactAsync(
+                agentId,
+                It.IsAny<GatewaySession>(),
+                It.IsAny<CancellationToken>(),
+                false,
+                CompactionHandlePolicy.KeepCurrent, It.Is<CompactionOptions?>(options => options != null && options.ContextWindowTokens == 8192)))
+            .ReturnsAsync(new SessionCompactionOutcome(
+                false, false, HistoryReplaceOutcome.Aborted, 0, 0, 100, 100,
+                "concurrent history change", CompactionSkipReason.ConcurrentHistoryChange))
+            .ReturnsAsync(new SessionCompactionOutcome(
+                true, true, HistoryReplaceOutcome.Applied, 1, 1, 100, 10, null));
+
+        var services = new ServiceCollection();
+        services.AddSingleton(ceilings.Object);
+        services.AddSingleton(sessionStore.Object);
+        services.AddSingleton(compactor.Object);
+        services.AddSingleton(coordinator.Object);
+        services.AddSingleton<IOptionsMonitor<CompactionOptions>>(
+            new StaticOptionsMonitor<CompactionOptions>(new CompactionOptions()));
+        var strategy = CreateStrategyWithRegisteredModel(serviceProvider: services.BuildServiceProvider());
+        var handle = await strategy.CreateAsync(
+            CreateDescriptor(),
+            new AgentExecutionContext { SessionId = sessionId });
+
+        var compacted = await GetAgentOptions(handle).ContextCompactionService!(CancellationToken.None);
+
+        compacted.ShouldNotBeNull();
+        compacted.SystemPrompt.ShouldNotBeNull();
+        compacted.SystemPrompt.ShouldContain("newest compacted summary");
+        observedCeilings.ShouldBe(new int?[] { 100, 200 });
+        compacted.Messages.OfType<AgentCoreUserMessage>()
+            .Select(message => message.Content)
+            .ShouldBe(["newest retained tail"]);
+        sessionStore.Verify(store => store.GetAsync(sessionId, It.IsAny<CancellationToken>()), Times.Exactly(3));
+        coordinator.Verify(value => value.CompactAsync(
+            agentId,
+            It.IsAny<GatewaySession>(),
+            It.IsAny<CancellationToken>(),
+            false,
+            CompactionHandlePolicy.KeepCurrent, It.Is<CompactionOptions?>(options => options != null && options.ContextWindowTokens == 8192)), Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task CreateAsync_MidLoopCompactionConflict_RefreshedBoundedSessionReplacesStaleContext()
+    {
+        var sessionId = SessionId.From("session-compaction-conflict-already-reconciled");
+        var agentId = AgentId.From("agent-a");
+        var stale = new GatewaySession { SessionId = sessionId, AgentId = agentId };
+        stale.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "stale oversized history" });
+        var refreshed = new GatewaySession { SessionId = sessionId, AgentId = agentId };
+        refreshed.AddEntries(
+        [
+            new SessionEntry
+            {
+                Role = MessageRole.System,
+                Content = "concurrently compacted summary",
+                IsCompactionSummary = true
+            },
+            new SessionEntry { Role = MessageRole.User, Content = "concurrently retained tail" }
+        ]);
+
+        var sessionStore = new Mock<ISessionStore>();
+        sessionStore.SetupSequence(store => store.GetAsync(sessionId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(stale)
+            .ReturnsAsync(stale)
+            .ReturnsAsync(refreshed);
+        var compactor = new Mock<ISessionCompactor>();
+        compactor.SetupSequence(value => value.ShouldCompact(It.IsAny<Session>(), It.IsAny<CompactionOptions>()))
+            .Returns(true)
+            .Returns(false);
+        var coordinator = new Mock<ISessionCompactionCoordinator>();
+        coordinator.Setup(value => value.CompactAsync(
+                agentId,
+                stale,
+                It.IsAny<CancellationToken>(),
+                false,
+                CompactionHandlePolicy.KeepCurrent, It.Is<CompactionOptions?>(options => options != null && options.ContextWindowTokens == 8192)))
+            .ReturnsAsync(new SessionCompactionOutcome(
+                false, false, HistoryReplaceOutcome.Aborted, 0, 0, 100, 100,
+                "concurrent history change", CompactionSkipReason.ConcurrentHistoryChange));
+
+        var services = new ServiceCollection();
+        services.AddSingleton(sessionStore.Object);
+        services.AddSingleton(compactor.Object);
+        services.AddSingleton(coordinator.Object);
+        services.AddSingleton<IOptionsMonitor<CompactionOptions>>(
+            new StaticOptionsMonitor<CompactionOptions>(new CompactionOptions()));
+        var strategy = CreateStrategyWithRegisteredModel(serviceProvider: services.BuildServiceProvider());
+        var handle = await strategy.CreateAsync(
+            CreateDescriptor(),
+            new AgentExecutionContext { SessionId = sessionId });
+
+        var compacted = await GetAgentOptions(handle).ContextCompactionService!(CancellationToken.None);
+
+        compacted.ShouldNotBeNull();
+        compacted.SystemPrompt.ShouldNotBeNull();
+        compacted.SystemPrompt.ShouldContain("concurrently compacted summary");
+        compacted.Messages.OfType<AgentCoreUserMessage>()
+            .Select(message => message.Content)
+            .ShouldBe(["concurrently retained tail"]);
+        coordinator.Verify(value => value.CompactAsync(
+            agentId,
+            It.IsAny<GatewaySession>(),
+            It.IsAny<CancellationToken>(),
+            false,
+            CompactionHandlePolicy.KeepCurrent, It.Is<CompactionOptions?>(options => options != null && options.ContextWindowTokens == 8192)), Times.Once);
+    }
+
+    [Fact]
+    public async Task CreateAsync_MidLoopCompactionConflictRetryExhausted_ThrowsRetryableFailure()
+    {
+        var sessionId = SessionId.From("session-compaction-conflict-exhausted");
+        var agentId = AgentId.From("agent-a");
+        var sessionStore = new Mock<ISessionStore>();
+        sessionStore.Setup(store => store.GetAsync(sessionId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new GatewaySession { SessionId = sessionId, AgentId = agentId });
+        var compactor = new Mock<ISessionCompactor>();
+        compactor.Setup(value => value.ShouldCompact(It.IsAny<Session>(), It.IsAny<CompactionOptions>()))
+            .Returns(true);
+        var coordinator = new Mock<ISessionCompactionCoordinator>();
+        coordinator.Setup(value => value.CompactAsync(
+                agentId,
+                It.IsAny<GatewaySession>(),
+                It.IsAny<CancellationToken>(),
+                false,
+                CompactionHandlePolicy.KeepCurrent, It.Is<CompactionOptions?>(options => options != null && options.ContextWindowTokens == 8192)))
+            .ReturnsAsync(new SessionCompactionOutcome(
+                false, false, HistoryReplaceOutcome.Aborted, 0, 0, 100, 100,
+                "concurrent history change", CompactionSkipReason.ConcurrentHistoryChange));
+
+        var services = new ServiceCollection();
+        services.AddSingleton(sessionStore.Object);
+        services.AddSingleton(compactor.Object);
+        services.AddSingleton(coordinator.Object);
+        services.AddSingleton<IOptionsMonitor<CompactionOptions>>(
+            new StaticOptionsMonitor<CompactionOptions>(new CompactionOptions()));
+        var strategy = CreateStrategyWithRegisteredModel(serviceProvider: services.BuildServiceProvider());
+        var handle = await strategy.CreateAsync(
+            CreateDescriptor(),
+            new AgentExecutionContext { SessionId = sessionId });
+
+        Func<Task> act = async () => _ = await GetAgentOptions(handle).ContextCompactionService!(CancellationToken.None);
+
+        var exception = await act.ShouldThrowAsync<ProactiveCompactionException>();
+        exception.Retryable.ShouldBeTrue();
+        sessionStore.Verify(store => store.GetAsync(sessionId, It.IsAny<CancellationToken>()), Times.Exactly(3));
+        coordinator.Verify(value => value.CompactAsync(
+            agentId,
+            It.IsAny<GatewaySession>(),
+            It.IsAny<CancellationToken>(),
+            false,
+            CompactionHandlePolicy.KeepCurrent, It.Is<CompactionOptions?>(options => options != null && options.ContextWindowTokens == 8192)), Times.Exactly(2));
+    }
+
+    [Fact]
     public async Task CreateAsync_WithOnlyCompactionSummary_FoldsSummaryIntoSystemPromptAndEmptyList()
     {
         // Regression: a session with only a compaction summary (no preserved turns yet)
@@ -439,7 +880,41 @@ public sealed class InProcessIsolationStrategyTests
         messages[0].ShouldBe(new AgentCoreUserMessage("hello"));
         var folded = options.InitialState!.SystemPrompt ?? string.Empty;
         folded.ShouldNotContain("helpful assistant");
-    }    private static InProcessIsolationStrategy CreateStrategyWithRegisteredModel(
+    }
+
+    [Fact]
+    public void ProviderConfig_ResolvesStreamIdleTimeoutMs()
+    {
+        var config = new ProviderConfig { StreamIdleTimeoutMs = 12_345 };
+
+        config.ResolveStreamIdleTimeoutMs().ShouldBe(12_345);
+    }
+
+    [Fact]
+    public void ResolveStreamIdleTimeoutMs_UsesProviderSpecificValueCaseInsensitively()
+    {
+        var config = new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["Example-Provider"] = new() { StreamIdleTimeoutMs = 12_345 }
+            }
+        };
+
+        var result = InProcessIsolationStrategy.ResolveStreamIdleTimeoutMs(config, "example-provider");
+
+        result.ShouldBe(12_345);
+    }
+
+    [Fact]
+    public void ResolveStreamIdleTimeoutMs_MissingProviderUsesDefaultSentinel()
+    {
+        var result = InProcessIsolationStrategy.ResolveStreamIdleTimeoutMs(new PlatformConfig(), "missing");
+
+        result.ShouldBeNull();
+    }
+
+    private static InProcessIsolationStrategy CreateStrategyWithRegisteredModel(
         IReadOnlyList<IAgentToolContributor>? contributors = null,
         IServiceProvider? serviceProvider = null)
     {
@@ -499,13 +974,16 @@ public sealed class InProcessIsolationStrategyTests
         return agent!.State.Tools;
     }
 
-    private static AgentOptions GetAgentOptions(IAgentHandle handle)
+    private static BotNexus.Agent.Core.Agent GetAgent(IAgentHandle handle)
     {
         var agentField = handle.GetType().GetField("_agent", BindingFlags.Instance | BindingFlags.NonPublic);
         agentField.ShouldNotBeNull();
-        var agent = agentField!.GetValue(handle) as BotNexus.Agent.Core.Agent;
-        agent.ShouldNotBeNull();
+        return agentField!.GetValue(handle).ShouldBeOfType<BotNexus.Agent.Core.Agent>();
+    }
 
+    private static AgentOptions GetAgentOptions(IAgentHandle handle)
+    {
+        var agent = GetAgent(handle);
         var optionsField = typeof(BotNexus.Agent.Core.Agent).GetField("_options", BindingFlags.Instance | BindingFlags.NonPublic);
         optionsField.ShouldNotBeNull();
         return optionsField!.GetValue(agent).ShouldBeOfType<AgentOptions>();
@@ -516,14 +994,15 @@ public sealed class InProcessIsolationStrategyTests
         public Task<string> BuildSystemPromptAsync(
             AgentDescriptor descriptor,
             AgentExecutionContext? executionContext,
+            EffectiveExecutionSettings? effectiveSettings = null,
             CancellationToken ct = default)
             => Task.FromResult(descriptor.SystemPrompt ?? string.Empty);
     }
 
     private sealed class StaticAgentToolFactory : IAgentToolFactory
     {
-        public IReadOnlyList<IAgentTool> CreateTools(string workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
-            => [new ReadTool(workingDirectory)];
+        public IReadOnlyList<IAgentTool> CreateTools(WorkingDir workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
+            => [new ReadTool(workingDirectory.Value)];
     }
 
     private sealed class TestWorkspaceManager : IAgentWorkspaceManager
@@ -553,7 +1032,7 @@ public sealed class InProcessIsolationStrategyTests
     {
         private readonly IMemoryStore _store = new StubMemoryStore();
 
-        public IMemoryStore Create(string agentId) => _store;
+        public IMemoryStore Create(AgentId agentId) => _store;
     }
 
     private sealed class StubMemoryStore : IMemoryStore
@@ -565,6 +1044,19 @@ public sealed class InProcessIsolationStrategyTests
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
         public Task<IReadOnlyList<MemoryEntry>> SearchAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
+
+        // #2781: explicit pass-through. Required (not default-implemented) on IMemoryStore because
+        // Moq returns null for default interface methods rather than running the default body.
+        public async Task<IReadOnlyList<ScoredMemoryEntry>> SearchScoredAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+        {
+            var entries = await SearchAsync(query, topK, filter, ct);
+            return entries.Select(entry => new ScoredMemoryEntry(entry, 0d)).ToList();
+        }
+
+        // #3244: explicit pass-through with a NotAttempted scan report - this stub runs no bounded
+        // vector scan, so claiming any coverage would be a lie the caller could act on.
+        public async Task<MemorySearchResult> SearchWithReportAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+            => new(await SearchScoredAsync(query, topK, filter, ct), MemoryVectorScanReport.NotAttempted);
         public Task DeleteAsync(string id, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task<MemoryStoreStats> GetStatsAsync(CancellationToken ct = default) => Task.FromResult(new MemoryStoreStats(0, 0, null));
@@ -654,8 +1146,9 @@ public sealed class InProcessIsolationStrategyTests
             descriptor,
             new AgentExecutionContext { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-think") });
 
-        var options = GetAgentOptions(handle);
-        var settings = options.GenerationSettings.ShouldBeOfType<SimpleStreamOptions>();
+        var agent = GetAgent(handle);
+        var settings = GetAgentOptions(handle).GenerationSettings.ShouldBeOfType<GenerationOptions>();
+        agent.State.ThinkingLevel.ShouldBe(ThinkingLevel.High);
         settings.Reasoning.ShouldBe(ThinkingLevel.High);
         settings.ContextWindow.ShouldBe(1_000_000);
     }
@@ -678,7 +1171,7 @@ public sealed class InProcessIsolationStrategyTests
             new AgentExecutionContext { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-nothink") });
 
         var options = GetAgentOptions(handle);
-        var settings = options.GenerationSettings.ShouldBeOfType<SimpleStreamOptions>();
+        var settings = options.GenerationSettings.ShouldBeOfType<GenerationOptions>();
         settings.Reasoning.ShouldBeNull();
         settings.ContextWindow.ShouldBeNull();
     }
@@ -880,9 +1373,21 @@ file sealed class CountingConversationStore(IConversationStore inner) : IConvers
 
     public Task PinAsync(BotNexus.Domain.Primitives.ConversationId conversationId, bool pin, CancellationToken ct = default)
         => inner.PinAsync(conversationId, pin, ct);
+    public Task<bool> AddBindingAsync(BotNexus.Domain.Primitives.ConversationId conversationId, BotNexus.Gateway.Abstractions.Models.ChannelBinding binding, CancellationToken ct = default)
+        => inner.AddBindingAsync(conversationId, binding, ct);
+    public Task<bool> RemoveBindingAsync(BotNexus.Domain.Primitives.ConversationId conversationId, BotNexus.Domain.Primitives.BindingId bindingId, CancellationToken ct = default)
+        => inner.RemoveBindingAsync(conversationId, bindingId, ct);
+    public Task<bool> MoveBindingAsync(BotNexus.Domain.Primitives.ConversationId fromConversationId, BotNexus.Domain.Primitives.ConversationId toConversationId, BotNexus.Domain.Primitives.BindingId bindingId, CancellationToken ct = default)
+        => inner.MoveBindingAsync(fromConversationId, toConversationId, bindingId, ct);
+    public Task<BotNexus.Gateway.Abstractions.Models.Conversation?> PatchMetadataAsync(BotNexus.Domain.Primitives.ConversationId conversationId, BotNexus.Gateway.Abstractions.Conversations.ConversationMetadataPatch patch, CancellationToken ct = default)
+        => inner.PatchMetadataAsync(conversationId, patch, ct);
+    public Task<BotNexus.Gateway.Abstractions.Models.Conversation?> PatchOverrideAsync(BotNexus.Domain.Primitives.ConversationId conversationId, BotNexus.Gateway.Abstractions.Conversations.ConversationOverridePatch patch, CancellationToken ct = default)
+        => inner.PatchOverrideAsync(conversationId, patch, ct);
 
     public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default)
         => inner.GetSummariesAsync(ct);
+    public Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default)
+        => inner.GetPendingAskUserCheckpointsAsync(ct);
 
     public Task<Dictionary<string, System.Text.Json.JsonElement>?> GetCanvasStateAsync(BotNexus.Domain.Primitives.ConversationId conversationId, CancellationToken ct = default)
         => inner.GetCanvasStateAsync(conversationId, ct);

@@ -24,12 +24,12 @@ namespace BotNexus.Architecture.Tests;
 /// include a self-test" convention.
 /// </para>
 /// </remarks>
-public sealed class ModelResolutionCentralizationArchitectureTests
+public sealed class ModelResolutionCentralizationArchitectureTests : ArchitectureTest
 {
     [Fact]
     public void NoProductionSourceFile_ResolvesModelFromRawModelId_OutsideResolver()
     {
-        var srcRoot = FindSourceRoot();
+        var srcRoot = Repository.SourceRoot;
         var violations = new List<string>();
 
         foreach (var path in EnumerateProductionCsFiles(srcRoot))
@@ -51,7 +51,7 @@ public sealed class ModelResolutionCentralizationArchitectureTests
     [Fact]
     public void Allowlist_OnlyContains_FilesThat_StillExist_AndStill_TripTheFence()
     {
-        var srcRoot = FindSourceRoot();
+        var srcRoot = Repository.SourceRoot;
         var stale = new List<string>();
 
         foreach (var relative in s_allowlist)
@@ -129,7 +129,7 @@ public sealed class ModelResolutionCentralizationArchitectureTests
         // model's capability set (supported thinking levels / context sizes) so it can REJECT
         // an agent-level thinking/context value the model does not support (PBI4, #1705). It
         // never resolves an effective turn model - that stays with ModelOverrideResolver.
-        Path.Combine("gateway", "BotNexus.Gateway", "Agents", "AgentDescriptorValidator.cs"),
+        Path.Combine("gateway", "BotNexus.Gateway.Configuration", "Validation", "AgentDescriptorValidator.cs"),
     };
 
     private static IEnumerable<string> EnumerateProductionCsFiles(string srcRoot)
@@ -149,18 +149,6 @@ public sealed class ModelResolutionCentralizationArchitectureTests
             : full;
     }
 
-    private static string FindSourceRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !File.Exists(Path.Combine(current.FullName, "BotNexus.slnx")))
-        {
-            current = current.Parent;
-        }
-        current.ShouldNotBeNull("Could not locate repo root from " + AppContext.BaseDirectory);
-        var srcRoot = Path.Combine(current.FullName, "src");
-        Directory.Exists(srcRoot).ShouldBeTrue("Expected src/ under " + current.FullName);
-        return srcRoot;
-    }
 
     /// <summary>
     /// Removes single-line and block C# comments while preserving string and char literals.

@@ -23,6 +23,29 @@ public interface IPortalPreferencesService
     /// <summary>Update the debug-mode preference and persist.</summary>
     Task SetDebugModeAsync(bool enabled);
 
+    /// <summary>Update decorative active-run motion and persist.</summary>
+    Task SetAnimateActiveRunIndicatorAsync(bool enabled);
+
     /// <summary>Update the archive-confirmation preference and persist.</summary>
     Task SetArchiveConfirmAsync(bool enabled);
+
+    /// <summary>
+    /// Update the UI density preset (#2441) and persist. Unrecognised values are coerced to
+    /// <see cref="PortalDensity.Compact"/> by <see cref="PortalDensity.Normalize"/>.
+    /// </summary>
+    /// <param name="density">Requested preset; see <see cref="PortalDensity"/>.</param>
+    Task SetDensityAsync(string density);
+
+    /// <summary>
+    /// Update the portal shell variant and persist. Unrecognised values are coerced to
+    /// <see cref="PortalShell.Classic"/> by <see cref="PortalShell.Normalize"/>.
+    /// </summary>
+    /// <param name="shell">Requested shell variant; see <see cref="PortalShell"/>.</param>
+    Task SetShellAsync(string shell);
+
+    /// <summary>
+    /// Sets the colour theme, applies it to the document element immediately, and persists it.
+    /// </summary>
+    /// <param name="theme">A <see cref="PortalTheme"/> value; coerced if unrecognised.</param>
+    Task SetThemeAsync(string theme);
 }

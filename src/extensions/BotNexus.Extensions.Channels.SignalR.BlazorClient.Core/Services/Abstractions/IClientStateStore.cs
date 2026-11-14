@@ -1,3 +1,5 @@
+using BotNexus.Gateway.Abstractions.Text;
+
 namespace BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
 
 /// <summary>
@@ -28,8 +30,54 @@ public interface IClientStateStore
     /// <summary>All known agents keyed by agent ID.</summary>
     IReadOnlyDictionary<string, AgentState> Agents { get; }
 
-    /// <summary>The currently visible/active agent tab.</summary>
-    string? ActiveAgentId { get; set; }
+    /// <summary>The currently visible/active agent tab. Read-only projection of the single
+    /// <see cref="ViewSelection"/> the store holds; mutate it only via <see cref="SelectView"/> (#2246).</summary>
+    string? ActiveAgentId { get; }
+
+    /// <summary>
+    /// The <see cref="SelectionSource"/> that requested the current active view. Read-only projection of
+    /// the single <see cref="ViewSelection"/> the store holds. Lets read-only be a VIEW concern (#2248):
+    /// a <see cref="SelectionSource.SubAgentView"/> selection is a read-only observer projection
+    /// regardless of any mutable session-type stamping. Mutated only via <see cref="SelectView"/>.
+    /// </summary>
+    SelectionSource ActiveSelectionSource { get; }
+
+    /// <summary>
+    /// True when the last active selection was invalidated by an inbound event (the active agent was
+    /// removed, or its active conversation 404'd server-side) and no replacement has been chosen yet.
+    /// Inbound handlers set this instead of mutating the active view themselves; the UI observes it on
+    /// the next render and resolves a fresh selection via <see cref="SelectView"/> (#2246).
+    /// </summary>
+    bool PendingSelectionInvalid { get; }
+
+    /// <summary>
+    /// Signals that the current active selection has been invalidated by an inbound event (e.g. its
+    /// active conversation 404'd server-side) without choosing a replacement view. Sets
+    /// <see cref="PendingSelectionInvalid"/>; the UI resolves a fresh selection on next render (#2246).
+    /// </summary>
+    void MarkSelectionInvalid();
+
+    /// <summary>
+    /// The single mutation path for the active view. Sets the active agent and (when supplied) the
+    /// active conversation atomically, tagged with the <see cref="SelectionSource"/> that requested it.
+    /// Only <see cref="SelectionSource.SubAgentView"/> may switch the active view onto a read-only
+    /// sub-agent session — every other source is rejected when the target is read-only, so a concurrent
+    /// <c>SubAgentSpawned</c> or streaming event can never hijack the active view onto a sub-agent
+    /// session (#2243). Pass an empty <paramref name="conversationId"/> when only the agent is known.
+    /// </summary>
+    /// <param name="agentId">The agent to make active, or empty to clear the active view.</param>
+    /// <param name="conversationId">The conversation to activate, or empty when unspecified.</param>
+    /// <param name="source">Which interaction requested this selection.</param>
+    void SelectView(string agentId, string conversationId, SelectionSource source);
+
+    /// <summary>
+    /// Records <paramref name="subAgentId"/> as a sub-agent session so the anti-hijack guard in
+    /// <see cref="SelectView"/> rejects any non-<see cref="SelectionSource.SubAgentView"/> switch onto
+    /// it, even before its <see cref="AgentState"/> exists or its SessionType has been stamped
+    /// read-only. Call this at sub-agent spawn time. Idempotent (#2243, folded via #2246).
+    /// </summary>
+    /// <param name="subAgentId">The spawned sub-agent id to mark read-only for navigation.</param>
+    void MarkSubAgent(string subAgentId);
 
     /// <summary>Seed initial agent list from hub or REST.</summary>
     void SeedAgents(IEnumerable<AgentSummary> agents);
@@ -50,12 +98,6 @@ public interface IClientStateStore
 
     /// <summary>Get a conversation state by conversation ID (searches all agents).</summary>
     ConversationState? GetConversation(string conversationId);
-
-    /// <summary>Set active conversation for an agent, updating both agent and global selection.</summary>
-    void SetActiveConversation(string agentId, string conversationId);
-
-    /// <summary>The active conversation ID for the active agent.</summary>
-    string? ActiveConversationId { get; }
 
     // ── Message operations ───────────────────────────────────────────────────
 
@@ -153,6 +195,14 @@ public interface IClientStateStore
 
     /// <summary>Get the pending steering queue for a conversation.</summary>
     IReadOnlyList<SteeringEntry> GetSteeringQueue(string conversationId);
+
+    /// <summary>
+    /// Drop every entry from a conversation's steering queue (#2439).
+    /// Used by the defensive clear paths — run settled, session reset, abort, conversation
+    /// switch, reconnect — where a pending indicator can no longer be verified and therefore
+    /// must not persist. Idempotent and safe for unknown conversation ids.
+    /// </summary>
+    void ClearSteeringQueue(string conversationId);
 }
 
 /// <summary>Agent-level state for the portal sidebar and chat panel.</summary>
@@ -170,30 +220,39 @@ public sealed class AgentState
     /// <summary>Short description of this agent's purpose.</summary>
     public string? Description { get; set; }
 
+    /// <summary>Agent-maintained summary of its current work and capabilities.</summary>
+    public string? Summary { get; set; }
+
     /// <summary>Whether this is a platform built-in agent (sorts after user agents in UI).</summary>
     public bool IsBuiltIn { get; set; }
 
     /// <summary>Active session ID (last established).</summary>
     public string? SessionId { get; set; }
 
-    /// <summary>
-    /// The session ID for the currently active conversation.
-    /// Prefers the active conversation's ActiveSessionId over the agent-level SessionId.
-    /// Use this for actions that target the current conversation (Steer, Abort, Reset, Compact).
-    /// </summary>
-    public string? ActiveConversationSessionId =>
-        ActiveConversationId is not null && Conversations.TryGetValue(ActiveConversationId, out var conv)
-            ? conv.ActiveSessionId ?? SessionId
-            : SessionId;
-
     /// <summary>Channel type for this session.</summary>
     public string? ChannelType { get; set; }
 
-    /// <summary>Session type — user-agent, agent-subagent, etc.</summary>
+    /// <summary>Session type — user-agent, agent-subagent, etc. This is a MUTABLE telemetry field
+    /// stamped by inbound session events via <c>RegisterSession</c>; it must NEVER drive read-only /
+    /// roster classification because a sub-agent session event can stamp a real user agent's
+    /// SessionType="agent-subagent" and poison its identity (#2248). Use <see cref="IsObserverAgent"/>
+    /// for any read-only or roster decision.</summary>
     public string SessionType { get; set; } = "user-agent";
 
-    /// <summary>Whether this session is read-only (sub-agent observer).</summary>
-    public bool IsReadOnly => SessionType == "agent-subagent";
+    /// <summary>
+    /// IMMUTABLE classification fixed at agent creation: <see langword="true"/> for a read-only
+    /// sub-agent / observer virtual entry (created in <c>AgentInteractionService.ViewSubAgentAsync</c>),
+    /// <see langword="false"/> for a real user agent seeded from the <c>/api/agents</c> identity
+    /// (SeedAgents / RefreshAgentsAsync / PortalLoadService). Unlike the mutable <see cref="SessionType"/>,
+    /// this can never be flipped by an inbound <c>RegisterSession</c> event, so a concurrent sub-agent
+    /// session event can never remove a real user agent from the roster or hide its composer (#2248).
+    /// </summary>
+    public bool IsObserverAgent { get; init; }
+
+    /// <summary>Whether this agent is a read-only (sub-agent observer) view. Derived from the
+    /// IMMUTABLE <see cref="IsObserverAgent"/> classification, NOT the mutable <see cref="SessionType"/>,
+    /// so session-type mutation can no longer poison a real user agent's read-only state (#2248).</summary>
+    public bool IsReadOnly => IsObserverAgent;
 
     /// <summary>Whether the SignalR hub connection is live.</summary>
     public bool IsConnected { get; set; }
@@ -213,9 +272,6 @@ public sealed class AgentState
     /// <summary>Whether thinking blocks are visible in the chat panel.</summary>
     public bool ShowThinking { get; set; } = true;
 
-    /// <summary>The currently selected conversation ID for this agent.</summary>
-    public string? ActiveConversationId { get; set; }
-
     /// <summary>Whether the conversation list has been loaded from REST.</summary>
     public bool ConversationsLoaded { get; set; }
 
@@ -230,6 +286,13 @@ public sealed class AgentState
 
     /// <summary>Sub-agents spawned by this agent keyed by sub-agent ID.</summary>
     public Dictionary<string, SubAgentInfo> SubAgents { get; } = new();
+
+    /// <summary>
+    /// Explicit lifecycle evidence for a locally synthesised sub-agent observer entry. This remains
+    /// <see cref="SubAgentObserverStatus.Unknown"/> when no terminal event has been observed; an
+    /// inactive stream alone must never be interpreted as successful completion.
+    /// </summary>
+    public SubAgentObserverStatus ObserverStatus { get; set; }
 
     /// <summary>Latest HTML payload published to the Canvas tab for this agent.</summary>
     public string? CanvasHtml { get; set; }
@@ -268,11 +331,61 @@ public sealed class ConversationState
     /// <summary>When the conversation was last updated.</summary>
     public DateTimeOffset UpdatedAt { get; set; }
 
-    /// <summary>True when this is a virtual read-only session row (for example, cron).</summary>
-    public bool IsVirtualSession { get; set; }
+    /// <summary>
+    /// The immutable origination trigger of this conversation, supplied by the server on every
+    /// conversation payload (epic #2300). <b>Write-once:</b> <c>init</c>-only by design so no inbound
+    /// SignalR event can ever mutate it — the exact defect class fixed for agents in #2248. All
+    /// read-only / composer / grouping render decisions derive from it via
+    /// <see cref="ConversationRenderProjection"/>.
+    /// </summary>
+    public ConversationSource Source { get; init; } = ConversationSource.Channel;
 
-    /// <summary>Virtual session kind label (for example, "cron"). Null for normal conversations.</summary>
-    public string? VirtualSessionKind { get; set; }
+    /// <summary>
+    /// The immutable citizen-pairing of this conversation, supplied by the server. <c>init</c>-only
+    /// for the same reason as <see cref="Source"/>; the two together form the projection input.
+    /// </summary>
+    public ConversationKind Kind { get; init; } = ConversationKind.HumanAgent;
+
+    /// <summary>
+    /// Who may see this conversation, supplied by the server on every conversation payload (#2340).
+    /// <c>init</c>-only for the same reason as <see cref="Source"/>: an inbound SignalR event must
+    /// never be able to make a runtime bookkeeping thread appear in the user's sidebar, nor make a
+    /// real conversation vanish from it.
+    /// </summary>
+    /// <remarks>
+    /// This replaces the last id-prefix probe in client rendering code - a
+    /// <c>ConversationId.StartsWith("internal:")</c> test that was the sole allowlisted exception to
+    /// the origin-inference fence. Visibility is a genuinely different axis from origin (<c>who may
+    /// see it</c> vs <c>why it exists</c>), which is why it is its own field rather than an
+    /// overload of <see cref="Source"/>.
+    /// </remarks>
+    public ConversationVisibility Visibility { get; init; } = ConversationVisibility.UserFacing;
+
+    /// <summary>
+    /// The deterministic render projection for this conversation under the supplied selection
+    /// source. The single approved way to ask "is this read-only / does it show a composer / how is
+    /// it grouped" — see <see cref="ConversationRenderProjection"/>.
+    /// </summary>
+    /// <param name="selectionSource">The source that requested the current active view.</param>
+    /// <returns>The projection over this conversation's immutable origin.</returns>
+    public ConversationRenderProjection Project(SelectionSource selectionSource) =>
+        ConversationRenderProjection.For(this, selectionSource);
+
+    /// <summary>
+    /// True for a row the CLIENT minted locally rather than one the server enumerated - today only
+    /// the sub-agent observer transcript row created by "view sub-agent". Such a row has no server
+    /// conversation behind it, so it reads the raw session transcript instead of merged conversation
+    /// history, is never back-paged, is never bound to an inbound session, and survives a
+    /// server-driven conversation-list reconciliation.
+    /// </summary>
+    /// <remarks>
+    /// <b>Write-once (#2305).</b> <c>init</c>-only, replacing the mutable virtual-session flag/kind
+    /// pair that epic #2300 deleted. It is deliberately a statement about
+    /// row PROVENANCE ("who created this row object"), not about conversation ORIGIN ("why does this
+    /// conversation exist") - origin is answered solely by the immutable <see cref="Source"/> /
+    /// <see cref="Kind"/> pair and never by a flag or an id substring.
+    /// </remarks>
+    public bool IsLocallySynthesised { get; init; }
 
 
     // ── Canvas ──────────────────────────────────────────────────────────────────
@@ -332,21 +445,54 @@ public sealed class ConversationState
     // List.FindIndex semantics so the lookup is behaviour-preserving.
     private readonly Dictionary<string, int> _messageIndex = new(StringComparer.Ordinal);
 
-    /// <summary>Messages in this conversation's timeline. Read-only view: mutate via
-    /// <see cref="AppendMessage"/>, <see cref="ReplaceMessageAt"/>, <see cref="PrependMessages"/>,
-    /// or <see cref="ClearMessages"/> so the id-&gt;index map stays consistent (#1622).</summary>
-    public IReadOnlyList<ChatMessage> Messages => _messages;
+    // #2712: every read of and mutation to the timeline (and the id->index map that must stay in step
+    // with it) is serialised on this gate. Before this, Messages handed out the LIVE backing List, so a
+    // caller's .ToArray() -- the #2320 fix applied at each call site -- raced a concurrent Add: ToArray
+    // reads Count, allocates, then CopyTo, and an Add landing in that window overran the destination
+    // with "ArgumentException: Destination array was not long enough". Guarding at the seam removes the
+    // unsynchronised access itself rather than moving the race one layer further out.
+    private readonly object _timelineGate = new();
+
+    // Immutable snapshots handed to readers, rebuilt lazily under the gate and dropped by every
+    // mutation. Lazy rather than eager so appends stay O(1) on the streaming hot path (#1620); the O(n)
+    // copy is paid only by a reader that actually observes a changed timeline, and repeat reads between
+    // mutations are free.
+    private ChatMessage[]? _messagesSnapshot;
+    private IReadOnlyDictionary<string, int>? _messageIndexSnapshot;
+
+    /// <summary>Messages in this conversation's timeline. Returns an immutable point-in-time snapshot
+    /// taken under the timeline lock (#2712), so a caller can enumerate, index or copy it without ever
+    /// observing a torn state. Mutate via <see cref="AppendMessage"/>, <see cref="ReplaceMessageAt"/>,
+    /// <see cref="PrependMessages"/>, <see cref="ReconcileMessages"/>, or <see cref="ClearMessages"/>
+    /// so the id-&gt;index map stays consistent (#1622).</summary>
+    public IReadOnlyList<ChatMessage> Messages
+    {
+        get { lock (_timelineGate) { return _messagesSnapshot ??= _messages.ToArray(); } }
+    }
 
     /// <summary>O(1) id-&gt;index map over <see cref="Messages"/>. Each non-empty message id maps to the
     /// first index it appears at (matching <c>List.FindIndex</c>). Used by the ToolEnd handler to locate
     /// the message a tool result belongs to without a linear scan (#1622).</summary>
-    public IReadOnlyDictionary<string, int> MessageIndex => _messageIndex;
+    public IReadOnlyDictionary<string, int> MessageIndex
+    {
+        get
+        {
+            lock (_timelineGate)
+            {
+                return _messageIndexSnapshot ??= new Dictionary<string, int>(_messageIndex, StringComparer.Ordinal);
+            }
+        }
+    }
 
     /// <summary>Appends a message to the timeline and indexes it in O(1).</summary>
     public void AppendMessage(ChatMessage message)
     {
-        _messages.Add(message);
-        IndexMessageAt(_messages.Count - 1);
+        lock (_timelineGate)
+        {
+            _messages.Add(message);
+            IndexMessageAt(_messages.Count - 1);
+            InvalidateSnapshots();
+        }
     }
 
     /// <summary>Replaces the message at <paramref name="index"/> in place (used by the ToolEnd update
@@ -355,24 +501,29 @@ public sealed class ConversationState
     /// updated to point the new id at this slot.</summary>
     public void ReplaceMessageAt(int index, ChatMessage message)
     {
-        if (index < 0 || index >= _messages.Count)
-            return;
-
-        var previous = _messages[index];
-        _messages[index] = message;
-
-        // If the id changed, drop the old id's entry only when it pointed at this slot (a later
-        // duplicate may still own the old id), then index the slot under the new id.
-        if (!string.Equals(previous.Id, message.Id, StringComparison.Ordinal))
+        lock (_timelineGate)
         {
-            if (!string.IsNullOrEmpty(previous.Id)
-                && _messageIndex.TryGetValue(previous.Id, out var owned)
-                && owned == index)
+            if (index < 0 || index >= _messages.Count)
+                return;
+
+            var previous = _messages[index];
+            _messages[index] = message;
+
+            // If the id changed, drop the old id's entry only when it pointed at this slot (a later
+            // duplicate may still own the old id), then index the slot under the new id.
+            if (!string.Equals(previous.Id, message.Id, StringComparison.Ordinal))
             {
-                _messageIndex.Remove(previous.Id);
+                if (!string.IsNullOrEmpty(previous.Id)
+                    && _messageIndex.TryGetValue(previous.Id, out var owned)
+                    && owned == index)
+                {
+                    _messageIndex.Remove(previous.Id);
+                }
+
+                IndexMessageAt(index);
             }
 
-            IndexMessageAt(index);
+            InvalidateSnapshots();
         }
     }
 
@@ -380,15 +531,63 @@ public sealed class ConversationState
     /// the id-&gt;index map is rebuilt.</summary>
     public void PrependMessages(IEnumerable<ChatMessage> messages)
     {
-        _messages.InsertRange(0, messages);
-        RebuildMessageIndex();
+        lock (_timelineGate)
+        {
+            _messages.InsertRange(0, messages);
+            RebuildMessageIndex();
+            InvalidateSnapshots();
+        }
+    }
+
+    /// <summary>
+    /// Atomically inserts rows missing from a freshly fetched server page while preserving timeline
+    /// mutations that landed after <paramref name="snapshot"/> was captured. Returns the exact number
+    /// of inserted server rows so history paging can advance without counting concurrent live rows.
+    /// </summary>
+    public int ReconcileMessages(
+        IReadOnlyList<ChatMessage> snapshot,
+        IReadOnlyList<ChatMessage> serverPage)
+    {
+        lock (_timelineGate)
+        {
+            // The caller's snapshot is optimistic identity only. If no mutation invalidated it, it is
+            // safe to reconcile directly; otherwise the current timeline must win so a concurrent
+            // append or terminal tool replacement cannot be overwritten by stale refresh state.
+            IReadOnlyList<ChatMessage> local = ReferenceEquals(snapshot, _messagesSnapshot)
+                ? snapshot
+                : _messages;
+            var inserted = TranscriptReconciler.CountMissing(local, serverPage);
+            var reconciled = TranscriptReconciler.Reconcile(local, serverPage);
+
+            foreach (var completedToolCallId in serverPage
+                .Where(message => message.ToolResult is not null)
+                .Select(message => message.ToolCallId)
+                .OfType<string>())
+            {
+                if (StreamState.ActiveToolCalls.Remove(completedToolCallId))
+                    StreamState.RecordActiveToolCallsChanged("MessageReconciliation");
+            }
+
+            if (reconciled.SequenceEqual(local))
+                return inserted;
+
+            _messages.Clear();
+            _messages.AddRange(reconciled);
+            RebuildMessageIndex();
+            InvalidateSnapshots();
+            return inserted;
+        }
     }
 
     /// <summary>Clears the timeline and the id-&gt;index map.</summary>
     public void ClearMessages()
     {
-        _messages.Clear();
-        _messageIndex.Clear();
+        lock (_timelineGate)
+        {
+            _messages.Clear();
+            _messageIndex.Clear();
+            InvalidateSnapshots();
+        }
     }
 
     /// <summary>Resolves a message id to its index in O(1). Returns <see langword="false"/> for a
@@ -396,11 +595,21 @@ public sealed class ConversationState
     /// miss the previous <c>FindIndex(...) == -1</c> path produced (#1622).</summary>
     public bool TryGetMessageIndex(string? id, out int index)
     {
-        if (!string.IsNullOrEmpty(id) && _messageIndex.TryGetValue(id, out index))
-            return true;
+        lock (_timelineGate)
+        {
+            if (!string.IsNullOrEmpty(id) && _messageIndex.TryGetValue(id, out index))
+                return true;
+        }
 
         index = -1;
         return false;
+    }
+
+    // Drops the cached reader snapshots so the next read rebuilds them. Callers must hold _timelineGate.
+    private void InvalidateSnapshots()
+    {
+        _messagesSnapshot = null;
+        _messageIndexSnapshot = null;
     }
 
     // Indexes the message at the given slot under its id, keeping FIRST-occurrence-wins semantics so a
@@ -432,6 +641,15 @@ public sealed class ConversationState
 /// <summary>Stream-buffer state for an active or recently active conversation.</summary>
 public sealed class ConversationStreamState
 {
+    /// <summary>Maximum number of active tool-call IDs included in a diagnostic snapshot.</summary>
+    public const int DiagnosticToolIdLimit = 32;
+    /// <summary>Maximum number of characters exposed for each diagnostic tool-call ID.</summary>
+    public const int DiagnosticToolCallIdLengthLimit = 128;
+
+    private string? _runStateLastChangedBy;
+    private string? _streamingLastChangedBy;
+    private string? _activeToolCallsLastChangedBy;
+
     /// <summary>Whether the conversation is currently receiving a streaming response.</summary>
     public bool IsStreaming { get; set; }
 
@@ -519,6 +737,64 @@ public sealed class ConversationStreamState
     public bool IsTurnActive => IsRunActive || IsStreaming || ActiveToolCalls.Count > 0;
 
     /// <summary>
+    /// Copies bounded run-state diagnostics without exposing message buffers, tool names, or tool payloads.
+    /// </summary>
+    public ConversationStreamDiagnosticSnapshot GetDiagnosticSnapshot()
+    {
+        var toolCallIds = ActiveToolCalls.Keys
+            .Take(DiagnosticToolIdLimit)
+            .Select(id => GraphemeSafeTruncation.Truncate(id, DiagnosticToolCallIdLengthLimit, string.Empty) ?? string.Empty)
+            .ToArray();
+
+        var toolCallIdsTruncated = ActiveToolCalls.Count > toolCallIds.Length
+            || ActiveToolCalls.Keys.Take(DiagnosticToolIdLimit)
+                .Any(id => id.Length > DiagnosticToolCallIdLengthLimit);
+
+        return new ConversationStreamDiagnosticSnapshot(
+            IsRunActive,
+            IsStreaming,
+            ActiveToolCalls.Count,
+            toolCallIds,
+            toolCallIdsTruncated,
+            _runStateLastChangedBy,
+            _streamingLastChangedBy,
+            _activeToolCallsLastChangedBy);
+    }
+
+    /// <summary>Records a real transition of the authoritative run-active signal.</summary>
+    public void SetRunActive(bool active, string eventName)
+    {
+        if (IsRunActive == active)
+            return;
+        IsRunActive = active;
+        _runStateLastChangedBy = eventName;
+    }
+
+    /// <summary>Records a real transition of the per-conversation streaming signal.</summary>
+    public void SetStreaming(bool streaming, string eventName)
+    {
+        if (IsStreaming == streaming)
+            return;
+        IsStreaming = streaming;
+        _streamingLastChangedBy = eventName;
+    }
+
+    /// <summary>Records which event last changed the active tool-call set.</summary>
+    public void RecordActiveToolCallsChanged(string eventName) => _activeToolCallsLastChangedBy = eventName;
+
+    /// <summary>Applies authoritative run activity while clearing stale per-turn state.</summary>
+    public void ApplyRunActivitySnapshot(bool isRunActive, string eventName)
+    {
+        Reset(eventName);
+        SetRunActive(isRunActive, eventName);
+        if (ActiveToolCalls.Count > 0)
+        {
+            ActiveToolCalls.Clear();
+            _activeToolCallsLastChangedBy = eventName;
+        }
+    }
+
+    /// <summary>
     /// Clears the streaming buffers and the <see cref="IsStreaming"/> flag atomically.
     /// Every terminal handler (message-end, error, turn-interrupted, turn-end, session-reset,
     /// reconnect) MUST call this rather than clearing the three fields by hand -- the portal
@@ -527,9 +803,9 @@ public sealed class ConversationStreamState
     /// invariant a single method a future handler cannot half-apply. Active tool calls are
     /// intentionally left untouched so <see cref="IsTurnActive"/> stays accurate while tools run.
     /// </summary>
-    public void Reset()
+    public void Reset(string eventName = "Reset")
     {
-        IsStreaming = false;
+        SetStreaming(false, eventName);
         _buffer.Clear();
         _thinkingBuffer.Clear();
         PendingRole = null;
@@ -543,11 +819,26 @@ public sealed class ConversationStreamState
     /// events (message-end, turn-end) must call <see cref="Reset"/> instead, because the loop may
     /// continue with more turns/tools and <see cref="IsRunActive"/> must stay asserted across them.
     /// </summary>
-    public void EndRun()
+    public void EndRun(string eventName = "EndRun")
     {
-        Reset();
-        IsRunActive = false;
-        ActiveToolCalls.Clear();
+        Reset(eventName);
+        SetRunActive(false, eventName);
+        if (ActiveToolCalls.Count > 0)
+        {
+            ActiveToolCalls.Clear();
+            _activeToolCallsLastChangedBy = eventName;
+        }
     }
 }
+
+/// <summary>Bounded, payload-free diagnostic view of one conversation's client run state.</summary>
+public sealed record ConversationStreamDiagnosticSnapshot(
+    bool IsRunActive,
+    bool IsStreaming,
+    int ActiveToolCallCount,
+    IReadOnlyList<string> ActiveToolCallIds,
+    bool ActiveToolCallIdsTruncated,
+    string? RunStateLastChangedBy,
+    string? StreamingLastChangedBy,
+    string? ActiveToolCallsLastChangedBy);
 

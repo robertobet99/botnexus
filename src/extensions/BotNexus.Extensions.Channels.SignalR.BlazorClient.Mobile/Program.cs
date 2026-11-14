@@ -1,5 +1,6 @@
 using BotNexus.Extensions.Channels.SignalR.BlazorClient.Mobile.Services;
 using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
+using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services.Abstractions;
 using Microsoft.AspNetCore.Components.Web;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
 using Microsoft.Extensions.Configuration;
@@ -12,10 +13,17 @@ builder.RootComponents.Add<HeadOutlet>("head::after");
 builder.Services.AddScoped(sp => new HttpClient { BaseAddress = new Uri(builder.HostEnvironment.BaseAddress) });
 builder.Services.AddScoped<GatewayHubConnection>();
 builder.Services.AddScoped<IClientStateStore, ClientStateStore>();
+// #3212: the route-derived "is this conversation displayed" predicate. ClientStateStore owns it
+// because it owns the single ViewSelection the route writes; resolve the SAME instance rather than
+// constructing a second store, or the predicate would answer from an empty selection.
+builder.Services.AddScoped<IDisplayedConversation>(sp => (ClientStateStore)sp.GetRequiredService<IClientStateStore>());
 builder.Services.AddScoped<IGatewayRestClient, GatewayRestClient>();
+builder.Services.AddScoped<GatewayInfoService>();
 builder.Services.AddScoped<IChannelErrorReporter>(sp => (GatewayRestClient)sp.GetRequiredService<IGatewayRestClient>());
 builder.Services.AddScoped<IGatewayEventHandler, GatewayEventHandler>();
 builder.Services.AddScoped<IAgentInteractionService, AgentInteractionService>();
+// #2036: start-conversation orchestration (create -> persist model override -> send first message).
+builder.Services.AddScoped<IStartConversationService, StartConversationService>();
 // #1951: the mobile chat palette consumes the SAME shared Core slash-command dispatcher the
 // desktop ChatPanel uses (registry + dispatcher from #1949, approval hook from #1950), giving
 // full command parity across clients. The approval hook is optional; when no implementation is
@@ -25,6 +33,13 @@ builder.Services.AddScoped<IPortalLoadService, PortalLoadService>();
 // #1615: the schema-driven mobile Settings page reads/writes platform config through this service
 // (GET /api/config/schema + PUT /api/config/{section}) -- the same client service the desktop uses.
 builder.Services.AddScoped<PlatformConfigService>();
+builder.Services.AddScoped<IPortalPreferencesService, PortalPreferencesService>();
+
+// #3073: the mobile conversation picker needs the authoritative cron-job -> conversation-id map to
+// classify a channel-created conversation later adopted by a cron job (its write-once Source stays
+// Channel - #2304). Same client the desktop registers; one fetch on Chat init, and a failure
+// degrades to projection-only grouping.
+builder.Services.AddScoped<CronApiClient>();
 
 // #1893: dynamic option sources for schema-driven config select widgets (provider model dropdowns).
 // Same abstraction the desktop registers; SchemaForm lives in Core and depends on it, so mobile

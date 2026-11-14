@@ -70,6 +70,33 @@ public sealed class CrossWorldFederationControllerTests
         payload.SessionId.ShouldNotBeNullOrWhiteSpace();
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("existing-session")]
+    public async Task RelayAsync_DisabledTargetRejectsBeforeStateOrSupervisorAccess(string? remoteSessionId)
+    {
+        var sessions = new Mock<ISessionStore>(MockBehavior.Strict);
+        var conversations = new Mock<IConversationStore>(MockBehavior.Strict);
+        var supervisor = new Mock<IAgentSupervisor>(MockBehavior.Strict);
+        // The fixture retains registration while exposing the explicit disabled state.
+        var registry = new Mock<IAgentRegistry>();
+        var descriptor = new AgentDescriptor
+        {
+            AgentId = AgentId.From(TargetAgentId), DisplayName = "Disabled", ModelId = "m", ApiProvider = "p", Enabled = false
+        };
+        registry.Setup(r => r.Contains(descriptor.AgentId)).Returns(true);
+        registry.Setup(r => r.Get(descriptor.AgentId, true)).Returns(descriptor);
+        var controller = BuildControllerCore(sessions.Object, conversations.Object, supervisor.Object, new SessionWriteLock(), registry.Object);
+        SetApiKeyHeader(controller, SharedApiKey);
+
+        var result = await controller.RelayAsync(BuildRequest(remoteSessionId: remoteSessionId), CancellationToken.None);
+
+        result.Result.ShouldBeOfType<NotFoundObjectResult>();
+        sessions.VerifyNoOtherCalls();
+        conversations.VerifyNoOtherCalls();
+        supervisor.VerifyNoOtherCalls();
+    }
+
     [Fact]
     public async Task RelayAsync_WithInvalidApiKey_ReturnsUnauthorized()
     {
@@ -1006,12 +1033,36 @@ public sealed class CrossWorldFederationControllerTests
     }
 
     [Fact]
-    public async Task RelayAsync_WhenSecondCallerUsesDifferentRemoteSessionId_DoesNotBlock()
+    public Task RelayAsync_WhenSecondCallerUsesDifferentRemoteSessionId_DoesNotBlock()
+        => RunDifferentSessionRelayScenarioAsync(iteration: 0);
+
+    /// <summary>
+    /// #3625 determinism proof. The single-shot pin above used to be gated on fixed wall-clock
+    /// budgets (two 5s <c>WaitAsync</c> calls and a 3s poll deadline), so a loaded CI runner
+    /// failed it with a bare <see cref="TimeoutException"/> even though the per-session keying
+    /// contract held. The budgets are now signals, which makes the scenario cheap enough to run
+    /// many times: this fact re-runs the exact same body 50 times and names the failing iteration,
+    /// so the repeat-execution evidence lives in the suite instead of expiring with a local loop.
+    /// Nothing sleeps, so the whole loop costs milliseconds.
+    /// </summary>
+    [Fact]
+    public async Task RelayAsync_WhenSecondCallerUsesDifferentRemoteSessionId_DoesNotBlock_IsDeterministicAcrossRepeats()
+    {
+        for (var iteration = 1; iteration <= DeterminismRepeatCount; iteration++)
+            await RunDifferentSessionRelayScenarioAsync(iteration);
+    }
+
+    /// <summary>Number of repeats executed by the #3625 determinism proof.</summary>
+    private const int DeterminismRepeatCount = 50;
+
+    private static async Task RunDifferentSessionRelayScenarioAsync(int iteration)
     {
         // Per-session keying: a relay against session X must NOT block a relay against session Y.
         // Defends against a regression that uses a single global mutex instead of per-session
         // keying — that would silently serialize unrelated cross-world traffic and make the
         // gateway a global bottleneck.
+
+        var where = iteration == 0 ? string.Empty : $" (iteration {iteration} of {DeterminismRepeatCount})";
 
         var (controller, sessions, conversations, _, barrier, _) = BuildControllerWithBarrier();
         SetApiKeyHeader(controller, SharedApiKey);
@@ -1041,31 +1092,74 @@ public sealed class CrossWorldFederationControllerTests
         var taskX = Task.Run(() => controller.RelayAsync(
             BuildRequest(message: "X", remoteSessionId: sessionXId.Value), CancellationToken.None));
 
-        // Wait for X's PromptAsync to park.
-        await barrier.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        // Wait for X's PromptAsync to park. This is a signal, not a duration: the barrier's
+        // Entered TCS is set from inside the mocked PromptAsync, so awaiting it establishes a
+        // happens-before edge with X's parking regardless of how much CPU the runner has left.
+        await AwaitSignalAsync(barrier.Entered.Task,
+            "Caller X's PromptAsync never parked on the barrier" + where);
 
         var taskY = Task.Run(() => controller.RelayAsync(
             BuildRequest(message: "Y", remoteSessionId: sessionYId.Value), CancellationToken.None));
 
         // Y targets a DIFFERENT session id — its PromptAsync should be invoked despite X being
         // parked. Because the barrier counter only blocks the FIRST call, Y's call returns
-        // immediately on entry (no barrier wait). We assert PromptCallCount reaches 2 BEFORE
-        // releasing X. A global lock regression would keep PromptCallCount at 1 here.
-        var pollDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
-        while (DateTime.UtcNow < pollDeadline && Volatile.Read(ref barrier.PromptCallCount) < 2)
-            await Task.Delay(25);
+        // immediately on entry (no barrier wait), so Y's own completion IS the signal that Y
+        // progressed: we await taskY rather than polling PromptCallCount against a deadline.
+        // Under a global-lock regression taskY cannot complete at all while X holds the lock, so
+        // the generous bound below still fails such a regression — it is a liveness backstop that
+        // no plausible scheduling delay can reach, not a timing heuristic the contract rests on.
+        var yResponse = await AwaitSignalAsync(taskY,
+            "Caller Y never completed while caller X was parked — per-session keying requires " +
+            "unrelated sessions to NOT block each other. A regression to a single global lock " +
+            "would park Y until X is released" + where);
+        yResponse.Result.ShouldBeOfType<OkObjectResult>();
 
         Volatile.Read(ref barrier.PromptCallCount).ShouldBe(2,
             "Caller Y's PromptAsync must have run while caller X is parked — per-session keying " +
             "requires unrelated sessions to NOT block each other. A regression to a global lock " +
-            "would prevent Y from progressing until X is released.");
+            "would prevent Y from progressing until X is released." + where);
         taskY.IsCompleted.ShouldBeTrue(
-            "Y should have completed independently of X because the lock is keyed per session id.");
+            "Y should have completed independently of X because the lock is keyed per session id." + where);
 
         // Release X and verify it completes cleanly.
         barrier.Release.SetResult();
-        var xResponse = await taskX.WaitAsync(TimeSpan.FromSeconds(5));
+        var xResponse = await AwaitSignalAsync(taskX,
+            "Caller X never completed after the barrier was released" + where);
         xResponse.Result.ShouldBeOfType<OkObjectResult>();
+    }
+
+    /// <summary>
+    /// Liveness backstop for signal-gated concurrency waits (#3625). The awaited task is the
+    /// ordering primitive; this bound exists only so a genuine deadlock reports a named failure
+    /// instead of hanging the run until the xUnit-level timeout. It is deliberately far above any
+    /// plausible scheduling delay on a loaded runner, and a real regression never completes at all
+    /// so a generous bound costs it nothing in detection power.
+    /// </summary>
+    private static readonly TimeSpan SignalLivenessBound = TimeSpan.FromSeconds(60);
+
+    private static async Task AwaitSignalAsync(Task signal, string because)
+    {
+        try
+        {
+            await signal.WaitAsync(SignalLivenessBound);
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail(because);
+        }
+    }
+
+    private static async Task<T> AwaitSignalAsync<T>(Task<T> signal, string because)
+    {
+        try
+        {
+            return await signal.WaitAsync(SignalLivenessBound);
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail(because);
+            throw; // unreachable: Assert.Fail always throws.
+        }
     }
 
     // ─── P9-C auto-archive A↔A receiver pins ────────────────────────────────────────────
@@ -1503,8 +1597,10 @@ public sealed class CrossWorldFederationControllerTests
     // before the catch-all so caller cancellation rethrows without touching session.Status.
     // The `when` filter is essential — OCEs from unrelated tokens still seal.
 
-    [Fact]
-    public async Task RelayAsync_WhenCallerCancelsDuringPromptAsync_RethrowsOce_AndDoesNotSealSession()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RelayAsync_WhenCallerCancelsDuringPromptAsync_RethrowsOce_AndDoesNotSealSession(bool partialInterruption)
     {
         using var cts = new CancellationTokenSource();
         var sessions = new InMemorySessionStore();
@@ -1514,9 +1610,14 @@ public sealed class CrossWorldFederationControllerTests
         handle.Setup(h => h.PromptAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns((string _, CancellationToken ct) =>
             {
-                // Cancel the caller's token then throw OCE bound to that same token, simulating
-                // a caller HTTP timeout / abort that propagates into PromptAsync.
+                // Exercise both cancellation before admission and a captured partial run.
                 cts.Cancel();
+                if (partialInterruption)
+                    throw new AgentPromptInterruptedException(new AgentResponse
+                    {
+                        Content = string.Empty,
+                        ToolCalls = [new("partial-4101", "read", true, "{}", null, IsIncomplete: true)]
+                    }, ct);
                 ct.ThrowIfCancellationRequested();
                 throw new InvalidOperationException("unreachable");
             });
@@ -1547,6 +1648,9 @@ public sealed class CrossWorldFederationControllerTests
         session.Metadata.ContainsKey("error").ShouldBeFalse(
             "The 'error' metadata key is written exclusively by the seal-on-error catch-all. " +
             "If it's present after caller cancellation, the OCE rethrow path took the wrong branch.");
+        if (partialInterruption)
+            session.GetHistorySnapshot().Where(row => row.ToolCallId == "partial-4101")
+                .ShouldHaveSingleItem().ToolIsIncomplete.ShouldBeTrue();
     }
 
     [Fact]
@@ -1756,7 +1860,8 @@ public sealed class CrossWorldFederationControllerTests
         ISessionStore sessions,
         IConversationStore conversations,
         IAgentSupervisor supervisor,
-        ISessionWriteLock sessionWriteLock)
+        ISessionWriteLock sessionWriteLock,
+        IAgentRegistry? registryOverride = null)
     {
         var platformConfig = new PlatformConfig
         {
@@ -1789,7 +1894,7 @@ public sealed class CrossWorldFederationControllerTests
         var monitor = new StaticOptionsMonitor<PlatformConfig>(platformConfig);
 
         return new CrossWorldFederationController(
-            registry.Object,
+            registryOverride ?? registry.Object,
             supervisor,
             sessions,
             conversations,
@@ -1924,8 +2029,20 @@ file sealed class ThrowingArchiveConversationStore : IConversationStore
         => _inner.TouchAsync(conversationId, ct);
     public Task PinAsync(ConversationId conversationId, bool pin, CancellationToken ct = default)
         => _inner.PinAsync(conversationId, pin, ct);
+    public Task<bool> AddBindingAsync(ConversationId conversationId, ChannelBinding binding, CancellationToken ct = default)
+        => _inner.AddBindingAsync(conversationId, binding, ct);
+    public Task<bool> RemoveBindingAsync(ConversationId conversationId, BindingId bindingId, CancellationToken ct = default)
+        => _inner.RemoveBindingAsync(conversationId, bindingId, ct);
+    public Task<bool> MoveBindingAsync(ConversationId fromConversationId, ConversationId toConversationId, BindingId bindingId, CancellationToken ct = default)
+        => _inner.MoveBindingAsync(fromConversationId, toConversationId, bindingId, ct);
+    public Task<Conversation?> PatchMetadataAsync(ConversationId conversationId, ConversationMetadataPatch patch, CancellationToken ct = default)
+        => _inner.PatchMetadataAsync(conversationId, patch, ct);
+    public Task<Conversation?> PatchOverrideAsync(ConversationId conversationId, ConversationOverridePatch patch, CancellationToken ct = default)
+        => _inner.PatchOverrideAsync(conversationId, patch, ct);
     public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default)
         => _inner.GetSummariesAsync(ct);
+    public Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default)
+        => _inner.GetPendingAskUserCheckpointsAsync(ct);
     public Task<Dictionary<string, System.Text.Json.JsonElement>?> GetCanvasStateAsync(ConversationId conversationId, CancellationToken ct = default)
         => _inner.GetCanvasStateAsync(conversationId, ct);
     public Task<bool> SetCanvasStateKeyAsync(ConversationId conversationId, string key, System.Text.Json.JsonElement value, CancellationToken ct = default)

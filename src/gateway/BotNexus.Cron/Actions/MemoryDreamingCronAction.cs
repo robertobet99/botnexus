@@ -1,6 +1,8 @@
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Triggers;
+using BotNexus.Gateway.Configuration;
 using BotNexus.Memory;
 using BotNexus.Memory.Learning;
 using BotNexus.Memory.Models;
@@ -91,6 +93,13 @@ public sealed class MemoryDreamingCronAction : ICronAction
             "Memory dreaming for agent '{AgentId}': {NoteCount} daily notes, {PromptLength} char prompt",
             agentId.Value, dailyNotes.Count, prompt.Length);
 
+        // #2373: classify an unresolvable model override before dispatch so the run records the
+        // real reason instead of an opaque provider error raised deep inside the agent turn.
+        if (context.EffectiveModel is null)
+            CronModelPreflight.EnsureResolvable(
+            context.Services.GetService<BotNexus.Agent.Providers.Core.Registry.ModelRegistry>(),
+            context.Job.Model);
+
         // Dispatch via internal trigger (same pattern as agent-prompt)
         var trigger = context.Services.GetServices<IInternalTrigger>()
             .FirstOrDefault(t => t.Type.Equals(TriggerType.Cron))
@@ -99,10 +108,13 @@ public sealed class MemoryDreamingCronAction : ICronAction
         var triggerRequest = new InternalTriggerRequest
         {
             CronJobId = context.Job.Id,
-            JobName = context.Job.Name,
+            JobName = ExternalText.Sanitize(context.Job.Name, ExternalText.DefaultDisplayLength),
             ModelOverride = context.Job.Model,
+            CronRequestedModel = context.EffectiveModel?.RequestedModel,
+            CronModelSource = context.EffectiveModel?.Source,
             ConversationId = context.Job.ConversationId,
-            CreatedBy = context.Job.CreatedBy
+            CreatedBy = context.Job.CreatedBy,
+            SessionCreatedAsync = context.PersistSessionIdAsync
         };
 
         var sessionId = await trigger
@@ -151,7 +163,7 @@ public sealed class MemoryDreamingCronAction : ICronAction
             return;
         }
 
-        var agentStore = memoryFactory.Create(agentId.Value);
+        var agentStore = memoryFactory.Create(agentId);
         await agentStore.InitializeAsync(ct).ConfigureAwait(false);
 
         try
@@ -259,7 +271,7 @@ public sealed class MemoryDreamingCronAction : ICronAction
             // Truncate individual file if it would exceed the cap
             var remaining = maxContentChars - totalChars;
             if (content.Length > remaining)
-                content = content[..remaining] + "\n[...truncated]";
+                content = TextTruncation.SafeTruncate(content, remaining, "\n[...truncated]")!;
 
             results.Add((date!.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), content));
             totalChars += content.Length;
@@ -303,9 +315,7 @@ public sealed class MemoryDreamingCronAction : ICronAction
             sb.AppendLine();
             sb.AppendLine("```markdown");
             // Truncate if very long — the agent only needs context, not the full file
-            var truncatedMemory = existingMemory.Length > 10_000
-                ? existingMemory[..10_000] + "\n[...truncated]"
-                : existingMemory;
+            var truncatedMemory = TextTruncation.SafeTruncate(existingMemory, 10_000, "\n[...truncated]")!;
             sb.AppendLine(truncatedMemory);
             sb.AppendLine("```");
             sb.AppendLine();
@@ -351,18 +361,35 @@ public sealed class MemoryDreamingCronAction : ICronAction
     /// Resolves the agent workspace path from the BotNexus home directory.
     /// Pattern: <c>{home}/agents/{agentId}/workspace</c>
     /// </summary>
-    private static string? ResolveWorkspacePath(IServiceProvider services, AgentId agentId)
+    /// <remarks>
+    /// Internal rather than private so #2819 regression coverage can assert the resolved path
+    /// directly. Dreaming otherwise only reveals its target home by rewriting a real MEMORY.md,
+    /// which is not something a test may do to the developer's live workspace.
+    /// </remarks>
+    internal static string? ResolveWorkspacePath(IServiceProvider services, AgentId agentId)
     {
-        // Resolve BotNexusHome.RootPath via reflection to avoid a hard project reference
-        var homeType = Type.GetType("BotNexus.Gateway.Configuration.BotNexusHome, BotNexus.Gateway");
-        var home = homeType is null ? null : services.GetService(homeType);
-        var rootPath = homeType?.GetProperty("RootPath")?.GetValue(home) as string;
+        // #2819: bind BotNexusHome BY TYPE. This was a Type.GetType("..., BotNexus.Gateway")
+        // string, which is exactly the second instance of the defect that made the cron store
+        // open the shared live home: #2765/#2777 moved the type into BotNexus.Gateway.Configuration,
+        // the lookup began returning null at runtime with nothing failing at compile time, and
+        // every caller silently fell through to the user-profile default below. Here that meant a
+        // gateway running against an isolated --target home dreamt over the DEVELOPER'S real agent
+        // workspace. A direct reference turns a future move into a build failure.
+        var home = services.GetService<BotNexusHome>();
+        var rootPath = home?.RootPath;
 
         if (string.IsNullOrWhiteSpace(rootPath))
         {
             rootPath = Path.GetFullPath(Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ".botnexus"));
+
+            services.GetService<ILogger<MemoryDreamingCronAction>>()?.LogWarning(
+                "No {HomeType} was registered, so the memory-dreaming workspace path fell back to the shared " +
+                "user-profile root {FallbackPath}. Any isolated home supplied by the host is being IGNORED " +
+                "and this process will read and write the live agent workspace (#2819).",
+                nameof(BotNexusHome),
+                rootPath);
         }
 
         return Path.Combine(rootPath, "agents", agentId.Value, "workspace");

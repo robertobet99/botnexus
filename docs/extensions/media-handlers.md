@@ -30,8 +30,9 @@ For each content part, the pipeline:
 3. If the handler returns `WasTransformed = true`, the transformed part replaces the original and continues through remaining handlers
 4. If a handler **throws**, the pipeline logs a warning and passes the part through unchanged — one failing handler never breaks the message flow
 
-!!! info "Pipeline composition"
-    Multiple handlers can process the same part sequentially. For example, a validation handler (priority 10) could check file size, then a transcription handler (priority 50) converts audio to text, and a metadata handler (priority 150) enriches the result.
+::: info Pipeline composition
+Multiple handlers can process the same part sequentially. For example, a validation handler (priority 10) could check file size, then a transcription handler (priority 50) converts audio to text, and a metadata handler (priority 150) enriches the result.
+:::
 
 ---
 
@@ -84,7 +85,7 @@ public sealed record ReferenceContentPart : MessageContentPart
 
 ```bash
 dotnet new classlib -n BotNexus.Extensions.MyHandler
-dotnet sln BotNexus.slnx add extensions/BotNexus.Extensions.MyHandler/BotNexus.Extensions.MyHandler.csproj
+dotnet build dirs.proj
 ```
 
 Add a reference to the contracts project:
@@ -214,8 +215,9 @@ public sealed record MediaProcessingResult
 }
 ```
 
-!!! tip "When to set `WasTransformed`"
-    Only set `WasTransformed = true` when your handler meaningfully changed the content. If you only read or validated the part without changing it, return the original part with `WasTransformed = false`. The pipeline uses this flag to decide whether to log transformation events and update telemetry counters.
+::: tip When to set `WasTransformed`
+Only set `WasTransformed = true` when your handler meaningfully changed the content. If you only read or validated the part without changing it, return the original part with `WasTransformed = false`. The pipeline uses this flag to decide whether to log transformation events and update telemetry counters.
+:::
 
 ### 4. Create an Extension Manifest
 
@@ -274,8 +276,9 @@ Handler priority determines execution order. Lower values run first.
 | **100–149** | Secondary transforms | Summarization, translation, description |
 | **150+** | Post-processing | Metadata enrichment, logging, analytics |
 
-!!! example "Built-in handler priorities"
-    The `WhisperTranscriptionHandler` uses priority **50** — placing it in the primary transform range so it runs early enough for downstream handlers to process the transcribed text.
+::: details Built-in handler priorities
+The `WhisperTranscriptionHandler` uses priority **50** — placing it in the primary transform range so it runs early enough for downstream handlers to process the transcribed text.
+:::
 
 ---
 

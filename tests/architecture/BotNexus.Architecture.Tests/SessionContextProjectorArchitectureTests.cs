@@ -12,7 +12,7 @@ namespace BotNexus.Architecture.Tests;
 /// <c>BotNexus.Gateway.Sessions</c> assembly — and is not re-invented inline
 /// anywhere else in <c>src/gateway/</c>.
 /// </summary>
-public sealed class SessionContextProjectorArchitectureTests
+public sealed class SessionContextProjectorArchitectureTests : ArchitectureTest
 {
     /// <summary>
     /// The projector must live in the <c>BotNexus.Gateway.Sessions</c> assembly so
@@ -48,7 +48,7 @@ public sealed class SessionContextProjectorArchitectureTests
     [Fact]
     public void NoInlineProjectionFilter_OutsideAllowlist()
     {
-        var gatewayRoot = FindGatewaySourceRoot();
+        var gatewayRoot = Repository.Path("src", "gateway");
         var allowlist = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             // The canonical filter — the one and only place that combines IsHistory and
@@ -61,10 +61,24 @@ public sealed class SessionContextProjectorArchitectureTests
             // MapHistoryEntry round-trips both flags as independent column reads - it does
             // not combine them into a projection predicate, so it shares SqliteSessionStore's
             // allowlist rationale. The projection still lives in SessionContextProjector.
-            "SessionRowMapper.cs",
+            "SqliteDataReaderExtensions.cs",
             // Documentation comment only; the actual projection is delegated to the
             // projector via SessionCompaction.ApplyLegacyHistoryProjection.
             "FileSessionStore.cs",
+            // #2936: the portal history read path. It references IsCrashSentinel (skipped -- a
+            // recovery placeholder is not transcript) and IsHistory (NOT skipped -- projected onto
+            // the wire as IsFolded so pre-compaction history stays reachable and renders collapsed).
+            // That is deliberately the OPPOSITE of the LLM-context predicate, not a copy of it: this
+            // file answers "should this go to the UI?", SessionContextProjector answers "should this
+            // go to the model?". Routing it through the projector would reintroduce the defect --
+            // it would drop every folded row again. The two flags never form a combined predicate
+            // here, so the fitness function's grep signal is a false positive on this file.
+            //
+            // #3278: that projection was extracted verbatim out of ConversationHistoryAssembler into
+            // ConversationHistoryProjection so the export routes could consume the SAME code rather
+            // than re-deriving it. The allowlist rationale above moved with the code - it is still
+            // exactly one file, still the UI-side predicate, still not a copy of the LLM-context one.
+            "ConversationHistoryProjection.cs",
         };
 
         var offenders = Directory
@@ -89,17 +103,4 @@ public sealed class SessionContextProjectorArchitectureTests
             "Offenders:\n  " + string.Join("\n  ", offenders));
     }
 
-    private static string FindGatewaySourceRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !File.Exists(Path.Combine(current.FullName, "BotNexus.slnx")))
-        {
-            current = current.Parent;
-        }
-
-        current.ShouldNotBeNull("Could not locate repo root from " + AppContext.BaseDirectory);
-        var gatewayRoot = Path.Combine(current.FullName, "src", "gateway");
-        Directory.Exists(gatewayRoot).ShouldBeTrue("Expected src/gateway under " + current.FullName);
-        return gatewayRoot;
-    }
 }

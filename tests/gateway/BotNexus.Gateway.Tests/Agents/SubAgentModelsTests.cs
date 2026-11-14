@@ -132,7 +132,9 @@ public sealed class SubAgentModelsTests
             SubAgentStatus.Completed,
             SubAgentStatus.Failed,
             SubAgentStatus.Killed,
-            SubAgentStatus.TimedOut });
+            SubAgentStatus.TimedOut,
+            SubAgentStatus.BudgetExhausted,
+            SubAgentStatus.HandedOff });
     }
 
     [Fact]
@@ -143,6 +145,13 @@ public sealed class SubAgentModelsTests
         ((int)SubAgentStatus.Failed).ShouldBe(2);
         ((int)SubAgentStatus.Killed).ShouldBe(3);
         ((int)SubAgentStatus.TimedOut).ShouldBe(4);
+
+        // Appended last so every pre-existing wire value is unchanged (#2656).
+        ((int)SubAgentStatus.BudgetExhausted).ShouldBe(5);
+
+        // Likewise appended last (#2725) - a spawn-only handoff is a new terminal disposition, so
+        // it must not renumber any status already persisted or sent on the wire.
+        ((int)SubAgentStatus.HandedOff).ShouldBe(6);
     }
 
     [Fact]
@@ -153,8 +162,10 @@ public sealed class SubAgentModelsTests
         options.MaxConcurrentPerSession.ShouldBe(5);
         options.DefaultMaxTurns.ShouldBe(30);
         options.MaxTurnsCeiling.ShouldBe(30);
+        options.AdvisoryMaxTurns.ShouldBe(30);
         options.DefaultTimeoutSeconds.ShouldBe(600);
         options.MaxTimeoutSeconds.ShouldBe(1800);
+        options.AdvisoryTimeoutSeconds.ShouldBe(1500);
         options.MaxDepth.ShouldBe(1);
         options.DefaultModel.ShouldBeEmpty();
     }

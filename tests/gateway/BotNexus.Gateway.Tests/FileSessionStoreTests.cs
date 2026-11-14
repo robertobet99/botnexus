@@ -12,6 +12,467 @@ namespace BotNexus.Gateway.Tests;
 
 public sealed class FileSessionStoreTests
 {
+    [Theory]
+    [InlineData(false, "append")]
+    [InlineData(true, "append")]
+    [InlineData(false, "replace")]
+    [InlineData(true, "replace")]
+    [InlineData(false, "metadata")]
+    [InlineData(true, "metadata")]
+    [InlineData(false, "unchanged")]
+    [InlineData(true, "unchanged")]
+    public async Task FencedSave_ContentSnapshot_ComparesAuthoritativeContentBeforePublishing(bool cold, string change)
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var original = await store.GetOrCreateAsync(SessionId.From("content-fenced"), AgentId.From("agent-a"));
+        original.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "original" });
+        await store.SaveAsync(original);
+        var candidate = original.CreateDetachedCopy();
+        var fence = SessionWriteFence.Capture(candidate) with
+        {
+            ExpectedContentFingerprint = SessionWriteFence.ContentFingerprint(candidate)
+        };
+        candidate.ReplaceHistory([new SessionEntry { Role = MessageRole.System, Content = "summary", IsCompactionSummary = true }]);
+        var timestamp = original.UpdatedAt;
+        if (change == "append") original.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "append" });
+        if (change == "replace") original.ReplaceHistory([new SessionEntry { Role = MessageRole.User, Content = "replacement" }]);
+        if (change == "metadata") original.Metadata["concurrent"] = "patch";
+        // The guard must detect actual content, not just count or a timestamp heuristic.
+        original.UpdatedAt = timestamp;
+        await store.SaveAsync(original);
+        var expected = original.GetHistorySnapshot().Select(e => e with { PersistenceId = null, PersistenceKey = null }).ToArray();
+        var writer = cold ? fixture.CreateStore() : store;
+        (await writer.SaveAsync(candidate, fence)).ShouldBe(change == "unchanged"
+            ? SessionSaveOutcome.Persisted : SessionSaveOutcome.Conflict);
+        var saved = (await fixture.CreateStore().GetAsync(original.SessionId)).ShouldNotBeNull();
+        if (change == "unchanged") saved.GetHistorySnapshot().ShouldContain(e => e.IsCompactionSummary);
+        else
+        {
+            saved.GetHistorySnapshot().ShouldBe(expected);
+            saved.Metadata.Count.ShouldBe(original.Metadata.Count);
+            foreach (var pair in original.Metadata)
+                saved.Metadata[pair.Key]?.ToString().ShouldBe(pair.Value?.ToString());
+            saved.GetHistorySnapshot().ShouldNotContain(e => e.IsCompactionSummary);
+        }
+        original.GetHistorySnapshot().ShouldNotContain(e => e.IsCompactionSummary);
+    }
+
+    [Fact]
+    public async Task FencedSave_ColdReadRacingSealedSave_CheckAndWriteShareOneLock()
+    {
+        using var fixture = new StoreFixture();
+        var originalStore = fixture.CreateStore();
+        var original = await originalStore.GetOrCreateAsync(SessionId.From("fenced"), AgentId.From("agent-a"));
+        original.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "original" });
+        await originalStore.SaveAsync(original);
+        var expectedLiveHistory = original.GetHistorySnapshot().Select(entry => entry with { }).ToArray();
+        // File JSON deliberately omits storage identity, but must retain every semantic record field.
+        var expectedColdHistory = expectedLiveHistory
+            .Select(entry => entry with { PersistenceId = null, PersistenceKey = null }).ToArray();
+        var candidate = original.CreateDetachedCopy();
+        candidate.ReplaceHistory([new SessionEntry { Role = MessageRole.System, Content = "summary", IsCompactionSummary = true }]);
+        var sealedCopy = original.CreateDetachedCopy();
+        sealedCopy.Status = SessionStatus.Sealed;
+        sealedCopy.ReplaceHistory(original.GetHistorySnapshot());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var file = new Moq.Mock<System.IO.Abstractions.IFile>();
+        var fs = new Moq.Mock<System.IO.Abstractions.IFileSystem>();
+        fs.SetupGet(x => x.Directory).Returns(fixture.FileSystem.Directory);
+        fs.SetupGet(x => x.File).Returns(file.Object);
+        fs.SetupGet(x => x.FileStream).Returns(fixture.FileSystem.FileStream);
+        file.Setup(x => x.ReadAllLinesAsync(Moq.It.IsAny<string>(), Moq.It.IsAny<CancellationToken>()))
+            .Returns((string path, CancellationToken token) => fixture.FileSystem.File.ReadAllLinesAsync(path, token));
+        file.Setup(x => x.Move(Moq.It.IsAny<string>(), Moq.It.IsAny<string>(), true))
+            .Callback((string source, string target, bool overwrite) => fixture.FileSystem.File.Move(source, target, overwrite));
+        file.Setup(x => x.Delete(Moq.It.IsAny<string>())).Callback((string path) => fixture.FileSystem.File.Delete(path));
+        file.Setup(x => x.Exists(Moq.It.IsAny<string>())).Returns((string path) => fixture.FileSystem.File.Exists(path));
+        var armed = false;
+        file.Setup(x => x.ReadAllTextAsync(Moq.It.IsAny<string>(), Moq.It.IsAny<CancellationToken>()))
+            .Returns(async (string path, CancellationToken token) =>
+            {
+                var text = await fixture.FileSystem.File.ReadAllTextAsync(path, token);
+                if (armed && path.EndsWith(".meta.json", StringComparison.Ordinal))
+                {
+                    armed = false;
+                    entered.TrySetResult();
+                    await release.Task.WaitAsync(token);
+                }
+                return text;
+            });
+        // Other file operations use the real in-memory filesystem, not substitute defaults.
+        // A forwarding interface proxy is only needed for the single cold sidecar read.
+        file.Setup(x => x.WriteAllTextAsync(Moq.It.IsAny<string>(), Moq.It.IsAny<string>(), Moq.It.IsAny<CancellationToken>()))
+            .Returns((string path, string text, CancellationToken token) => fixture.FileSystem.File.WriteAllTextAsync(path, text, token));
+        file.Setup(x => x.AppendAllTextAsync(Moq.It.IsAny<string>(), Moq.It.IsAny<string>(), Moq.It.IsAny<CancellationToken>()))
+            .Returns((string path, string text, CancellationToken token) => fixture.FileSystem.File.AppendAllTextAsync(path, text, token));
+        var store = new FileSessionStore(fixture.StorePath, NullLogger<FileSessionStore>.Instance, fs.Object, fixture.Conversations);
+        await store.GetAsync(SessionId.From("missing")); // Finish migration before arming the cold fence read.
+        armed = true;
+        var pending = store.SaveAsync(candidate, SessionWriteFence.Capture(original));
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var resetSave = store.SaveAsync(sealedCopy);
+            resetSave.IsCompleted.ShouldBeFalse(); // The cold fence read owns the same save lock.
+            release.TrySetResult();
+            (await pending).ShouldBe(SessionSaveOutcome.Persisted);
+            await resetSave;
+            var saved = (await fixture.CreateStore().GetAsync(original.SessionId)).ShouldNotBeNull();
+            saved.Status.ShouldBe(SessionStatus.Sealed);
+            saved.GetHistorySnapshot().ShouldBe(expectedColdHistory);
+            original.GetHistorySnapshot().ShouldBe(expectedLiveHistory);
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [Theory]
+    [InlineData(false, "sealed")]
+    [InlineData(true, "sealed")]
+    [InlineData(false, "expired")]
+    [InlineData(true, "expired")]
+    [InlineData(false, "rebound")]
+    [InlineData(true, "rebound")]
+    [InlineData(false, "deleted")]
+    [InlineData(true, "deleted")]
+    public async Task FencedSave_LifecycleChange_RejectsDetachedCandidateWithoutWriting(bool cold, string change)
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var original = await store.GetOrCreateAsync(SessionId.From("fenced"), AgentId.From("agent-a"));
+        original.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "original" });
+        await store.SaveAsync(original);
+        var expectedLiveHistory = original.GetHistorySnapshot().Select(entry => entry with { }).ToArray();
+        // The final reader is cold even when the fenced writer uses its live cache.
+        var expectedColdHistory = expectedLiveHistory
+            .Select(entry => entry with { PersistenceId = null, PersistenceKey = null }).ToArray();
+        var fence = SessionWriteFence.Capture(original);
+        var candidate = original.CreateDetachedCopy();
+        candidate.ReplaceHistory([new SessionEntry { Role = MessageRole.System, Content = "discarded summary", IsCompactionSummary = true }]);
+        if (change == "deleted") await store.DeleteAsync(original.SessionId);
+        else
+        {
+            if (change == "rebound")
+            {
+                var conversation = await fixture.Conversations.CreateAsync(new Conversation
+                {
+                    ConversationId = ConversationId.Create(), AgentId = original.AgentId
+                });
+                original.ConversationId = conversation.ConversationId;
+            }
+            else original.Status = change == "sealed" ? SessionStatus.Sealed : SessionStatus.Expired;
+            await store.SaveAsync(original);
+        }
+        var writer = cold ? fixture.CreateStore() : store;
+        (await writer.SaveAsync(candidate, fence)).ShouldBe(SessionSaveOutcome.Rebound);
+        var persisted = await fixture.CreateStore().GetAsync(original.SessionId);
+        if (change == "deleted") persisted.ShouldBeNull();
+        else
+        {
+            persisted.ShouldNotBeNull().Status.ShouldBe(original.Status);
+            persisted.ConversationId.ShouldBe(original.ConversationId);
+            persisted.GetHistorySnapshot().ShouldBe(expectedColdHistory);
+        }
+        original.GetHistorySnapshot().ShouldBe(expectedLiveHistory);
+    }
+
+    [Fact]
+    public async Task SaveSubAgentSessionAsync_ToolOrigin_ColdLookupRetainsRunningPartialEvidence()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        await store.SaveSubAgentSessionAsync(RetainedRun(SubAgentStatus.Running));
+        var cold = fixture.CreateStore();
+        var run = await cold.FindSubAgentSpawnAsync(SessionId.From("parent"), "spawn-call");
+        run.ShouldNotBeNull();
+        run.Status.ShouldBe(SubAgentStatus.Running);
+        run.ResultSummary.ShouldBe("partial evidence");
+        (await cold.GetSubAgentSessionAsync("file-run")).ShouldBe(run);
+        (await cold.ListSubAgentSessionsAsync(SessionId.From("parent"))).ShouldHaveSingleItem();
+    }
+
+    private static SubAgentInfo RetainedRun(SubAgentStatus status = SubAgentStatus.Completed) => new()
+    {
+        SubAgentId = "file-run", SpawningToolCallId = "spawn-call",
+        ParentSessionId = SessionId.From("parent"), ChildSessionId = SessionId.From("child"),
+        ParentAgentId = "agent-a", Task = "task", Status = status,
+        StartedAt = DateTimeOffset.UtcNow, ResultSummary = "partial evidence"
+    };
+
+    private static SessionEntry ReceiptResult(string call, string content = "retained-result") => new()
+    {
+        Role = MessageRole.Tool, Kind = MessageKind.ToolResult, ToolName = "manage_subagent",
+        ToolCallId = call, ToolArgs = "{\"action\":\"wait\",\"subAgentId\":\"file-run\"}", Content = content
+    };
+
+    private static async Task<GatewaySession> ArrangeReceiptAsync(FileSessionStore store)
+    {
+        var parent = await store.GetOrCreateAsync(SessionId.From("parent"), AgentId.From("agent-a"));
+        await store.SaveAsync(parent);
+        await store.SaveSubAgentSessionAsync(RetainedRun());
+        return parent;
+    }
+
+    [Fact]
+    public async Task Consume_ColdRetryAndLaterAggregateSave_RetainsOneExactOriginalRow()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var stale = await ArrangeReceiptAsync(store);
+        (await store.ConsumeSubAgentResultAsync("file-run", stale.SessionId, stale.ConversationId, ReceiptResult("call"))).ShouldBe("retained-result");
+        stale.AddEntry(ReceiptResult("call", "later incomplete payload"));
+        await store.SaveAsync(stale);
+        var cold = fixture.CreateStore();
+        (await cold.ConsumeSubAgentResultAsync("file-run", stale.SessionId, stale.ConversationId, ReceiptResult("call", "retry changed payload"))).ShouldBe("retained-result");
+        (await cold.ConsumeSubAgentResultAsync("file-run", stale.SessionId, stale.ConversationId, ReceiptResult("other"))).ShouldBeNull();
+        var parent = await cold.GetAsync(stale.SessionId);
+        parent.ShouldNotBeNull();
+        parent.GetHistorySnapshot().Where(e => e.Kind == MessageKind.ToolResult).ShouldHaveSingleItem().Content.ShouldBe("retained-result");
+        // Destructive aggregate reconciliation must not erase authoritative consumption evidence.
+        parent.ReplaceHistory([]);
+        await cold.SaveAsync(parent);
+        (await fixture.CreateStore().ConsumeSubAgentResultAsync("file-run", stale.SessionId, stale.ConversationId, ReceiptResult("call"))).ShouldBe("retained-result");
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task Save_WithReceipt_ConcurrentMutationAtWriteBoundary_RemainsPending(bool afterWrite, bool destructive)
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        await store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("call"));
+        parent.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "captured-before-write" });
+        // The aggregate is stale and must reconcile to the authoritative receipt, not this payload.
+        parent.AddEntry(ReceiptResult("call", "stale-result"));
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task PauseAsync()
+        {
+            reached.TrySetResult();
+            return release.Task;
+        }
+        if (afterWrite) store.AfterReceiptHistorySaveAsync = PauseAsync;
+        else store.BeforeReceiptHistorySaveAsync = _ => PauseAsync();
+
+        var save = store.SaveAsync(parent);
+        await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var additions = new SessionEntry[]
+        {
+            new() { Role = MessageRole.Tool, Kind = MessageKind.ToolStart, ToolName = "parallel-tool",
+                ToolCallId = "parallel-call", Content = "concurrent-tool-start" },
+            new() { Role = MessageRole.User, Content = "concurrent-new-entry" }
+        };
+        try
+        {
+            if (destructive) parent.ReplaceHistory(additions);
+            else parent.AddEntries(additions);
+        }
+        finally { release.TrySetResult(); }
+        await save;
+        store.BeforeReceiptHistorySaveAsync = null;
+        store.AfterReceiptHistorySaveAsync = null;
+
+        var live = parent.GetHistorySnapshot();
+        live.ShouldContain(additions[0]);
+        live.ShouldContain(additions[1]);
+        if (destructive) live.ShouldBe(additions);
+        else live.Single(e => e.Kind == MessageKind.ToolResult).Content.ShouldBe("retained-result");
+        var pending = parent.CaptureHistoryForPersistence();
+        pending.RequiresReplacement.ShouldBe(destructive);
+        pending.Entries.ShouldBe(additions);
+
+        var firstWrite = await fixture.CreateStore().GetAsync(parent.SessionId);
+        firstWrite.ShouldNotBeNull();
+        firstWrite.GetHistorySnapshot().ShouldNotContain(e => e.Content == "concurrent-new-entry");
+        firstWrite.GetHistorySnapshot().Single(e => e.Kind == MessageKind.ToolResult).Content.ShouldBe("retained-result");
+        await store.SaveAsync(parent);
+        var cold = fixture.CreateStore();
+        var reloaded = await cold.GetAsync(parent.SessionId);
+        reloaded.ShouldNotBeNull();
+        var durable = reloaded.GetHistorySnapshot();
+        durable.Count(e => e.Content == "concurrent-tool-start").ShouldBe(1);
+        durable.Count(e => e.Content == "concurrent-new-entry").ShouldBe(1);
+        durable.Count(e => e.Content == "captured-before-write").ShouldBe(destructive ? 0 : 1);
+        durable.Where(e => e.Kind == MessageKind.ToolResult).ShouldHaveSingleItem().Content.ShouldBe("retained-result");
+        (await cold.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId,
+            ReceiptResult("call", "retry-changed"))).ShouldBe("retained-result");
+        parent.CaptureHistoryForPersistence().Entries.ShouldBeEmpty();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Consume_FaultAtCommitBoundary_ColdRetryUsesOnlyDurableOriginalRow(bool afterWrite)
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        if (afterWrite)
+            store.AfterSubAgentReceiptCommitAsync = () => throw new IOException("after-write");
+        else
+            store.BeforeSubAgentReceiptCommitAsync = _ => throw new IOException("before-write");
+        await Should.ThrowAsync<IOException>(() => store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("fault")));
+        var cold = fixture.CreateStore();
+        var reloaded = await cold.GetAsync(parent.SessionId);
+        reloaded.ShouldNotBeNull();
+        reloaded.GetHistorySnapshot().Count(e => e.Kind == MessageKind.ToolResult).ShouldBe(afterWrite ? 1 : 0);
+        (await cold.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult(afterWrite ? "fault" : "fresh"))).ShouldBe("retained-result");
+        (await cold.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("other"))).ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task Consume_CancellationBeforeWrite_DoesNotConsume()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        using var cancelled = new CancellationTokenSource();
+        store.BeforeSubAgentReceiptCommitAsync = _ => { cancelled.Cancel(); return Task.CompletedTask; };
+        await Should.ThrowAsync<OperationCanceledException>(() => store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("cancelled"), cancelled.Token));
+        (await fixture.CreateStore().ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("fresh"))).ShouldBe("retained-result");
+    }
+
+    [Fact]
+    public async Task Consume_CancellationAfterWrite_ColdRetryRetainsAcceptedResult()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        using var cancelled = new CancellationTokenSource();
+        store.AfterSubAgentReceiptCommitAsync = () =>
+        {
+            cancelled.Cancel();
+            return Task.FromCanceled(cancelled.Token);
+        };
+        await Should.ThrowAsync<OperationCanceledException>(() => store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("accepted"), cancelled.Token));
+        var cold = fixture.CreateStore();
+        (await cold.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("accepted"))).ShouldBe("retained-result");
+        (await cold.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("other"))).ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task Consume_TwoChildren_IndependentReceiptsSurviveAggregateSave()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        await store.SaveSubAgentSessionAsync(RetainedRun() with { SubAgentId = "second-run", SpawningToolCallId = "second-spawn" });
+        (await store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("first"))).ShouldBe("retained-result");
+        (await store.ConsumeSubAgentResultAsync("second-run", parent.SessionId, parent.ConversationId, ReceiptResult("second", "second-result"))).ShouldBe("second-result");
+        await store.SaveAsync(parent);
+        var cold = fixture.CreateStore();
+        (await cold.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("first"))).ShouldBe("retained-result");
+        (await cold.ConsumeSubAgentResultAsync("second-run", parent.SessionId, parent.ConversationId, ReceiptResult("second"))).ShouldBe("second-result");
+        var reloaded = await cold.GetAsync(parent.SessionId);
+        reloaded.ShouldNotBeNull();
+        reloaded.GetHistorySnapshot().Count(e => e.Kind == MessageKind.ToolResult).ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task Consume_ExistingErrorCollision_LeavesResultRetrievable()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        parent.AddEntry(ReceiptResult("error", "original error") with { ToolIsError = true });
+        await store.SaveAsync(parent);
+        await Should.ThrowAsync<InvalidOperationException>(() => store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("error")));
+        (await fixture.CreateStore().ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("fresh"))).ShouldBe("retained-result");
+        var coldParent = await fixture.CreateStore().GetAsync(parent.SessionId);
+        coldParent.ShouldNotBeNull();
+        coldParent.GetHistorySnapshot().Single(e => e.ToolCallId == "error").Content.ShouldBe("original error");
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("sealed")]
+    [InlineData("rebound")]
+    [InlineData("owner")]
+    [InlineData("running")]
+    public async Task Consume_InvalidParentOrRun_RefusesWithoutReceipt(string scenario)
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        var originalConversation = parent.ConversationId;
+        if (scenario == "missing") await store.DeleteAsync(parent.SessionId);
+        if (scenario == "sealed") { parent.Status = SessionStatus.Sealed; await store.SaveAsync(parent); }
+        if (scenario == "rebound")
+        {
+            var rebound = ConversationId.From("rebound");
+            await fixture.Conversations.CreateAsync(new Conversation { ConversationId = rebound, AgentId = AgentId.From("agent-a") });
+            parent.ConversationId = rebound;
+            await store.SaveAsync(parent);
+        }
+        if (scenario == "running") await store.UpdateSubAgentSessionAsync(RetainedRun(SubAgentStatus.Running));
+        if (scenario == "owner")
+        {
+            await Should.ThrowAsync<UnauthorizedAccessException>(() =>
+                store.UpdateSubAgentSessionAsync(RetainedRun() with { ParentAgentId = "other-agent" }));
+            (await fixture.CreateStore().GetSubAgentSessionAsync("file-run")).ShouldNotBeNull().ParentAgentId.ShouldBe("agent-a");
+        }
+        else await Should.ThrowAsync<InvalidOperationException>(() => store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, originalConversation, ReceiptResult("call")));
+        if (fixture.FileSystem.File.Exists(fixture.HistoryPath("parent")))
+            fixture.FileSystem.File.ReadAllText(fixture.HistoryPath("parent")).ShouldNotContain("retained-result");
+    }
+
+    [Fact]
+    public async Task Consume_RedactsOriginalRowAndRunDetail_ColdRetryContainsOnlySafePayload()
+    {
+        using var fixture = new StoreFixture();
+        var redactor = new Moq.Mock<BotNexus.Gateway.Abstractions.Security.ISecretRedactor>();
+        redactor.Setup(r => r.Redact(Moq.It.IsAny<string>()))
+            .Returns<string>(text => text.Replace("private-marker", "[REDACTED]", StringComparison.Ordinal));
+        var store = new FileSessionStore(fixture.StorePath, NullLogger<FileSessionStore>.Instance,
+            fixture.FileSystem, fixture.Conversations, redactor.Object);
+        var parent = await ArrangeReceiptAsync(store);
+        await store.UpdateSubAgentSessionAsync(RetainedRun() with { ResultSummary = "private-marker summary" });
+        var result = ReceiptResult("safe", "private-marker result") with { ToolArgs = "private-marker args" };
+        (await store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, result)).ShouldBe("[REDACTED] result");
+        var cold = fixture.CreateStore();
+        (await cold.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, result)).ShouldBe("[REDACTED] result");
+        fixture.FileSystem.File.ReadAllText(fixture.HistoryPath("parent")).ShouldNotContain("private-marker");
+        var run = await cold.GetSubAgentSessionAsync("file-run");
+        run.ShouldNotBeNull();
+        run.ResultSummary.ShouldBe("[REDACTED] summary");
+    }
+
+    [Fact]
+    public async Task SaveSubAgentSession_DuplicateSpawnAndMissingIndex_PreservesRetainedIdentity()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        await store.SaveSubAgentSessionAsync(RetainedRun(SubAgentStatus.Running));
+        await store.SaveSubAgentSessionAsync(RetainedRun());
+        await Should.ThrowAsync<InvalidOperationException>(() => store.SaveSubAgentSessionAsync(RetainedRun() with { SubAgentId = "duplicate" }));
+        var indexDirectory = Path.Combine(fixture.StorePath, "subagent-spawns");
+        fixture.FileSystem.Directory.Delete(indexDirectory, true);
+        var run = await fixture.CreateStore().FindSubAgentSpawnAsync(SessionId.From("parent"), "spawn-call");
+        run.ShouldNotBeNull();
+        run.SubAgentId.ShouldBe("file-run");
+        run.Status.ShouldBe(SubAgentStatus.Running);
+    }
+
+    [Fact]
+    public async Task Consume_ConcurrentCallsOnSingleStore_OneWinner()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var parent = await ArrangeReceiptAsync(store);
+        var results = await Task.WhenAll(
+            store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("one")),
+            store.ConsumeSubAgentResultAsync("file-run", parent.SessionId, parent.ConversationId, ReceiptResult("two")));
+        results.Count(r => r == "retained-result").ShouldBe(1);
+        var cold = await fixture.CreateStore().GetAsync(parent.SessionId);
+        cold.ShouldNotBeNull();
+        cold.GetHistorySnapshot().Count(e => e.Kind == MessageKind.ToolResult).ShouldBe(1);
+    }
+
     [Fact]
     public async Task SaveAsync_PreservesConversationId_AcrossReload()
     {
@@ -41,6 +502,24 @@ public sealed class FileSessionStoreTests
         reloaded.Session.ConversationId.ShouldBe(
             conversationId,
             "FileSessionStore corrupted ConversationId on round-trip");
+    }
+
+    [Fact]
+    public async Task SaveAsync_PreservesRunCompletion_AcrossReload()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var completion = new RunCompletionSignal(
+            "Parked", ["decision"], "UserInput", "Waiting for input.",
+            "ask_user persisted", "user", "user responds", 1);
+        var session = await store.GetOrCreateAsync(SessionId.From("s-run-completion"), AgentId.From("agent-a"));
+        session.RunCompletion = completion;
+
+        await store.SaveAsync(session);
+
+        var reloaded = await fixture.CreateStore().GetAsync(session.SessionId);
+        reloaded.ShouldNotBeNull();
+        AssertCompletion(reloaded!.RunCompletion, completion);
     }
 
     [Fact]
@@ -165,6 +644,46 @@ public sealed class FileSessionStoreTests
         var reloaded = await fixture.CreateStore().GetAsync(SessionId.From("s1"));
 
         reloaded!.History.Where(e => e.Content == "hello").ShouldHaveSingleItem();
+    }
+
+    [Fact]
+    public async Task SaveAsync_AfterAppend_AppendsOneJsonlLineWithoutRewritingPrefix()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var session = await store.GetOrCreateAsync(SessionId.From("append-only"), AgentId.From("agent-a"));
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "first" });
+        await store.SaveAsync(session);
+        var historyPath = fixture.HistoryPath("append-only");
+        var firstWrite = fixture.FileSystem.File.ReadAllText(historyPath);
+
+        session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = "second" });
+        await store.SaveAsync(session);
+
+        var secondWrite = fixture.FileSystem.File.ReadAllText(historyPath);
+        secondWrite.StartsWith(firstWrite, StringComparison.Ordinal).ShouldBeTrue(
+            "ordinary file-store saves must append rather than recreate prior JSONL history");
+        secondWrite.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task SaveAsync_AfterDestructiveMutation_RewritesJsonlWithCurrentHistory()
+    {
+        using var fixture = new StoreFixture();
+        var store = fixture.CreateStore();
+        var session = await store.GetOrCreateAsync(SessionId.From("replace"), AgentId.From("agent-a"));
+        session.AddEntries([
+            new SessionEntry { Role = MessageRole.User, Content = "remove" },
+            new SessionEntry { Role = MessageRole.Assistant, Content = "keep" }
+        ]);
+        await store.SaveAsync(session);
+
+        session.ReplaceHistory(session.GetHistorySnapshot().Where(entry => entry.Content == "keep").ToArray());
+        await store.SaveAsync(session);
+
+        var reloaded = await fixture.CreateStore().GetAsync(SessionId.From("replace"));
+        reloaded.ShouldNotBeNull();
+        reloaded.GetHistorySnapshot().Select(entry => entry.Content).ShouldBe(["keep"]);
     }
 
     [Fact]
@@ -659,6 +1178,19 @@ public sealed class FileSessionStoreTests
         sessions.Select(session => session.SessionId.Value).ShouldHaveSingleItem().ShouldBe("participant");
     }
 
+    private static void AssertCompletion(RunCompletionSignal? actual, RunCompletionSignal expected)
+    {
+        actual.ShouldNotBeNull();
+        actual!.Status.ShouldBe(expected.Status);
+        actual.OpenItemIds.ShouldBe(expected.OpenItemIds);
+        actual.StopReason.ShouldBe(expected.StopReason);
+        actual.Detail.ShouldBe(expected.Detail);
+        actual.Evidence.ShouldBe(expected.Evidence);
+        actual.ContinuationOwner.ShouldBe(expected.ContinuationOwner);
+        actual.WakeCondition.ShouldBe(expected.WakeCondition);
+        actual.ContinuationAttempts.ShouldBe(expected.ContinuationAttempts);
+    }
+
     private static async Task CreateAndSaveAsync(FileSessionStore store, string sessionId, AgentId agentId)
     {
         var session = await store.GetOrCreateAsync(SessionId.From(sessionId), agentId);
@@ -684,6 +1216,9 @@ public sealed class FileSessionStoreTests
 
         public FileSessionStore CreateStore(IConversationStore? conversationStore = null)
             => new(StorePath, NullLogger<FileSessionStore>.Instance, FileSystem, conversationStore ?? Conversations);
+
+        public string HistoryPath(string sessionId)
+            => Path.Combine(StorePath, SessionFileNames.HistoryFileName(sessionId));
 
         public void Dispose()
         {

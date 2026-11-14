@@ -92,9 +92,55 @@ public sealed class ServiceBusChannelOptions
     public int MaxConcurrentCalls { get; set; } = 1;
 
     /// <summary>
+    /// Maximum wall-clock duration, in minutes, for which the processor keeps automatically
+    /// renewing a message lock while the agent turn is still running. The Azure SDK default is
+    /// five minutes, which is shorter than many agent turns; when it lapses the completion call
+    /// fails with a lock-lost error and Service Bus redelivers work that already succeeded.
+    /// Set to zero to disable automatic renewal entirely (not recommended).
+    /// </summary>
+    [Display(
+        Name = "Max auto lock renewal minutes",
+        Description = "How long the processor keeps renewing a message lock while an agent turn runs.",
+        GroupName = "Service Bus",
+        Order = 5)]
+    [DefaultValue(30)]
+    [Range(0, 1440)]
+    [ConfigField(Widget = ConfigFieldWidget.Number, Group = "service-bus", Order = 5)]
+    public int MaxAutoLockRenewalMinutes { get; set; } = 30;
+
+    /// <summary>
     /// Allow-list of sender IDs permitted to dispatch messages into the gateway.
     /// When non-empty, messages from senders not in this list are silently dropped.
     /// An empty list permits all senders.
     /// </summary>
     public ICollection<string> AllowedSenderIds { get; } = [];
+
+    /// <summary>
+    /// #3501: returns a description of the self-send misconfiguration when
+    /// <see cref="DefaultReplyQueueName"/> resolves to the same entity as
+    /// <see cref="InboundQueueName"/>, or <see langword="null"/> when the configuration is safe.
+    /// </summary>
+    /// <remarks>
+    /// Replying into the queue the processor consumes from is an unbounded redelivery loop: every
+    /// reply is re-consumed as new inbound work and only <c>maxDeliveryCount</c> eventually
+    /// dead-letters it, after the throughput and DLQ capacity have already been spent. The
+    /// comparison is case-insensitive because Service Bus entity names are not case-sensitive, so
+    /// <c>botnexus-inbound</c> and <c>BotNexus-Inbound</c> are the same queue.
+    /// </remarks>
+    internal string? DescribeSelfSendMisconfiguration()
+        => !string.IsNullOrWhiteSpace(InboundQueueName)
+            && string.Equals(InboundQueueName, DefaultReplyQueueName, StringComparison.OrdinalIgnoreCase)
+            ? $"DefaultReplyQueueName '{DefaultReplyQueueName}' is the same Service Bus queue as InboundQueueName '{InboundQueueName}'. "
+              + "Every reply would be re-consumed as new inbound work until maxDeliveryCount dead-letters it. "
+              + "Configure a separate reply queue."
+            : null;
+
+    /// <summary>
+    /// #3501: whether <paramref name="queueName"/> names the queue this adapter's processor
+    /// consumes from. Publishing there is always a self-send loop, whatever resolved the value.
+    /// </summary>
+    internal bool IsInboundQueue(string? queueName)
+        => !string.IsNullOrWhiteSpace(queueName)
+            && !string.IsNullOrWhiteSpace(InboundQueueName)
+            && string.Equals(queueName, InboundQueueName, StringComparison.OrdinalIgnoreCase);
 }

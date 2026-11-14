@@ -5,6 +5,7 @@ using BotNexus.Domain.World;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Channels;
 using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Configuration;
@@ -41,10 +42,18 @@ namespace BotNexus.Scenarios.Harness;
 /// </remarks>
 public sealed class VirtualWorld : IAsyncDisposable
 {
+    /// <summary>
+    /// Upper bound on waiting for a config-plane agent registration to land. Deliberately generous:
+    /// it exists to turn a hang into a readable failure, not to police how fast startup is, so
+    /// raising it is never the fix for a scenario that fails here.
+    /// </summary>
+    private static readonly TimeSpan RegistrationHangGuard = TimeSpan.FromSeconds(30);
+
     private readonly IHost _host;
     private readonly VirtualChannelAdapter _adapter;
     private readonly ScenarioFakeApiProvider _provider;
     private readonly string _tempHomePath;
+    private readonly IOptionsMonitor<PlatformConfig> _platformConfig;
     private readonly IAgentRegistry _agentRegistry;
     private readonly IConversationStore _conversationStore;
     private readonly ISessionStore _sessionStore;
@@ -56,6 +65,7 @@ public sealed class VirtualWorld : IAsyncDisposable
         VirtualChannelAdapter adapter,
         ScenarioFakeApiProvider provider,
         string tempHomePath,
+        IOptionsMonitor<PlatformConfig> platformConfig,
         IAgentRegistry agentRegistry,
         IConversationStore conversationStore,
         ISessionStore sessionStore,
@@ -66,6 +76,7 @@ public sealed class VirtualWorld : IAsyncDisposable
         _adapter = adapter;
         _provider = provider;
         _tempHomePath = tempHomePath;
+        _platformConfig = platformConfig;
         _agentRegistry = agentRegistry;
         _conversationStore = conversationStore;
         _sessionStore = sessionStore;
@@ -82,6 +93,29 @@ public sealed class VirtualWorld : IAsyncDisposable
 
     /// <summary>The fake provider — exposes turn count and the canned response factory.</summary>
     public ScenarioFakeApiProvider Provider => _provider;
+
+    /// <summary>Live failure diagnostics; attempted/completed dispatch is deliberately distinct from provider entry.</summary>
+    public string DescribeInboundProgress()
+    {
+        var attempts = _adapter.InboundDispatched;
+        var outcomes = _adapter.InboundOutcomes;
+        var acceptances = _adapter.InboundAcceptances;
+        var entries = _provider.Invocations;
+        return $"Inbound attempts={attempts.Count}, completed={outcomes.Count}, provider count={_provider.TurnCount}; " +
+            string.Join("; ", attempts.Select(message =>
+            {
+                var outcome = outcomes.LastOrDefault(item => ReferenceEquals(item.Message, message));
+                var acceptance = acceptances.LastOrDefault(item => ReferenceEquals(item.Message, message));
+                return $"sender={message.SenderId}, address={message.ChannelAddress}, content={message.Content}, " +
+                    $"adapter={outcome?.Outcome?.ToString() ?? "pending-or-faulted"}, " +
+                    $"acceptance={acceptance?.Result.Status.ToString() ?? "unobserved"}, " +
+                    $"targets=[{string.Join(",", acceptance?.Result.Dispatches.Select(d => $"{d.Resolution.ConversationId}/{d.Resolution.SessionId}") ?? [])}], " +
+                    $"error={outcome?.Error}";
+            })) + "; provider entries=[" +
+            string.Join("; ", entries.Select(entry => $"turn={entry.TurnIndex}, latest-user={entry.UserText}")) +
+            "]; outbound=[" + string.Join("; ", _adapter.Outbound.Select(message =>
+                $"address={message.ChannelAddress}, content={message.Content}")) + "]";
+    }
 
     /// <summary>
     /// Bootstraps a fully wired in-process gateway, registers the virtual channel + fake
@@ -116,8 +150,11 @@ public sealed class VirtualWorld : IAsyncDisposable
 
         // PlatformConfig is consumed by GatewayAuthManager + isolation strategies. Register a
         // default-shaped options monitor (no provider configuration) so DI resolves cleanly
-        // without reaching for a real config.json on disk.
-        services.AddOptions<PlatformConfig>();
+        // without reaching for a real config.json on disk. When the world is booting through the
+        // real config plane, AddPlatformConfiguration binds this same options type from the file
+        // instead, so registering an unbound one here would only obscure where the values came from.
+        if (!options.ReconcileBundledAgents)
+            services.AddOptions<PlatformConfig>();
 
         // GatewayAuthManager is registered by AddPlatformConfiguration in production, NOT by
         // AddBotNexusGateway. Scenarios don't call AddPlatformConfiguration (it touches the
@@ -127,14 +164,34 @@ public sealed class VirtualWorld : IAsyncDisposable
 
         // Empty in-memory agent config source so AddBotNexusGateway's default file-based
         // source is skipped. Scenarios register agents programmatically via GivenAgentAsync.
-        services.AddSingleton<IAgentConfigurationSource, EmptyAgentConfigurationSource>();
+        if (!options.ReconcileBundledAgents)
+            services.AddSingleton<IAgentConfigurationSource, EmptyAgentConfigurationSource>();
 
         services.AddBotNexusGateway();
+
+        // #3699. Hosted services registered up to THIS point are harness scaffolding that the
+        // default world strips. Snapshotting them here (rather than after the config plane is
+        // added) is what lets the strip below remove exactly those and keep everything
+        // AddPlatformConfiguration registers - in its own registration order, which is the
+        // mechanism that puts the bundled-agent reconciler ahead of agent registration.
+        var strippableHostedDescriptors = services
+            .Where(d => d.ServiceType == typeof(IHostedService))
+            .ToList();
+
+        if (options.ReconcileBundledAgents)
+        {
+            var configPath = await SeedConfigStoreAsync(
+                tempHomePath,
+                options.SeedConfigAgentId,
+                cancellationToken);
+            services.AddPlatformConfiguration(configPath);
+        }
 
         // The single virtual channel — register the concrete type AND the IChannelAdapter
         // contract that ChannelManager scans for.
         services.AddSingleton(adapter);
         services.AddSingleton<IChannelAdapter>(adapter);
+        services.AddSingleton<IConversationEventSink>(adapter);
 
         // LLM stack — gateway does NOT auto-register these (Program.cs does in production).
         services.AddSingleton<ApiProviderRegistry>();
@@ -147,15 +204,13 @@ public sealed class VirtualWorld : IAsyncDisposable
             return new LlmClient(apis, models);
         });
 
-        // Strip ALL background hosted services and re-add only GatewayHost — it owns the
-        // channel-adapter startup loop and the dispatch pipeline that scenarios drive. The
-        // rest (UpdateCheckService, MemoryIndexer, SessionWarmupService, SessionCleanupService,
-        // AgentConfigurationHostedService) are noise that slows startup and drags in extra
-        // dependencies (HttpClient, file watchers) that scenarios don't exercise.
-        var hostedDescriptors = services
-            .Where(d => d.ServiceType == typeof(IHostedService))
-            .ToList();
-        foreach (var descriptor in hostedDescriptors)
+        // Strip the background hosted services registered by AddBotNexusGateway and re-add only
+        // GatewayHost — it owns the channel-adapter startup loop and the dispatch pipeline that
+        // scenarios drive. The rest (UpdateCheckService, MemoryIndexer, SessionWarmupService,
+        // SessionCleanupService, AgentConfigurationHostedService) are noise that slows startup and
+        // drags in extra dependencies (HttpClient, file watchers) that scenarios don't exercise.
+        // Config-plane hosted services added after the snapshot survive on purpose.
+        foreach (var descriptor in strippableHostedDescriptors)
             services.Remove(descriptor);
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<BotNexus.Gateway.GatewayHost>());
 
@@ -174,6 +229,7 @@ public sealed class VirtualWorld : IAsyncDisposable
             adapter,
             provider,
             tempHomePath,
+            host.Services.GetRequiredService<IOptionsMonitor<PlatformConfig>>(),
             host.Services.GetRequiredService<IAgentRegistry>(),
             host.Services.GetRequiredService<IConversationStore>(),
             host.Services.GetRequiredService<ISessionStore>(),
@@ -295,16 +351,19 @@ public sealed class VirtualWorld : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channelAddress);
-        var deadline = DateTimeOffset.UtcNow + (timeout ?? _defaultOutboundWaitTimeout);
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
+        AgentReply? reply = null;
+        await TestAwait.EventuallyAsync(
+            () =>
+            {
 
             // Non-streaming delivery — completed OutboundMessage on the channel address.
             var outbound = _adapter.Outbound.FirstOrDefault(m =>
                 string.Equals(m.ChannelAddress.Value, channelAddress, StringComparison.Ordinal));
             if (outbound is not null)
-                return new AgentReply(outbound.Content, channelAddress, AgentReplyDelivery.Outbound);
+            {
+                reply = new AgentReply(outbound.Content, channelAddress, AgentReplyDelivery.Outbound);
+                return true;
+            }
 
             // Streaming delivery — the channel saw TurnEnd or MessageEnd for this address,
             // meaning the agent has emitted a complete reply over the stream.
@@ -326,18 +385,74 @@ public sealed class VirtualWorld : IAsyncDisposable
                         content = string.Concat(deltas);
                     }
 
-                    return new AgentReply(content, channelAddress, AgentReplyDelivery.Stream);
+                    reply = new AgentReply(content, channelAddress, AgentReplyDelivery.Stream);
+                    return true;
                 }
             }
 
-            await Task.Delay(20, cancellationToken);
+                return false;
+            },
+            $"an agent reply on '{channelAddress}' " +
+            $"(outbound={_adapter.Outbound.Count}, streamEvents={(_adapter.StreamEvents.TryGetValue(channelAddress, out var e) ? e.Count : 0)}, " +
+            $"providerTurns={_provider.TurnCount})",
+            timeout ?? _defaultOutboundWaitTimeout,
+            cancellationToken: cancellationToken);
+
+        return reply ?? throw new InvalidOperationException("Reply observation completed without a reply.");
+    }
+
+    /// <summary>
+    /// Returns every agent currently registered with the platform. Bring-up journeys need
+    /// this to assert the <em>starting</em> state — that a fresh world genuinely has no
+    /// agents — which is what distinguishes a first-agent bring-up journey from an ordinary
+    /// message round-trip. Exposed as a typed verb rather than letting scenarios resolve
+    /// <c>IAgentRegistry</c>, per the <c>ScenarioTests_DoNotDependOnIServiceProvider</c> rule.
+    /// </summary>
+    public Task<IReadOnlyList<RegisteredAgent>> ListAgentsAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        IReadOnlyList<RegisteredAgent> agents =
+        [
+            .. _agentRegistry.GetAll().Select(d => new RegisteredAgent(d.AgentId.Value, d.DisplayName))
+        ];
+        return Task.FromResult(agents);
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="agentId"/> appears in the live registered-agent set, then
+    /// returns it.
+    /// </summary>
+    /// <remarks>
+    /// Needed for agents that arrive via the CONFIG plane rather than
+    /// <see cref="GivenAgentAsync"/> (#3699): those are registered by a hosted service during
+    /// startup, so a bare read immediately after <see cref="StartAsync"/> races the registration.
+    /// This is a hang guard, not a latency budget - a scenario that genuinely never registers the
+    /// agent fails with the registered set named in the message rather than a bare timeout.
+    /// </remarks>
+    /// <exception cref="TimeoutException">The agent never appeared within the wait.</exception>
+    public async Task<RegisteredAgent> WaitForRegisteredAgentAsync(
+        string agentId,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(agentId);
+        try
+        {
+            await TestAwait.EventuallyAsync(
+                () => _agentRegistry.Contains(AgentId.From(agentId)),
+                $"agent '{agentId}' to be registered",
+                timeout ?? RegistrationHangGuard,
+                cancellationToken: cancellationToken);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new TimeoutException(BuildRegistrationDiagnostic(agentId), ex);
         }
 
-        throw new TimeoutException(
-            $"No agent reply observed on channel address '{channelAddress}' within " +
-            $"{(timeout ?? _defaultOutboundWaitTimeout).TotalMilliseconds:F0}ms " +
-            $"(outbound={_adapter.Outbound.Count}, streamEvents={(_adapter.StreamEvents.TryGetValue(channelAddress, out var e) ? e.Count : 0)}, " +
-            $"providerTurns={_provider.TurnCount}).");
+        var descriptor = _agentRegistry.Get(AgentId.From(agentId))
+            ?? throw new InvalidOperationException(
+                $"Agent '{agentId}' was observed as registered but could not be read back.");
+        return new RegisteredAgent(descriptor.AgentId.Value, descriptor.DisplayName);
     }
 
     /// <summary>
@@ -401,6 +516,15 @@ public sealed class VirtualWorld : IAsyncDisposable
         _host.Dispose();
         try
         {
+            ConfigStoreBootstrap.ReleaseConnections(
+                Path.Combine(_tempHomePath, ConfigStoreBootstrap.StoreFileName));
+        }
+        catch
+        {
+            // Best-effort release; a world without the config store has no pooled connection.
+        }
+        try
+        {
             if (Directory.Exists(_tempHomePath))
                 Directory.Delete(_tempHomePath, recursive: true);
         }
@@ -410,18 +534,72 @@ public sealed class VirtualWorld : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Creates the authoritative SQLite configuration store a config-plane world boots from
+    /// (#3699): one enabled agent pointed at the scenario fake provider, and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The JSON path is still supplied to the production composition root because <c>config.db</c>
+    /// is discovered beside it, but no JSON seed is written. The store file existing is the
+    /// production opt-in, and <see cref="ConfigStoreBootstrap.PopulateAsync"/> is the supported
+    /// bootstrap seam. This makes the journey fail if startup silently falls back to file-only
+    /// configuration.
+    /// </para>
+    /// <para>
+    /// The seed agent is not decoration. <c>PlatformAgentReconciliationService</c> copies its
+    /// provider/model onto the bundled entry it inserts; with an empty config the reconciler would
+    /// resolve nothing and insert the bundled agent DISABLED, so the scenario would be asserting
+    /// against the fallback path rather than the one a real install with a working agent takes.
+    /// </para>
+    /// </remarks>
+    private static async Task<string> SeedConfigStoreAsync(
+        string homePath,
+        string seedAgentId,
+        CancellationToken cancellationToken)
+    {
+        var configPath = Path.Combine(homePath, "config.json");
+        var storePath = Path.Combine(homePath, ConfigStoreBootstrap.StoreFileName);
+        var document = new System.Text.Json.Nodes.JsonObject
+        {
+            ["agents"] = new System.Text.Json.Nodes.JsonObject
+            {
+                [seedAgentId] = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["displayName"] = seedAgentId,
+                    ["provider"] = ScenarioFakeApiProvider.ProviderName,
+                    ["model"] = ScenarioFakeApiProvider.ModelId,
+                    ["isolationStrategy"] = "in-process",
+                    ["enabled"] = true
+                }
+            }
+        };
+
+        await ConfigStoreBootstrap.PopulateAsync(storePath, document, cancellationToken);
+        return configPath;
+    }
+
+    private string BuildRegistrationDiagnostic(string agentId)
+    {
+        var registered = string.Join(", ", _agentRegistry.GetAll().Select(d => d.AgentId.Value));
+        var configured = string.Join(", ", _platformConfig.CurrentValue.Agents?.Keys ?? Enumerable.Empty<string>());
+        var storePath = Path.Combine(_tempHomePath, ConfigStoreBootstrap.StoreFileName);
+        var store = new BotNexus.Gateway.Configuration.Store.SqliteConfigStore($"Data Source={storePath}");
+        var persisted = store.ReadEntriesAsync().GetAwaiter().GetResult().Keys
+            .Where(key => key.StartsWith("agents.", StringComparison.OrdinalIgnoreCase))
+            .Order(StringComparer.OrdinalIgnoreCase);
+
+        return $"Agent '{agentId}' was not registered. Registered=[{registered}]; "
+            + $"boundConfigAgents=[{configured}]; persistedAgentKeys=[{string.Join(", ", persisted)}].";
+    }
+
     private static async Task WaitForAdapterStartAsync(VirtualChannelAdapter adapter, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            if (adapter.IsRunning) return;
-            cancellationToken.ThrowIfCancellationRequested();
-            await Task.Delay(10, cancellationToken);
-        }
-        throw new TimeoutException(
-            $"VirtualChannelAdapter did not start within {timeout.TotalSeconds:F0}s. " +
-            "Likely the gateway's BackgroundService failed to start its channel adapters.");
+        await TestAwait.EventuallyAsync(
+            () => adapter.IsRunning,
+            "the VirtualChannelAdapter to start; the gateway BackgroundService may have failed",
+            timeout,
+            cancellationToken: cancellationToken);
     }
 
     private static ConversationView ToView(Conversation conversation)

@@ -36,6 +36,28 @@ public sealed class InMemoryConversationStore : IConversationStore
     }
 
     /// <inheritdoc />
+    public Task<ConversationOwnership?> GetOwnershipAsync(ConversationId conversationId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(_conversations.TryGetValue(conversationId.Value, out var conversation)
+            ? new ConversationOwnership(conversation.ConversationId, conversation.AgentId) : null);
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<ConversationOwnership>> ListOwnershipAsync(AgentId? agentId = null, CancellationToken ct = default)
+    {
+        var result = new List<ConversationOwnership>();
+        foreach (var conversation in _conversations.Values)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (agentId is null || conversation.AgentId == agentId.Value)
+                result.Add(new(conversation.ConversationId, conversation.AgentId));
+        }
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<ConversationOwnership>>(result);
+    }
+
+    /// <inheritdoc />
     public Task<Conversation?> GetAsync(ConversationId conversationId, CancellationToken ct = default)
     {
         var conversation = _conversations.GetValueOrDefault(conversationId.Value);
@@ -69,6 +91,8 @@ public sealed class InMemoryConversationStore : IConversationStore
 
     public Task<Conversation> CreateAsync(Conversation conversation, CancellationToken ct = default)
     {
+        if (conversation.CompactionTokenCeiling is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(conversation), "CompactionTokenCeiling must be positive or null.");
         StampWorldId(conversation);
         if (!_conversations.TryAdd(conversation.ConversationId.Value, conversation))
             throw new InvalidOperationException($"A conversation with id '{conversation.ConversationId}' already exists.");
@@ -78,6 +102,10 @@ public sealed class InMemoryConversationStore : IConversationStore
     /// <inheritdoc />
     public Task SaveAsync(Conversation conversation, CancellationToken ct = default)
     {
+        if (conversation.CompactionTokenCeiling is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(conversation), "CompactionTokenCeiling must be positive or null.");
+        if (conversation.Status == ConversationStatus.Archived && conversation.ActiveSessionId is not null)
+            throw new InvalidOperationException($"Conversation '{conversation.ConversationId}' cannot be archived while an active session is assigned.");
         StampWorldId(conversation);
         conversation = conversation with { UpdatedAt = DateTimeOffset.UtcNow };
         _conversations[conversation.ConversationId.Value] = conversation;
@@ -87,14 +115,43 @@ public sealed class InMemoryConversationStore : IConversationStore
     /// <inheritdoc />
     public Task ArchiveAsync(ConversationId conversationId, CancellationToken ct = default)
     {
-        if (_conversations.TryGetValue(conversationId.Value, out var existing))
-            _conversations[conversationId.Value] = existing with
+        _ = TryArchiveCore(conversationId);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task<bool> TryArchiveAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(actor);
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(TryArchiveCore(conversationId));
+    }
+
+    private bool TryArchiveCore(ConversationId conversationId)
+    {
+        while (_conversations.TryGetValue(conversationId.Value, out var existing))
+        {
+            if (existing.Status != ConversationStatus.Active)
+                return false;
+
+            var archived = existing with
             {
                 Status = ConversationStatus.Archived,
                 ActiveSessionId = null,
-                UpdatedAt = DateTimeOffset.UtcNow
+                UpdatedAt = DateTimeOffset.UtcNow,
+                Version = existing.Version + 1
             };
-        return Task.CompletedTask;
+            if (_conversations.TryUpdate(conversationId.Value, archived, existing))
+                return true;
+        }
+
+        return false;
     }
 
     /// <inheritdoc />
@@ -167,6 +224,134 @@ public sealed class InMemoryConversationStore : IConversationStore
         => _participantLocks.GetOrAdd(conversationId, static _ => new SemaphoreSlim(1, 1));
 
     /// <inheritdoc />
+    public async Task<bool> AddBindingAsync(ConversationId conversationId, ChannelBinding binding, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(binding);
+        var conversationLock = GetParticipantLock(conversationId.Value);
+        await conversationLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!_conversations.TryGetValue(conversationId.Value, out var existing))
+                return false;
+            // Copy the binding list so a concurrent add builds on a private copy rather than
+            // mutating a list that may be aliased by an already-returned GetAsync reference.
+            var bindings = new List<ChannelBinding>(existing.ChannelBindings) { binding };
+            _conversations[conversationId.Value] = existing with { ChannelBindings = bindings, UpdatedAt = DateTimeOffset.UtcNow };
+            return true;
+        }
+        finally { conversationLock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RemoveBindingAsync(ConversationId conversationId, BindingId bindingId, CancellationToken ct = default)
+    {
+        var conversationLock = GetParticipantLock(conversationId.Value);
+        await conversationLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!_conversations.TryGetValue(conversationId.Value, out var existing))
+                return false;
+            var target = existing.ChannelBindings.FirstOrDefault(b => b.BindingId == bindingId);
+            if (target is null)
+                return false;
+            var bindings = existing.ChannelBindings.Where(b => b.BindingId != bindingId).ToList();
+            _conversations[conversationId.Value] = existing with { ChannelBindings = bindings, UpdatedAt = DateTimeOffset.UtcNow };
+            return true;
+        }
+        finally { conversationLock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> MoveBindingAsync(ConversationId fromConversationId, ConversationId toConversationId, BindingId bindingId, CancellationToken ct = default)
+    {
+        // Deterministic lock ordering (ordinal) to avoid inverse-move deadlock.
+        var (first, second) = string.CompareOrdinal(fromConversationId.Value, toConversationId.Value) <= 0
+            ? (fromConversationId.Value, toConversationId.Value)
+            : (toConversationId.Value, fromConversationId.Value);
+        var firstLock = GetParticipantLock(first);
+        await firstLock.WaitAsync(ct).ConfigureAwait(false);
+        SemaphoreSlim? secondLock = null;
+        try
+        {
+            if (!string.Equals(first, second, StringComparison.Ordinal))
+            {
+                secondLock = GetParticipantLock(second);
+                await secondLock.WaitAsync(ct).ConfigureAwait(false);
+            }
+
+            if (!_conversations.TryGetValue(fromConversationId.Value, out var source))
+                return false;
+            if (!_conversations.TryGetValue(toConversationId.Value, out var destination))
+                return false;
+            var target = source.ChannelBindings.FirstOrDefault(b => b.BindingId == bindingId);
+            if (target is null)
+                return false;
+
+            var now = DateTimeOffset.UtcNow;
+            var sourceBindings = source.ChannelBindings.Where(b => b.BindingId != bindingId).ToList();
+            var destinationBindings = new List<ChannelBinding>(destination.ChannelBindings) { target };
+            _conversations[fromConversationId.Value] = source with { ChannelBindings = sourceBindings, UpdatedAt = now };
+            _conversations[toConversationId.Value] = destination with { ChannelBindings = destinationBindings, UpdatedAt = now };
+            return true;
+        }
+        finally
+        {
+            secondLock?.Release();
+            firstLock.Release();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<Conversation?> PatchMetadataAsync(ConversationId conversationId, ConversationMetadataPatch patch, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(patch);
+        var conversationLock = GetParticipantLock(conversationId.Value);
+        await conversationLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!_conversations.TryGetValue(conversationId.Value, out var existing))
+                return null;
+            var updated = existing with
+            {
+                Title = patch.Title.IsSet ? patch.Title.Value : existing.Title,
+                Purpose = patch.Purpose.IsSet ? patch.Purpose.Value : existing.Purpose,
+                Instructions = patch.Instructions.IsSet ? patch.Instructions.Value : existing.Instructions,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+            _conversations[conversationId.Value] = updated;
+            return BackfillWorldId(updated);
+        }
+        finally { conversationLock.Release(); }
+    }
+
+    /// <inheritdoc />
+    public async Task<Conversation?> PatchOverrideAsync(ConversationId conversationId, ConversationOverridePatch patch, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(patch);
+        if (patch.CompactionTokenCeiling.IsSet && patch.CompactionTokenCeiling.Value is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(patch), "CompactionTokenCeiling must be positive or null.");
+        var conversationLock = GetParticipantLock(conversationId.Value);
+        await conversationLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!_conversations.TryGetValue(conversationId.Value, out var existing))
+                return null;
+            var updated = existing with
+            {
+                ModelOverride = patch.Model.IsSet ? patch.Model.Value : existing.ModelOverride,
+                ThinkingOverride = patch.Thinking.IsSet ? patch.Thinking.Value : existing.ThinkingOverride,
+                ContextWindowOverride = patch.ContextWindow.IsSet ? patch.ContextWindow.Value : existing.ContextWindowOverride,
+                CompactionTokenCeiling = patch.CompactionTokenCeiling.IsSet ? patch.CompactionTokenCeiling.Value : existing.CompactionTokenCeiling,
+                ToolOverrideJson = patch.ToolOverrideJson.IsSet ? patch.ToolOverrideJson.Value : existing.ToolOverrideJson,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+            _conversations[conversationId.Value] = updated;
+            return BackfillWorldId(updated);
+        }
+        finally { conversationLock.Release(); }
+    }
+
+    /// <inheritdoc />
     public Task<Conversation?> ResolveByBindingAsync(
         AgentId agentId,
         ChannelKey channelType,
@@ -186,15 +371,71 @@ public sealed class InMemoryConversationStore : IConversationStore
     /// <inheritdoc />
     public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default)
     {
-        // Archived conversations are excluded from the active list.
+        // Archived conversations are excluded from the active list, as are nested sub-agent runs
+        // (#2338): a conversation with a parent is reachable only by expanding its spawning tool
+        // call in that parent, never as a top-level entry.
         IReadOnlyList<ConversationSummary> summaries = [.. _conversations.Values
             .Where(c => c.Status != ConversationStatus.Archived)
+            .Where(c => c.ParentConversationId is null)
             .OrderByDescending(c => c.IsPinned)
             .ThenByDescending(c => c.PinnedAt)
             .ThenByDescending(c => c.UpdatedAt)
             .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal)
             .Select(ToSummary)];
         return Task.FromResult(summaries);
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(
+        DateTimeOffset? activitySince, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        IReadOnlyList<ConversationSummary> summaries = [.. _conversations.Values
+            .Where(c => c.Status == ConversationStatus.Active && c.ParentConversationId is null)
+            .Select(c => (Conversation: c, Activity: ConversationStoreShared.EffectiveActivity(c)))
+            .Where(x => activitySince is null || x.Activity >= activitySince.Value)
+            .OrderByDescending(x => x.Conversation.IsPinned)
+            .ThenByDescending(x => x.Conversation.PinnedAt)
+            .ThenByDescending(x => x.Activity)
+            .ThenBy(x => x.Conversation.ConversationId.Value, StringComparer.Ordinal)
+            .Select(x => ToSummary(x.Conversation) with { UpdatedAt = x.Activity })];
+        return Task.FromResult(summaries);
+    }
+    /// <inheritdoc />
+    public Task<IReadOnlyList<ConversationRetentionCandidate>> GetRetentionCandidatesAsync(
+        ConversationSource? source = null,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        IReadOnlyList<ConversationRetentionCandidate> candidates = [.. _conversations.Values
+            .Where(c => c.Status == ConversationStatus.Active && (!source.HasValue || c.Source == source.Value))
+            .OrderBy(c => c.UpdatedAt)
+            .Select(c => new ConversationRetentionCandidate(
+                c.ConversationId,
+                c.AgentId,
+                c.UpdatedAt,
+                c.IsPinned,
+                c.Source,
+                c.SourceId))];
+        return Task.FromResult(candidates);
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default)
+    {
+        // #3660 (criterion 6): cancellation must surface rather than resolve to an empty list.
+        // A silently-empty result would skip rehydration and reintroduce the #2047 mis-dispatch,
+        // so this synchronous implementation checks the token explicitly.
+        ct.ThrowIfCancellationRequested();
+        // #3660: parity with the SQLite filtered query. There is no cheaper projection available
+        // over a dictionary of live objects, but the contract is the same - only non-empty
+        // checkpoints are surfaced, so the caller never re-checks emptiness.
+        IReadOnlyList<PendingAskUserCheckpoint> checkpoints = [.. _conversations.Values
+            .Where(c => !string.IsNullOrEmpty(c.PendingAskUserJson))
+            .OrderByDescending(c => c.UpdatedAt)
+            .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal)
+            .Select(c => new PendingAskUserCheckpoint(c.ConversationId, c.PendingAskUserJson!))];
+        return Task.FromResult(checkpoints);
     }
 
     // World-id stamping/back-fill is shared across all three conversation stores — see
@@ -219,12 +460,16 @@ public sealed class InMemoryConversationStore : IConversationStore
             c.UpdatedAt,
             c.Purpose,
             c.Kind.ToString(),
+            c.Source.ToString(),
+            c.Visibility.ToString(),
             c.IsPinned,
             c.PinnedAt,
             c.Participants.Select(p => new ParticipantSummary(
                 p.CitizenId.Kind.ToString(),
                 p.CitizenId.Value,
-                p.Role)).ToList());
+                p.Role)).ToList(),
+            // #2121: SourceId travels with Source everywhere Source is projected.
+            c.SourceId);
 
     // ── Canvas State ───────────────────────────────────────────────────────
 

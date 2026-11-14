@@ -1,3 +1,4 @@
+using BotNexus.Memory.Embeddings;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Models;
@@ -162,13 +163,14 @@ public sealed class SystemPromptCaptureTests
         public Task<string> BuildSystemPromptAsync(
             AgentDescriptor descriptor,
             AgentExecutionContext? executionContext,
+            EffectiveExecutionSettings? effectiveSettings = null,
             CancellationToken cancellationToken = default)
             => Task.FromResult(prompt);
     }
 
     private sealed class NoOpAgentToolFactory : IAgentToolFactory
     {
-        public IReadOnlyList<IAgentTool> CreateTools(string workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
+        public IReadOnlyList<IAgentTool> CreateTools(WorkingDir workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
             => Array.Empty<IAgentTool>();
     }
 
@@ -191,7 +193,7 @@ public sealed class SystemPromptCaptureTests
 
     private sealed class NoOpMemoryStoreFactory : IMemoryStoreFactory
     {
-        public IMemoryStore Create(string agentId) => new NoOpMemoryStore();
+        public IMemoryStore Create(AgentId agentId) => new NoOpMemoryStore();
     }
 
     private sealed class NoOpMemoryStore : IMemoryStore
@@ -203,6 +205,19 @@ public sealed class SystemPromptCaptureTests
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
         public Task<IReadOnlyList<MemoryEntry>> SearchAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
+
+        // #2781: explicit pass-through. Required (not default-implemented) on IMemoryStore because
+        // Moq returns null for default interface methods rather than running the default body.
+        public async Task<IReadOnlyList<ScoredMemoryEntry>> SearchScoredAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+        {
+            var entries = await SearchAsync(query, topK, filter, ct);
+            return entries.Select(entry => new ScoredMemoryEntry(entry, 0d)).ToList();
+        }
+
+        // #3244: explicit pass-through with a NotAttempted scan report - this stub runs no bounded
+        // vector scan, so claiming any coverage would be a lie the caller could act on.
+        public async Task<MemorySearchResult> SearchWithReportAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+            => new(await SearchScoredAsync(query, topK, filter, ct), MemoryVectorScanReport.NotAttempted);
         public Task DeleteAsync(string id, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task<MemoryStoreStats> GetStatsAsync(CancellationToken ct = default) => Task.FromResult(new MemoryStoreStats(0, 0, null));

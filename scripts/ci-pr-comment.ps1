@@ -33,77 +33,27 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Rendering is factored into scripts/repo/CiCommentRendering.ps1 so it can be
+# exercised without touching GitHub. See issue #2997.
+. (Join-Path $PSScriptRoot 'repo/CiCommentRendering.ps1')
+
 $marker  = "<!-- farnsworth:ci-monitor-$PR -->"
 $nowUtc  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm UTC')
 
-# ---------------------------------------------------------------------------
-# 1. Render check table rows
-# ---------------------------------------------------------------------------
-$statusIcon = @{
-    'pass'    = 'pass'
-    'fail'    = 'FAIL'
-    'pending' = 'pending'
-    'skipped' = 'skipped'
-}
-
-# Known checks in display order; any extras from CheckRows appended at end
-$knownOrder = @(
-    'impacted-tests',
-    'CodeQL',
-    'Analyze (csharp)',
-    'Code Pattern Checks',
-    'Dependency Security Audit',
-    'Secret Scanning (TruffleHog)'
-)
-
-$checkMap = @{}
-foreach ($row in $CheckRows) { $checkMap[$row.name] = $row.status }
-
-# Build ordered list: known first, then any unknown checks
-$orderedNames = $knownOrder + ($checkMap.Keys | Where-Object { $_ -notin $knownOrder } | Sort-Object)
-
-$tableRows = $orderedNames | ForEach-Object {
-    $n = $_
-    $s = if ($checkMap.ContainsKey($n)) { $statusIcon[$checkMap[$n]] ?? $checkMap[$n] } else { 'skipped' }
-    "| $n | $s |"
-}
-$tableBody = $tableRows -join "`n"
-
-# ---------------------------------------------------------------------------
-# 2. Render bullet lists
-# ---------------------------------------------------------------------------
-function Format-Bullets([array]$items) {
-    ($items | ForEach-Object { "- $_" }) -join "`n"
-}
-
-$actionBullets  = Format-Bullets $Actions
-$blockerBullets = Format-Bullets $Blockers
-
-# ---------------------------------------------------------------------------
-# 3. Render full template (history block placeholder filled below)
-# ---------------------------------------------------------------------------
 function New-Body([string]$historyBlock) {
-    @"
-$marker
-## CI Health Check -- PR #$PR
-
-| Check | Status |
-|-------|--------|
-$tableBody
-
-**Branch:** ``$Branch`` | **Behind main:** $BehindBy commits | **Mergeable:** $Mergeable
-
-**Actions taken:**
-$actionBullets
-
-**Blockers for Jon:**
-$blockerBullets
-
----
-$historyBlock
----
-*Farnsworth (automated CI monitor) -- [BotNexus](https://github.com/Sytone/$($Repo.Split('/')[1])) -- Last updated: $nowUtc*
-"@
+    $renderArgs = @{
+        PR           = $PR
+        CheckRows    = $CheckRows
+        BehindBy     = $BehindBy
+        Mergeable    = $Mergeable
+        Actions      = $Actions
+        Blockers     = $Blockers
+        Branch       = $Branch
+        Repo         = $Repo
+        HistoryBlock = $historyBlock
+        NowUtc       = $nowUtc
+    }
+    New-CiHealthCheckBody @renderArgs
 }
 
 # ---------------------------------------------------------------------------
@@ -162,14 +112,80 @@ if ($existingBody -and ((Strip-Volatile $existingBody) -eq (Strip-Volatile $newB
 # ---------------------------------------------------------------------------
 # 7. Create or patch
 # ---------------------------------------------------------------------------
+# A write that cannot be confirmed is a FAILED write, not a successful one (#3005).
+# `gh` reports auth/EMU failures on stderr and a non-zero exit code; neither is
+# surfaced by `| Out-Null`, and $ErrorActionPreference = 'Stop' does not apply to
+# native exit codes. Both the exit code and the verification read are therefore
+# checked explicitly, and either failing produces action='failed' + exit 1.
+function Write-CiCommentFailure {
+    param([string]$Reason, [string]$Detail)
+    if ($Detail) { [Console]::Error.WriteLine($Detail.TrimEnd()) }
+    @{ action = 'failed'; commentId = $null; pr = $PR; error = $Reason } | ConvertTo-Json -Compress
+    exit 1
+}
+
+# Runs a native gh command, capturing stderr to a temp file so it can be replayed
+# rather than discarded. Returns the captured stderr text via [ref]; the caller
+# inspects $LASTEXITCODE.
+function Invoke-GhCapture {
+    param([string[]]$GhArgs, [ref]$Stderr)
+    $errPath = [IO.Path]::GetTempFileName()
+    try {
+        & gh @GhArgs 2> $errPath | Out-Null
+        $Stderr.Value = (Get-Content -LiteralPath $errPath -Raw -ErrorAction SilentlyContinue)
+    } finally {
+        Remove-Item -LiteralPath $errPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# The comment body is multi-line by construction (marker, markdown table, action
+# bullets, history block). Passing it as an inline `--body <value>` argument does
+# not survive the native gh.exe boundary on Windows: the value stops being a
+# single argument and gh parses one of its lines as a positional, producing the
+# misleading `GraphQL: Could not resolve to a Repository with the name '<a body
+# line>'` (issue #3850). `--body-file` avoids the boundary entirely and is the
+# form gh documents for long bodies. The file is removed in a `finally` on both
+# the success and the failure path.
+function Invoke-GhWithBodyFile {
+    param(
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter(Mandatory)][scriptblock]$BuildArgs,   # [string]$path -> string[]
+        [ref]$Stderr
+    )
+    $bodyPath = [IO.Path]::Combine(
+        [IO.Path]::GetTempPath(),
+        "ci-pr-comment-$PR-$([Guid]::NewGuid().ToString('N')).md")
+    try {
+        # -NoNewline keeps the written bytes byte-identical to the rendered body.
+        Set-Content -LiteralPath $bodyPath -Value $Body -Encoding UTF8 -NoNewline
+        Invoke-GhCapture -GhArgs (& $BuildArgs $bodyPath) -Stderr $Stderr
+    } finally {
+        Remove-Item -LiteralPath $bodyPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$ghErr = $null
 if ($existingId) {
-    gh api "repos/$Repo/issues/comments/$existingId" -X PATCH -f body=$newBody | Out-Null
+    Invoke-GhCapture -GhArgs @('api', "repos/$Repo/issues/comments/$existingId", '-X', 'PATCH', '-f', "body=$newBody") -Stderr ([ref]$ghErr)
+    if ($LASTEXITCODE -ne 0) {
+        Write-CiCommentFailure -Reason 'patch-failed' -Detail $ghErr
+    }
     @{ action = 'updated'; commentId = $existingId; pr = $PR } | ConvertTo-Json -Compress
 } else {
-    $result = gh pr comment $PR --repo $Repo --body $newBody | Out-Null
-    # Fetch the new comment id
+    Invoke-GhWithBodyFile -Body $newBody -Stderr ([ref]$ghErr) -BuildArgs {
+        param([string]$path)
+        @('pr', 'comment', "$PR", '--repo', $Repo, '--body-file', $path)
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-CiCommentFailure -Reason 'create-failed' -Detail $ghErr
+    }
+    # Verification read: the comment id IS the proof the write landed.
     $newId = (gh api "repos/$Repo/issues/$PR/comments" --paginate 2>$null |
         ConvertFrom-Json | Where-Object { $_.body -match [regex]::Escape($marker) } |
         Select-Object -Last 1).id
+    if (-not $newId) {
+        Write-CiCommentFailure -Reason 'comment-not-found-after-create' `
+            -Detail "gh pr comment exited 0 but no comment carrying marker $marker could be found on PR $PR."
+    }
     @{ action = 'created'; commentId = $newId; pr = $PR } | ConvertTo-Json -Compress
 }

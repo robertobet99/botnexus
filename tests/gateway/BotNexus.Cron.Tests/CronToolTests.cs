@@ -128,7 +128,7 @@ public sealed class CronToolTests
     public async Task ExecuteAsync_Delete_OwnedJob_Succeeds()
     {
         var store = new Mock<ICronStore>();
-        var scheduler = CreateScheduler();
+        var scheduler = CreateScheduler(store.Object);
         store.Setup(value => value.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(CreateJob("job-1", createdBy: "agent-a"));
         store.Setup(value => value.DeleteAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
@@ -176,9 +176,7 @@ public sealed class CronToolTests
         store.Setup(value => value.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(value => value.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"));
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -209,9 +207,7 @@ public sealed class CronToolTests
         store.Setup(value => value.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(value => value.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"));
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -269,9 +265,7 @@ public sealed class CronToolTests
         store.Setup(value => value.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(value => value.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"));
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -327,9 +321,7 @@ public sealed class CronToolTests
         store.Setup(value => value.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(value => value.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"));
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -355,9 +347,7 @@ public sealed class CronToolTests
         store.Setup(value => value.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(value => value.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"));
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -417,7 +407,7 @@ public sealed class CronToolTests
     public async Task ExecuteAsync_Delete_JobTargetingCallingAgent_CreatedByOther_Succeeds()
     {
         var store = new Mock<ICronStore>();
-        var scheduler = CreateScheduler();
+        var scheduler = CreateScheduler(store.Object);
         store.Setup(s => s.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(CreateJobWithTarget("job-1", createdBy: "nova", agentId: "farnsworth"));
         store.Setup(s => s.DeleteAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
@@ -461,9 +451,7 @@ public sealed class CronToolTests
         store.Setup(s => s.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(s => s.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("farnsworth"));
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -484,8 +472,8 @@ public sealed class CronToolTests
         var existingJob = CreateJobWithTarget("job-1", createdBy: "nova", agentId: "farnsworth");
         store.Setup(s => s.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
-        store.Setup(s => s.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        store.Setup(s => s.UpdateDefinitionAsync(It.IsAny<CronJob>(), It.IsAny<CronJobOwnershipExpectation?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((CronJob job, CronJobOwnershipExpectation? _, CancellationToken _) => (CronJob?)job);
 
         var cronStore2 = store.Object;
         var scopeFactory = new ServiceCollection()
@@ -632,7 +620,7 @@ public sealed class CronToolTests
 
         var ex = await act.ShouldThrowAsync<UnauthorizedAccessException>();
         ex.Message.ShouldContain("Cron jobs may only target the calling agent.");
-        store.Verify(s => s.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()), Times.Never);
+        store.Verify(s => s.UpdateDefinitionAsync(It.IsAny<CronJob>(), It.IsAny<CronJobOwnershipExpectation?>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -645,9 +633,7 @@ public sealed class CronToolTests
         store.Setup(s => s.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(s => s.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"), allowCrossAgentCron: false);
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -671,9 +657,7 @@ public sealed class CronToolTests
         store.Setup(s => s.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(s => s.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"), allowCrossAgentCron: false);
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -698,9 +682,7 @@ public sealed class CronToolTests
         store.Setup(s => s.GetAsync(JobId.From("job-1"), It.IsAny<CancellationToken>()))
             .ReturnsAsync(existingJob);
         CronJob? saved = null;
-        store.Setup(s => s.UpdateAsync(It.IsAny<CronJob>(), It.IsAny<CancellationToken>()))
-            .Callback<CronJob, CancellationToken>((job, _) => saved = job)
-            .ReturnsAsync((CronJob job, CancellationToken _) => job);
+        SetupDefinitionWrites(store, existingJob, job => saved = job);
         var tool = new CronTool(store.Object, scheduler, AgentId.From("agent-a"), allowCrossAgentCron: true);
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -915,15 +897,57 @@ public sealed class CronToolTests
         store.Verify(s => s.GetRunHistoryAsync(JobId.From("job-1"), 20, It.IsAny<CancellationToken>()), Times.Once());
     }
 
-    private static CronScheduler CreateScheduler()
+    // #2133: the tool now splits its update into a narrow UpdateDefinitionAsync (definition
+    // columns only) plus, when the schedule/timezone changed, a narrow SetNextRunAtAsync.
+    // This stateful helper mirrors the SQLite store: definition writes preserve scheduler-owned
+    // runtime bookkeeping and the conversation pin; next-run writes touch only NextRunAt. The
+    // onWrite callback captures the latest job so existing assertions on `saved` still hold.
+    private static void SetupDefinitionWrites(Mock<ICronStore> store, CronJob initial, Action<CronJob> onWrite)
     {
-        var store = new Mock<ICronStore>().Object;
+        var holder = new[] { initial };
+        store.Setup(s => s.GetAsync(initial.Id, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => holder[0]);
+        store.Setup(s => s.UpdateDefinitionAsync(It.IsAny<CronJob>(), It.IsAny<CronJobOwnershipExpectation?>(), It.IsAny<CancellationToken>()))
+            .Returns<CronJob, CronJobOwnershipExpectation?, CancellationToken>((job, _, _) =>
+            {
+                var existing = holder[0];
+                var merged = job with
+                {
+                    CreatedAt = existing.CreatedAt,
+                    LastRunAt = existing.LastRunAt,
+                    NextRunAt = existing.NextRunAt,
+                    LastRunStatus = existing.LastRunStatus,
+                    LastRunError = existing.LastRunError,
+                    ConversationId = existing.ConversationId
+                };
+                holder[0] = merged;
+                onWrite(merged);
+                return Task.FromResult<CronJob?>(merged);
+            });
+        store.Setup(s => s.SetNextRunAtAsync(It.IsAny<JobId>(), It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+            .Returns<JobId, DateTimeOffset?, CancellationToken>((_, next, _2) =>
+            {
+                holder[0] = holder[0] with { NextRunAt = next };
+                onWrite(holder[0]);
+                return Task.CompletedTask;
+            });
+    }
+
+    /// <param name="store">
+    /// The store the scheduler itself reads/writes. #3160 made <c>delete</c> route through
+    /// <see cref="CronScheduler.DeleteJobAsync"/> rather than straight at the store, so a test that
+    /// asserts on the delete must hand the scheduler the SAME mock the tool was given - otherwise
+    /// the scheduler resolves the job against a second, empty store, early-outs, and the assertion
+    /// passes or fails for reasons unrelated to the tool.
+    /// </param>
+    private static CronScheduler CreateScheduler(ICronStore? store = null)
+    {
         var scopeFactory = new ServiceCollection()
             .BuildServiceProvider()
             .GetRequiredService<IServiceScopeFactory>();
         var options = new StaticOptionsMonitor<CronOptions>(new CronOptions());
         return new CronScheduler(
-            store,
+            store ?? new Mock<ICronStore>().Object,
             Array.Empty<ICronAction>(),
             scopeFactory,
             options,

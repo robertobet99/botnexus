@@ -11,11 +11,11 @@ namespace BotNexus.Gateway.Abstractions.Sessions;
 /// history, apply + persist with optimistic concurrency, and evict the cached
 /// agent handle so the next turn rebuilds from post-compaction history.
 ///
-/// User notification is intentionally a separate step (<see cref="BuildNotificationText"/>
-/// + <see cref="TrySendChannelNotificationAsync"/>) so callers can deliver the
-/// canonical text through whichever transport they own — a channel adapter for
-/// inbound-channel-driven compactions, the SignalR hub return value plus a
-/// local system message for the Blazor portal — without forking the text.
+/// User notification is intentionally a separate post-compaction step
+/// (<see cref="BuildNotificationText"/> + <see cref="TryPublishNotificationAsync"/>).
+/// Channel-driven callers persist the canonical notification in the session, then publish the
+/// committed item through the channel-neutral conversation event seam. SignalR RPC and command
+/// callers may still use the canonical text as their direct return value without forking it.
 ///
 /// Introduced to fix three subtly different compaction code paths that left
 /// the manual paths missing agent-handle eviction (Bug 3 in PR #602),
@@ -26,7 +26,7 @@ public interface ISessionCompactionCoordinator
     /// <summary>
     /// Run flush + compact + save + handle-eviction. Does not emit any user
     /// notification — callers use <see cref="BuildNotificationText"/> and
-    /// <see cref="TrySendChannelNotificationAsync"/> for that.
+    /// <see cref="TryPublishNotificationAsync"/> for that.
     /// </summary>
     /// <param name="agentId">Target agent.</param>
     /// <param name="session">The session to compact.</param>
@@ -35,11 +35,18 @@ public interface ISessionCompactionCoordinator
     /// regardless of token thresholds or preserved-turn limits. Used by
     /// user-initiated /compact commands where the user's intent overrides
     /// automatic heuristics.</param>
+    /// <param name="handlePolicy">Controls whether an applied compaction evicts the cached handle.
+    /// Mid-loop callers must keep their executing handle and resynchronise its context instead.</param>
+    /// <param name="resolvedOptions">The options snapshot used for the caller's scoped threshold
+    /// decision. Flush and compaction must share this snapshot (with the force override applied).
+    /// Null retains the configured global options for manual and default callers.</param>
     Task<SessionCompactionOutcome> CompactAsync(
         AgentId agentId,
         GatewaySession session,
         CancellationToken cancellationToken,
-        bool force = false);
+        bool force = false,
+        CompactionHandlePolicy handlePolicy = CompactionHandlePolicy.Evict,
+        CompactionOptions? resolvedOptions = null);
 
     /// <summary>
     /// Build the canonical user-facing notification text for an outcome.
@@ -49,22 +56,33 @@ public interface ISessionCompactionCoordinator
     string BuildNotificationText(SessionCompactionOutcome outcome);
 
     /// <summary>
-    /// Convenience helper that resolves the channel adapter for
-    /// <paramref name="channelType"/> and sends the canonical notification
-    /// text. Swallows transport failures (logs a warning) so a delivery
-    /// problem never masks a successful compaction. Returns <c>false</c> if
-    /// the adapter could not be resolved or the send threw.
+    /// Appends and persists the canonical notification, then publishes the exact committed
+    /// session item through the conversation-event seam. Persistence failures propagate and publish
+    /// no success fact. Publication rejection or failure is non-transactional: it is logged and
+    /// returns <c>false</c>, while the durable session item remains available for reconciliation.
     /// </summary>
-    Task<bool> TrySendChannelNotificationAsync(
+    Task<bool> TryPublishNotificationAsync(
         SessionCompactionOutcome outcome,
-        ChannelKey channelType,
-        ChannelAddress channelAddress,
-        string sessionId,
+        AgentId agentId,
+        GatewaySession session,
         CancellationToken cancellationToken);
 }
 
+
 /// <summary>
-/// Result of <see cref="ISessionCompactionCoordinator.CompactAndNotifyAsync"/>.
+/// Selects how the coordinator treats the cached agent handle after an applied compaction.
+/// </summary>
+public enum CompactionHandlePolicy
+{
+    /// <summary>Evict the cached handle so a later external turn rebuilds from persisted history.</summary>
+    Evict,
+
+    /// <summary>Keep the currently executing handle; the caller must resynchronise its live context.</summary>
+    KeepCurrent,
+}
+
+/// <summary>
+/// Result of <see cref="ISessionCompactionCoordinator.CompactAsync"/>.
 /// </summary>
 /// <param name="Succeeded">Whether <see cref="ISessionCompactor"/> returned a valid summary.</param>
 /// <param name="Applied">Whether the new history was actually applied to the session.</param>
@@ -74,6 +92,14 @@ public interface ISessionCompactionCoordinator
 /// <param name="TokensBefore">Approximate token count before compaction.</param>
 /// <param name="TokensAfter">Approximate token count after compaction.</param>
 /// <param name="FailureReason">Human-readable reason when <paramref name="Applied"/> is false.</param>
+/// <param name="SkipReason">Stable machine-readable code naming the abort branch.</param>
+/// <param name="FailureExceptionType">
+/// #3362: the CLR type name of the exception that aborted compaction, when one was thrown
+/// (e.g. <c>IOException</c>). Null when no exception was involved. Carried separately from
+/// <paramref name="FailureReason"/> so an operator can tell an I/O fault from a deserialization
+/// fault without parsing prose — the collapsed cause information is exactly what made a read
+/// failure look like a summarization-model failure.
+/// </param>
 public sealed record SessionCompactionOutcome(
     bool Succeeded,
     bool Applied,
@@ -82,4 +108,6 @@ public sealed record SessionCompactionOutcome(
     int EntriesPreserved,
     int TokensBefore,
     int TokensAfter,
-    string? FailureReason);
+    string? FailureReason,
+    CompactionSkipReason? SkipReason = null,
+    string? FailureExceptionType = null);

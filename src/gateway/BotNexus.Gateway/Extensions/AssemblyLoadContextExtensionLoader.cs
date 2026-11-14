@@ -1,4 +1,4 @@
-﻿using System.Reflection;
+using System.Reflection;
 using System.Runtime.Loader;
 using System.Text.Json;
 using System.IO.Abstractions;
@@ -8,12 +8,14 @@ using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Channels;
 using BotNexus.Gateway.Abstractions.Extensions;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Hooks;
 using BotNexus.Gateway.Abstractions.Isolation;
 using BotNexus.Gateway.Abstractions.Media;
 using BotNexus.Gateway.Abstractions.Routing;
 using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Channels.Startup;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -32,6 +34,7 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
     private static readonly Type[] DiscoverableServiceContracts =
     [
         typeof(IChannelAdapter),
+        typeof(IConversationEventSink),
         typeof(IIsolationStrategy),
         typeof(ISessionStore),
         typeof(IGatewayAuthHandler),
@@ -58,6 +61,28 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
     private readonly IFileSystem _fileSystem;
     private readonly Lock _sync = new();
     private readonly Dictionary<string, LoadedExtensionRuntime> _loaded = new(StringComparer.OrdinalIgnoreCase);
+
+    // Every (contract, implementation) pair this loader auto-registers into the host container.
+    // Extension services are resolved as sets during startup (e.g. IEnumerable<IAgentTool>,
+    // IEnumerable<IAgentToolContributor>); if any one cannot be activated by the container the
+    // whole enumeration throws and aborts the host. After all extensions load we probe these
+    // against the built container and prune the un-activatable ones. See
+    // PruneUnconstructableExtensionServices and issue #2220.
+    private readonly List<(Type Contract, Type Implementation)> _registeredExtensionServices = [];
+
+    // #2731: channel-extension hosted services are registered as a concrete self-binding PLUS a
+    // barrier factory descriptor. The factory carries no ImplementationType, so the #2220 prune
+    // pass cannot find it by (contract, implementation) matching. Remember the exact descriptors
+    // so pruning can remove both - leaving the factory behind would make it resolve a type that
+    // is no longer registered and abort IEnumerable<IHostedService> resolution at host start.
+    private readonly Dictionary<Type, List<ServiceDescriptor>> _channelHostedServiceDescriptors = [];
+
+    // Multi-contract implementations use factory aliases that resolve one shared concrete
+    // singleton. ServiceDescriptor does not expose the implementation captured by a factory, so
+    // pruning retains the exact aliases created for each contract/implementation pair. Matching
+    // every factory for the same contract removes unrelated adapters (#4196).
+    private readonly Dictionary<(Type Contract, Type Implementation), List<ServiceDescriptor>>
+        _extensionFactoryDescriptors = [];
 
     public AssemblyLoadContextExtensionLoader(
         IServiceCollection services,
@@ -147,7 +172,11 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
             var assembly = loadContext.LoadFromAssemblyPath(extension.EntryAssemblyPath);
 
             var discoveredImplementations = DiscoverImplementations(assembly);
-            _logger.LogWarning(
+            // #2751: routine per-extension startup chatter. Emitted once per discovered extension
+            // (13 on a default boot), so at Warning it alone puts a permanent noise floor on every
+            // clean boot and hides genuinely new warnings. Discovering implementations is the
+            // expected outcome, not an anomaly - the anomalous cases already log at Error below.
+            _logger.LogInformation(
                 "Extension '{ExtensionId}' from '{Path}': discovered {Count} implementation(s){Details}",
                 extension.Manifest.Id,
                 extension.EntryAssemblyPath,
@@ -157,7 +186,7 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
                     : " — no discoverable types found");
 
             var hookHandlerTypes = DiscoverHookHandlers(assembly);
-            var registeredServiceNames = RegisterServices(discoveredImplementations);
+            var registeredServiceNames = RegisterServices(discoveredImplementations, extension.Manifest);
             RegisterHookHandlers(hookHandlerTypes, registeredServiceNames);
             InvokeServiceContributors(assembly, registeredServiceNames);
 
@@ -172,7 +201,8 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
                 LoadedAtUtc = DateTimeOffset.UtcNow,
                 RegisteredServices = registeredServiceNames,
                 Enabled = extension.Manifest.Enabled,
-                ConfigSchema = extension.Manifest.ConfigSchema
+                ConfigSchema = extension.Manifest.ConfigSchema,
+                ConfigurationScopes = extension.Manifest.ConfigurationScopes
             };
 
             lock (_sync)
@@ -180,7 +210,9 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
                 _loaded[extension.Manifest.Id] = new LoadedExtensionRuntime(loadedExtension, loadContext);
             }
 
-            _logger.LogWarning(
+            // #2751: successful load is the success path; it belongs at Information (its original
+            // level, before the b78ff8a1 debug commit raised it) rather than Warning.
+            _logger.LogInformation(
                 "Loaded extension '{ExtensionId}' ({Name} v{Version}) with {ServiceCount} service registration(s).",
                 loadedExtension.ExtensionId,
                 loadedExtension.Name,
@@ -301,6 +333,12 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
             "api-contributor"
         };
 
+        var configurationScopes = manifest.ConfigurationScopes ?? [];
+        if ((manifest.ConfigSchema?.Count ?? 0) > 0 && configurationScopes.Count == 0)
+            throw new InvalidOperationException($"Manifest for '{manifest.Id}' declares configSchema and must define at least one configurationScope (world, gateway, or agent).");
+        if (configurationScopes.Count != configurationScopes.Distinct().Count())
+            throw new InvalidOperationException($"Manifest for '{manifest.Id}' declares duplicate configurationScopes.");
+
         var invalidTypes = extensionTypes
             .Where(extensionType => !allowedTypes.Contains(extensionType))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -378,12 +416,32 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
         return implementations;
     }
 
-    private List<string> RegisterServices(IReadOnlyList<(Type ServiceContract, Type Implementation)> implementations)
+    /// <summary>
+    /// Registers the contracts discovered in an extension assembly.
+    /// </summary>
+    /// <remarks>
+    /// #2731: an <see cref="IHostedService"/> contributed by a CHANNEL extension is registered
+    /// behind <see cref="ChannelFaultBarrierHostedService"/> instead of with the container's
+    /// default hosted-service semantics. A channel is one optional ingress surface, so a missing
+    /// Telegram BotToken must cost that channel and nothing else. Hosted services from
+    /// NON-channel extensions keep the default <c>StopHost</c> behaviour deliberately - their
+    /// failure means the process is not fit to serve and must stop loudly.
+    /// </remarks>
+    private List<string> RegisterServices(
+        IReadOnlyList<(Type ServiceContract, Type Implementation)> implementations,
+        ExtensionManifest manifest)
     {
         List<string> registered = [];
-        foreach (var (contract, implementation) in implementations)
+        var isChannelExtension = manifest.ExtensionTypes?.Any(
+            extensionType => extensionType.Equals("channel", StringComparison.OrdinalIgnoreCase)) is true;
+
+        foreach (var implementationGroup in implementations.GroupBy(item => item.Implementation))
         {
-            if (contract == typeof(IAgentTool) && !HasAutoResolvableConstructor(implementation, out var skipReason))
+            var implementation = implementationGroup.Key;
+            var contracts = implementationGroup.Select(item => item.ServiceContract).Distinct().ToArray();
+
+            if (contracts.Contains(typeof(IAgentTool)) &&
+                !HasAutoResolvableConstructor(implementation, out var skipReason))
             {
                 _logger.LogDebug(
                     "Skipping auto-registration for tool implementation '{ImplementationType}' because no DI-compatible constructor was found ({Reason}).",
@@ -392,39 +450,180 @@ public sealed class AssemblyLoadContextExtensionLoader : IExtensionLoader
                 continue;
             }
 
-            if (_services.Any(descriptor =>
-                    descriptor.ServiceType == contract &&
-                    descriptor.ImplementationType == implementation))
-            {
+            var contractsToRegister = contracts.Where(contract => !_services.Any(descriptor =>
+                descriptor.ServiceType == contract &&
+                (descriptor.ImplementationType == implementation || descriptor.ServiceType == implementation)))
+                .ToArray();
+            if (contractsToRegister.Length == 0)
                 continue;
+
+            ServiceDescriptor? implementationDescriptor = null;
+            if (contractsToRegister.Length > 1)
+            {
+                implementationDescriptor = ServiceDescriptor.Singleton(implementation, implementation);
+                _services.TryAdd(implementationDescriptor);
             }
 
-            if (contract == typeof(IChannelAdapter) || 
-                contract == typeof(IIsolationStrategy) ||
-                contract == typeof(IAgentChangeNotifier) ||
-                contract == typeof(IConversationChangeNotifier) ||
-                contract == typeof(IAgentCanvasNotifier) ||
-                contract == typeof(IAgentTodoNotifier) ||
-                contract == typeof(IAgentToolContributor) ||
-                contract == typeof(IAgentTool) ||
-                contract == typeof(ICommandContributor) ||
-                contract == typeof(IMediaHandler) ||
-                contract == typeof(IEndpointContributor) ||
-                contract == typeof(IApiContributor) ||
-                contract == typeof(IHostedService))
+            foreach (var contract in contractsToRegister)
             {
-                _services.AddSingleton(contract, implementation);
-            }
-            else
-            {
-                _services.TryAddSingleton(contract, implementation);
-            }
+                if (contract == typeof(IHostedService) && isChannelExtension)
+                {
+                    _channelHostedServiceDescriptors[implementation] =
+                        [.. _services.AddChannelHostedService(implementation, manifest.Id)];
+                    registered.Add($"{contract.Name}->{implementation.FullName} (channel fault barrier)");
+                    _registeredExtensionServices.Add((contract, implementation));
+                    continue;
+                }
 
-            registered.Add($"{contract.Name}->{implementation.FullName}");
+                var enumerableContract = contract == typeof(IChannelAdapter) ||
+                    contract == typeof(IConversationEventSink) ||
+                    contract == typeof(IIsolationStrategy) ||
+                    contract == typeof(IAgentChangeNotifier) ||
+                    contract == typeof(IConversationChangeNotifier) ||
+                    contract == typeof(IAgentCanvasNotifier) ||
+                    contract == typeof(IAgentTodoNotifier) ||
+                    contract == typeof(IAgentToolContributor) ||
+                    contract == typeof(IAgentTool) ||
+                    contract == typeof(ICommandContributor) ||
+                    contract == typeof(IMediaHandler) ||
+                    contract == typeof(IEndpointContributor) ||
+                    contract == typeof(IApiContributor) ||
+                    contract == typeof(IHostedService);
+
+                if (contractsToRegister.Length > 1)
+                {
+                    var factoryDescriptor = ServiceDescriptor.Singleton(
+                        contract,
+                        serviceProvider => serviceProvider.GetRequiredService(implementation));
+                    _services.Add(factoryDescriptor);
+                    TrackExtensionFactoryDescriptor(contract, implementation, factoryDescriptor);
+                }
+                else if (enumerableContract)
+                {
+                    _services.AddSingleton(contract, implementation);
+                }
+                else
+                {
+                    _services.TryAddSingleton(contract, implementation);
+                }
+
+                registered.Add($"{contract.Name}->{implementation.FullName}");
+                _registeredExtensionServices.Add((contract, implementation));
+            }
         }
 
         return registered;
     }
+
+    /// <summary>
+    /// Probes every extension service this loader registered against the fully-configured host
+    /// container and removes any whose implementation has no constructor the container can satisfy.
+    /// This must run after all extensions have loaded (so the whole service graph is present) and
+    /// before the host is built. It exists because extension services are resolved as sets during
+    /// startup — <c>IEnumerable&lt;IAgentTool&gt;</c>, <c>IEnumerable&lt;IAgentToolContributor&gt;</c>,
+    /// hosted services, channel adapters, notifiers — and DI set resolution is all-or-nothing: a
+    /// single un-activatable implementation (for example a session-scoped tool whose backend is not
+    /// a registered service, or a contributor with a bare <c>string</c> constructor parameter) throws
+    /// and aborts host startup, surfacing only as a generic health-check timeout. Pruning turns that
+    /// fatal boot failure into a logged warning and a gateway that still starts (issue #2220).
+    /// </summary>
+    /// <returns>The pruned registrations, for boot-report/diagnostic surfacing.</returns>
+    public IReadOnlyList<(Type Contract, Type Implementation, string Reason)> PruneUnconstructableExtensionServices()
+    {
+        List<(Type Contract, Type Implementation, string Reason)> pruned = [];
+        if (_registeredExtensionServices.Count == 0)
+            return pruned;
+
+        using var probeProvider = _services.BuildServiceProvider(new ServiceProviderOptions
+        {
+            ValidateOnBuild = false,
+            ValidateScopes = false
+        });
+
+        // IServiceProviderIsService reports registration without constructing anything, so this
+        // check is side-effect-free (it does not eagerly build any singleton).
+        var isService = probeProvider.GetService<IServiceProviderIsService>();
+        if (isService is null)
+            return pruned;
+
+        foreach (var (contract, implementation) in _registeredExtensionServices)
+        {
+            if (HasContainerSatisfiableConstructor(implementation, isService))
+                continue;
+
+            _channelHostedServiceDescriptors.TryGetValue(implementation, out var channelDescriptors);
+
+            for (var i = _services.Count - 1; i >= 0; i--)
+            {
+                var descriptor = _services[i];
+                _extensionFactoryDescriptors.TryGetValue(
+                    (contract, implementation),
+                    out var factoryDescriptors);
+                if ((descriptor.ServiceType == contract && descriptor.ImplementationType == implementation) ||
+                    (descriptor.ServiceType == implementation && descriptor.ImplementationType == implementation) ||
+                    factoryDescriptors?.Contains(descriptor) is true ||
+                    channelDescriptors?.Contains(descriptor) is true)
+                {
+                    _services.RemoveAt(i);
+                }
+            }
+
+            const string reason = "no public constructor whose parameters are all resolvable from the host container";
+            pruned.Add((contract, implementation, reason));
+            // #2751: pruning an optional registration the host cannot supply a dependency for is an
+            // EXPECTED outcome of this pass, not a fault - the pass exists precisely so those
+            // registrations are removed instead of aborting boot. It stays at Information (not
+            // Debug) so the boot record still names what was dropped, but it no longer counts as a
+            // warning on an otherwise clean boot.
+            _logger.LogInformation(
+                "Pruned extension service registration '{Contract}->{Implementation}' because it cannot be activated by the host container ({Reason}). The gateway will start without it.",
+                contract.Name,
+                implementation.FullName,
+                reason);
+        }
+
+        return pruned;
+    }
+
+    private void TrackExtensionFactoryDescriptor(
+        Type contract,
+        Type implementation,
+        ServiceDescriptor descriptor)
+    {
+        var key = (contract, implementation);
+        if (!_extensionFactoryDescriptors.TryGetValue(key, out var descriptors))
+        {
+            descriptors = [];
+            _extensionFactoryDescriptors[key] = descriptors;
+        }
+
+        descriptors.Add(descriptor);
+    }
+
+    /// <summary>
+    /// Mirrors the constructor selection the DI container performs: the greediest public
+    /// constructor whose every parameter is either a registered service, an
+    /// <see cref="IServiceProvider"/>, or has a default value. Uses the actual container
+    /// registrations (via <paramref name="isService"/>) rather than assuming any interface is
+    /// resolvable — the assumption that broke <c>DataStoreTool</c> whose <c>IDataStoreBackend</c>
+    /// parameter is a per-session type that is never registered as a host service.
+    /// </summary>
+    internal static bool HasContainerSatisfiableConstructor(Type implementation, IServiceProviderIsService isService)
+    {
+        var constructors = implementation.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
+        foreach (var constructor in constructors.OrderByDescending(c => c.GetParameters().Length))
+        {
+            if (constructor.GetParameters().All(parameter => IsContainerResolvableParameter(parameter, isService)))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsContainerResolvableParameter(ParameterInfo parameter, IServiceProviderIsService isService)
+        => parameter.HasDefaultValue
+            || parameter.ParameterType == typeof(IServiceProvider)
+            || isService.IsService(parameter.ParameterType);
 
     private static IReadOnlyList<Type> GetLoadableTypes(Assembly assembly)
     {

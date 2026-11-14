@@ -1,4 +1,6 @@
+using System.Collections.Immutable;
 using BotNexus.Extensions.Channels.SignalR;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Domain.Primitives;
 using Microsoft.AspNetCore.SignalR;
@@ -9,6 +11,51 @@ namespace BotNexus.Gateway.Tests;
 
 public sealed class SignalRChannelAdapterTests
 {
+    [Theory]
+    [InlineData(null)]
+    [InlineData("different-session")]
+    public async Task Post_ProcessingFailure_ConcreteAdapterTargetsRequestedConversation(string? sessionId)
+    {
+        var clientProxy = new Mock<IGatewayHubClient>(MockBehavior.Strict);
+        clientProxy.Setup(proxy => proxy.ContentDelta(It.IsAny<object>())).Returns(Task.CompletedTask);
+        var clients = new Mock<IHubClients<IGatewayHubClient>>(MockBehavior.Strict);
+        clients.Setup(value => value.Group("conversation:failed-conversation")).Returns(clientProxy.Object);
+        var hubContext = new Mock<IHubContext<GatewayHub, IGatewayHubClient>>();
+        hubContext.SetupGet(value => value.Clients).Returns(clients.Object);
+        var adapter = new SignalRChannelAdapter(NullLogger<SignalRChannelAdapter>.Instance, hubContext.Object);
+        var manager = new Mock<BotNexus.Gateway.Abstractions.Channels.IChannelManager>();
+        manager.Setup(value => value.Get(ChannelKey.From("signalr"))).Returns(adapter);
+        var processor = new Mock<BotNexus.Gateway.Dispatching.IInboundMessageProcessor>();
+        processor.Setup(value => value.ProcessAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("private persistence failure"));
+        var message = new InboundMessage
+        {
+            ChannelType = ChannelKey.From("signalr"),
+            ChannelAddress = ChannelAddress.From("different-connection"),
+            SenderId = "sender-1",
+            Sender = BotNexus.Domain.World.CitizenId.Of(UserId.From("sender-1")),
+            Content = "hello",
+            RoutingHints = InboundMessageRoutingHints.LiftFromStrings(null, sessionId, "failed-conversation"),
+            ChannelRequestId = "different-request"
+        };
+        var orchestrator = new BotNexus.Gateway.Dispatching.DefaultInboundMessageOrchestrator(
+            processor.Object,
+            NullLogger<BotNexus.Gateway.Dispatching.DefaultInboundMessageOrchestrator>.Instance,
+            manager.Object);
+
+        orchestrator.Post(message).ShouldBeTrue();
+        await orchestrator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        clients.Verify(value => value.Group("conversation:failed-conversation"), Times.Once);
+        clientProxy.Verify(proxy => proxy.ContentDelta(It.Is<object>(arg =>
+            arg is ContentDeltaPayload &&
+            ((ContentDeltaPayload)arg).ConversationId == "failed-conversation" &&
+            ((ContentDeltaPayload)arg).ContentDelta ==
+                "Your message could not be processed because an internal error occurred.")), Times.Once);
+        clients.VerifyNoOtherCalls();
+        processor.Verify(value => value.ProcessAsync(message, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     [Fact]
     public async Task SendStreamEventAsync_RoutesByConversationGroup_AndSurfacesSessionOnPayload()
     {
@@ -42,6 +89,59 @@ public sealed class SignalRChannelAdapterTests
                     ((AgentStreamEvent)arg).SessionId == SessionId.From("session-1") &&
                     ((AgentStreamEvent)arg).ConversationId == ConversationId.From("conv-1"))),
             Times.Once);
+    }
+
+    [Fact]
+    public async Task OnConversationEventAsync_TwoBindingsForOneConversation_DeliversOnceToConversationGroup()
+    {
+        var clientProxy = new Mock<IGatewayHubClient>();
+        clientProxy.Setup(proxy => proxy.ContentDelta(It.IsAny<object>()))
+            .Returns(Task.CompletedTask);
+
+        var clients = new Mock<IHubClients<IGatewayHubClient>>();
+        clients.Setup(value => value.Group("conversation:conv-1")).Returns(clientProxy.Object);
+
+        var hubContext = new Mock<IHubContext<GatewayHub, IGatewayHubClient>>();
+        hubContext.SetupGet(value => value.Clients).Returns(clients.Object);
+
+        var adapter = new SignalRChannelAdapter(NullLogger<SignalRChannelAdapter>.Instance, hubContext.Object);
+        var conversationId = ConversationId.From("conv-1");
+        var sessionId = SessionId.From("session-1");
+        var streamEvent = new AgentStreamEvent
+        {
+            Type = AgentStreamEventType.ContentDelta,
+            ContentDelta = "delta",
+            ConversationId = conversationId,
+            SessionId = sessionId,
+            AgentId = AgentId.From("agent-1")
+        };
+        var conversationEvent = new ConversationAgentEvent
+        {
+            AgentId = AgentId.From("agent-1"),
+            ConversationId = conversationId,
+            SessionId = sessionId,
+            Bindings = ImmutableArray.Create(
+                new ConversationBindingSnapshot(
+                    BindingId.From("binding-tab-1"),
+                    ChannelKey.From("signalr"),
+                    null,
+                    ChannelAddress.From("connection-1"),
+                    BindingMode.Interactive,
+                    ThreadingMode.Single),
+                new ConversationBindingSnapshot(
+                    BindingId.From("binding-tab-2"),
+                    ChannelKey.From("signalr"),
+                    null,
+                    ChannelAddress.From("connection-2"),
+                    BindingMode.Interactive,
+                    ThreadingMode.Single)),
+            StreamEvent = streamEvent
+        };
+
+        await adapter.OnConversationEventAsync(conversationEvent);
+
+        clients.Verify(value => value.Group("conversation:conv-1"), Times.Once);
+        clientProxy.Verify(proxy => proxy.ContentDelta(It.IsAny<object>()), Times.Once);
     }
 
     [Fact]

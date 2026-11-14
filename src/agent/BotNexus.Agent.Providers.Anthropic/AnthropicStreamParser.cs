@@ -1,8 +1,10 @@
 using System.Text;
 using System.Text.Json;
+using BotNexus.Agent.Providers.Core.Diagnostics;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Streaming;
 using BotNexus.Agent.Providers.Core.Utilities;
+using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Agent.Providers.Anthropic;
 
@@ -11,6 +13,16 @@ namespace BotNexus.Agent.Providers.Anthropic;
 /// </summary>
 internal static class AnthropicStreamParser
 {
+    /// <summary>
+    /// Logger category for the stream-assembly diagnostic. This parser is an <c>internal static</c>
+    /// helper with no injected logger, so it takes the ambient factory the composition root sets on
+    /// <see cref="ProviderDiagnostics"/> - the same seam #2485 introduced for the static converters.
+    /// Passing <c>null</c> here instead is what made the checksum unreportable (#3443):
+    /// <c>Reconcile</c> guards its whole diagnostic behind <c>logger?.</c>, so a null argument does
+    /// not degrade the warning, it deletes it.
+    /// </summary>
+    private const string LoggerCategory = "AnthropicStreamParser";
+
     internal static async Task<(Usage Usage, string? ResponseId, StopReason StopReason)> ProcessStreamAsync(
         StreamReader reader,
         LlmModel model,
@@ -27,9 +39,17 @@ internal static class AnthropicStreamParser
         var usage = initialUsage;
         var blockTypes = new Dictionary<int, string>();
         var textAccumulators = new Dictionary<int, StringBuilder>();
+        // Text deltas that actually contributed to each block, so the mismatch diagnostic reports
+        // the real fragment count instead of a constant 0 (#3443). Counted at the point of append
+        // so it can never drift from what was accumulated.
+        var textDeltaCounts = new Dictionary<int, int>();
+        var logger = ProviderDiagnostics.CreateLogger(LoggerCategory);
         var signatureAccumulators = new Dictionary<int, StringBuilder>();
         var toolCallIds = new Dictionary<int, string>();
         var toolCallNames = new Dictionary<int, string>();
+        // One budget per streamed tool call, bounding the cumulative UTF-8 byte cost of its
+        // input_json_delta fragments (#2902). Created on content_block_start for tool_use blocks.
+        var argumentBudgets = new Dictionary<int, StreamToolArgumentBudget>();
         string? responseId = null;
         var stopReason = StopReason.Stop;
         string? currentEvent = null;
@@ -74,12 +94,15 @@ internal static class AnthropicStreamParser
                     contentBlocks,
                     blockTypes,
                     textAccumulators,
+                    textDeltaCounts,
                     signatureAccumulators,
                     toolCallIds,
                     toolCallNames,
+                    argumentBudgets,
                     usage,
                     tools,
                     isOAuthToken,
+                    logger,
                     buildMessage,
                     mapStopReason,
                     ref responseId,
@@ -101,12 +124,15 @@ internal static class AnthropicStreamParser
         List<ContentBlock> contentBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
         Dictionary<int, string> toolCallIds,
         Dictionary<int, string> toolCallNames,
+        Dictionary<int, StreamToolArgumentBudget> argumentBudgets,
         Usage usage,
         IReadOnlyList<Tool>? tools,
         bool isOAuthToken,
+        ILogger logger,
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage,
         Func<string?, StopReason> mapStopReason,
         ref string? responseId,
@@ -134,18 +160,19 @@ internal static class AnthropicStreamParser
 
             case "content_block_start":
                 HandleContentBlockStart(data, model, stream, contentBlocks, blockTypes,
-                    textAccumulators, signatureAccumulators, toolCallIds, toolCallNames, usage, responseId,
+                    textAccumulators, textDeltaCounts, signatureAccumulators, toolCallIds, toolCallNames, argumentBudgets, usage, responseId,
                     tools, isOAuthToken, buildMessage);
                 break;
 
             case "content_block_delta":
                 HandleContentBlockDelta(data, model, stream, contentBlocks, blockTypes,
-                    textAccumulators, signatureAccumulators, usage, responseId, buildMessage);
+                    textAccumulators, textDeltaCounts, signatureAccumulators, argumentBudgets,
+                    toolCallIds, toolCallNames, usage, responseId, buildMessage);
                 break;
 
             case "content_block_stop":
                 HandleContentBlockStop(data, model, stream, contentBlocks, blockTypes,
-                    textAccumulators, signatureAccumulators, toolCallIds, toolCallNames, usage, responseId, buildMessage);
+                    textAccumulators, textDeltaCounts, signatureAccumulators, toolCallIds, toolCallNames, usage, logger, responseId, buildMessage);
                 break;
 
             case "message_delta":
@@ -176,9 +203,11 @@ internal static class AnthropicStreamParser
         List<ContentBlock> contentBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
         Dictionary<int, string> toolCallIds,
         Dictionary<int, string> toolCallNames,
+        Dictionary<int, StreamToolArgumentBudget> argumentBudgets,
         Usage usage,
         string? responseId,
         IReadOnlyList<Tool>? tools,
@@ -191,6 +220,7 @@ internal static class AnthropicStreamParser
         var blockType = block.GetProperty("type").GetString() ?? "text";
         blockTypes[index] = blockType;
         textAccumulators[index] = new StringBuilder();
+        textDeltaCounts[index] = 0;
         signatureAccumulators[index] = new StringBuilder();
 
         var partial = buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId);
@@ -216,7 +246,16 @@ internal static class AnthropicStreamParser
                     toolCallNames[index] = isOAuthToken
                         ? AnthropicMessageConverter.FromClaudeCodeName(tcName.GetString() ?? "", tools)
                         : tcName.GetString() ?? "";
-                stream.Push(new ToolCallStartEvent(index, partial));
+                // Bound this tool call's argument accumulation before the first fragment arrives
+                // (#2902): a hostile stream must not be able to grow the buffer without limit.
+                argumentBudgets[index] = StreamToolArgumentBudget.ForToolCall(
+                    model.Provider, model.Id,
+                    $"tool '{toolCallNames.GetValueOrDefault(index, "")}' (block {index})");
+                stream.Push(new ToolCallStartEvent(
+                    index,
+                    partial,
+                    toolCallIds.GetValueOrDefault(index),
+                    toolCallNames.GetValueOrDefault(index)));
                 break;
         }
     }
@@ -228,7 +267,11 @@ internal static class AnthropicStreamParser
         List<ContentBlock> contentBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
+        Dictionary<int, StreamToolArgumentBudget> argumentBudgets,
+        Dictionary<int, string> toolCallIds,
+        Dictionary<int, string> toolCallNames,
         Usage usage,
         string? responseId,
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage)
@@ -243,7 +286,10 @@ internal static class AnthropicStreamParser
         {
             case "text_delta":
                 var text = delta.GetProperty("text").GetString() ?? "";
+                // Empty fragments carry no content; whitespace (including a lone LF) does (#3301).
+                if (text.Length == 0) break;
                 textAccumulators[index].Append(text);
+                textDeltaCounts[index] = textDeltaCounts.GetValueOrDefault(index) + 1;
                 stream.Push(new TextDeltaEvent(index, text, partial));
                 break;
             case "thinking_delta":
@@ -253,8 +299,19 @@ internal static class AnthropicStreamParser
                 break;
             case "input_json_delta":
                 var jsonFrag = delta.GetProperty("partial_json").GetString() ?? "";
-                textAccumulators[index].Append(jsonFrag);
-                stream.Push(new ToolCallDeltaEvent(index, jsonFrag, partial));
+                // Budgeted append: throws StreamToolArgumentsTooLargeException on overflow, which the
+                // provider's stream task turns into a terminal error event rather than emitting a
+                // truncated-and-therefore-invalid argument blob (#2902).
+                if (argumentBudgets.TryGetValue(index, out var budget))
+                    budget.Append(textAccumulators[index], jsonFrag);
+                else
+                    textAccumulators[index].Append(jsonFrag);
+                stream.Push(new ToolCallDeltaEvent(
+                    index,
+                    jsonFrag,
+                    partial,
+                    toolCallIds.GetValueOrDefault(index),
+                    toolCallNames.GetValueOrDefault(index)));
                 break;
             case "signature_delta":
                 var sig = delta.GetProperty("signature").GetString() ?? "";
@@ -270,10 +327,12 @@ internal static class AnthropicStreamParser
         List<ContentBlock> contentBlocks,
         Dictionary<int, string> blockTypes,
         Dictionary<int, StringBuilder> textAccumulators,
+        Dictionary<int, int> textDeltaCounts,
         Dictionary<int, StringBuilder> signatureAccumulators,
         Dictionary<int, string> toolCallIds,
         Dictionary<int, string> toolCallNames,
         Usage usage,
+        ILogger logger,
         string? responseId,
         Func<LlmModel, List<ContentBlock>, Usage, StopReason, string?, string?, AssistantMessage> buildMessage)
     {
@@ -287,6 +346,21 @@ internal static class AnthropicStreamParser
         switch (blockType)
         {
             case "text":
+                // Same reconciliation as the Responses and Copilot-Messages parsers (#3336). It
+                // was wired into ResponsesStreamParser alone, so an Anthropic-shaped stream had no
+                // protection at all against a per-delta transport artifact reaching history.
+                // Fail-open: a stop frame with no final value yields null and assembled stands.
+                accumulated = StreamAssemblyConformance.Reconcile(
+                    accumulated,
+                    data.TryRead(),
+                    model.Provider,
+                    model.Id,
+                    "anthropic-messages",
+                    "sse",
+                    textDeltaCounts.GetValueOrDefault(index),
+                    logger,
+                    stream,
+                    () => buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId));
                 contentBlocks.Add(new TextContent(accumulated, signature));
                 var textPartial = buildMessage(model, contentBlocks, usage, StopReason.Stop, null, responseId);
                 stream.Push(new TextEndEvent(index, accumulated, textPartial));

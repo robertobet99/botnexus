@@ -18,7 +18,7 @@ public sealed class DebugToolTests : IDisposable
 
     public void Dispose()
     {
-        SqliteConnection.ClearAllPools();
+        SqlitePoolCleanup.ClearPoolFor(_dbPath);
         if (File.Exists(_dbPath))
             File.Delete(_dbPath);
     }
@@ -945,5 +945,7 @@ public sealed class DebugToolTests : IDisposable
             WasInvoked = true;
             return input.Replace(secret, "[REDACTED]");
         }
+
+        public string RedactForExternalDelivery(string input) => Redact(input);
     }
 }

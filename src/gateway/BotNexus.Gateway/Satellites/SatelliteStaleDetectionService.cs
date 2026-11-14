@@ -15,15 +15,26 @@ public sealed class SatelliteStaleDetectionService : BackgroundService
     private readonly ILogger<SatelliteStaleDetectionService> _logger;
     private readonly TimeSpan _checkInterval;
 
-    /// <summary>Creates the stale detection service with a 30-second check interval.</summary>
+    /// <summary>
+    /// Drives the sweep cadence. Freshness itself is decided inside the registry against a single
+    /// monotonic clock (#3780); this service no longer supplies a "now" to compare against.
+    /// </summary>
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>
+    /// Creates the periodic stale detector. The clock is injectable so a sweep can evaluate the
+    /// configured heartbeat boundaries without depending on wall-clock timing.
+    /// </summary>
     public SatelliteStaleDetectionService(
         ISatelliteRegistry registry,
         ILogger<SatelliteStaleDetectionService> logger,
-        TimeSpan? checkInterval = null)
+        TimeSpan? checkInterval = null,
+        TimeProvider? timeProvider = null)
     {
         _registry = registry;
         _logger = logger;
         _checkInterval = checkInterval ?? TimeSpan.FromSeconds(30);
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <inheritdoc />
@@ -35,7 +46,7 @@ public sealed class SatelliteStaleDetectionService : BackgroundService
         {
             try
             {
-                await Task.Delay(_checkInterval, stoppingToken);
+                await Task.Delay(_checkInterval, _timeProvider, stoppingToken);
                 DetectAndMarkStale();
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -49,10 +60,9 @@ public sealed class SatelliteStaleDetectionService : BackgroundService
         }
     }
 
-    private void DetectAndMarkStale()
+    internal void DetectAndMarkStale()
     {
-        var now = DateTimeOffset.UtcNow;
-        var stale = _registry.GetStaleSatellites(now);
+        var stale = _registry.GetStaleSatellites();
 
         foreach (var satellite in stale)
         {
@@ -61,7 +71,8 @@ public sealed class SatelliteStaleDetectionService : BackgroundService
                 satellite.Id,
                 satellite.LastSeen,
                 satellite.StaleTimeoutSeconds);
-            _registry.MarkOffline(satellite.Id);
+            if (satellite.ConnectionId is not null)
+                _registry.MarkOffline(satellite.Id, satellite.ConnectionId);
         }
     }
 }

@@ -1,0 +1,48 @@
+<!--
+  Deployment closure for `botnexus build` / `botnexus update` / `botnexus serve`.
+
+  WHY THIS EXISTS
+  Building root `dirs.proj` includes every test project. Even with
+  `SkipTests=true` (which strips their inputs so they emit empty assemblies) MSBuild still
+  evaluates, restores and target-walks all 55. Nothing that is deployed consumes them.
+
+  WHAT IS INCLUDED
+  EVERY project under `src/`, discovered by a wildcard, never a hand-maintained list.
+  This is deliberately conservative: the deployed artefacts are the gateway host plus the
+  extension assemblies that `DeployExtensionsSilent` copies, and both live under `src/`.
+  A hand-curated list would silently stop building a newly added extension the day someone
+  forgot to add it, and a stale deployed binary after a "successful" update is a far worse
+  failure than a slightly slower build. A wildcard cannot go stale.
+
+  This file only narrows the SET of projects handed to MSBuild. It never decides whether an
+  individual project is up to date; MSBuild's own incremental logic does that, using all of
+  its real inputs (sources, csproj, Directory.Build.props, global.json, NuGet assets, TFM).
+  Microsoft.Build.Traversal dispatches each ProjectReference through the MSBuild task exactly
+  as the previous hand-rolled BotNexus.Deploy.proj did, so incremental behaviour is unchanged.
+-->
+<Project Sdk="Microsoft.Build.Traversal">
+
+  <ItemGroup>
+    <!--
+      The bin/obj exclude is #2666. `ProjectReference` is an explicit item, so `DefaultItemExcludes`
+      does not apply and MSBuild would otherwise recursively walk every `bin/` and `obj/` directory
+      under `src/` - directories the build itself is concurrently creating and deleting. A walk
+      racing with that churn is what intermittently produced an EMPTY traversal set on Linux CI.
+      No `.csproj` is ever emitted into bin/obj, so this is a strict-subset narrowing that cannot
+      change the evaluated set; `SrcTraversal_BinObjExclude_DoesNotChangeTheEvaluatedSet` pins it.
+    -->
+    <ProjectReference Include="$(MSBuildThisFileDirectory)**\*.csproj"
+                      Exclude="$(MSBuildThisFileDirectory)**\bin\**\*.csproj;$(MSBuildThisFileDirectory)**\obj\**\*.csproj" />
+  </ItemGroup>
+
+  <!--
+    SkipCli=true excludes BotNexus.Cli from the build; it is the process running the build, so
+    its own output file is locked on Windows. The exclusion is also implemented inside
+    BotNexus.Cli.csproj via IsExcludedFromBuild; the project set is narrowed here to match so
+    MSBuild does not even evaluate it.
+  -->
+  <ItemGroup Condition="'$(SkipCli)' == 'true'">
+    <ProjectReference Remove="$(MSBuildThisFileDirectory)gateway\BotNexus.Cli\BotNexus.Cli.csproj" />
+  </ItemGroup>
+
+</Project>

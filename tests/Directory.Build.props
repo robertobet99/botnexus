@@ -2,10 +2,10 @@
   <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
 
   <PropertyGroup>
-    <!-- Apply test.runsettings to all test projects automatically.
-         This sets BOTNEXUS_HOME to a temp path so tests never touch ~/.botnexus -->
-    <RunSettingsFilePath>$(MSBuildThisFileDirectory)test.runsettings</RunSettingsFilePath>
     <IsPackable>false</IsPackable>
+
+    <!-- BOTNEXUS_HOME isolation is configured in Directory.Build.targets, which is imported late
+         enough that BaseIntermediateOutputPath exists. -->
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,5 +18,8 @@
 
   <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)NullableBoolShouldlyExtensions.cs" Link="NullableBoolShouldlyExtensions.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)BotNexus.Testing/TestAwait.cs" Link="Shared/TestAwait.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)BotNexus.Testing/ManualTimeProvider.cs" Link="Shared/ManualTimeProvider.cs" />
+    <Using Include="BotNexus.Testing" />
   </ItemGroup>
 </Project>

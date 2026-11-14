@@ -11,6 +11,18 @@ namespace BotNexus.Cron.Tests;
 
 public sealed class CronSchedulerTests
 {
+    /// <summary>
+    /// How long a job waits at the concurrency rendezvous before giving up (#2911).
+    ///
+    /// This is an OBSERVATION WINDOW, not a performance budget. It is deliberately generous:
+    /// enlarging it cannot make a serially-executing scheduler pass, because the first job would
+    /// still be waiting for a second job that has not been started. Contrast the assertion it
+    /// replaced, where the timeout WAS the assertion and every widening eroded the test's ability
+    /// to detect the defect. Do not shrink this to "tighten" the test - it would only make the
+    /// test flaky again without testing anything more.
+    /// </summary>
+    private static readonly TimeSpan RendezvousWindow = TimeSpan.FromSeconds(30);
+
     [Fact]
     public async Task Scheduler_ExecutesDueJobs()
     {
@@ -179,7 +191,7 @@ public sealed class CronSchedulerTests
         corrected.NextRunAt!.Value.ShouldBeLessThan(DateTimeOffset.UtcNow.AddDays(364),
             "NextRunAt should have been corrected from 365 days out");
 
-        await context.Store.UpdateAsync(corrected with { NextRunAt = DateTimeOffset.UtcNow.AddMinutes(-1) });
+        await context.Store.SetNextRunAtAsync(corrected.Id, DateTimeOffset.UtcNow.AddMinutes(-1));
 
         // Second tick: job fires because NextRunAt is now in the past.
         await InvokeProcessTickAsync(scheduler);
@@ -280,10 +292,10 @@ public sealed class CronSchedulerTests
         // Update the schedule while the job exists
         var updated = job with
         {
-            Schedule = "0 0 1 1 *",
-            NextRunAt = new DateTimeOffset(DateTimeOffset.UtcNow.Year + 1, 1, 1, 0, 0, 0, TimeSpan.Zero)
+            Schedule = "0 0 1 1 *"
         };
-        await context.Store.UpdateAsync(updated);
+        await context.Store.UpdateDefinitionAsync(updated);
+        await context.Store.SetNextRunAtAsync(updated.Id, new DateTimeOffset(DateTimeOffset.UtcNow.Year + 1, 1, 1, 0, 0, 0, TimeSpan.Zero));
 
         // Manual run should not clobber the updated NextRunAt
         await scheduler.RunNowAsync(JobId.From("job-1"));
@@ -442,7 +454,7 @@ public sealed class CronSchedulerTests
         // Now simulate config sync changing the schedule to every minute
         // but NOT recomputing NextRunAt (the SyncConfiguredJobs bug)
         var synced = job with { Schedule = "* * * * *" };
-        await context.Store.UpdateAsync(synced);
+        await context.Store.UpdateDefinitionAsync(synced);
 
         var scheduler = CreateScheduler(context.Store, [action]);
         await InvokeProcessTickAsync(scheduler);
@@ -572,10 +584,31 @@ public sealed class CronSchedulerTests
     [Fact]
     public async Task Scheduler_MultipleDueJobs_RunConcurrently_NotSerially()
     {
-        // Two jobs each take ~150ms. Serial execution would take >=300ms.
-        // Concurrent execution should finish in <250ms.
+        // Asserts CONCURRENCY DIRECTLY via a rendezvous barrier, not by timing the tick (#2911).
+        //
+        // This test used to assert `sw.ElapsedMilliseconds < 800` around two 150ms jobs. That
+        // measures machine load as much as scheduling: the bound was widened 400 -> 800 in an
+        // unrelated PR and still failed on the remote gate at 1703ms and at 929ms, on branches
+        // touching no cron code. Widening it again would eventually exceed 2 x 150ms, at which
+        // point a fully SERIAL scheduler would also pass and the test would assert nothing.
+        //
+        // The barrier below cannot pass under serial execution at any speed. Each job announces
+        // its arrival and then waits for the other; the second arrival releases both. Run
+        // serially, the first job waits for a second job that has not been started yet and times
+        // out. Run concurrently, both arrive and both complete. The timeout is a generous
+        // OBSERVATION WINDOW rather than the subject of the assertion - enlarging it cannot turn a
+        // serial scheduler green, which is precisely the property the old assertion lacked.
         await using var context = await CronStoreTestContext.CreateAsync();
-        var action = new DelayedAction("slow-action", TimeSpan.FromMilliseconds(150));
+
+        var arrivals = 0;
+        var rendezvous = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var action = new RendezvousAction("slow-action", async ct =>
+        {
+            if (Interlocked.Increment(ref arrivals) == 2)
+                rendezvous.TrySetResult();
+
+            await rendezvous.Task.WaitAsync(RendezvousWindow, ct);
+        });
 
         for (var i = 1; i <= 2; i++)
         {
@@ -587,13 +620,15 @@ public sealed class CronSchedulerTests
         }
 
         var scheduler = CreateScheduler(context.Store, [action]);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
         await InvokeProcessTickAsync(scheduler);
-        sw.Stop();
 
         action.ExecutionCount.ShouldBe(2, "both jobs must run");
-        sw.ElapsedMilliseconds.ShouldBeLessThan(800,
-            "concurrent execution of two 150ms jobs should complete well under 300ms");
+        action.Faulted.ShouldBeNull(
+            "a job timed out waiting at the rendezvous, which means the scheduler ran the two jobs " +
+            "one after another instead of concurrently");
+        rendezvous.Task.IsCompletedSuccessfully.ShouldBeTrue(
+            "both jobs must be in flight simultaneously for the rendezvous to complete - serial " +
+            "execution can never satisfy this, at any machine speed");
     }
 
     [Fact]
@@ -667,7 +702,8 @@ public sealed class CronSchedulerTests
         ICronStore store,
         IEnumerable<ICronAction> actions,
         CronOptions? options = null,
-        ILogger<CronScheduler>? logger = null)
+        ILogger<CronScheduler>? logger = null,
+        IPlannedShutdownState? shutdownState = null)
     {
         var services = new ServiceCollection().BuildServiceProvider();
         var scopeFactory = services.GetRequiredService<IServiceScopeFactory>();
@@ -676,7 +712,8 @@ public sealed class CronSchedulerTests
             actions,
             scopeFactory,
             new StaticOptionsMonitor<CronOptions>(options ?? new CronOptions { Enabled = true, TickIntervalSeconds = 1 }),
-            logger ?? NullLogger<CronScheduler>.Instance);
+            logger ?? NullLogger<CronScheduler>.Instance,
+            plannedShutdownState: shutdownState);
     }
 
     private static async Task InvokeProcessTickAsync(CronScheduler scheduler)
@@ -686,6 +723,11 @@ public sealed class CronSchedulerTests
         var task = method!.Invoke(scheduler, [CancellationToken.None]) as Task;
         Assert.NotNull(task);
         await task!;
+
+        // #4688: the tick now dispatches and returns, so completion must be awaited explicitly.
+        // These suites assert on executed runs and their persisted bookkeeping, not on dispatch
+        // latency, so draining here preserves their original intent.
+        await scheduler.WaitForInFlightAsync();
     }
 
     private static async Task InvokeSyncConfiguredJobsAsync(CronScheduler scheduler, CronOptions options)
@@ -707,6 +749,36 @@ public sealed class CronSchedulerTests
         {
             await Task.Delay(delay, cancellationToken);
             Interlocked.Increment(ref _executionCount);
+        }
+    }
+
+    /// <summary>
+    /// Runs an arbitrary body per execution and captures any fault, so a test can assert on WHAT
+    /// went wrong rather than only that a count was short. Used by the concurrency test, where a
+    /// serial scheduler manifests as a rendezvous timeout inside the body (#2911).
+    /// </summary>
+    private sealed class RendezvousAction(string actionType, Func<CancellationToken, Task> body) : ICronAction
+    {
+        private int _executionCount;
+        public int ExecutionCount => _executionCount;
+        public string ActionType => actionType;
+
+        /// <summary>First fault thrown by any execution, or null if all completed cleanly.</summary>
+        public Exception? Faulted { get; private set; }
+
+        public async Task ExecuteAsync(CronExecutionContext context, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _executionCount);
+            try
+            {
+                await body(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // Recorded rather than rethrown: the scheduler records a thrown action as a failed
+                // run, which would mask the distinction between "ran serially" and "threw".
+                Faulted ??= ex;
+            }
         }
     }
 
@@ -757,6 +829,12 @@ public sealed class CronSchedulerTests
             // Block until cancelled; Task.Delay observes the linked token and throws on cancel.
             await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private sealed class PlannedShutdownState : IPlannedShutdownState
+    {
+        public bool CurrentShutdownIsPlanned { get; set; }
+        public bool PreviousShutdownWasPlanned => false;
     }
 
     private sealed class StaticOptionsMonitor<T>(T currentValue) : IOptionsMonitor<T>
@@ -889,6 +967,34 @@ public sealed class CronSchedulerTests
         updated!.LastRunStatus.ShouldBe("error");
         updated.LastRunError.ShouldNotBeNull();
         updated.LastRunError.ShouldContain("aborted");
+    }
+
+    [Fact]
+    public async Task RunNow_PlannedShutdown_RecordsExplicitRestartDisposition()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        var action = new AbortableAction("test-action");
+        await context.Store.CreateAsync(CronStoreTestContext.CreateJob("job-1", actionType: "test-action"));
+        var options = new CronOptions { Enabled = true, TickIntervalSeconds = 1, DefaultJobTimeoutSeconds = 600 };
+        var shutdownState = new PlannedShutdownState();
+        var scheduler = CreateScheduler(
+            context.Store,
+            [action],
+            options,
+            shutdownState: shutdownState);
+
+        using var cts = new CancellationTokenSource();
+        var runTask = scheduler.RunNowAsync(JobId.From("job-1"), cts.Token);
+        await action.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        shutdownState.CurrentShutdownIsPlanned = true;
+        await cts.CancelAsync();
+        await Should.ThrowAsync<OperationCanceledException>(async () => await runTask);
+
+        var entry = (await context.Store.GetRunHistoryAsync(JobId.From("job-1"))).ShouldHaveSingleItem();
+        entry.Status.ShouldBe(CronRunStatus.Error);
+        entry.Error.ShouldBe(CronScheduler.PlannedRestartReason);
+        var updated = await context.Store.GetAsync(JobId.From("job-1"));
+        updated!.LastRunError.ShouldBe(CronScheduler.PlannedRestartReason);
     }
 
     [Fact]

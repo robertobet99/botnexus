@@ -21,7 +21,23 @@ public sealed record AddBindingRequest(
     string? ThreadingMode,
     string? DisplayPrefix);
 
+/// <summary>
+/// Request body for moving an existing channel binding to a different conversation
+/// (issue #140). The binding keeps its identity, address and mode; only its owning
+/// conversation changes, so channel history and routing continuity are preserved.
+/// </summary>
+/// <param name="TargetConversationId">The conversation to re-parent the binding onto. Must exist, must belong to the same agent, and must not already hold a binding for the same (channel type, address) pair.</param>
+public sealed record MoveBindingRequest(string TargetConversationId);
+
 /// <summary>Full conversation response including bindings.</summary>
+/// <remarks>
+/// <c>Kind</c>, <c>Source</c> and <c>Visibility</c> are the orthogonal provenance axes a client needs
+/// to render a conversation without inference (epic #2300, issue #2340): <c>Kind</c> is the pairing
+/// topology, <c>Source</c>
+/// is the origination trigger, <c>Visibility</c> is who may see it. All are emitted as the enum
+/// <em>name</em>, matching the existing
+/// string convention already used for <c>Status</c> on this contract.
+/// </remarks>
 public sealed record ConversationResponse(
     string ConversationId,
     string AgentId,
@@ -36,7 +52,12 @@ public sealed record ConversationResponse(
     DateTimeOffset UpdatedAt,
     string? ModelOverride = null,
     string? ThinkingOverride = null,
-    int? ContextWindowOverride = null);
+    int? ContextWindowOverride = null,
+    string? ToolOverrideJson = null,
+    string Kind = "HumanAgent",
+    string Source = "Channel",
+    string Visibility = "UserFacing",
+    int? CompactionTokenCeiling = null);
 
 /// <summary>
 /// Request body for setting or clearing a conversation's model / thinking / context override
@@ -47,10 +68,33 @@ public sealed record ConversationResponse(
 /// <param name="Model">Optional model-id override; <c>null</c> clears the model override.</param>
 /// <param name="Thinking">Optional thinking-level wire token (e.g. <c>high</c>, <c>max</c>); <c>null</c> clears the thinking override.</param>
 /// <param name="ContextWindow">Optional context-window override in tokens; <c>null</c> clears the context override.</param>
+/// <param name="ToolOverrideJson">
+/// Optional serialized per-session tool overlay (<c>SessionToolOverride</c>, issue #2523);
+/// <c>null</c> clears the overlay back to the agent's full configured tool set. IGNORED unless
+/// <paramref name="ApplyToolOverride"/> is <c>true</c> - see that parameter for why.
+/// </param>
+/// <param name="ApplyToolOverride">
+/// Opt-in flag gating the tool-overlay field (issue #3271). The other three fields on this request
+/// are applied unconditionally, so a caller that only meant to set a model would silently CLEAR an
+/// overlay it never mentioned. Rather than change the established semantics of the existing fields,
+/// the new field is written ONLY when this flag is set, which makes an existing caller's payload
+/// bit-for-bit non-destructive. Defaults to <c>false</c>.
+/// </param>
+/// <param name="CompactionTokenCeiling">Positive token ceiling; null resets to inheritance when explicitly applied.</param>
+/// <param name="ApplyCompactionTokenCeiling">
+/// Opt-in ownership flag; false leaves the ceiling unchanged, true applies the value (null resets
+/// inheritance). This does NOT make the request a field-only patch: Model, Thinking and
+/// ContextWindow are still applied unconditionally. Ceiling callers must resend their current
+/// values to preserve them; omitting them clears those overrides, as on every existing PUT.
+/// </param>
 public sealed record SetConversationOverrideRequest(
     string? Model = null,
     string? Thinking = null,
-    int? ContextWindow = null);
+    int? ContextWindow = null,
+    string? ToolOverrideJson = null,
+    bool ApplyToolOverride = false,
+    [property: System.Text.Json.Serialization.JsonNumberHandling(System.Text.Json.Serialization.JsonNumberHandling.Strict)] int? CompactionTokenCeiling = null,
+    bool ApplyCompactionTokenCeiling = false);
 
 /// <summary>Channel binding response.</summary>
 public sealed record BindingResponse(
@@ -82,8 +126,25 @@ public sealed record ConversationHistoryResponse(
 /// <summary>A single history entry — either a message or a session boundary marker.</summary>
 public sealed class ConversationHistoryEntry
 {
+    /// <summary>Authoritative run identity, including host terminal notices.</summary>
+    public string? AgentRunId { get; init; }
+
     /// <summary>Entry kind: "message" or "boundary".</summary>
     public required string Kind { get; init; }
+
+    /// <summary>
+    /// Stable identifier for this entry within the assembled transcript, in the form
+    /// <c>{sessionId}#{ordinal}</c> (issue #3279). This is the token a partial-range export uses to
+    /// name its first and last included entry.
+    /// </summary>
+    /// <remarks>
+    /// The ordinal counts the entries this projection actually emitted for the owning session, so
+    /// it is stable against anything that does not change the transcript itself and - unlike a
+    /// position in the flattened cross-session list - does not silently start naming a different
+    /// entry when an earlier session gains or loses turns. It is not a database key and carries no
+    /// meaning outside the projection.
+    /// </remarks>
+    public string? EntryId { get; init; }
 
     /// <summary>The session this entry belongs to.</summary>
     public required string SessionId { get; init; }
@@ -100,6 +161,9 @@ public sealed class ConversationHistoryEntry
     /// <summary>Message content (for kind = "message").</summary>
     public string? Content { get; init; }
 
+    /// <summary>Inline source-backed attachments retained with the stored message.</summary>
+    public IReadOnlyList<ConversationHistoryAttachment>? Attachments { get; init; }
+
     /// <summary>Tool name (for kind = "message" with tool role).</summary>
     public string? ToolName { get; init; }
 
@@ -115,6 +179,38 @@ public sealed class ConversationHistoryEntry
     /// <summary>Reason for the boundary (for kind = "boundary").</summary>
     public string? Reason { get; init; }
 
+    /// <summary>
+    /// True when the underlying transcript entry has been folded into a later compaction summary
+    /// (<c>SessionEntry.IsHistory</c>). Folded entries are still returned so the transcript remains
+    /// reachable from the portal (#2936) - compaction removes an entry from the LLM context window,
+    /// it does not delete it - but the client renders them collapsed beneath the compaction boundary
+    /// rather than as ordinary turns.
+    /// </summary>
+    public bool IsFolded { get; init; }
+
     /// <summary>Thinking/reasoning content from the model (for assistant messages).</summary>
     public string? ThinkingContent { get; init; }
+
+    /// <summary>
+    /// Origin attribution for this entry (issue #2840) - e.g. <c>api:cron:pr-doctor</c> for a message
+    /// posted through <c>POST /api/agents/{agentId}/conversations/{conversationId}/messages</c>.
+    /// <c>null</c> for ordinary channel turns and for every entry persisted before #2840.
+    /// </summary>
+    /// <remarks>
+    /// Caller-supplied display text. Render it as provenance; never treat it as an identity claim.
+    /// </remarks>
+    public string? SenderId { get; init; }
+
+    /// <summary>
+    /// Orthogonal, typed presentation/delivery kind of the underlying transcript entry (issue
+    /// #2149): <c>message</c> (ordinary/default), <c>subagent-completion</c> (the internal
+    /// completion notification), or <c>subagent-response</c> (the parent agent's response to it).
+    /// Distinct from <see cref="Kind"/>, which discriminates the history-envelope shape
+    /// (<c>message</c> vs <c>compaction</c>). Always emitted so replay recovers the distinction a
+    /// portal/channel needs without inferring it from <see cref="Role"/>, ids, or content.
+    /// </summary>
+    public string? MessageKind { get; init; }
 }
+
+/// <summary>Safe inline attachment projected from persisted source content.</summary>
+public sealed record ConversationHistoryAttachment(string FileName, string MimeType, long? Size, string Base64Data);

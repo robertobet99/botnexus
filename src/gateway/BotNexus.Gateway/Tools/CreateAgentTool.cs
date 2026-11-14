@@ -22,13 +22,15 @@ public sealed class CreateAgentTool(
     IEnumerable<IAgentChangeNotifier> changeNotifiers,
     BotNexusHome botNexusHome,
     IOptions<PlatformConfig>? platformConfigOptions = null,
-    ApiProviderRegistry? apiProviderRegistry = null,
     ModelRegistry? modelRegistry = null) : IAgentTool
 {
     private static readonly Regex IdPattern = new(@"^[a-z0-9][a-z0-9-]*[a-z0-9]$", RegexOptions.Compiled);
 
     public string Name => "create_agent";
     public string Label => "Create Agent";
+
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Returns a locally generated registration confirmation.</summary>
+    public string ContentSource => ToolContentSource.Local;
 
     public Tool Definition => new(
         Name,
@@ -57,11 +59,11 @@ public sealed class CreateAgentTool(
                 },
                 "modelId": {
                   "type": "string",
-                  "description": "The LLM model identifier (e.g., 'claude-sonnet-4-20250514')."
+                  "description": "The LLM model identifier (e.g., 'claude-sonnet-4-20250514'). Must be registered for the chosen apiProvider. Persisted as 'model' in config.json."
                 },
                 "apiProvider": {
                   "type": "string",
-                  "description": "The API provider key (e.g., 'anthropic', 'openai', 'copilot')."
+                  "description": "Provider instance key as registered in the model registry (e.g., 'github-copilot', 'anthropic') - NOT an API contract name such as 'github-copilot-messages'. Persisted as 'provider' in config.json and resolved with modelId at spawn time."
                 },
                 "systemPrompt": {
                   "type": "string",
@@ -112,6 +114,11 @@ public sealed class CreateAgentTool(
         if (id.Length < 2 || id.Length > 64 || !IdPattern.IsMatch(id))
             return Error($"Invalid agent ID '{id}'. Must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$, 2-64 chars.");
 
+        // #2136: the six worker archetype ids are reserved for spawn_subagent(archetype:...) and may
+        // not be created as real named agents.
+        if (BotNexus.Gateway.Agents.BuiltInArchetypes.IsReserved(id))
+            return Error($"Agent ID '{id}' is a reserved sub-agent archetype and cannot be created as a named agent. Use spawn_subagent(archetype: \"{id}\") instead.");
+
         if (string.IsNullOrWhiteSpace(displayName))
             return Error("Parameter 'displayName' is required.");
 
@@ -121,8 +128,12 @@ public sealed class CreateAgentTool(
         if (string.IsNullOrWhiteSpace(apiProvider))
             return Error("Parameter 'apiProvider' is required.");
 
-        if (apiProviderRegistry is not null && apiProviderRegistry.Get(apiProvider) is null)
-            return Error($"Unknown API provider '{apiProvider}'. Available providers: {string.Join(", ", apiProviderRegistry.GetAll().Select(p => p.Api))}.");
+        // #2649: validate against the MODEL registry - the namespace InProcessIsolationStrategy
+        // resolves descriptor.ApiProvider against at spawn time - not the API-contract registry.
+        // Checking the contract registry rejected the only values that work ('github-copilot') and
+        // accepted values that persisted a permanently unspawnable agent ('github-copilot-messages').
+        if (BotNexus.Gateway.Agents.AgentModelPreflight.ValidateResolvable(apiProvider, modelId, modelRegistry) is { } preflightError)
+            return Error(preflightError);
 
         var agentId = AgentId.From(id);
         if (agentRegistry.Contains(agentId))
@@ -161,8 +172,18 @@ public sealed class CreateAgentTool(
         if (capabilityErrors.Count > 0)
             return Error(string.Join(" ", capabilityErrors));
 
+        // #2065: persist the candidate config BEFORE mutating the runtime registry so a disk
+        // failure cannot leave runtime state inconsistent with config.json. The descriptor was
+        // fully validated above, so a blank/incomplete descriptor never reaches persistence.
+        try
+        {
+            await configurationWriter.SaveAsync(descriptor, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return Error($"Failed to persist agent configuration; agent was not created: {ex.Message}");
+        }
         agentRegistry.Register(descriptor);
-        await configurationWriter.SaveAsync(descriptor, cancellationToken).ConfigureAwait(false);
         botNexusHome.GetAgentDirectory(id);
 
         foreach (var notifier in changeNotifiers)
@@ -261,7 +282,7 @@ public sealed class CreateAgentTool(
     {
         var config = new Dictionary<string, JsonElement>();
 
-        var extensionDefaults = platformConfig?.Gateway?.Extensions?.Defaults;
+        var extensionDefaults = platformConfig?.AgentDefaults?.Extensions;
         if (extensionDefaults is not null &&
             extensionDefaults.TryGetValue("botnexus-skills", out var skillsDefault) &&
             skillsDefault.ValueKind == JsonValueKind.Object &&

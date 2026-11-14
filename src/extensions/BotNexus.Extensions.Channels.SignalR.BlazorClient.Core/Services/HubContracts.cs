@@ -7,6 +7,12 @@ namespace BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
 
 // ── Server → Client payloads ────────────────────────────────────────────
 
+/// <summary>A durable cursor invalidation scoped by the server to the connected reader.</summary>
+public sealed record ConversationReadStateChangedPayload(
+    [property: JsonPropertyName("conversationId")] string ConversationId,
+    [property: JsonPropertyName("position")] long Position,
+    [property: JsonPropertyName("version")] long Version);
+
 /// <summary>Payload sent via the <c>Connected</c> client method on hub connect.</summary>
 public sealed record ConnectedPayload(
     [property: JsonPropertyName("connectionId")] string ConnectionId,
@@ -15,12 +21,18 @@ public sealed record ConnectedPayload(
     [property: JsonPropertyName("capabilities")] HubCapabilities Capabilities);
 
 /// <summary>Agent identity summary included in <see cref="ConnectedPayload"/>.</summary>
+/// <remarks>
+/// #3596: <c>summary</c> is the agent-maintained counterpart to the human-owned
+/// <c>description</c>. Appended last with a null default so a payload from a server that does
+/// not send it still binds, and vice versa.
+/// </remarks>
 public sealed record AgentSummary(
     [property: JsonPropertyName("agentId")] string AgentId,
     [property: JsonPropertyName("displayName")] string DisplayName,
     [property: JsonPropertyName("emoji")] string? Emoji = null,
     [property: JsonPropertyName("description")] string? Description = null,
-    [property: JsonPropertyName("isBuiltIn")] bool IsBuiltIn = false);
+    [property: JsonPropertyName("isBuiltIn")] bool IsBuiltIn = false,
+    [property: JsonPropertyName("summary")] string? Summary = null);
 
 /// <summary>Hub capabilities advertised on connect.</summary>
 public sealed record HubCapabilities(
@@ -42,6 +54,12 @@ public sealed record ContentDeltaPayload(
 /// <summary>Agent stream event for MessageStart, ThinkingDelta, ToolStart, ToolEnd, MessageEnd, Error.</summary>
 public sealed record AgentStreamEvent
 {
+    [JsonPropertyName("agentRunId")]
+    public string? AgentRunId { get; init; }
+
+    [JsonPropertyName("completion")]
+    public RunCompletionPayload? Completion { get; init; }
+
     [JsonPropertyName("type")]
     public string? Type { get; init; }
 
@@ -89,6 +107,26 @@ public sealed record AgentStreamEvent
 
     [JsonPropertyName("userInputRequest")]
     public AskUserRequestPayload? UserInputRequest { get; init; }
+}
+
+/// <summary>Terminal evidence needed by the shared desktop/mobile projection.</summary>
+public sealed record RunCompletionPayload
+{
+    [JsonPropertyName("stopReason")]
+    public string? StopReason { get; init; }
+
+    [JsonPropertyName("toolResultBudget")]
+    public BotNexus.Gateway.Abstractions.Models.ToolResultBudgetSignal? ToolResultBudget { get; init; }
+
+    [JsonPropertyName("guardObservations")]
+    public IReadOnlyList<RunGuardPayload> GuardObservations { get; init; } = [];
+}
+
+/// <summary>Legacy absolute-fuse evidence, distinct from semantic nonprogress.</summary>
+public sealed record RunGuardPayload
+{
+    [JsonPropertyName("absoluteLimitReached")]
+    public bool AbsoluteLimitReached { get; init; }
 }
 
 /// <summary>Token usage emitted with MessageEnd events.</summary>
@@ -171,9 +209,16 @@ public sealed record SendMessageResult(
     [property: JsonPropertyName("agentId")] string AgentId,
     [property: JsonPropertyName("channelType")] string? ChannelType);
 
+/// <summary>Authoritative server-owned activity for a run in flight at subscribe time.</summary>
+public sealed record RunActivitySnapshot(
+    [property: JsonPropertyName("sessionId")] string SessionId,
+    [property: JsonPropertyName("agentId")] string AgentId,
+    [property: JsonPropertyName("conversationId")] string? ConversationId);
+
 /// <summary>Result returned by <c>SubscribeAll</c>.</summary>
 public sealed record SubscribeAllResult(
-    [property: JsonPropertyName("sessions")] IReadOnlyList<SessionSummary> Sessions);
+    [property: JsonPropertyName("sessions")] IReadOnlyList<SessionSummary> Sessions,
+    [property: JsonPropertyName("activeRuns")] IReadOnlyList<RunActivitySnapshot> ActiveRuns);
 
 /// <summary>Session summary returned in <see cref="SubscribeAllResult"/> and GET /api/sessions.</summary>
 public sealed record SessionSummary(
@@ -187,6 +232,21 @@ public sealed record SessionSummary(
     [property: JsonPropertyName("createdAt")] DateTimeOffset? CreatedAt = null,
     [property: JsonPropertyName("updatedAt")] DateTimeOffset? UpdatedAt = null,
     [property: JsonPropertyName("conversationId")] string? ConversationId = null);
+
+/// <summary>
+/// One page of <c>GET /api/sessions</c> plus the explicit exhaustion signal (#2532 AC5).
+/// </summary>
+/// <remarks>
+/// The endpoint used to return a bare JSON array with no total, so a client could only discover
+/// it was done by requesting another page and getting nothing back - and it could not use "shorter
+/// than requested" as the signal either, because the server clamps <c>limit</c> to its own maximum
+/// (#2499). <see cref="HasMore"/> is now authoritative and is the only thing a paging walk should
+/// terminate on.
+/// </remarks>
+public sealed record SessionPageDto(
+    [property: JsonPropertyName("sessions")] IReadOnlyList<SessionSummary> Sessions,
+    [property: JsonPropertyName("totalCount")] int TotalCount,
+    [property: JsonPropertyName("hasMore")] bool HasMore);
 
 /// <summary>Result returned by <c>CompactSession</c>.</summary>
 public sealed record CompactSessionResult(

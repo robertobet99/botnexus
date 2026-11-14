@@ -22,13 +22,43 @@ public sealed class WebhookInboundController(
     IWebhookRegistrationStore registrationStore,
     IWebhookRunStore runStore,
     IInboundMessageOrchestrator orchestrator,
+    IConversationDispatcher conversationDispatcher,
     IConversationStore conversationStore,
     ISessionStore sessionStore,
     IHttpClientFactory httpClientFactory,
-    ILogger<WebhookInboundController> logger) : ControllerBase
+    ILogger<WebhookInboundController> logger,
+    WebhookInboundBodyGuard? bodyGuard = null,
+    WebhookInboundQueue? inboundQueue = null,
+    IHostApplicationLifetime? applicationLifetime = null,
+    TimeProvider? timeProvider = null) : ControllerBase
 {
     private const string SignatureHeader = "X-BotNexus-Signature-256";
     private const int SyncTimeoutSeconds = 120;
+
+    /// <summary>
+    /// Fallback guard for callers that construct the controller without DI. The bounds are a
+    /// security floor, not a tuning knob, so an unwired controller must still be bounded (#3807).
+    /// </summary>
+    private static readonly WebhookInboundBodyGuard DefaultBodyGuard = new();
+
+    /// <summary>
+    /// Fallback queue for callers that construct the controller without DI. Like the body guard,
+    /// the bound is a correctness floor rather than a tuning knob (#3851): an unwired controller
+    /// must still be bounded, because "unbounded" is the defect.
+    /// </summary>
+    private static readonly WebhookInboundQueue DefaultInboundQueue = new(new WebhookInboundQueueOptions());
+
+    private WebhookInboundBodyGuard BodyGuard => bodyGuard ?? DefaultBodyGuard;
+
+    private WebhookInboundQueue InboundQueue => inboundQueue ?? DefaultInboundQueue;
+
+    /// <summary>
+    /// Host shutdown signal folded into every dispatch. Before #3851 both background dispatch sites
+    /// passed <c>CancellationToken.None</c>, so a shutting-down gateway could not stop an in-flight
+    /// webhook turn or drain the ones queued behind it.
+    /// </summary>
+    private CancellationToken ShutdownToken =>
+        applicationLifetime?.ApplicationStopping ?? CancellationToken.None;
 
     /// <summary>
     /// Accepts an inbound message from an external system, verifies the HMAC-SHA256
@@ -50,6 +80,8 @@ public sealed class WebhookInboundController(
     [ProducesResponseType(typeof(WebhookSyncResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status413PayloadTooLarge)]
+    [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> Receive(
         string agentId,
@@ -57,11 +89,58 @@ public sealed class WebhookInboundController(
         CancellationToken cancellationToken)
     {
         // ── 1. Read raw body for HMAC verification ───────────────────────────
-        Request.EnableBuffering();
-        using var ms = new MemoryStream();
-        await Request.Body.CopyToAsync(ms, cancellationToken);
-        var rawBody = ms.ToArray();
-        Request.Body.Position = 0;
+        // This route is anonymous, and the signature is computed over these exact bytes, so the
+        // read necessarily precedes authentication. That makes it an unauthenticated allocation
+        // primitive unless it is bounded here (#3807): a declared-length check first (a truthful
+        // oversized request then costs nothing), then an in-flight slot, then a length-capped copy.
+        var guard = BodyGuard;
+
+        if (guard.ExceedsDeclaredLength(Request.ContentLength))
+        {
+            logger.LogWarning(
+                "Webhook '{WebhookId}' rejected — declared body length {Declared} exceeds the {Limit} byte ceiling, from {RemoteIp}.",
+                webhookId, Request.ContentLength, guard.MaxBodyBytes, HttpContext.Connection.RemoteIpAddress);
+            return StatusCode(
+                StatusCodes.Status413PayloadTooLarge,
+                new { error = $"Request body exceeds the {guard.MaxBodyBytes} byte limit." });
+        }
+
+        if (!guard.TryAcquireReadSlot())
+        {
+            logger.LogWarning(
+                "Webhook '{WebhookId}' rejected — {Limit} concurrent pre-authentication body reads already in flight, from {RemoteIp}.",
+                webhookId, guard.MaxInFlightReads, HttpContext.Connection.RemoteIpAddress);
+            return StatusCode(
+                StatusCodes.Status429TooManyRequests,
+                new { error = "Too many concurrent webhook requests." });
+        }
+
+        byte[] rawBody;
+        try
+        {
+            Request.EnableBuffering();
+            var read = await guard.ReadBoundedAsync(Request.Body, cancellationToken);
+            if (read.IsTooLarge)
+            {
+                logger.LogWarning(
+                    "Webhook '{WebhookId}' rejected — body exceeds the {Limit} byte ceiling, from {RemoteIp}.",
+                    webhookId, read.Limit, HttpContext.Connection.RemoteIpAddress);
+                return StatusCode(
+                    StatusCodes.Status413PayloadTooLarge,
+                    new { error = $"Request body exceeds the {read.Limit} byte limit." });
+            }
+
+            rawBody = read.Body;
+        }
+        finally
+        {
+            // Released as soon as the pre-signature region ends. The cap bounds unauthenticated
+            // reads, not the authenticated work that follows.
+            guard.ReleaseReadSlot();
+        }
+
+        if (Request.Body.CanSeek)
+            Request.Body.Position = 0;
 
         // ── 2. Parse request body ────────────────────────────────────────────
         WebhookInboundRequest? body;
@@ -108,16 +187,22 @@ public sealed class WebhookInboundController(
         {
             // Try to pin one — create a new conversation if not yet pinned.
             var now = DateTimeOffset.UtcNow;
-            var conversation = new BotNexus.Gateway.Abstractions.Models.Conversation
-            {
-                ConversationId = ConversationId.Create(),
-                AgentId = typedAgentId,
-                Title = $"Webhook: {registration.Label}",
-                Status = ConversationStatus.Active,
-                CreatedAt = now,
-                UpdatedAt = now,
-                Initiator = CitizenId.Of(typedAgentId)
-            };
+            // Inbound-webhook origination (#2302): no human is in the loop, which is exactly
+            // what read-only/composer gating needs to know. Minted through the single creation
+            // seam (#2310) so provenance cannot be silently omitted.
+            var conversation = BotNexus.Gateway.Abstractions.Models.ConversationFactory.CreateForWebhook(
+                ConversationId.Create(),
+                typedAgentId,
+                title: $"Webhook: {registration.Label}",
+                initiator: CitizenId.Of(typedAgentId),
+                // #2121: stamp the owning registration id onto the conversation itself so the
+                // portal (and source-specific retention) can attribute it from the summary rather
+                // than from the metadata bag or the title text.
+                sourceId: typedWebhookId.Value,
+                timestamp: now);
+            // Stamp authoritative webhook provenance so source-specific retention (#2125) can
+            // identify this conversation by its originating registration id, never by title.
+            WebhookConversationProvenance.Stamp(conversation.Metadata, typedWebhookId);
             var created = await conversationStore.CreateAsync(conversation, cancellationToken);
             var winner = await registrationStore.TryPinConversationAsync(
                 typedWebhookId, created.ConversationId, cancellationToken);
@@ -127,7 +212,7 @@ public sealed class WebhookInboundController(
             // compare-and-set. Keep only the winning conversation visible; the loser has not
             // been dispatched or bound yet, so it is safe to archive immediately.
             if (winner.HasValue && winner.Value != created.ConversationId)
-                await conversationStore.ArchiveAsync(created.ConversationId, cancellationToken);
+                await conversationStore.ArchiveAsync(created.ConversationId, "webhook-loser-cleanup", System.Diagnostics.Activity.Current?.Id, "system", cancellationToken);
         }
 
         // ── 7. Resolve response mode ─────────────────────────────────────────
@@ -163,11 +248,36 @@ public sealed class WebhookInboundController(
 
         if (!run.AgentAction)
         {
-            // Store-only mode — record a session entry but don't run the agent.
-            await StoreMessageOnlyAsync(typedAgentId, resolvedConversationId, body.Message, cancellationToken);
-            run.Status = WebhookRunStatus.Completed;
-            run.CompletedAt = DateTimeOffset.UtcNow;
-            run.AgentResponse = null;
+            // Store-only mode — append to the conversation's own session, but don't run the agent.
+            var storedSessionId = await StoreMessageOnlyAsync(
+                run, typedAgentId, resolvedConversationId, body.Message, cancellationToken);
+
+            if (storedSessionId is null)
+            {
+                // The write did not land. Returning 202 here (issue #2839) handed the caller a
+                // success receipt plus a valid-looking conversation id for a message that could
+                // never be read back, so nothing signalled a retry. Fail loudly instead.
+                run.Status = WebhookRunStatus.Failed;
+                run.CompletedAt = DateTimeOffset.UtcNow;
+                run.Error = $"Store-only delivery could not resolve a session for conversation '{resolvedConversationId.Value}'.";
+                await runStore.UpdateAsync(run, cancellationToken);
+
+                logger.LogError(
+                    "Webhook '{WebhookId}' store-only run '{RunId}' could not resolve a session for conversation '{ConversationId}'.",
+                    webhookId, run.Id, resolvedConversationId);
+
+                return StatusCode(
+                    StatusCodes.Status503ServiceUnavailable,
+                    new { error = "Could not resolve a session for the target conversation; message was not stored." });
+            }
+
+            run = run with
+            {
+                Status = WebhookRunStatus.Completed,
+                CompletedAt = DateTimeOffset.UtcNow,
+                AgentResponse = null,
+                SessionId = storedSessionId
+            };
             await runStore.UpdateAsync(run, cancellationToken);
             return Accepted(new WebhookAcceptedResponse(run.Id.Value, pollUrl, resolvedConversationId.Value));
         }
@@ -186,16 +296,61 @@ public sealed class WebhookInboundController(
         WebhookRun run, AgentId agentId, ConversationId conversationId,
         string message, string pollUrl, CancellationToken ct)
     {
-        // Fire-and-forget: accept immediately, agent runs in background.
+        // Admission is decided HERE, on the request thread, before any 202 is written (#3851 AC4).
+        // Deciding it inside the background task would mean the caller had already been handed a
+        // success receipt by the time the refusal was known - which is the defect, not the fix.
+        WebhookQueueTicket ticket;
+        try
+        {
+            ticket = InboundQueue.Admit(agentId, conversationId);
+        }
+        catch (WebhookBackpressureException ex)
+        {
+            return await RejectAsync(run, agentId, ex);
+        }
+
+        try
+        {
+            if (!ticket.IsImmediate)
+                await MarkQueuedAsync(run, agentId);
+        }
+        catch
+        {
+            ticket.Dispose();
+            throw;
+        }
+
+        var shutdown = ShutdownToken;
+        var runTimeout = InboundQueue.RunTimeout;
+
+        // Fire-and-forget in the sense that the CALLER does not wait - but the work itself is now
+        // bounded, cancellable and observable, which the bare Task.Run it replaces was not.
         _ = Task.Run(async () =>
         {
             try
             {
-                await ExecuteAgentAsync(run, agentId, conversationId, message, CancellationToken.None);
+                using var deadline = new CancellationTokenSource(runTimeout, timeProvider ?? TimeProvider.System);
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(shutdown, deadline.Token);
+                using var lease = await ticket.WaitAsync(cts.Token);
+                await ExecuteAgentAsync(run, agentId, conversationId, message, cts.Token);
+            }
+            catch (WebhookNotDispatchedException ex)
+            {
+                await MarkTimedOutAsync(run, agentId, ex.Message);
+            }
+            catch (OperationCanceledException)
+            {
+                await MarkTimedOutAsync(
+                    run, agentId,
+                    $"Background webhook run exceeded its {runTimeout.TotalSeconds:0}s ceiling or the gateway is shutting down.");
             }
             catch (Exception ex)
             {
                 logger.LogError(ex, "Background webhook run '{RunId}' failed.", run.Id);
+            }
+            finally
+            {
+                ticket.Dispose();
             }
         }, CancellationToken.None);
 
@@ -207,24 +362,64 @@ public sealed class WebhookInboundController(
         WebhookRun run, AgentId agentId, ConversationId conversationId,
         string message, string pollUrl, CancellationToken ct)
     {
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromSeconds(SyncTimeoutSeconds));
+        WebhookQueueTicket ticket;
+        try
+        {
+            ticket = InboundQueue.Admit(agentId, conversationId);
+        }
+        catch (WebhookBackpressureException ex)
+        {
+            return await RejectAsync(run, agentId, ex);
+        }
+
+        using var ticketOwnership = ticket;
+        if (!ticket.IsImmediate)
+            await MarkQueuedAsync(run, agentId);
+
+        using var deadline = new CancellationTokenSource(
+            TimeSpan.FromSeconds(SyncTimeoutSeconds), timeProvider ?? TimeProvider.System);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct, ShutdownToken, deadline.Token);
 
         try
         {
-            await ExecuteAgentAsync(run, agentId, conversationId, message, cts.Token);
+            using (await ticket.WaitAsync(cts.Token))
+            {
+                await ExecuteAgentAsync(run, agentId, conversationId, message, cts.Token);
+            }
+
             var completed = await runStore.GetAsync(run.Id, CancellationToken.None);
             if (completed?.Status == WebhookRunStatus.Completed)
                 return Ok(new WebhookSyncResponse(completed.Id.Value, completed.AgentResponse, conversationId.Value));
 
             return StatusCode(StatusCodes.Status503ServiceUnavailable, new { error = "Agent run did not complete." });
         }
+        catch (WebhookNotDispatchedException) when (ct.IsCancellationRequested)
+        {
+            // The request disappeared while this accepted run was still queued. Persist with a
+            // non-cancelled token before preserving the caller's cancellation contract; otherwise
+            // the durable row remains Queued forever even though the ticket returned its capacity.
+            try
+            {
+                await MarkCallerCancelledAsync(run, agentId);
+            }
+            finally
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+
+            throw new InvalidOperationException("The caller cancellation token was expected to be cancelled.");
+        }
+        catch (WebhookNotDispatchedException ex)
+        {
+            // The deadline expired while still queued: the agent never saw this message at all.
+            // Say so, rather than reporting a timeout of work that never started.
+            await MarkTimedOutAsync(run, agentId, ex.Message);
+            Response.Headers["Location"] = pollUrl;
+            return Accepted(new WebhookAcceptedResponse(run.Id.Value, pollUrl, conversationId.Value));
+        }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            run.Status = WebhookRunStatus.Timeout;
-            run.CompletedAt = DateTimeOffset.UtcNow;
-            run.Error = $"Sync mode timeout after {SyncTimeoutSeconds}s.";
-            await runStore.UpdateAsync(run, CancellationToken.None);
+            await MarkTimedOutAsync(run, agentId, $"Sync mode timeout after {SyncTimeoutSeconds}s.");
             Response.Headers["Location"] = pollUrl;
             return Accepted(new WebhookAcceptedResponse(run.Id.Value, pollUrl, conversationId.Value));
         }
@@ -235,17 +430,62 @@ public sealed class WebhookInboundController(
         string message, string pollUrl, CancellationToken ct)
     {
         var callbackUrl = run.CallbackUrl;
+
+        WebhookQueueTicket ticket;
+        try
+        {
+            ticket = InboundQueue.Admit(agentId, conversationId);
+        }
+        catch (WebhookBackpressureException ex)
+        {
+            return await RejectAsync(run, agentId, ex);
+        }
+
+        try
+        {
+            if (!ticket.IsImmediate)
+                await MarkQueuedAsync(run, agentId);
+        }
+        catch
+        {
+            ticket.Dispose();
+            throw;
+        }
+
+        var shutdown = ShutdownToken;
+        var runTimeout = InboundQueue.RunTimeout;
+
         _ = Task.Run(async () =>
         {
             try
             {
-                await ExecuteAgentAsync(run, agentId, conversationId, message, CancellationToken.None);
+                using var deadline = new CancellationTokenSource(runTimeout, timeProvider ?? TimeProvider.System);
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(shutdown, deadline.Token);
+                using (await ticket.WaitAsync(cts.Token))
+                {
+                    await ExecuteAgentAsync(run, agentId, conversationId, message, cts.Token);
+                }
+
                 if (!string.IsNullOrWhiteSpace(callbackUrl))
-                    await DeliverCallbackAsync(run.Id, callbackUrl, CancellationToken.None);
+                    await DeliverCallbackAsync(run.Id, callbackUrl, shutdown);
+            }
+            catch (WebhookNotDispatchedException ex)
+            {
+                await MarkCallbackTimedOutAsync(run, agentId, callbackUrl, shutdown, ex.Message);
+            }
+            catch (OperationCanceledException)
+            {
+                await MarkCallbackTimedOutAsync(
+                    run, agentId, callbackUrl, shutdown,
+                    $"Callback webhook run exceeded its {runTimeout.TotalSeconds:0}s ceiling or the gateway is shutting down.");
             }
             catch (Exception ex)
             {
                 logger.LogError(ex, "Callback webhook run '{RunId}' failed.", run.Id);
+            }
+            finally
+            {
+                ticket.Dispose();
             }
         }, CancellationToken.None);
 
@@ -253,14 +493,99 @@ public sealed class WebhookInboundController(
         return Accepted(new WebhookAcceptedResponse(run.Id.Value, pollUrl, conversationId.Value));
     }
 
+    /// <summary>
+    /// Records a delivery refused because the agent's bounded queue was full, and returns the
+    /// explicit <c>503</c> the caller needs in order to retry (#3851 AC4).
+    /// </summary>
+    private async Task<IActionResult> RejectAsync(
+        WebhookRun run, AgentId agentId, WebhookBackpressureException ex)
+    {
+        run.Status = WebhookRunStatus.Rejected;
+        run.CompletedAt = DateTimeOffset.UtcNow;
+        run.Error = ex.Message;
+        await runStore.UpdateAsync(run, CancellationToken.None);
+
+        logger.LogWarning(
+            "Webhook run '{RunId}' rejected - agent '{AgentId}' inbound queue is full at depth {Depth}.",
+            run.Id, agentId.Value, ex.MaxQueueDepth);
+
+        return StatusCode(
+            StatusCodes.Status503ServiceUnavailable,
+            new { error = ex.Message, queueDepth = ex.MaxQueueDepth, runId = run.Id.Value });
+    }
+
+    /// <summary>
+    /// Publishes <see cref="WebhookRunStatus.Queued"/> for a delivery that could not start
+    /// immediately, and logs the agent's current backlog depth (#3851 AC2, AC5).
+    /// </summary>
+    /// <remarks>
+    /// Called only when admission did NOT take the slot outright. A queued state set on every run
+    /// would carry no more information than the <c>Running</c>-for-everything it replaces.
+    /// </remarks>
+    private async Task MarkQueuedAsync(WebhookRun run, AgentId agentId)
+    {
+        run.Status = WebhookRunStatus.Queued;
+        await runStore.UpdateAsync(run, CancellationToken.None);
+
+        logger.LogInformation(
+            "Webhook run '{RunId}' queued for agent '{AgentId}' - {Waiting} delivery(s) waiting, bound {Depth}.",
+            run.Id, agentId.Value, InboundQueue.WaitingCount(agentId), InboundQueue.MaxQueueDepth);
+    }
+
+    /// <summary>
+    /// Records an accepted run abandoned by its caller before dispatch. Failed is the existing
+    /// terminal non-timeout state; the explicit error preserves cancellation provenance without a
+    /// persisted-status migration.
+    /// </summary>
+    private async Task MarkCallerCancelledAsync(WebhookRun run, AgentId agentId)
+    {
+        run.Status = WebhookRunStatus.Failed;
+        run.CompletedAt = DateTimeOffset.UtcNow;
+        run.Error = "The webhook caller cancelled the request before the queued delivery was dispatched.";
+        await runStore.UpdateAsync(run, CancellationToken.None);
+
+        logger.LogInformation(
+            "Webhook run '{RunId}' for agent '{AgentId}' was cancelled by its caller before dispatch.",
+            run.Id, agentId.Value);
+    }
+
+    /// <summary>
+    /// Records a run that hit its deadline, whether it timed out waiting for the slot or while
+    /// executing (#3851 AC3).
+    /// </summary>
+    private async Task MarkTimedOutAsync(WebhookRun run, AgentId agentId, string error)
+    {
+        run.Status = WebhookRunStatus.Timeout;
+        run.CompletedAt = DateTimeOffset.UtcNow;
+        run.Error = error;
+        await runStore.UpdateAsync(run, CancellationToken.None);
+
+        logger.LogWarning(
+            "Webhook run '{RunId}' for agent '{AgentId}' timed out: {Error}", run.Id, agentId.Value, error);
+    }
+
+    /// <summary>
+    /// Persists the callback run's terminal timeout before attempting delivery. A live-host deadline
+    /// still owes the accepted caller one terminal callback; host shutdown does not start new
+    /// outbound work and remains bounded by the existing shutdown token.
+    /// </summary>
+    private async Task MarkCallbackTimedOutAsync(
+        WebhookRun run,
+        AgentId agentId,
+        string? callbackUrl,
+        CancellationToken shutdown,
+        string error)
+    {
+        await MarkTimedOutAsync(run, agentId, error);
+
+        if (!shutdown.IsCancellationRequested && !string.IsNullOrWhiteSpace(callbackUrl))
+            await DeliverCallbackAsync(run.Id, callbackUrl, shutdown);
+    }
+
     private async Task ExecuteAgentAsync(
         WebhookRun run, AgentId agentId, ConversationId conversationId,
         string message, CancellationToken ct)
     {
-        run.Status = WebhookRunStatus.Running;
-        run.StartedAt = DateTimeOffset.UtcNow;
-        await runStore.UpdateAsync(run, CancellationToken.None);
-
         try
         {
             // Build inbound message routing through the existing orchestrator —
@@ -283,7 +608,15 @@ public sealed class WebhookInboundController(
                 }
             };
 
-            var result = await orchestrator.AcceptAsync(inbound, ct);
+            var executionControl = new InboundExecutionControl(
+                ct,
+                async () =>
+                {
+                    run.Status = WebhookRunStatus.Running;
+                    run.StartedAt = DateTimeOffset.UtcNow;
+                    await runStore.UpdateAsync(run, CancellationToken.None);
+                });
+            var result = await orchestrator.AcceptAsync(inbound, executionControl, ct);
 
             // Extract session ID and agent response from the session store.
             var sessionId = result.Dispatches.FirstOrDefault()?.Resolution.SessionId;
@@ -304,6 +637,10 @@ public sealed class WebhookInboundController(
                 SessionId = sessionId
             };
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "Webhook run '{RunId}' agent execution failed.", run.Id);
@@ -317,19 +654,54 @@ public sealed class WebhookInboundController(
         }
     }
 
-    private async Task StoreMessageOnlyAsync(
-        AgentId agentId, ConversationId conversationId, string message, CancellationToken ct)
+    /// <summary>
+    /// Store-only path: append the user message to the session bound to the requested conversation
+    /// without executing an agent turn. Useful for audit trails and async aggregation.
+    /// </summary>
+    /// <remarks>
+    /// Session resolution is delegated to <see cref="IConversationDispatcher"/> — the same seam
+    /// <see cref="ExecuteAgentAsync"/> reaches through <see cref="IInboundMessageOrchestrator"/> —
+    /// so the two modes cannot drift on <em>where</em> a message is stored. Before #2839 this method
+    /// minted <c>SessionId.From(Guid.NewGuid())</c> and ignored <paramref name="conversationId"/>
+    /// entirely, writing every delivery into a fresh session bound to no conversation.
+    /// </remarks>
+    /// <returns>
+    /// The session the message was appended to, or <see langword="null"/> when no session could be
+    /// resolved or the append was refused — the caller must then not report success.
+    /// </returns>
+    private async Task<SessionId?> StoreMessageOnlyAsync(
+        WebhookRun run, AgentId agentId, ConversationId conversationId, string message, CancellationToken ct)
     {
-        // Minimal store-only path: create/get a session and append the user message.
-        // Agent does not run — useful for audit trails, async aggregation, etc.
-        var sessionId = SessionId.From(Guid.NewGuid().ToString("N"));
-        var session = await sessionStore.GetOrCreateAsync(sessionId, agentId, ct);
-        session.AddEntry(new SessionEntry
+        var inbound = new InboundMessage
         {
-            Role = MessageRole.User,
-            Content = message
-        });
-        await sessionStore.SaveAsync(session, ct);
+            ChannelType = ChannelKey.From("webhook"),
+            SenderId = $"webhook:{run.WebhookId.Value}",
+            Sender = CitizenId.Of(agentId),
+            ChannelAddress = ChannelAddress.From(run.WebhookId.Value),
+            Content = message.Trim(),
+            RoutingHints = new InboundMessageRoutingHints(
+                RequestedAgentId: agentId,
+                RequestedSessionId: null,
+                RequestedConversationId: conversationId),
+            Metadata = new Dictionary<string, object?>
+            {
+                ["webhookRunId"] = run.Id.Value,
+                ["webhookId"] = run.WebhookId.Value
+            }
+        };
+
+        var context = InboundMessageContext.FromInboundMessage(agentId, inbound);
+        var dispatch = await conversationDispatcher.DispatchAsync(context, ct);
+        var sessionId = dispatch.Resolution.SessionId;
+
+        // Narrow append rather than a read-mutate-save of the whole aggregate (#2132): a store-only
+        // write must not roll back a metadata patch or lifecycle transition that landed concurrently.
+        var appended = await sessionStore.AppendEntriesAsync(
+            sessionId,
+            [new SessionEntry { Role = MessageRole.User, Content = message }],
+            ct);
+
+        return appended.Outcome == SessionMutationOutcome.Applied ? sessionId : null;
     }
 
     private async Task DeliverCallbackAsync(WebhookRunId runId, string callbackUrl, CancellationToken ct)

@@ -38,7 +38,7 @@ public static class CompletionsMessageConverter
         if (systemPrompt is not null)
         {
             var role = model.Reasoning && compat.SupportsDeveloperRole != false ? "developer" : "system";
-            result.Add(new JsonObject { ["role"] = role, ["content"] = UnicodeSanitizer.SanitizeSurrogates(systemPrompt) });
+            result.Add(new JsonObject { ["role"] = role, ["content"] = systemPrompt.SanitizeSurrogates() });
         }
 
         for (var i = 0; i < transformedMessages.Count; i++)
@@ -55,7 +55,7 @@ public static class CompletionsMessageConverter
             {
                 case UserMessage user:
                 {
-                    var userMessage = ConvertUserMessage(user, model.Input.Contains("image"));
+                    var userMessage = ConvertUserMessage(user, model);
                     if (userMessage is not null)
                         result.Add(userMessage);
                     lastRole = "user";
@@ -78,12 +78,13 @@ public static class CompletionsMessageConverter
                     for (; j < transformedMessages.Count && transformedMessages[j] is ToolResultMessage; j++)
                     {
                         var tr = (ToolResultMessage)transformedMessages[j];
-                        result.Add(ConvertToolResultMessage(tr, compat));
+                        result.Add(ConvertToolResultMessage(tr, compat, model));
 
-                        var hasImages = tr.Content.Any(c => c is ImageContent);
-                        if (hasImages && model.Input.Contains("image"))
+                        var trImages = tr.Content.OfType<ImageContent>().ToList();
+                        if (trImages.Count > 0 &&
+                            ImageModalityGuard.AllowImages(model, trImages.Count, "completions.tool-result"))
                         {
-                            foreach (var image in tr.Content.OfType<ImageContent>())
+                            foreach (var image in trImages)
                             {
                                 imageBlocks.Add(new JsonObject
                                 {
@@ -138,6 +139,9 @@ public static class CompletionsMessageConverter
 
     private static string NormalizeToolCallId(string id, LlmModel sourceModel, string targetProviderId)
     {
+        if (sourceModel.IsMistralFamily())
+            return id.NormalizeMistralToolCallId();
+
         if (id.Contains('|'))
         {
             var callId = id.Split('|', 2)[0];
@@ -150,13 +154,21 @@ public static class CompletionsMessageConverter
         return id;
     }
 
-    private static JsonObject? ConvertUserMessage(UserMessage user, bool supportsImages)
+    private static JsonObject? ConvertUserMessage(UserMessage user, LlmModel model)
     {
+        var droppedImageCount = user.Content.IsText
+            ? 0
+            : user.Content.Blocks!.Count(b => b is ImageContent);
+        var supportsImages = ImageModalityGuard.AllowImages(
+            model,
+            droppedImageCount,
+            "completions.user");
+
         if (user.Content.IsText)
             return new JsonObject
             {
                 ["role"] = "user",
-                ["content"] = UnicodeSanitizer.SanitizeSurrogates(user.Content.Text ?? string.Empty)
+                ["content"] = (user.Content.Text ?? string.Empty).SanitizeSurrogates()
             };
 
         var contentArray = new JsonArray();
@@ -168,7 +180,7 @@ public static class CompletionsMessageConverter
                     contentArray.Add(new JsonObject
                     {
                         ["type"] = "text",
-                        ["text"] = UnicodeSanitizer.SanitizeSurrogates(text.Text)
+                        ["text"] = text.Text.SanitizeSurrogates()
                     });
                     break;
 
@@ -183,6 +195,16 @@ public static class CompletionsMessageConverter
                     });
                     break;
             }
+        }
+
+        // #2485 AC4: the drop must be visible to the USER, not only in the log. Substitute an
+        // in-band text part for the removed images so the agent can explain the absence instead of
+        // silently answering as though no attachment was ever sent.
+        if (!supportsImages)
+        {
+            var notice = ImageModalityGuard.BuildDropNotice(model, droppedImageCount);
+            if (notice is not null)
+                contentArray.Add(new JsonObject { ["type"] = "text", ["text"] = notice });
         }
 
         if (contentArray.Count == 0)
@@ -205,7 +227,7 @@ public static class CompletionsMessageConverter
             {
                 case TextContent text:
                     if (!string.IsNullOrWhiteSpace(text.Text))
-                        textParts.Add(UnicodeSanitizer.SanitizeSurrogates(text.Text));
+                        textParts.Add(text.Text.SanitizeSurrogates());
                     break;
 
                 case ThinkingContent thinking:
@@ -214,14 +236,14 @@ public static class CompletionsMessageConverter
 
                     if (compat.RequiresThinkingAsText == true)
                     {
-                        thinkingParts.Add(UnicodeSanitizer.SanitizeSurrogates(thinking.Thinking));
+                        thinkingParts.Add(thinking.Thinking.SanitizeSurrogates());
                     }
                     else if (!string.IsNullOrWhiteSpace(thinking.ThinkingSignature))
                     {
                         var signature = thinking.ThinkingSignature;
                         msg[signature] = string.Join("\n", assistant.Content.OfType<ThinkingContent>()
                             .Where(t => !string.IsNullOrWhiteSpace(t.Thinking))
-                            .Select(t => UnicodeSanitizer.SanitizeSurrogates(t.Thinking)));
+                            .Select(t => t.Thinking.SanitizeSurrogates()));
                     }
                     break;
 
@@ -269,16 +291,17 @@ public static class CompletionsMessageConverter
         return msg;
     }
 
-    private static JsonObject ConvertToolResultMessage(ToolResultMessage toolResult, OpenAICompletionsCompat compat)
+    private static JsonObject ConvertToolResultMessage(
+        ToolResultMessage toolResult, OpenAICompletionsCompat compat, LlmModel model)
     {
         var content = string.Join("\n", toolResult.Content
             .OfType<TextContent>()
-            .Select(t => UnicodeSanitizer.SanitizeSurrogates(t.Text)));
+            .Select(t => t.Text.SanitizeSurrogates()));
 
         var msg = new JsonObject
         {
             ["role"] = "tool",
-            ["tool_call_id"] = toolResult.ToolCallId,
+            ["tool_call_id"] = NormalizeToolCallId(toolResult.ToolCallId, model, model.Provider),
             ["content"] = string.IsNullOrWhiteSpace(content) ? "(see attached image)" : content
         };
 

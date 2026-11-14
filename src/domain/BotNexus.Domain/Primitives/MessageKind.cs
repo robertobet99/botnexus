@@ -1,0 +1,121 @@
+using System.Collections.Concurrent;
+using System.Text.Json.Serialization;
+using BotNexus.Domain.Serialization;
+
+namespace BotNexus.Domain.Primitives;
+
+/// <summary>
+/// Orthogonal, typed presentation/delivery kind for a message or transcript entry (issue #2149).
+/// It is deliberately independent of <see cref="MessageRole"/>: <see cref="MessageRole"/> stays the
+/// LLM/conversation role (<c>user</c>/<c>assistant</c>/...), while <see cref="MessageKind"/> lets a
+/// channel adapter distinguish an ordinary direct response from a sub-agent completion notification
+/// and from the parent agent's response produced while handling that completion. The kind survives
+/// the whole path (InboundMessage -> SessionEntry -> session store -> history/conversation DTOs ->
+/// OutboundMessage / conversation event -> channel adapter) so replay and live delivery agree, and
+/// no channel has to parse role, sender ids, session ids, or message text to recover the distinction.
+/// </summary>
+[JsonConverter(typeof(SmartEnumJsonConverter<MessageKind>))]
+public sealed class MessageKind : IEquatable<MessageKind>
+{
+    private static readonly ConcurrentDictionary<string, MessageKind> Registry = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Ordinary direct response / default. Legacy rows and messages with no explicit kind resolve here.</summary>
+    public static readonly MessageKind Message = Register("message");
+
+    /// <summary>The internal sub-agent completion notification delivered to the parent session.</summary>
+    public static readonly MessageKind SubAgentCompletion = Register("subagent-completion");
+
+    /// <summary>The parent agent's response produced while handling a sub-agent completion.</summary>
+    public static readonly MessageKind SubAgentResponse = Register("subagent-response");
+
+    /// <summary>
+    /// A user turn injected by a canvas <c>submitToAgent</c> click (#2449). The turn is a genuine
+    /// user turn - a human pressed a button in the canvas the agent rendered - so its
+    /// <see cref="MessageRole"/> stays <c>user</c>; this kind is the typed answer to "why does this
+    /// message exist?", the message-level analogue of the conversation-level
+    /// <c>ConversationSource.Cron</c> (#2300). It is stamped at the hub from the transport surface
+    /// the click arrived on, never from iframe-supplied content.
+    /// </summary>
+    public static readonly MessageKind CanvasSubmission = Register("canvas-submission");
+
+    /// <summary>
+    /// The audit row written when a tool call is observed to START (#2906). Before this kind
+    /// existed the only way to tell a start row from a result row was the accident that the result
+    /// row had no <c>ToolArgs</c> - which is precisely the data loss #2906 fixes. Making the
+    /// distinction explicit and typed lets BOTH rows carry their arguments without any consumer
+    /// having to infer the row's meaning from a missing field.
+    /// </summary>
+    public static readonly MessageKind ToolStart = Register("tool-start");
+
+    /// <summary>
+    /// The audit row written when a tool call produces a RESULT (#2906), including the synthesized
+    /// row for a call that never completed. This row is self-describing: it carries the arguments
+    /// that produced the result, so a query over result rows never needs a self-join on
+    /// <c>tool_call_id</c> to see the inputs.
+    /// </summary>
+    public static readonly MessageKind ToolResult = Register("tool-result");
+    /// <summary>
+    /// A handoff status line published into the INITIATING conversation while an
+    /// <c>agent_converse</c> exchange runs (#3176). It is not the child agent's output and is not
+    /// part of the exchange transcript - it is an observability record that lets a reader of the
+    /// delegating thread see the handoff start, finish, fail, or be halted. Typed so a channel or
+    /// portal can render or filter it distinctly from a real assistant reply without parsing text.
+    /// </summary>
+    public static readonly MessageKind AgentExchangeProgress = Register("agent-exchange-progress");
+
+    /// <summary>Gets the stable wire value of this kind.</summary>
+    public string Value { get; }
+
+    private MessageKind(string value) => Value = value;
+
+    /// <summary>
+    /// Resolves a <see cref="MessageKind"/> from its wire value, registering previously unseen values
+    /// so forward-compatible kinds round-trip through persistence without a schema change. Trims and
+    /// lower-cases so the token is canonical.
+    /// </summary>
+    /// <param name="value">The wire value (e.g. <c>message</c>, <c>subagent-completion</c>).</param>
+    /// <returns>The corresponding kind.</returns>
+    public static MessageKind FromString(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("MessageKind cannot be empty", nameof(value));
+
+        return Registry.GetOrAdd(value.Trim().ToLowerInvariant(), static v => new MessageKind(v));
+    }
+
+    /// <summary>
+    /// Resolves a kind from an optional wire value, mapping <c>null</c>/blank (a legacy or unstamped
+    /// row) to <see cref="Message"/>. This is the single place the "default safely to message" rule
+    /// lives so every read path (session store, DTO projection) agrees.
+    /// </summary>
+    /// <param name="value">The optional wire value; <c>null</c> or blank yields <see cref="Message"/>.</param>
+    /// <returns>The resolved kind, never <c>null</c>.</returns>
+    public static MessageKind FromNullableString(string? value)
+        => string.IsNullOrWhiteSpace(value) ? Message : FromString(value);
+
+    /// <summary>Performs the declared conversion or operator operation.</summary>
+    public static implicit operator MessageKind(string value) => FromString(value);
+
+    /// <summary>Performs the declared conversion or operator operation.</summary>
+    public static implicit operator string(MessageKind kind) => kind.Value;
+
+    /// <inheritdoc/>
+    public bool Equals(MessageKind? other) =>
+        other is not null && string.Equals(Value, other.Value, StringComparison.OrdinalIgnoreCase);
+
+    /// <inheritdoc/>
+    public override bool Equals(object? obj) => obj is MessageKind other && Equals(other);
+
+    /// <inheritdoc/>
+    public override int GetHashCode() => StringComparer.OrdinalIgnoreCase.GetHashCode(Value);
+
+    /// <inheritdoc/>
+    public override string ToString() => Value;
+
+    private static MessageKind Register(string value)
+    {
+        var kind = new MessageKind(value);
+        Registry.TryAdd(value, kind);
+        return kind;
+    }
+}

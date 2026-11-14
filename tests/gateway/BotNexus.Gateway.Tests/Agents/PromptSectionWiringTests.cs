@@ -43,6 +43,20 @@ public sealed class PromptSectionWiringTests
     }
 
     [Fact]
+    public void ToolEnforcementSection_IncludesTodoBoundaryGuidance()
+    {
+        var prompt = BuildFullPrompt();
+
+        // Guards the todo boundary guidance (#2071): the todo tool is the agent's own
+        // per-conversation execution checklist for its work loop, and the guidance stays generic
+        // -- it must NOT name any particular external task/work-tracking system.
+        prompt.ShouldContain("per-conversation execution checklist");
+        prompt.ShouldContain("loop or set of loops");
+        prompt.ShouldContain("not a durable or user-facing system of record");
+        prompt.ShouldNotContain("TaskNexus");
+    }
+
+    [Fact]
     public void ShellEfficiencySection_AppearsInFullPrompt()
     {
         var prompt = BuildFullPrompt();
@@ -68,6 +82,43 @@ public sealed class PromptSectionWiringTests
         var prompt = BuildFullPrompt(tools: ["read", "write", "shell"]);
 
         prompt.ShouldNotContain("partially relevant");
+    }
+
+    [Fact]
+    public void SubAgentScopingSection_AppearsWhenSpawnToolAvailable()
+    {
+        var prompt = BuildFullPrompt(tools: ["read", "spawn_subagent"]);
+
+        prompt.ShouldContain("<subagent_scoping>");
+        prompt.ShouldContain("</subagent_scoping>");
+        prompt.ShouldContain("Budget by stage, not by feature");
+        prompt.ShouldContain("1500");
+    }
+
+    [Fact]
+    public void SubAgentScopingSection_OmittedWhenSpawnToolAbsent()
+    {
+        // #2444: an agent with no dispatch capability pays no tokens for scoping advice.
+        var prompt = BuildFullPrompt(tools: ["read", "write", "shell"]);
+
+        prompt.ShouldNotContain("<subagent_scoping>");
+        prompt.ShouldNotContain("Budget by stage, not by feature");
+    }
+
+    [Fact]
+    public void SectionOrder_SubAgentScoping_AfterSkillsAndBeforeMemory()
+    {
+        var prompt = BuildFullPrompt(tools: ["read", "skills", "spawn_subagent"]);
+
+        var skillsIdx = prompt.IndexOf("<skills>", StringComparison.Ordinal);
+        var scopingIdx = prompt.IndexOf("<subagent_scoping>", StringComparison.Ordinal);
+        var memoryIdx = prompt.IndexOf("<memory>", StringComparison.Ordinal);
+
+        skillsIdx.ShouldBeGreaterThan(-1);
+        scopingIdx.ShouldBeGreaterThan(-1);
+        memoryIdx.ShouldBeGreaterThan(-1);
+        skillsIdx.ShouldBeLessThan(scopingIdx);
+        scopingIdx.ShouldBeLessThan(memoryIdx);
     }
 
     [Fact]
@@ -98,20 +149,90 @@ public sealed class PromptSectionWiringTests
         prompt.ShouldContain("absolute paths");
     }
 
+    /// <summary>
+    /// #2433 INVERTS this expectation deliberately. It previously asserted the section was OMITTED
+    /// for an unrecognised model -- i.e. it PINNED the fail-open, where a model the family switch had
+    /// never heard of silently received zero behavioural guidance. The registry's default rung is
+    /// mandatory precisely so that state is unreachable, so the correct assertion is the opposite.
+    /// </summary>
     [Fact]
-    public void ModelGuidanceSection_OmittedForUnknownModel()
+    public void ModelGuidanceSection_EmitsTheDefaultRungForUnknownModel()
     {
         var prompt = BuildFullPrompt(model: "some-unknown-model-v1");
 
-        prompt.ShouldNotContain("<model_guidance>");
+        prompt.ShouldContain("<model_guidance>");
+        prompt.ShouldContain("Never answer from memory");
+
+        // Non-vacuity: the DEFAULT rung, not somebody else's family rung.
+        prompt.ShouldNotContain("edit tool over write");
+        prompt.ShouldNotContain("absolute paths");
     }
 
     [Fact]
-    public void ModelGuidanceSection_OmittedWhenModelIsNull()
+    public void ModelGuidanceSection_EmitsTheDefaultRungWhenModelIsNull()
     {
         var prompt = BuildFullPrompt(model: null);
 
-        prompt.ShouldNotContain("<model_guidance>");
+        prompt.ShouldContain("<model_guidance>");
+        prompt.ShouldContain("Never answer from memory");
+        prompt.ShouldNotContain("edit tool over write");
+    }
+
+    [Fact]
+    public void CanvasGuidanceSection_AppearsWhenCanvasToolAvailable()
+    {
+        var prompt = BuildFullPrompt(tools: ["read", "write", "canvas"]);
+
+        prompt.ShouldContain("<canvas>");
+        prompt.ShouldContain("</canvas>");
+        prompt.ShouldContain("sortable");
+    }
+
+    [Fact]
+    public void CanvasGuidanceSection_OmittedWhenCanvasToolAbsent()
+    {
+        // AC#2: an agent without the canvas tool pays no tokens for guidance it cannot act on.
+        var prompt = BuildFullPrompt(tools: ["read", "write", "shell"]);
+
+        prompt.ShouldNotContain("<canvas>");
+    }
+
+    [Fact]
+    public void CanvasGuidanceSection_NamesNonTriggersNotJustTriggers()
+    {
+        // AC#3: the section must stay a two-sided trigger list. A future edit that reduces it to
+        // blanket "prefer the canvas" encouragement produces canvas renders for two-line answers,
+        // which is worse than having no guidance at all -- so pin the non-trigger clauses by name.
+        var prompt = BuildFullPrompt(tools: ["read", "canvas"]);
+
+        prompt.ShouldContain("Do NOT use the canvas for");
+        prompt.ShouldContain("a file is the right surface");
+        prompt.ShouldContain("outlive the conversation");
+    }
+
+    [Fact]
+    public void CanvasGuidanceSection_WarnsThatNonPortalChannelsCannotSeeIt()
+    {
+        // The canvas renders only in the portal; on Signal/Telegram the reply itself must still
+        // carry the substance or the user receives nothing.
+        var prompt = BuildFullPrompt(tools: ["read", "canvas"]);
+
+        prompt.ShouldContain("reply must still carry the answer");
+    }
+
+    [Fact]
+    public void SectionOrder_CanvasGuidance_AfterMessaging()
+    {
+        // AC#4: the canvas section has a defined PromptOrder slot next to the other
+        // output-surface guidance (messaging/voice), not an arbitrary append.
+        var prompt = BuildFullPrompt(tools: ["read", "canvas"]);
+
+        var messagingIdx = prompt.IndexOf("<messaging>", StringComparison.Ordinal);
+        var canvasIdx = prompt.IndexOf("<canvas>", StringComparison.Ordinal);
+
+        messagingIdx.ShouldBeGreaterThan(-1);
+        canvasIdx.ShouldBeGreaterThan(-1);
+        messagingIdx.ShouldBeLessThan(canvasIdx);
     }
 
     [Fact]

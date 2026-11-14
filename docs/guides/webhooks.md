@@ -38,9 +38,74 @@ endpoint `POST /api/webhooks/{agentId}/{webhookId}`.
 
 ---
 
+## Automatic per-agent provisioning
+
+Everything below describes registering a webhook **by hand**, which is still the right
+path for an arbitrary external caller. Separately, BotNexus reconciles one
+**platform-owned registration per agent** automatically from agent lifecycle, so a
+downstream system that needs a callback for every agent does not have to be wired up
+by a setup script that nobody remembers to re-run.
+
+How it behaves:
+
+- **On agent create and on agent update**, the gateway ensures a registration exists
+  for that agent and pushes the binding (agent id, current display name, webhook id,
+  inbound path, secret) to every configured delivery target.
+- **On agent delete**, the registration is removed and the target is told **which exact
+  registration** was removed (agent id *and* webhook id), once per owned registration.
+  This step is best-effort: a downstream outage never blocks deleting an agent.
+- **At startup**, every registered agent is reconciled again. That pass is deliberately
+  the only recovery path — there is no retry queue or outbox for a failed push.
+
+Provisioner-owned registrations carry the deterministic label
+`agent-webhook:<agentId>`. Two consequences worth knowing:
+
+- **Provisioning never rotates a secret.** When a labelled registration already exists
+  the store is not written to at all and the existing secret is re-sent. A display-name
+  change therefore cannot break a binding the downstream system already holds. (An
+  agent id itself is immutable in BotNexus, so the label is stable by construction.)
+- **A registration you created by hand is never touched**, because it does not carry
+  that label. It survives agent deletion.
+
+### Configuring a delivery target
+
+Delivery targets ship as extensions; the gateway core names no downstream product. The
+bundled TaskNexus target is inert until you configure a base URL:
+
+| Key | Meaning |
+|---|---|
+| `extensions:tasknexus:baseUrl` | Base URL of the TaskNexus instance to notify. **Absent means disabled** — no outbound call is attempted at all. |
+| `extensions:tasknexus:callbackOrigin` | Externally reachable gateway origin, prepended to the relative inbound path. The gateway does not reliably know its own public origin, so a target that needs an absolute URL composes one from this. |
+
+With no target configured, startup completes normally and the provisioner still keeps
+the registrations themselves in sync — there is simply nothing to push them to.
+
+### Delete notifications carry the webhook id — and why that matters
+
+A removal notification names the **exact registration** being removed, not just the
+agent. The bundled TaskNexus target sends:
+
+```
+DELETE {baseUrl}/api/botnexus/agents/{agentId}/{webhookId}
+```
+
+A delivery target **must** condition its delete on both values
+(`WHERE agent = ? AND webhook_id = ?`) and treat a mismatch or a missing row as an
+idempotent no-op rather than an error.
+
+The reason is that agent ids are immutable, and therefore **reusable**: an agent can be
+deleted and a new one created with the same id, which gets a fresh registration. If the
+delete were keyed on agent id alone, a delayed or retried DELETE belonging to the *old*
+agent would arrive after the recreate and silently erase the *new* agent's binding. The
+webhook id acts as a generation token so that stale delete simply matches nothing.
+
 ## Quick start
 
 ### 1. Register a webhook
+
+This is the manual path, for an external caller that is not tied to an agent's
+lifecycle. For the automatic per-agent binding, see
+[Automatic per-agent provisioning](#automatic-per-agent-provisioning) above.
 
 ```bash
 curl -X POST https://your-host/api/webhooks/registrations \
@@ -297,6 +362,46 @@ established on the registration and reused for all subsequent runs.
 
 ---
 
+## Concurrency policy
+
+Webhook delivery follows one explicit rule:
+
+> **The canonical conversation is the unit of isolation.**
+
+A conversation owns its `active_session_id`, message history, pending `ask_user`
+state, todo/canvas state and finalizer writes. Two agent turns running at once in
+one conversation would stomp all of it, so the gateway serializes them instead.
+
+What this means in practice:
+
+- **One canonical conversation per registration.** Each registration lazily pins
+  exactly one conversation and reuses it for every delivery.
+- **One stable active session** per registration/conversation for as long as that
+  session remains reusable. Each run records the session it resolved to.
+- **Deliveries sharing a conversation are FIFO serialized** - including deliveries
+  arriving through *different* registrations that are pinned to the same
+  conversation. Ordering follows arrival order; turns never overlap.
+- **A run is an execution record, not a conversation.** Every delivery gets its own
+  run ID and status, but runs never materialize as sidebar conversations.
+- **Parallelism requires separate conversations.** Deliveries to different
+  conversations run concurrently. If you need true parallel processing, use
+  separate conversations - never concurrent sessions over one conversation.
+
+### How this applies per response mode
+
+| Mode | Isolation |
+| --- | --- |
+| `async` | Serialized per conversation. The 202 returns immediately; the queued turn still waits its place in the conversation's FIFO order. |
+| `sync` | Serialized per conversation. The connection is held while the turn waits its turn and then executes, so a busy conversation makes a sync call wait. |
+| `callback` | Serialized per conversation, identical to `async`. The callback fires after that delivery's turn completes. |
+| `agentAction: false` | No agent turn runs, so the delivery never enters the queue and is outside the isolation boundary entirely. |
+
+> **Sync mode and busy conversations.** Because sync holds the connection while
+> queued, a backlog on a shared conversation counts against the 120s sync timeout.
+> Use `async` for high-volume registrations, or give them their own conversations.
+
+---
+
 ## Store-only delivery (`agentAction: false`)
 
 Set `agentAction` to `false` to record the message **without** triggering an agent
@@ -313,6 +418,16 @@ curl -X POST https://your-host/api/webhooks/my-agent/wh_9f2c... \
 The response is `202 Accepted` and the run is immediately marked `Completed` with
 a `null` `agentResponse` — there is nothing for the agent to say because it never
 ran. `agentAction` defaults to `true`.
+
+The message lands in the **same** session an `agentAction: true` delivery would
+resolve, so successive store-only posts accumulate in one conversation transcript
+and are readable from that conversation's history. The only difference between the
+two modes is whether an agent turn runs, not where the message is stored.
+
+If no session can be resolved for the target conversation the endpoint returns
+`503 Service Unavailable` and the run is marked `Failed` — a store-only delivery
+never reports `202` for a write that did not land, so a caller always has a signal
+to retry.
 
 Use this for high-volume signal capture (heartbeats, telemetry, log lines) that you
 want on the record but do not want to spend an LLM run on. A later message with

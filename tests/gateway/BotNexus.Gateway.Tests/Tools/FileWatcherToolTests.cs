@@ -28,14 +28,13 @@ public sealed class FileWatcherToolTests : IDisposable
         var path = Path.Combine(root, "watched.txt");
         await File.WriteAllTextAsync(path, "initial");
 
-        var watchTask = ExecuteAsync(tool, new Dictionary<string, object?>
+        var (watchTask, ready) = StartWatch(tool, new Dictionary<string, object?>
         {
             ["path"] = path,
             ["event"] = "modified",
             ["timeout"] = 5
         });
-
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await ready;
         await File.WriteAllTextAsync(path, "updated");
 
         var result = await watchTask;
@@ -49,14 +48,13 @@ public sealed class FileWatcherToolTests : IDisposable
         var root = CreateTempDirectory();
         var path = Path.Combine(root, "created.txt");
 
-        var watchTask = ExecuteAsync(tool, new Dictionary<string, object?>
+        var (watchTask, ready) = StartWatch(tool, new Dictionary<string, object?>
         {
             ["path"] = path,
             ["event"] = "created",
             ["timeout"] = 5
         });
-
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await ready;
         await File.WriteAllTextAsync(path, "created");
 
         var result = await watchTask;
@@ -71,18 +69,175 @@ public sealed class FileWatcherToolTests : IDisposable
         var path = Path.Combine(root, "deleted.txt");
         await File.WriteAllTextAsync(path, "delete me");
 
-        var watchTask = ExecuteAsync(tool, new Dictionary<string, object?>
+        var (watchTask, ready) = StartWatch(tool, new Dictionary<string, object?>
         {
             ["path"] = path,
             ["event"] = "deleted",
             ["timeout"] = 5
         });
-
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await ready;
         File.Delete(path);
 
         var result = await watchTask;
         ReadText(result).ShouldContain("File deleted:");
+    }
+
+    /// <summary>
+    /// Pins the ordering contract of #2988: the readiness notice must not be emitted until the watcher is
+    /// actually raising events. This deletes the file synchronously ON the callback thread, so the
+    /// mutation is strictly ordered between the notice and whatever the tool does next. With the notice
+    /// emitted before <c>EnableRaisingEvents = true</c> the deletion is provably unobservable and the
+    /// watch always times out; the assertion therefore fails 100% of the time against the unfixed code
+    /// rather than merely narrowing a window.
+    /// </summary>
+    [Fact]
+    public async Task FileWatcherTool_ReadinessNotice_IsEmittedOnlyAfterWatcherIsArmed()
+    {
+        var tool = CreateTool();
+        var root = CreateTempDirectory();
+        var path = Path.Combine(root, "armed.txt");
+        await File.WriteAllTextAsync(path, "delete me");
+
+        var deleted = false;
+
+        var result = await ExecuteAsync(
+            tool,
+            new Dictionary<string, object?>
+            {
+                ["path"] = path,
+                ["event"] = "deleted",
+                ["timeout"] = 5
+            },
+            CancellationToken.None,
+            update =>
+            {
+                var text = update.Content
+                    .FirstOrDefault(c => c.Type == AgentToolContentType.Text)?.Value;
+
+                if (deleted || text is null || !text.Contains("Watching '", StringComparison.Ordinal))
+                    return;
+
+                // Acting on the notice the instant it arrives is precisely what a real caller does.
+                deleted = true;
+                File.Delete(path);
+            });
+
+        deleted.ShouldBeTrue("the tool must emit a readiness notice");
+        ReadText(result).ShouldContain("File deleted:");
+    }
+
+    [Theory]
+    [InlineData("deleted")]
+    [InlineData("any")]
+    public async Task FileWatcherTool_ReadinessDeletion_IsObservedWithoutNativeNotification(string eventType)
+    {
+        var root = CreateTempDirectory();
+        var path = Path.Combine(root, "no-notification.txt");
+        File.WriteAllText(path, "delete me");
+        // A real watcher with an unrelated filter deterministically withholds the target notification.
+        // This models the startup delivery gap without relying on OS scheduling or timing.
+        var tool = new FileWatcherTool(
+            Options.Create(new FileWatcherToolOptions { DebounceMilliseconds = 50 }),
+            (directory, _) => new FileSystemWatcher(directory, "unrelated.txt"));
+        var notices = 0;
+
+        var result = await ExecuteAsync(tool, new Dictionary<string, object?>
+        {
+            ["path"] = path,
+            ["event"] = eventType,
+            ["timeout"] = 1
+        }, onUpdate: _ =>
+        {
+            notices++;
+            File.Delete(path);
+        });
+
+        notices.ShouldBe(1);
+        File.Exists(path).ShouldBeFalse();
+        ReadText(result).ShouldContain("File deleted:");
+    }
+
+    [Theory]
+    [InlineData("created")]
+    [InlineData("any")]
+    public async Task FileWatcherTool_ReadinessCreation_IsObservedWithoutNativeNotification(string eventType)
+    {
+        var root = CreateTempDirectory();
+        var path = Path.Combine(root, "no-notification.txt");
+        var tool = new FileWatcherTool(
+            Options.Create(new FileWatcherToolOptions { DebounceMilliseconds = 50 }),
+            (directory, _) => new FileSystemWatcher(directory, "unrelated.txt"));
+
+        var result = await ExecuteAsync(tool, new Dictionary<string, object?>
+        {
+            ["path"] = path,
+            ["event"] = eventType,
+            ["timeout"] = 1
+        }, onUpdate: _ => File.WriteAllText(path, "created"));
+
+        File.Exists(path).ShouldBeTrue();
+        ReadText(result).ShouldContain("File created:");
+    }
+
+    [Theory]
+    [InlineData("deleted")]
+    [InlineData("created")]
+    [InlineData("any")]
+    public async Task FileWatcherTool_ReadinessWithoutMutation_DoesNotInventEvent(string eventType)
+    {
+        var root = CreateTempDirectory();
+        var path = Path.Combine(root, "unchanged.txt");
+        if (eventType != "created")
+            File.WriteAllText(path, "unchanged");
+
+        var result = await ExecuteAsync(CreateTool(), new Dictionary<string, object?>
+        {
+            ["path"] = path,
+            ["event"] = eventType,
+            ["timeout"] = 1
+        }, onUpdate: _ => { });
+
+        ReadText(result).ShouldContain("Timeout after 1 seconds");
+    }
+
+    [Theory]
+    [InlineData("deleted", "deleted")]
+    [InlineData("any", "deleted")]
+    [InlineData("created", "created")]
+    [InlineData("any", "created")]
+    public async Task FileWatcherTool_ImmediateReadinessMutation_ParallelWatchesObserveEvent(
+        string eventType, string mutation)
+    {
+        // Allocate cleanup paths on the test thread; each parallel watch owns a separate directory.
+        var paths = Enumerable.Range(0, 16)
+            .Select(_ => Path.Combine(CreateTempDirectory(), "parallel.txt"))
+            .ToArray();
+        var tool = CreateTool(debounceMilliseconds: 50);
+        var results = await Task.WhenAll(paths.Select(path => Task.Run(async () =>
+        {
+            if (mutation == "deleted")
+                File.WriteAllText(path, "delete me");
+            var notices = 0;
+            var result = await ExecuteAsync(tool, new Dictionary<string, object?>
+            {
+                ["path"] = path,
+                ["event"] = eventType,
+                ["timeout"] = 5
+            }, onUpdate: _ =>
+            {
+                notices++;
+                if (mutation == "deleted")
+                    File.Delete(path);
+                else
+                    File.WriteAllText(path, "created");
+            });
+            notices.ShouldBe(1);
+            return ReadText(result);
+        })));
+
+        results.Length.ShouldBe(16);
+        foreach (var result in results)
+            result.ShouldContain($"File {mutation}:");
     }
 
     [Fact]
@@ -137,6 +292,26 @@ public sealed class FileWatcherToolTests : IDisposable
         await act.ShouldThrowAsync<ArgumentException>();
     }
 
+    /// <summary>
+    /// Proves the 999s request is clamped to the configured 2s maximum.
+    /// </summary>
+    /// <remarks>
+    /// This assertion used to bound <see cref="Stopwatch.ElapsedMilliseconds"/> above by 4000ms for a
+    /// 2-second clamp. That measured runner scheduling and <see cref="FileSystemWatcher"/> teardown, not
+    /// the clamp, and a contended hosted runner measured 7771ms — a red gate on a diff that cannot reach
+    /// this tool (#3333). The upper bound is now expressed two ways that a loaded machine cannot breach
+    /// but an unclamped tool cannot satisfy:
+    /// <list type="number">
+    /// <item>The tool's own readiness notice reports the EFFECTIVE timeout it is about to wait for, so
+    /// <c>timeout: 2s</c> observes the clamped value directly with no wall clock involved. A mutant that
+    /// honours the requested 999s announces <c>timeout: 999s</c> and fails here within milliseconds.</item>
+    /// <item>A generous <see cref="ClampWatchdog"/> ceiling replaces the tight 4000ms bound. It is ~15x
+    /// the clamped wait, so scheduling noise cannot trip it, yet a mutant that waits 999s never completes
+    /// and fails deterministically instead of hanging the suite until the test host is killed.</item>
+    /// </list>
+    /// The lower bound is retained: it is the non-vacuity guard proving the tool actually waited out the
+    /// clamped timeout rather than returning immediately, and no amount of load can make a wait too fast.
+    /// </remarks>
     [Fact]
     public async Task FileWatcherTool_ClampsTimeout()
     {
@@ -145,18 +320,49 @@ public sealed class FileWatcherToolTests : IDisposable
         var path = Path.Combine(root, "clamped.txt");
         await File.WriteAllTextAsync(path, "unchanged");
 
+        string? readinessNotice = null;
+
         var stopwatch = Stopwatch.StartNew();
-        var result = await ExecuteAsync(tool, new Dictionary<string, object?>
-        {
-            ["path"] = path,
-            ["event"] = "modified",
-            ["timeout"] = 999
-        });
+        var watch = ExecuteAsync(
+            tool,
+            new Dictionary<string, object?>
+            {
+                ["path"] = path,
+                ["event"] = "modified",
+                ["timeout"] = 999
+            },
+            CancellationToken.None,
+            update =>
+            {
+                var text = update.Content
+                    .FirstOrDefault(c => c.Type == AgentToolContentType.Text)?.Value;
+
+                if (text is not null && text.Contains("Watching '", StringComparison.Ordinal))
+                    readinessNotice = text;
+            });
+
+        var completed = await Task.WhenAny(watch, Task.Delay(ClampWatchdog));
+        completed.ShouldBeSameAs(
+            watch,
+            $"The watch did not return within {ClampWatchdog.TotalSeconds:0}s, so the 999-second request " +
+            "was not clamped to the configured 2-second maximum.");
+
+        var result = await watch;
+
+        // The effective timeout the tool armed itself with — the clamp, observed directly.
+        readinessNotice.ShouldNotBeNull();
+        readinessNotice.ShouldContain("timeout: 2s");
 
         stopwatch.ElapsedMilliseconds.ShouldBeGreaterThanOrEqualTo(1800);
-        stopwatch.ElapsedMilliseconds.ShouldBeLessThan(4000);
         ReadText(result).ShouldContain("Timeout after 2 seconds");
     }
+
+    /// <summary>
+    /// Upper bound for <see cref="FileWatcherTool_ClampsTimeout"/>. Generous enough that runner
+    /// contention cannot breach it (the observed worst case for a 2s clamp was 7.8s), tight enough that
+    /// an unclamped 999-second wait fails the test rather than stalling the run.
+    /// </summary>
+    private static readonly TimeSpan ClampWatchdog = TimeSpan.FromSeconds(30);
 
     [Fact]
     public async Task FileWatcherTool_ReportsElapsedTime()
@@ -166,14 +372,13 @@ public sealed class FileWatcherToolTests : IDisposable
         var path = Path.Combine(root, "elapsed.txt");
         await File.WriteAllTextAsync(path, "initial");
 
-        var watchTask = ExecuteAsync(tool, new Dictionary<string, object?>
+        var (watchTask, ready) = StartWatch(tool, new Dictionary<string, object?>
         {
             ["path"] = path,
             ["event"] = "modified",
             ["timeout"] = 5
         });
-
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await ready;
         await File.WriteAllTextAsync(path, "updated");
 
         var result = await watchTask;
@@ -188,14 +393,13 @@ public sealed class FileWatcherToolTests : IDisposable
         var path = Path.Combine(root, "debounced.txt");
         await File.WriteAllTextAsync(path, "start");
 
-        var watchTask = ExecuteAsync(tool, new Dictionary<string, object?>
+        var (watchTask, ready) = StartWatch(tool, new Dictionary<string, object?>
         {
             ["path"] = path,
             ["event"] = "modified",
             ["timeout"] = 5
         });
-
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await ready;
         for (var i = 0; i < 5; i++)
         {
             await File.WriteAllTextAsync(path, $"change-{i}");
@@ -223,10 +427,54 @@ public sealed class FileWatcherToolTests : IDisposable
     private static async Task<AgentToolResult> ExecuteAsync(
         IAgentTool tool,
         IReadOnlyDictionary<string, object?> args,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        AgentToolUpdateCallback? onUpdate = null)
     {
         var prepared = await tool.PrepareArgumentsAsync(args, cancellationToken);
-        return await tool.ExecuteAsync("call-watch-file-test", prepared, cancellationToken);
+        return await tool.ExecuteAsync("call-watch-file-test", prepared, cancellationToken, onUpdate);
+    }
+
+    /// <summary>
+    /// Starts a watch and returns once the tool has reported that its <see cref="FileSystemWatcher"/> is
+    /// armed, so the caller can mutate the file knowing the event will be observed (#2988).
+    /// </summary>
+    /// <remarks>
+    /// These tests previously slept for a fixed second between starting the watch and touching the file.
+    /// That is a guess, not a synchronisation primitive: the watcher is armed inside the background task,
+    /// so on a loaded CI runner the mutation could land BEFORE <c>EnableRaisingEvents = true</c>, the
+    /// event was never raised, and the test then sat out its full timeout and failed with
+    /// "Timeout after 5 seconds - no change detected". The tool already announces readiness through its
+    /// onUpdate callback, which is a real happens-before edge -- use it instead of sleeping.
+    /// </remarks>
+    private static (Task<AgentToolResult> Watch, Task Ready) StartWatch(
+        IAgentTool tool,
+        IReadOnlyDictionary<string, object?> args)
+    {
+        var armed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var watch = ExecuteAsync(
+            tool,
+            args,
+            CancellationToken.None,
+            update =>
+            {
+                // The tool emits exactly one "Watching '<path>' for <event> event..." notice, and only
+                // once EnableRaisingEvents is true. Anything else is ignored.
+                var text = update.Content
+                    .FirstOrDefault(c => c.Type == AgentToolContentType.Text)?.Value;
+
+                if (text is not null && text.Contains("Watching '", StringComparison.Ordinal))
+                    armed.TrySetResult();
+            });
+
+        // If the watch faults before ever arming, surface that instead of hanging on the gate.
+        _ = watch.ContinueWith(
+            t => armed.TrySetException(t.Exception!.GetBaseException()),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        return (watch, armed.Task);
     }
 
     private static IAgentTool CreateTool(

@@ -16,6 +16,11 @@ public static class ContextOverflowDetector
         new("input is too long for requested model", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("exceeds the context window", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("input token count.*exceeds the maximum", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new(@"\brequested token count\b.{0,80}\bexceeds\b.{0,80}\bmaximum context length\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new(@"\binput length\b.{0,80}\bexceeds\b.{0,80}\bcontext length\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new(@"\binput length\b.{0,80}\bexceeds\b.{0,80}\bmaximum allowed input length\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new(@"\binput\b.{0,80}\bis longer than\b.{0,80}\bcontext length\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new(@"\bprompt has\b.{0,80}\btokens\b.{0,80}\bconfigured context size\b", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("maximum prompt length is \\d+", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("reduce the length of the messages", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("maximum context length is \\d+ tokens", RegexOptions.IgnoreCase | RegexOptions.Compiled),
@@ -30,7 +35,10 @@ public static class ContextOverflowDetector
         new("context[_ ]length[_ ]exceeded", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("too many tokens", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("token limit exceeded", RegexOptions.IgnoreCase | RegexOptions.Compiled),
-        new("^4(?:00|13)\\s*(?:status code)?\\s*\\(no body\\)", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        // A bodyless 413 (payload too large) is a genuine overflow signal (e.g. Cerebras).
+        // A bodyless 400 is NOT: it is a transient/malformed-request error and must surface
+        // to the caller rather than trigger lossy compaction. See issue #2844.
+        new("^413\\s*(?:status code)?\\s*\\(no body\\)", RegexOptions.IgnoreCase | RegexOptions.Compiled),
     ];
 
     private static readonly Regex[] NonOverflowPatterns =

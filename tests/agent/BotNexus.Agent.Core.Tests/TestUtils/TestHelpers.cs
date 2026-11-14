@@ -1,4 +1,6 @@
 using BotNexus.Agent.Core.Configuration;
+using BotNexus.Agent.Core.ExtensionPoints.ToolExecution;
+using BotNexus.Agent.Core.ExtensionPoints.ToolResults;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Models;
@@ -33,23 +35,35 @@ internal static class TestHelpers
     public static AgentLoopConfig CreateTestConfig(
         LlmModel? model = null,
         ToolExecutionMode toolExecutionMode = ToolExecutionMode.Sequential,
-        BeforeToolCallDelegate? beforeToolCall = null,
-        AfterToolCallDelegate? afterToolCall = null,
-        TimeSpan? toolTimeout = null)
+        ToolExecutionPolicy? beforeToolCall = null,
+        ToolAuditGate? beforeToolAudit = null,
+        ToolResultTransformer? afterToolCall = null,
+        TimeSpan? toolTimeout = null,
+        TimeSpan? beforeToolCallTimeout = null,
+        Action<string>? onDiagnostic = null,
+        BotNexus.Agent.Core.Loop.IHostSuspendDetector? suspendDetector = null,
+        ToolExecutionDecisionObserver? onToolCallDisposition = null,
+        BotNexus.Agent.Core.Tools.SatelliteToolExecutionOptions? satelliteToolExecution = null)
     {
         return new AgentLoopConfig(
             Model: model ?? CreateTestModel(),
             LlmClient: CreateLlmClient(),
-            ConvertToLlm: (messages, _) => Task.FromResult<IReadOnlyList<Message>>(ConvertMessages(messages)),
-            TransformContext: (messages, _) => Task.FromResult(messages),
-            GetApiKey: (_, _) => Task.FromResult<string?>(null),
-            GetSteeringMessages: null,
-            GetFollowUpMessages: null,
+            ProviderMessageTransformer: (messages, _) => Task.FromResult<IReadOnlyList<Message>>(ConvertMessages(messages)),
+            AgentContextTransformer: (messages, _) => Task.FromResult(messages),
+            ProviderExecutionOptionsProvider: (_, _) => Task.FromResult<ProviderExecutionOptions?>(null),
+            SteeringMessageProvider: null,
+            FollowUpMessageProvider: null,
             ToolExecutionMode: toolExecutionMode,
-            BeforeToolCall: beforeToolCall,
-            AfterToolCall: afterToolCall,
-            GenerationSettings: new SimpleStreamOptions(),
-            ToolTimeout: toolTimeout);
+            ToolExecutionPolicy: beforeToolCall,
+            ToolAuditGate: beforeToolAudit,
+            ToolResultTransformer: afterToolCall,
+            GenerationSettings: new GenerationOptions(),
+            ToolTimeout: toolTimeout,
+            ToolExecutionPolicyTimeout: beforeToolCallTimeout,
+            DiagnosticObserver: onDiagnostic,
+            SuspendDetector: suspendDetector,
+            ToolExecutionDecisionObserver: onToolCallDisposition,
+            SatelliteToolExecution: satelliteToolExecution);
     }
 
     public static AgentOptions CreateTestOptions(
@@ -62,15 +76,15 @@ internal static class TestHelpers
             InitialState: initialState,
             Model: model ?? CreateTestModel(),
             LlmClient: CreateLlmClient(),
-            ConvertToLlm: (messages, _) => Task.FromResult<IReadOnlyList<Message>>(ConvertMessages(messages)),
-            TransformContext: (messages, _) => Task.FromResult(messages),
-            GetApiKey: (_, _) => Task.FromResult<string?>(null),
-            GetSteeringMessages: null,
-            GetFollowUpMessages: null,
+            ProviderMessageTransformer: (messages, _) => Task.FromResult<IReadOnlyList<Message>>(ConvertMessages(messages)),
+            AgentContextTransformer: (messages, _) => Task.FromResult(messages),
+            ProviderExecutionOptionsProvider: (_, _) => Task.FromResult<ProviderExecutionOptions?>(null),
+            SteeringMessageProvider: null,
+            FollowUpMessageProvider: null,
             ToolExecutionMode: ToolExecutionMode.Sequential,
-            BeforeToolCall: null,
-            AfterToolCall: null,
-            GenerationSettings: new SimpleStreamOptions(),
+            ToolExecutionPolicy: null,
+            ToolResultTransformer: null,
+            GenerationSettings: new GenerationOptions(),
             SteeringMode: steeringMode,
             FollowUpMode: followUpMode,
             SessionId: "test-session");

@@ -1,6 +1,8 @@
+using System.IO.Abstractions;
 using BotNexus.Cron;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Api.Controllers;
+using BotNexus.Gateway.Api.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -8,7 +10,7 @@ using Microsoft.Extensions.Options;
 
 namespace BotNexus.Gateway.Tests;
 
-public sealed class CronControllerTests
+public sealed partial class CronControllerTests
 {
     [Fact]
     public async Task List_ReturnsAllJobs()
@@ -46,7 +48,7 @@ public sealed class CronControllerTests
         var controller = CreateController(store, new RecordingAction(), new CronOptions());
         var request = CreateJob("job-create");
 
-        var result = await controller.Create(request, CancellationToken.None);
+        var result = await controller.Create(ToCreateRequest(request), CancellationToken.None);
 
         var created = (result.Result as CreatedAtActionResult)?.Value as CronJob;
         created.ShouldNotBeNull();
@@ -125,7 +127,7 @@ public sealed class CronControllerTests
             Model = "openai/gpt-4.1"
         };
 
-        var result = await controller.Create(request, CancellationToken.None);
+        var result = await controller.Create(ToCreateRequest(request), CancellationToken.None);
 
         var created = (result.Result as CreatedAtActionResult)?.Value as CronJob;
         created.ShouldNotBeNull();
@@ -144,7 +146,7 @@ public sealed class CronControllerTests
             NextRunAt = new DateTimeOffset(9001, 1, 1, 0, 0, 0, TimeSpan.Zero)
         };
 
-        var result = await controller.Create(request, CancellationToken.None);
+        var result = await controller.Create(ToCreateRequest(request), CancellationToken.None);
 
         result.Result.ShouldBeOfType<BadRequestObjectResult>();
     }
@@ -160,7 +162,7 @@ public sealed class CronControllerTests
             NextRunAt = new DateTimeOffset(1969, 12, 31, 23, 59, 59, TimeSpan.Zero)
         };
 
-        var result = await controller.Create(request, CancellationToken.None);
+        var result = await controller.Create(ToCreateRequest(request), CancellationToken.None);
 
         result.Result.ShouldBeOfType<BadRequestObjectResult>();
     }
@@ -176,7 +178,7 @@ public sealed class CronControllerTests
             NextRunAt = new DateTimeOffset(9001, 6, 15, 0, 0, 0, TimeSpan.Zero)
         };
 
-        var result = await controller.Update("job-upd", request, CancellationToken.None);
+        var result = await controller.Update("job-upd", CronJobUpdateRequest.FromCronJob(request), CancellationToken.None);
 
         result.Result.ShouldBeOfType<BadRequestObjectResult>();
     }
@@ -189,7 +191,7 @@ public sealed class CronControllerTests
         var futureTime = DateTimeOffset.UtcNow.AddHours(1);
         var request = CreateJob("job-validnext") with { NextRunAt = futureTime };
 
-        var result = await controller.Create(request, CancellationToken.None);
+        var result = await controller.Create(ToCreateRequest(request), CancellationToken.None);
 
         var created = (result.Result as CreatedAtActionResult)?.Value as CronJob;
         created.ShouldNotBeNull();
@@ -206,12 +208,276 @@ public sealed class CronControllerTests
             CreatedAt = new DateTimeOffset(9001, 1, 1, 0, 0, 0, TimeSpan.Zero)
         };
 
-        var result = await controller.Create(request, CancellationToken.None);
+        var result = await controller.Create(ToCreateRequest(request), CancellationToken.None);
 
         result.Result.ShouldBeOfType<BadRequestObjectResult>();
     }
 
-    private static CronController CreateController(FakeCronStore store, ICronAction action, CronOptions options)
+    // #2133 controller-path same-job concurrency seam: a paused controller definition update
+    // (routed through the narrow UpdateDefinitionAsync + SetNextRunAtAsync writes) racing the
+    // scheduler's narrow runtime/conversation writes on the SAME job must not regress run
+    // status, timestamps, next run, or the conversation pin. Uses a real SQLite store.
+    [Fact]
+    public async Task Update_RacingSchedulerRuntimeWrites_PreservesRuntimeAndConversation()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "botnexus-cron-ctrl-tests", Guid.NewGuid().ToString("N"));
+        var dbPath = Path.Combine(tempDir, "cron.db");
+        var store = new SqliteCronStore(dbPath, new FileSystem());
+        try
+        {
+            await store.InitializeAsync();
+            await store.CreateAsync(CreateJob("job-1") with { Schedule = "*/5 * * * *" });
+            var jobId = JobId.From("job-1");
+
+            var scheduler = new CronScheduler(
+                store,
+                [new RecordingAction()],
+                new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
+                new StaticOptionsMonitor<CronOptions>(new CronOptions()),
+                NullLogger<CronScheduler>.Instance);
+            var controller = new CronController(
+                store, scheduler, new StaticOptionsMonitor<CronOptions>(new CronOptions()), NullLogger<CronController>.Instance);
+
+            var runAt = DateTimeOffset.UtcNow;
+            var nextRun = runAt.AddMinutes(5);
+
+            var controllerUpdate = Task.Run(async () =>
+                await controller.Update("job-1", CronJobUpdateRequest.FromCronJob(CreateJob("job-1") with { Schedule = "*/5 * * * *", Name = "Edited", Enabled = false }), CancellationToken.None));
+
+            var runtimeWrites = Task.Run(async () =>
+            {
+                await store.RecordRunFinalizationAsync(jobId, runAt, "ok", null);
+                await store.SetNextRunAtAsync(jobId, nextRun);
+                await store.TrySetConversationIdAsync(jobId, ConversationId.From("conv-1"));
+            });
+
+            await Task.WhenAll(controllerUpdate, runtimeWrites);
+
+            var loaded = await store.GetAsync(jobId);
+            loaded.ShouldNotBeNull();
+            loaded!.Name.ShouldBe("Edited");
+            loaded.Enabled.ShouldBeFalse();
+            loaded.LastRunStatus.ShouldBe("ok");
+            loaded.NextRunAt.ShouldNotBeNull();
+            loaded.NextRunAt!.Value.ShouldBe(nextRun, TimeSpan.FromSeconds(1));
+            loaded.ConversationId!.Value.Value.ShouldBe("conv-1");
+        }
+        finally
+        {
+            SqlitePoolCleanup.ClearPoolFor(dbPath);
+            if (Directory.Exists(tempDir))
+            {
+                try { Directory.Delete(tempDir, recursive: true); } catch (IOException) { }
+            }
+        }
+    }
+
+    // #2389: creating a resource must not force the caller to invent the server's identifier.
+    [Fact]
+    public async Task Create_WithoutId_GeneratesServerSideId()
+    {
+        var store = new FakeCronStore();
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+        var request = new CronJobCreateRequest
+        {
+            Name = "Server generated",
+            Schedule = "0 * * * *",
+            ActionType = "command",
+            ShellCommand = "./check.ps1"
+        };
+
+        var result = await controller.Create(request, CancellationToken.None);
+
+        var created = (result.Result as CreatedAtActionResult)?.Value as CronJob;
+        created.ShouldNotBeNull();
+        created!.Id.Value.ShouldNotBeNullOrWhiteSpace();
+        created.ActionType.ShouldBe("command");
+        created.ShellCommand.ShouldBe("./check.ps1");
+        (await store.GetAsync(created.Id)).ShouldNotBeNull();
+    }
+
+    [Fact]
+    public async Task Create_WithExplicitId_HonoursIt()
+    {
+        var store = new FakeCronStore();
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+        var request = new CronJobCreateRequest
+        {
+            Id = "explicit-id",
+            Name = "Explicit",
+            Schedule = "0 * * * *",
+            ActionType = "agent-prompt",
+            Message = "hi"
+        };
+
+        var result = await controller.Create(request, CancellationToken.None);
+
+        var created = (result.Result as CreatedAtActionResult)?.Value as CronJob;
+        created.ShouldNotBeNull();
+        created!.Id.Value.ShouldBe("explicit-id");
+    }
+
+    [Fact]
+    public async Task Create_WithoutName_ReturnsBadRequest()
+    {
+        var store = new FakeCronStore();
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+
+        var result = await controller.Create(
+            new CronJobCreateRequest { Schedule = "0 * * * *" },
+            CancellationToken.None);
+
+        result.Result.ShouldBeOfType<BadRequestObjectResult>();
+    }
+
+    [Fact]
+    public async Task Create_WithoutSchedule_ReturnsBadRequest()
+    {
+        var store = new FakeCronStore();
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+
+        var result = await controller.Create(
+            new CronJobCreateRequest { Name = "No schedule" },
+            CancellationToken.None);
+
+        result.Result.ShouldBeOfType<BadRequestObjectResult>();
+    }
+
+    // #2552 AC2: a credential-bearing webhook URL is rejected with a 400 AND nothing is persisted.
+    // Asserting only the 400 would still pass while the row landed in the store.
+    [Theory]
+    [InlineData("https://u:p@example.com/hook")]
+    [InlineData("http://user@example.com/hook")]
+    public async Task Create_WithCredentialBearingWebhookUrl_ReturnsBadRequest_AndPersistsNothing(string webhookUrl)
+    {
+        var store = new FakeCronStore();
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+
+        var result = await controller.Create(
+            new CronJobCreateRequest
+            {
+                Id = "job-webhook",
+                Name = "Webhook job",
+                Schedule = "0 * * * *",
+                ActionType = "webhook",
+                WebhookUrl = webhookUrl
+            },
+            CancellationToken.None);
+
+        result.Result.ShouldBeOfType<BadRequestObjectResult>();
+        (await store.GetAsync(JobId.From("job-webhook"))).ShouldBeNull();
+        (await store.ListAsync()).ShouldBeEmpty();
+    }
+
+    // #2552 AC4: non-http(s) schemes.
+    [Theory]
+    [InlineData("file:///etc/passwd")]
+    [InlineData("ftp://example.com/hook")]
+    [InlineData("javascript:alert(1)")]
+    public async Task Create_WithNonHttpWebhookScheme_ReturnsBadRequest_AndPersistsNothing(string webhookUrl)
+    {
+        var store = new FakeCronStore();
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+
+        var result = await controller.Create(
+            new CronJobCreateRequest
+            {
+                Id = "job-webhook",
+                Name = "Webhook job",
+                Schedule = "0 * * * *",
+                ActionType = "webhook",
+                WebhookUrl = webhookUrl
+            },
+            CancellationToken.None);
+
+        result.Result.ShouldBeOfType<BadRequestObjectResult>();
+        (await store.ListAsync()).ShouldBeEmpty();
+    }
+
+    // #2552 AC2 on the update path: PUT must be closed too, otherwise a valid job can be edited
+    // into a credential-bearing target after creation.
+    [Fact]
+    public async Task Update_WithCredentialBearingWebhookUrl_ReturnsBadRequest_AndLeavesStoredValueIntact()
+    {
+        var store = new FakeCronStore();
+        await store.CreateAsync(CreateJob("job-1", actionType: "webhook") with { WebhookUrl = "https://example.com/hook" });
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+
+        var result = await controller.Update(
+            "job-1",
+            CronJobUpdateRequest.FromCronJob(CreateJob("job-1", actionType: "webhook") with { WebhookUrl = "https://u:p@example.com/hook" }),
+            CancellationToken.None);
+
+        result.Result.ShouldBeOfType<BadRequestObjectResult>();
+        (await store.GetAsync(JobId.From("job-1")))!.WebhookUrl.ShouldBe("https://example.com/hook");
+    }
+
+    // #2552 AC5: a valid https URL round-trips unchanged through create, list and update.
+    [Fact]
+    public async Task ValidWebhookUrl_RoundTripsUnchanged_ThroughCreateListAndUpdate()
+    {
+        const string Url = "https://example.com/hook";
+        var store = new FakeCronStore();
+        var controller = CreateController(store, new RecordingAction(), new CronOptions());
+
+        var createResult = await controller.Create(
+            new CronJobCreateRequest
+            {
+                Id = "job-1",
+                Name = "Webhook job",
+                Schedule = "0 * * * *",
+                ActionType = "webhook",
+                WebhookUrl = Url
+            },
+            CancellationToken.None);
+
+        var created = (createResult.Result as CreatedAtActionResult)?.Value as CronJob;
+        created.ShouldNotBeNull();
+        created!.WebhookUrl.ShouldBe(Url);
+
+        var listResult = await controller.List(CancellationToken.None);
+        var listed = ((listResult.Result as OkObjectResult)?.Value as IReadOnlyList<CronJob>)!
+            .Single(j => j.Id.Value == "job-1");
+        listed.WebhookUrl.ShouldBe(Url);
+
+        var updateResult = await controller.Update("job-1", CronJobUpdateRequest.FromCronJob(listed with { Name = "Renamed" }), CancellationToken.None);
+        var updated = (updateResult.Result as OkObjectResult)?.Value as CronJob;
+        updated.ShouldNotBeNull();
+        updated!.WebhookUrl.ShouldBe(Url);
+        (await store.GetAsync(JobId.From("job-1")))!.WebhookUrl.ShouldBe(Url);
+    }
+
+    // #2389: POST /api/cron now binds CronJobCreateRequest (id optional) rather than the domain
+    // record. Existing cases still express their intent as a CronJob and project it here, so the
+    // scenarios they assert are unchanged.
+    private static CronJobCreateRequest ToCreateRequest(CronJob job) => new()
+    {
+        Id = job.Id.Value,
+        Name = job.Name,
+        Schedule = job.Schedule,
+        ActionType = job.ActionType,
+        AgentId = job.AgentId?.Value,
+        Message = job.Message,
+        TemplateName = job.TemplateName,
+        TemplateParameters = job.TemplateParameters,
+        Model = job.Model,
+        WebhookUrl = job.WebhookUrl,
+        ShellCommand = job.ShellCommand,
+        Enabled = job.Enabled,
+        System = job.System,
+        DeleteAfterRun = job.DeleteAfterRun,
+        TimeZone = job.TimeZone,
+        CreatedBy = job.CreatedBy,
+        CreatedAt = job.CreatedAt,
+        NextRunAt = job.NextRunAt,
+        Metadata = job.Metadata
+    };
+
+    private static CronController CreateController(
+        FakeCronStore store,
+        ICronAction action,
+        CronOptions options,
+        ICronAlertTargetResolver? alertTargetResolver = null)
     {
         var scheduler = new CronScheduler(
             store,
@@ -219,7 +485,12 @@ public sealed class CronControllerTests
             new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
             new StaticOptionsMonitor<CronOptions>(new CronOptions()),
             NullLogger<CronScheduler>.Instance);
-        return new CronController(store, scheduler, new StaticOptionsMonitor<CronOptions>(options), NullLogger<CronController>.Instance);
+        return new CronController(
+            store,
+            scheduler,
+            new StaticOptionsMonitor<CronOptions>(options),
+            NullLogger<CronController>.Instance,
+            alertTargetResolver);
     }
 
     private static CronJob CreateJob(string id, string actionType = "agent-prompt")
@@ -248,7 +519,7 @@ public sealed class CronControllerTests
         }
     }
 
-    private sealed class FakeCronStore : ICronStore
+    internal class FakeCronStore : ICronStore
     {
         private readonly Dictionary<string, CronJob> _jobs = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CronRun> _runs = new(StringComparer.OrdinalIgnoreCase);
@@ -265,7 +536,7 @@ public sealed class CronControllerTests
             return Task.FromResult(created);
         }
 
-        public Task<CronJob?> GetAsync(JobId jobId, CancellationToken ct = default)
+        public virtual Task<CronJob?> GetAsync(JobId jobId, CancellationToken ct = default)
             => Task.FromResult(_jobs.GetValueOrDefault(jobId.Value));
 
         public Task<IReadOnlyList<CronJob>> ListAsync(AgentId? agentId = null, CancellationToken ct = default)
@@ -276,10 +547,65 @@ public sealed class CronControllerTests
             return Task.FromResult(jobs);
         }
 
-        public Task<CronJob> UpdateAsync(CronJob job, CancellationToken ct = default)
+        public virtual Task<CronJob?> UpdateDefinitionAsync(
+            CronJob job,
+            CronJobOwnershipExpectation? expectedOwnership = null,
+            CancellationToken ct = default)
         {
-            _jobs[job.Id.Value] = job;
-            return Task.FromResult(job);
+            // Mirror the SQLite narrow definition write: preserve scheduler-owned runtime
+            // bookkeeping (LastRun*/NextRunAt) and the CAS-pinned conversation from the stored
+            // row; only the caller-authored definition columns are overwritten (#2133).
+            if (!_jobs.TryGetValue(job.Id.Value, out var existing))
+                return Task.FromResult<CronJob?>(null);
+
+            // #3573: mirror the store's commit-time ownership predicate too, so the controller
+            // test double cannot pass a case the real SQLite store would reject.
+            if (expectedOwnership is { } expected
+                && (!string.Equals(existing.CreatedBy, expected.CreatedBy, StringComparison.Ordinal)
+                    || !string.Equals(existing.AgentId?.Value, expected.AgentId, StringComparison.Ordinal)))
+            {
+                throw new CronJobOwnershipChangedException(job.Id);
+            }
+
+            var merged = job with
+            {
+                CreatedAt = existing.CreatedAt,
+                LastRunAt = existing.LastRunAt,
+                NextRunAt = existing.NextRunAt,
+                LastRunStatus = existing.LastRunStatus,
+                LastRunError = existing.LastRunError,
+                BackoffUntil = existing.BackoffUntil,
+                ConversationId = existing.ConversationId
+            };
+            _jobs[job.Id.Value] = merged;
+            return Task.FromResult<CronJob?>(merged);
+        }
+
+        public Task SetNextRunAtAsync(JobId jobId, DateTimeOffset? nextRunAt, CancellationToken ct = default)
+        {
+            if (_jobs.TryGetValue(jobId.Value, out var existing))
+                _jobs[jobId.Value] = existing with { NextRunAt = nextRunAt };
+            return Task.CompletedTask;
+        }
+
+        public Task SetBackoffUntilAsync(JobId jobId, DateTimeOffset? backoffUntil, CancellationToken ct = default)
+        {
+            // Mirrors the SQLite narrow write (#3350): one column, and specifically NOT NextRunAt.
+            if (_jobs.TryGetValue(jobId.Value, out var existing))
+                _jobs[jobId.Value] = existing with { BackoffUntil = backoffUntil };
+            return Task.CompletedTask;
+        }
+
+        public Task RecordRunFinalizationAsync(JobId jobId, DateTimeOffset lastRunAt, string lastRunStatus, string? lastRunError, CancellationToken ct = default)
+        {
+            if (_jobs.TryGetValue(jobId.Value, out var existing))
+                _jobs[jobId.Value] = existing with
+                {
+                    LastRunAt = lastRunAt,
+                    LastRunStatus = lastRunStatus,
+                    LastRunError = lastRunError
+                };
+            return Task.CompletedTask;
         }
 
         public Task DeleteAsync(JobId jobId, CancellationToken ct = default)
@@ -317,7 +643,7 @@ public sealed class CronControllerTests
             return Task.FromResult(run);
         }
 
-        public Task RecordRunCompleteAsync(RunId runId, string status, string? error = null, SessionId? sessionId = null, CancellationToken ct = default)
+        public Task RecordRunCompleteAsync(RunId runId, string status, string? error = null, SessionId? sessionId = null, CronRunCost? cost = null, CancellationToken ct = default)
         {
             if (_runs.TryGetValue(runId.Value, out var run))
             {
@@ -326,11 +652,60 @@ public sealed class CronControllerTests
                     Status = status,
                     Error = error,
                     SessionId = sessionId,
-                    CompletedAt = DateTimeOffset.UtcNow
+                    CompletedAt = DateTimeOffset.UtcNow,
+                    // #2641: a null cost preserves whatever was measured, mirroring the real
+                    // store's COALESCE - a fake that clobbered it would hide the regression the
+                    // COALESCE exists to prevent.
+                    Cost = cost ?? run.Cost
                 };
             }
             return Task.CompletedTask;
         }
+
+        public virtual Task<IReadOnlyList<CronJobCostRollup>> GetJobCostRollupsAsync(
+            IReadOnlyCollection<JobId> jobIds,
+            int windowDays,
+            CancellationToken ct = default)
+        {
+            if (jobIds.Count == 0)
+                return Task.FromResult<IReadOnlyList<CronJobCostRollup>>([]);
+
+            var scope = jobIds.ToHashSet();
+            var rollups = _runs.Values
+                .Where(run => scope.Contains(run.JobId))
+                .GroupBy(run => run.JobId)
+                .Select(group =>
+                {
+                    var measured = group.Where(run => run.Cost.TotalTokens is not null).ToList();
+                    return new CronJobCostRollup
+                    {
+                        JobId = group.Key,
+                        RunCount = group.Count(),
+                        MeasuredRunCount = measured.Count,
+                        TotalTokens = measured.Count == 0 ? null : measured.Sum(run => run.Cost.TotalTokens!.Value),
+                        TotalToolCalls = group.Any(run => run.Cost.ToolCallCount is not null)
+                            ? group.Sum(run => (long)(run.Cost.ToolCallCount ?? 0))
+                            : null,
+                        TotalTurns = group.Any(run => run.Cost.TurnCount is not null)
+                            ? group.Sum(run => (long)(run.Cost.TurnCount ?? 0))
+                            : null,
+                        TotalDurationMs = group.Any(run => run.Cost.DurationMs is not null)
+                            ? group.Sum(run => run.Cost.DurationMs ?? 0)
+                            : null,
+                        WindowStart = DateTimeOffset.UtcNow.AddDays(-windowDays),
+                        WindowDays = windowDays,
+                        WindowTruncatedByRetention = false
+                    };
+                })
+                .OrderByDescending(rollup => rollup.TotalTokens.HasValue)
+                .ThenByDescending(rollup => rollup.TotalTokens ?? 0)
+                .ToList();
+
+            return Task.FromResult<IReadOnlyList<CronJobCostRollup>>(rollups);
+        }
+
+        public Task<CronRun?> GetRunAsync(RunId runId, CancellationToken ct = default)
+            => Task.FromResult(_runs.GetValueOrDefault(runId.Value));
 
         public Task<IReadOnlyList<CronRun>> GetRunHistoryAsync(JobId jobId, int limit = 20, CancellationToken ct = default)
         {
@@ -341,6 +716,51 @@ public sealed class CronControllerTests
                 .ToList();
             return Task.FromResult<IReadOnlyList<CronRun>>(runs);
         }
+
+        public Task<IReadOnlyList<CronRun>> GetRecentRunsAsync(
+            IReadOnlyCollection<JobId> jobIds,
+            IReadOnlyCollection<string>? statuses = null,
+            int limit = 20,
+            CancellationToken ct = default)
+        {
+            // An empty scope means "no jobs", never "no filter" - mirrors the SQLite contract.
+            if (jobIds.Count == 0)
+                return Task.FromResult<IReadOnlyList<CronRun>>([]);
+
+            var recent = _runs.Values
+                .Where(run => jobIds.Contains(run.JobId))
+                .Where(run => statuses is null || statuses.Contains(run.Status, StringComparer.Ordinal))
+                .OrderByDescending(run => run.StartedAt)
+                .Take(limit)
+                .ToList();
+            return Task.FromResult<IReadOnlyList<CronRun>>(recent);
+        }
+
+        // #2477: idempotent by (jobId, scheduled occurrence) - a repeat scan must not add a row.
+        public Task<bool> TryRecordMissedRunAsync(JobId jobId, DateTimeOffset scheduledOccurrenceUtc, CancellationToken ct = default)
+        {
+            var occurrence = scheduledOccurrenceUtc.ToUniversalTime();
+            if (_runs.Values.Any(r => r.JobId == jobId
+                && r.Status == CronRunStatus.Missed
+                && r.StartedAt.ToUniversalTime() == occurrence))
+            {
+                return Task.FromResult(false);
+            }
+
+            var run = new CronRun
+            {
+                Id = RunId.Create(),
+                JobId = jobId,
+                StartedAt = occurrence,
+                CompletedAt = occurrence,
+                Status = CronRunStatus.Missed
+            };
+            _runs[run.Id.Value] = run;
+            return Task.FromResult(true);
+        }
+
+        public Task<IReadOnlyList<CronRun>> ListRunningRunsAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<CronRun>>(_runs.Values.Where(r => r.Status == CronRunStatus.Running).ToList());
 
         public Task<int> PurgeRunsOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
         {

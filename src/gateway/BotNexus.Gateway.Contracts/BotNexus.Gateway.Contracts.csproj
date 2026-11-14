@@ -6,6 +6,18 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Temporary residual dependency for #3040 AC6, not an implementation-facing exemption.
+         IAgentTool still appears in IAgentHandleInspector.ResolveTool, IAgentToolFactory.CreateTools,
+         and CommandExecutionContext.ResolveSessionTool; migration owner: #3446.
+         Provider-model contracts are gateway-owned projections as of #3445, with conversion
+         confined to Gateway/Isolation. The provider registry remains the sole catalogue owner.
+         This is the remaining #3251 tool cluster. Remove this reference when #3446 leaves it unused;
+         do not widen the existing
+         six-member equality IL fence in GatewayAbstractionCoreLeakFenceArchitectureTests.
+         Tracking: https://github.com/sytone/botnexus/issues/3040
+                   https://github.com/sytone/botnexus/issues/3251
+                   https://github.com/sytone/botnexus/issues/3445
+                   https://github.com/sytone/botnexus/issues/3446 -->
     <ProjectReference Include="..\..\agent\BotNexus.Agent.Core\BotNexus.Agent.Core.csproj" />
     <ProjectReference Include="..\..\domain\BotNexus.Domain\BotNexus.Domain.csproj" />
   </ItemGroup>

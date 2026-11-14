@@ -1,0 +1,679 @@
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using BotNexus.Domain.Primitives;
+using BotNexus.Domain.World;
+using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Models;
+using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Api.Controllers;
+using BotNexus.Gateway.Conversations;
+using BotNexus.Gateway.Dispatching;
+using BotNexus.Gateway.Webhooks;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
+using NSubstitute;
+
+namespace BotNexus.Gateway.Tests.Controllers;
+
+/// <summary>
+/// Controller-level coverage of the #3851 webhook inbound queue, asserting on OBSERVABLE run state
+/// read back from the production SQLite run store rather than on any internal flag.
+/// </summary>
+/// <remarks>
+/// The reported defect was precisely that internal state and observable state disagreed: a delivery
+/// blocked on the session write lock reported <see cref="WebhookRunStatus.Running"/>, so the only
+/// evidence a caller could obtain said the agent was working when it had not started. A test that
+/// asserted on the queue object would therefore prove nothing about the defect - every assertion
+/// here goes through the run store or the HTTP result.
+/// </remarks>
+public sealed class WebhookInboundBackpressureTests : IAsyncLifetime
+{
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(30);
+
+    private string _dbPath = string.Empty;
+    private SqliteWebhookRegistrationStore _registrations = null!;
+    private SqliteWebhookRunStore _runs = null!;
+    private InMemoryConversationStore _conversations = null!;
+    private ISessionStore _sessions = null!;
+    private IHttpClientFactory _httpClientFactory = null!;
+
+    /// <summary>Registration under test, captured so run lookups can be scoped to it.</summary>
+    private WebhookId _webhookId;
+
+    public async Task InitializeAsync()
+    {
+        _dbPath = Path.Combine(Path.GetTempPath(), $"webhook-backpressure-{Guid.NewGuid():N}.db");
+        _registrations = new SqliteWebhookRegistrationStore(_dbPath);
+        _runs = new SqliteWebhookRunStore(_dbPath);
+        await _registrations.InitializeAsync();
+        await _runs.InitializeAsync();
+        _conversations = new InMemoryConversationStore();
+        _sessions = Substitute.For<ISessionStore>();
+        _httpClientFactory = Substitute.For<IHttpClientFactory>();
+    }
+
+    public Task DisposeAsync()
+    {
+        SqlitePoolCleanup.ClearPoolFor(_dbPath);
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+        {
+            var path = _dbPath + suffix;
+            if (File.Exists(path))
+            {
+                try { File.Delete(path); }
+                catch (IOException) { /* parallel suites can briefly retain a handle */ }
+            }
+        }
+        return Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task DeliveryBlockedBehindAnotherTurn_ReportsQueued_NotRunning()
+    {
+        // AC2, the heart of the issue. Delivery one holds the agent's slot; delivery two cannot
+        // start. Its OBSERVABLE run status must say Queued, because pre-fix it said Running and a
+        // caller had no way to tell "waiting for the agent" from "the agent is working".
+        var registration = await _registrations.CreateAsync(CreateRegistration());
+        _webhookId = registration.Id;
+        var queue = CreateQueue(depth: 8);
+        var orchestrator = new GatedOrchestrator();
+
+        var first = InvokeAsync(registration, orchestrator, queue);
+        await orchestrator.FirstEntered.Task.WaitAsync(TestTimeout);
+
+        var second = InvokeAsync(registration, orchestrator, queue);
+
+        // Deterministic: the second delivery is admitted to the queue synchronously, so once the
+        // depth is visible its run row has already been written.
+        await WaitForWaitingCountAsync(queue, registration.AgentId, 1);
+        var queuedRun = await WaitForStatusAsync(WebhookRunStatus.Queued);
+
+        queuedRun.Status.ShouldBe(WebhookRunStatus.Queued);
+        queuedRun.StartedAt.ShouldBeNull("a queued delivery has not begun executing");
+
+        orchestrator.Release();
+        await Task.WhenAll(first, second).WaitAsync(TestTimeout);
+
+        var all = await _runs.ListByWebhookAsync(registration.Id, 10);
+        all.Count().ShouldBe(2);
+        all.ShouldAllBe(r => r.Status == WebhookRunStatus.Completed);
+    }
+
+    [Fact]
+    public async Task DeliveryBeyondTheBound_IsRefusedWith503_NotAccepted()
+    {
+        // AC4: overload is shed explicitly. Pre-fix every one of these got a 202 receipt for work
+        // that might never be serviced.
+        var registration = await _registrations.CreateAsync(CreateRegistration());
+        _webhookId = registration.Id;
+        var queue = CreateQueue(depth: 1);
+        var orchestrator = new GatedOrchestrator();
+
+        var holder = InvokeAsync(registration, orchestrator, queue);
+        await orchestrator.FirstEntered.Task.WaitAsync(TestTimeout);
+
+        var waiter = InvokeAsync(registration, orchestrator, queue);
+        await WaitForWaitingCountAsync(queue, registration.AgentId, 1);
+
+        // The bound is now fully subscribed - this third delivery must be refused outright.
+        var refused = await InvokeOnceAsync(registration, orchestrator, queue);
+
+        var status = refused.ShouldBeOfType<ObjectResult>();
+        status.StatusCode.ShouldBe(StatusCodes.Status503ServiceUnavailable);
+
+        var rejectedRun = await WaitForStatusAsync(WebhookRunStatus.Rejected);
+        rejectedRun.Error.ShouldNotBeNullOrWhiteSpace(
+            "a refused delivery must record why, so the caller can distinguish it from a failure");
+        rejectedRun.StartedAt.ShouldBeNull("a refused delivery never started");
+
+        orchestrator.Release();
+        await Task.WhenAll(holder, waiter).WaitAsync(TestTimeout);
+    }
+
+    [Theory]
+    [InlineData(WebhookResponseMode.Async)]
+    [InlineData(WebhookResponseMode.Sync)]
+    [InlineData(WebhookResponseMode.Callback)]
+    public async Task QueuedPersistenceFailure_ReturnsReservedCapacity_WithoutDispatch(
+        WebhookResponseMode responseMode)
+    {
+        var registration = await _registrations.CreateAsync(CreateRegistration(responseMode));
+        _webhookId = registration.Id;
+        var queue = CreateQueue(depth: 1);
+        using var holder = await queue.Admit(registration.AgentId, registration.PinnedConversationId!.Value)
+            .WaitAsync(CancellationToken.None);
+        var orchestrator = Substitute.For<IInboundMessageOrchestrator>();
+        var failingRuns = new FailingQueuedRunStore(_runs);
+
+        await Should.ThrowAsync<InvalidOperationException>(
+            () => InvokeOnceAsync(registration, orchestrator, queue, failingRuns));
+
+        queue.WaitingCount(registration.AgentId).ShouldBe(0);
+        var replacement = queue.Admit(registration.AgentId, registration.PinnedConversationId.Value);
+        replacement.IsImmediate.ShouldBeFalse();
+        replacement.Dispose();
+        await orchestrator.DidNotReceiveWithAnyArgs().AcceptAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task QueuedCallbackDeadline_DeliversExactlyOneTerminalTimeout_WithoutAgentInvocation()
+    {
+        var registration = await _registrations.CreateAsync(CreateRegistration(WebhookResponseMode.Callback));
+        _webhookId = registration.Id;
+        var queue = new WebhookInboundQueue(new WebhookInboundQueueOptions
+        {
+            MaxQueueDepth = 1,
+            RunTimeout = TimeSpan.FromMilliseconds(100)
+        });
+        using var holder = await queue.Admit(registration.AgentId, registration.PinnedConversationId!.Value)
+            .WaitAsync(CancellationToken.None);
+        var orchestrator = Substitute.For<IInboundMessageOrchestrator>();
+        var callback = new RecordingCallbackHandler();
+        _httpClientFactory = new StubHttpClientFactory(new HttpClient(callback));
+
+        var accepted = await InvokeOnceAsync(
+            registration, orchestrator, queue, callbackUrl: "https://callback.example/webhook");
+
+        accepted.ShouldBeOfType<AcceptedResult>();
+        await callback.Delivered.Task.WaitAsync(TestTimeout);
+        var timedOut = await WaitForStatusAsync(WebhookRunStatus.Timeout);
+
+        timedOut.StartedAt.ShouldBeNull("the queued delivery never acquired its dispatch slot");
+        queue.WaitingCount(registration.AgentId).ShouldBe(0, "terminal timeout releases waiting capacity");
+        callback.RequestCount.ShouldBe(1, "one accepted callback run has one terminal delivery");
+        using var payload = JsonDocument.Parse(callback.Payload.ShouldNotBeNull());
+        payload.RootElement.GetProperty("status").GetString().ShouldBe(nameof(WebhookRunStatus.Timeout));
+        await orchestrator.DidNotReceiveWithAnyArgs().AcceptAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task QueuedCallbackHostShutdown_DoesNotStartUnboundedTerminalDelivery()
+    {
+        var registration = await _registrations.CreateAsync(CreateRegistration(WebhookResponseMode.Callback));
+        _webhookId = registration.Id;
+        var queue = new WebhookInboundQueue(new WebhookInboundQueueOptions
+        {
+            MaxQueueDepth = 1,
+            RunTimeout = TimeSpan.FromMinutes(1)
+        });
+        using var holder = await queue.Admit(registration.AgentId, registration.PinnedConversationId!.Value)
+            .WaitAsync(CancellationToken.None);
+        var orchestrator = Substitute.For<IInboundMessageOrchestrator>();
+        var callback = new RecordingCallbackHandler();
+        _httpClientFactory = new StubHttpClientFactory(new HttpClient(callback));
+        using var stopping = new CancellationTokenSource();
+        stopping.Cancel();
+        var lifetime = Substitute.For<IHostApplicationLifetime>();
+        lifetime.ApplicationStopping.Returns(stopping.Token);
+
+        await InvokeOnceAsync(
+            registration, orchestrator, queue, applicationLifetime: lifetime,
+            callbackUrl: "https://callback.example/webhook");
+        var timedOut = await WaitForStatusAsync(WebhookRunStatus.Timeout);
+
+        timedOut.StartedAt.ShouldBeNull();
+        queue.WaitingCount(registration.AgentId).ShouldBe(0);
+        callback.RequestCount.ShouldBe(0, "shutdown must not start new outbound callback work");
+        await orchestrator.DidNotReceiveWithAnyArgs().AcceptAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task CallerCancellationWhileQueued_TerminalizesRunWithoutDispatch_AndRestoresCapacity()
+    {
+        var registration = await _registrations.CreateAsync(CreateRegistration());
+        _webhookId = registration.Id;
+        var queue = CreateQueue(depth: 1);
+        var orchestrator = new GatedOrchestrator();
+
+        var holder = InvokeAsync(registration, orchestrator, queue);
+        await orchestrator.FirstEntered.Task.WaitAsync(TestTimeout);
+
+        using var callerCancellation = new CancellationTokenSource();
+        var cancelled = InvokeOnceAsync(
+            registration, orchestrator, queue, cancellationToken: callerCancellation.Token);
+        await WaitForWaitingCountAsync(queue, registration.AgentId, 1);
+        await WaitForStatusAsync(WebhookRunStatus.Queued);
+
+        callerCancellation.Cancel();
+        await Should.ThrowAsync<OperationCanceledException>(() => cancelled);
+
+        var terminal = await WaitForStatusAsync(WebhookRunStatus.Failed);
+        terminal.StartedAt.ShouldBeNull("caller cancellation while queued never dispatches the agent");
+        terminal.CompletedAt.ShouldNotBeNull("an abandoned durable run must be terminal for retention");
+        terminal.Error.ShouldNotBeNull();
+        terminal.Error.ShouldContain("caller cancelled", Case.Insensitive);
+        queue.WaitingCount(registration.AgentId).ShouldBe(0, "caller cancellation returns waiting capacity exactly once");
+        orchestrator.CallCount.ShouldBe(1, "the cancelled delivery must not reach the orchestrator");
+
+        var replacement = InvokeAsync(registration, orchestrator, queue);
+        await WaitForWaitingCountAsync(queue, registration.AgentId, 1);
+        orchestrator.Release();
+        await Task.WhenAll(holder, replacement).WaitAsync(TestTimeout);
+
+        queue.WaitingCount(registration.AgentId).ShouldBe(0);
+        orchestrator.CallCount.ShouldBe(2, "a subsequent delivery reuses the returned capacity");
+    }
+
+    [Fact]
+    public Task ExecutingDelivery_ReportsRunningAtProcessorBoundary_AndHonoursDeadline()
+        => AssertExecutingDeadlineAsync(holdBeforeStart: false);
+
+    [Fact]
+    public Task ExecutingDelivery_PreStartCoordinationExceedsDeadline_ReadinessPrecedesTimerDispatch()
+        => AssertExecutingDeadlineAsync(holdBeforeStart: true);
+
+    private async Task AssertExecutingDeadlineAsync(bool holdBeforeStart)
+    {
+        var testName = holdBeforeStart
+            ? nameof(ExecutingDelivery_PreStartCoordinationExceedsDeadline_ReadinessPrecedesTimerDispatch)
+            : nameof(ExecutingDelivery_ReportsRunningAtProcessorBoundary_AndHonoursDeadline);
+        var clock = new ControlledWebhookClock();
+        var entered = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stage = "processor entry";
+        var registration = await _registrations.CreateAsync(CreateRegistration(WebhookResponseMode.Async));
+        _webhookId = registration.Id;
+        var queue = new WebhookInboundQueue(new WebhookInboundQueueOptions
+        {
+            MaxQueueDepth = 1,
+            RunTimeout = TimeSpan.FromMilliseconds(100)
+        });
+        WebhookRun? observedAtProcessor = null;
+        var processorToken = new TaskCompletionSource<CancellationToken>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var processor = Substitute.For<IInboundMessageProcessor>();
+        processor
+            .ProcessAsync(Arg.Any<InboundMessage>(), Arg.Any<InboundExecutionControl>())
+            .Returns(async callInfo =>
+            {
+                var control = callInfo.ArgAt<InboundExecutionControl>(1);
+                try
+                {
+                    stage = "pre-start coordination gate";
+                    entered.TrySetResult(control.CancellationToken);
+                    await releaseStart.Task.WaitAsync(TestTimeout);
+                    stage = "NotifyStartedAsync / Running persistence";
+                    control.CancellationToken.ThrowIfCancellationRequested();
+                    await control.NotifyStartedAsync();
+                    stage = "SQLite Running readback";
+                    var runs = await _runs.ListByWebhookAsync(registration.Id, 10);
+                    observedAtProcessor = runs.Single();
+                    processorToken.TrySetResult(control.CancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    processorToken.TrySetException(new InvalidOperationException(
+                        $"{testName}: readiness failed at {stage}.", ex));
+                    throw;
+                }
+                await Task.Delay(Timeout.InfiniteTimeSpan, control.CancellationToken);
+                return new InboundProcessingOutcome(Array.Empty<DispatchResult>(), false);
+            });
+        await using var orchestrator = new DefaultInboundMessageOrchestrator(
+            processor, NullLogger<DefaultInboundMessageOrchestrator>.Instance);
+
+        try
+        {
+            var accepted = await InvokeOnceAsync(registration, orchestrator, queue, timeProvider: clock);
+            accepted.ShouldBeOfType<AcceptedResult>();
+
+            var timer = await AwaitReadinessAsync(clock.Scheduled.Task, testName, () => "deadline scheduling");
+            timer.DueTime.ShouldBe(TimeSpan.FromMilliseconds(100));
+            timer.Period.ShouldBe(Timeout.InfiniteTimeSpan);
+            var entryToken = await AwaitReadinessAsync(entered.Task, testName, () => stage);
+            if (holdBeforeStart)
+            {
+                // Model scheduler/persistence coordination taking longer than the deadline, without
+                // dispatching timers. An eager timer-dispatch mutation cancels this pre-start token
+                // and reproduces the old readiness race, rather than merely failing to compile.
+                clock.AdvanceWithoutDispatch(TimeSpan.FromMilliseconds(200));
+                entryToken.IsCancellationRequested.ShouldBeFalse(
+                    "logical pre-start time must not dispatch the deadline before explicit readiness");
+                processorToken.Task.IsCompleted.ShouldBeFalse("the pre-start gate is still held");
+            }
+            releaseStart.TrySetResult();
+
+            var observedToken = await AwaitReadinessAsync(processorToken.Task, testName, () => stage);
+            observedAtProcessor.ShouldNotBeNull();
+            observedAtProcessor.Status.ShouldBe(WebhookRunStatus.Running);
+            observedAtProcessor.StartedAt.ShouldNotBeNull();
+            observedToken.CanBeCanceled.ShouldBeTrue("the webhook deadline must reach real processor work");
+            observedToken.IsCancellationRequested.ShouldBeFalse("readiness precedes deadline dispatch");
+
+            if (!holdBeforeStart)
+                clock.AdvanceWithoutDispatch(TimeSpan.FromMilliseconds(100));
+            clock.DispatchDueTimer();
+            observedToken.IsCancellationRequested.ShouldBeTrue();
+            var timedOut = await WaitForStatusAsync(WebhookRunStatus.Timeout);
+            timedOut.StartedAt.ShouldNotBeNull("the run began before its execution deadline fired");
+            timedOut.CompletedAt.ShouldNotBeNull("the timeout is durable and terminal");
+            timedOut.Id.ShouldBe(observedAtProcessor.Id);
+            timedOut.StartedAt.ShouldBe(observedAtProcessor.StartedAt,
+                "terminalization preserves the persisted processor-start boundary");
+        }
+        finally
+        {
+            // Failed assertions must not strand the orchestrator's worker on either test sentinel.
+            releaseStart.TrySetResult();
+            clock.FireForCleanup();
+        }
+    }
+
+    private static async Task<T> AwaitReadinessAsync<T>(Task<T> signal, string testName, Func<string> stage)
+    {
+        try
+        {
+            return await signal.WaitAsync(TestTimeout);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new TimeoutException($"{testName}: readiness timed out at {stage()}.", ex);
+        }
+    }
+
+    [Fact]
+    public async Task UncontendedDelivery_NeverPassesThroughQueued()
+    {
+        // The queued state must carry information: a state set on every run would be no better than
+        // the Running-for-everything it replaces.
+        var registration = await _registrations.CreateAsync(CreateRegistration());
+        _webhookId = registration.Id;
+        var queue = CreateQueue(depth: 8);
+        var observed = new List<WebhookRunStatus>();
+        var orchestrator = new StatusRecordingOrchestrator(_runs, registration.Id, observed);
+
+        await InvokeOnceAsync(registration, orchestrator, queue);
+
+        observed.ShouldNotContain(
+            WebhookRunStatus.Queued,
+            "a delivery that took the slot immediately never waited for it");
+    }
+
+    [Fact]
+    public async Task BacklogDepthIsObservable_WithoutReadingRunRows()
+    {
+        // AC5: a growing backlog is diagnosable from the queue's own depth signal.
+        var registration = await _registrations.CreateAsync(CreateRegistration());
+        var queue = CreateQueue(depth: 8);
+        var orchestrator = new GatedOrchestrator();
+        var peak = 0;
+        queue.WaitingCountChanged += (_, waiting) => Interlocked.Exchange(ref peak, Math.Max(peak, waiting));
+
+        var holder = InvokeAsync(registration, orchestrator, queue);
+        await orchestrator.FirstEntered.Task.WaitAsync(TestTimeout);
+
+        var waiters = new[]
+        {
+            InvokeAsync(registration, orchestrator, queue),
+            InvokeAsync(registration, orchestrator, queue)
+        };
+        await WaitForWaitingCountAsync(queue, registration.AgentId, 2);
+
+        peak.ShouldBeGreaterThanOrEqualTo(2, "the depth signal must report the backlog forming");
+
+        orchestrator.Release();
+        await Task.WhenAll(waiters.Append(holder)).WaitAsync(TestTimeout);
+        queue.WaitingCount(registration.AgentId).ShouldBe(0, "the depth signal must also drain");
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    private static WebhookInboundQueue CreateQueue(int depth) =>
+        new(new WebhookInboundQueueOptions { MaxQueueDepth = depth });
+
+    private static Task WaitForWaitingCountAsync(
+        WebhookInboundQueue queue, AgentId agentId, int expected)
+        => TestAwait.EventuallyAsync(
+            () => queue.WaitingCount(agentId) >= expected,
+            $"the inbound queue depth for '{agentId.Value}' reaches {expected}",
+            TestTimeout);
+
+    private async Task<WebhookRun> WaitForStatusAsync(WebhookRunStatus status)
+    {
+        WebhookRun? match = null;
+        await TestAwait.EventuallyAsync(
+            async () =>
+            {
+                var runs = await _runs.ListByWebhookAsync(_webhookId, 200);
+                match = runs.FirstOrDefault(r => r.Status == status);
+                return match is not null;
+            },
+            $"a webhook run reaches {status}",
+            TestTimeout);
+        return match!;
+    }
+
+    private async Task InvokeAsync(
+        WebhookRegistration registration,
+        IInboundMessageOrchestrator orchestrator,
+        WebhookInboundQueue queue)
+        => await InvokeOnceAsync(registration, orchestrator, queue);
+
+    private async Task<IActionResult> InvokeOnceAsync(
+        WebhookRegistration registration,
+        IInboundMessageOrchestrator orchestrator,
+        WebhookInboundQueue queue,
+        IWebhookRunStore? runStore = null,
+        IHostApplicationLifetime? applicationLifetime = null,
+        string? callbackUrl = null,
+        CancellationToken cancellationToken = default,
+        TimeProvider? timeProvider = null)
+    {
+        var rawBody = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+        {
+            message = "payload",
+            agentAction = true,
+            callbackUrl
+        }));
+        var controller = new WebhookInboundController(
+            _registrations, runStore ?? _runs, orchestrator,
+            Substitute.For<IConversationDispatcher>(),
+            _conversations, _sessions,
+            _httpClientFactory, NullLogger<WebhookInboundController>.Instance,
+            bodyGuard: null, inboundQueue: queue, applicationLifetime: applicationLifetime,
+            timeProvider: timeProvider)
+        {
+            ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() }
+        };
+        controller.Request.Scheme = "https";
+        controller.Request.Host = new HostString("gateway.test");
+        controller.Request.Body = new MemoryStream(rawBody);
+        controller.Request.ContentLength = rawBody.Length;
+        controller.Request.Headers["X-BotNexus-Signature-256"] =
+            WebhookSecretHelper.ComputeSignature(registration.Secret, rawBody);
+
+        return await controller.Receive(
+            registration.AgentId.Value, registration.Id.Value, cancellationToken);
+    }
+
+    // Sync mode so the controller awaits the turn inline: every assertion then observes a run row
+    // the request itself wrote, never one a background task might still be racing to write.
+    private static WebhookRegistration CreateRegistration(
+        WebhookResponseMode responseMode = WebhookResponseMode.Sync) => new()
+    {
+        Id = WebhookId.Create(),
+        Label = "backpressure",
+        AgentId = AgentId.From("tinker"),
+        Secret = WebhookSecretHelper.GenerateSecret(),
+        DefaultResponseMode = responseMode,
+        Enabled = true,
+        CreatedAt = DateTimeOffset.UtcNow,
+        PinnedConversationId = ConversationId.Create()
+    };
+
+    /// <summary>Orchestrator that holds every call on a gate until released.</summary>
+    private sealed class GatedOrchestrator : IInboundMessageOrchestrator
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource FirstEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int CallCount { get; private set; }
+
+        public void Release() => _release.TrySetResult();
+
+        public async Task<InboundDispatchResult> AcceptAsync(
+            InboundMessage message, CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            FirstEntered.TrySetResult();
+            await _release.Task.WaitAsync(TestTimeout);
+            return Resolve(message);
+        }
+
+        public bool Post(InboundMessage message) => true;
+    }
+
+    /// <summary>Orchestrator that snapshots the run's observable status mid-turn.</summary>
+    private sealed class StatusRecordingOrchestrator(
+        SqliteWebhookRunStore runs, WebhookId webhookId, List<WebhookRunStatus> observed)
+        : IInboundMessageOrchestrator
+    {
+        public async Task<InboundDispatchResult> AcceptAsync(
+            InboundMessage message, CancellationToken cancellationToken = default)
+        {
+            foreach (var run in await runs.ListByWebhookAsync(webhookId, 200))
+                observed.Add(run.Status);
+            return Resolve(message);
+        }
+
+        public bool Post(InboundMessage message) => true;
+    }
+
+    private sealed class StubHttpClientFactory(HttpClient client) : IHttpClientFactory
+    {
+        public HttpClient CreateClient(string name) => client;
+    }
+
+    private sealed class RecordingCallbackHandler : HttpMessageHandler
+    {
+        private int _requestCount;
+
+        public int RequestCount => Volatile.Read(ref _requestCount);
+        public string? Payload { get; private set; }
+        public TaskCompletionSource Delivered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _requestCount);
+            Payload = request.Content is null
+                ? null
+                : await request.Content.ReadAsStringAsync(cancellationToken);
+            Delivered.TrySetResult();
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+    }
+
+    // Clock progression and timer dispatch are deliberately separate scheduler operations. This
+    // lets slow pre-start coordination consume logical time without racing the readiness signal.
+    private sealed class ControlledWebhookClock : TimeProvider
+    {
+        private long _ticks;
+        public TaskCompletionSource<ControlledTimer> Scheduled { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override DateTimeOffset GetUtcNow()
+            => DateTimeOffset.UnixEpoch.AddTicks(Interlocked.Read(ref _ticks));
+        public override long GetTimestamp() => Interlocked.Read(ref _ticks);
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new ControlledTimer(this, callback, state, dueTime, period);
+            if (!Scheduled.TrySetResult(timer))
+                throw new InvalidOperationException("Only one webhook deadline is expected.");
+            return timer;
+        }
+
+        public void AdvanceWithoutDispatch(TimeSpan duration)
+            => Interlocked.Add(ref _ticks, duration.Ticks);
+
+        public void DispatchDueTimer()
+        {
+            if (!Scheduled.Task.IsCompletedSuccessfully)
+                throw new InvalidOperationException("The webhook deadline has not been scheduled.");
+            var timer = Scheduled.Task.GetAwaiter().GetResult();
+            timer.IsDue.ShouldBeTrue("the logical clock has reached the configured deadline");
+            timer.Fire();
+        }
+
+        public void FireForCleanup()
+        {
+            if (Scheduled.Task.IsCompletedSuccessfully)
+                Scheduled.Task.GetAwaiter().GetResult().Fire();
+        }
+
+        public sealed class ControlledTimer(
+            ControlledWebhookClock owner, TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) : ITimer
+        {
+            private long _dueAt = owner.GetTimestamp() + dueTime.Ticks;
+            private int _finished;
+            public TimeSpan DueTime { get; } = dueTime;
+            public TimeSpan Period { get; } = period;
+            public bool IsDue => owner.GetTimestamp() >= Interlocked.Read(ref _dueAt);
+
+            public void Fire()
+            {
+                if (Interlocked.Exchange(ref _finished, 1) == 0)
+                    callback(state);
+            }
+
+            public bool Change(TimeSpan nextDueTime, TimeSpan nextPeriod)
+            {
+                Interlocked.Exchange(ref _dueAt, nextDueTime == Timeout.InfiniteTimeSpan
+                    ? long.MaxValue : owner.GetTimestamp() + nextDueTime.Ticks);
+                return Volatile.Read(ref _finished) == 0;
+            }
+
+            public void Dispose() => Interlocked.Exchange(ref _finished, 1);
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+        }
+    }
+
+    private sealed class FailingQueuedRunStore(IWebhookRunStore inner) : IWebhookRunStore
+    {
+        public Task InitializeAsync(CancellationToken ct = default) => inner.InitializeAsync(ct);
+        public Task<WebhookRun> CreateAsync(WebhookRun run, CancellationToken ct = default)
+            => inner.CreateAsync(run, ct);
+        public Task<WebhookRun?> GetAsync(WebhookRunId runId, CancellationToken ct = default)
+            => inner.GetAsync(runId, ct);
+        public Task<WebhookRun> UpdateAsync(WebhookRun run, CancellationToken ct = default)
+            => run.Status == WebhookRunStatus.Queued
+                ? Task.FromException<WebhookRun>(new InvalidOperationException("queued persistence failed"))
+                : inner.UpdateAsync(run, ct);
+        public Task<IReadOnlyList<WebhookRun>> ListByWebhookAsync(
+            WebhookId webhookId, int limit = 20, CancellationToken ct = default)
+            => inner.ListByWebhookAsync(webhookId, limit, ct);
+        public Task<int> PurgeOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+            => inner.PurgeOlderThanAsync(cutoff, ct);
+    }
+
+    private static InboundDispatchResult Resolve(InboundMessage message)
+    {
+        var hints = InboundMessageRoutingHints.FromMessage(message);
+        var context = new InboundMessageContext(
+            AgentId.From("tinker"), message,
+            new ChannelSource(message.ChannelType, message.ChannelAddress, message.SenderId),
+            RequestedConversationId: hints.RequestedConversationId);
+        var resolution = new ConversationSessionResolution(
+            hints.RequestedConversationId ?? ConversationId.Create(),
+            SessionId.From("sess-stable-1"),
+            IsNewConversation: false,
+            IsNewSession: false,
+            OriginatingBindingId: null,
+            DisplayPrefix: null);
+        var dispatch = new DispatchResult(
+            context,
+            new ChannelSource(message.ChannelType, message.ChannelAddress, message.SenderId),
+            resolution);
+        return new InboundDispatchResult(InboundDispatchStatus.Accepted, new[] { dispatch });
+    }
+}

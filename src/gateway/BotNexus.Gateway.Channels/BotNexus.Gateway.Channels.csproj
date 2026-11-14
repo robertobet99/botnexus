@@ -8,10 +8,23 @@
   <ItemGroup>
     <ProjectReference Include="..\..\domain\BotNexus.Domain\BotNexus.Domain.csproj" />
     <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Contracts\BotNexus.Gateway.Contracts.csproj" />
+    <!-- #3399: CrossWorldChannelAdapter's relay error path reuses ProviderHttpErrorHelper's bounded
+         + redacted error-detail seam (#2881) rather than hand-rolling a second inline formatter.
+         Gateway.Contracts already references Agent.Core, which references Agent.Providers.Core, so
+         this is an explicit spelling of an edge that is already in the graph transitively - not a
+         new layering dependency. -->
+    <ProjectReference Include="..\..\agent\BotNexus.Agent.Providers.Core\BotNexus.Agent.Providers.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Configuration.Abstractions supplies IConfiguration + IChangeToken (via its transitive
+         Microsoft.Extensions.Primitives) used by LateBoundChannelOptions to reload late-loaded
+         channel extension options on config.json change. See issue #2010. -->
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <!-- #2731: the channel fault barrier is an IHostedService registered via DI. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     <PackageReference Include="OpenTelemetry.Api" />
   </ItemGroup>
 

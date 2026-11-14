@@ -1,3 +1,5 @@
+using BotNexus.Domain.Primitives;
+using BotNexus.Memory.Embeddings;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Hooks;
@@ -176,14 +178,15 @@ public sealed class ToolHookWiringTests
         public Task<string> BuildSystemPromptAsync(
             AgentDescriptor descriptor,
             AgentExecutionContext? executionContext,
+            EffectiveExecutionSettings? effectiveSettings = null,
             CancellationToken ct = default)
             => Task.FromResult(descriptor.SystemPrompt ?? string.Empty);
     }
 
     private sealed class StaticToolFactory : IAgentToolFactory
     {
-        public IReadOnlyList<IAgentTool> CreateTools(string workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
-            => [new ReadTool(workingDirectory)];
+        public IReadOnlyList<IAgentTool> CreateTools(WorkingDir workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
+            => [new ReadTool(workingDirectory.Value)];
     }
 
     private sealed class StubWorkspaceManager : IAgentWorkspaceManager
@@ -211,7 +214,7 @@ public sealed class ToolHookWiringTests
     private sealed class StubMemoryStoreFactory : IMemoryStoreFactory
     {
         private readonly IMemoryStore _store = new StubMemoryStore();
-        public IMemoryStore Create(string agentId) => _store;
+        public IMemoryStore Create(AgentId agentId) => _store;
     }
 
     private sealed class StubMemoryStore : IMemoryStore
@@ -223,6 +226,19 @@ public sealed class ToolHookWiringTests
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
         public Task<IReadOnlyList<MemoryEntry>> SearchAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
+
+        // #2781: explicit pass-through. Required (not default-implemented) on IMemoryStore because
+        // Moq returns null for default interface methods rather than running the default body.
+        public async Task<IReadOnlyList<ScoredMemoryEntry>> SearchScoredAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+        {
+            var entries = await SearchAsync(query, topK, filter, ct);
+            return entries.Select(entry => new ScoredMemoryEntry(entry, 0d)).ToList();
+        }
+
+        // #3244: explicit pass-through with a NotAttempted scan report - this stub runs no bounded
+        // vector scan, so claiming any coverage would be a lie the caller could act on.
+        public async Task<MemorySearchResult> SearchWithReportAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+            => new(await SearchScoredAsync(query, topK, filter, ct), MemoryVectorScanReport.NotAttempted);
         public Task DeleteAsync(string id, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task<MemoryStoreStats> GetStatsAsync(CancellationToken ct = default) => Task.FromResult(new MemoryStoreStats(0, 0, null));

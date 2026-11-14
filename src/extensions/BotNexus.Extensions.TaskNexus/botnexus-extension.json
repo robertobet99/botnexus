@@ -1,0 +1,30 @@
+{
+  "id": "botnexus-tasknexus",
+  "name": "TaskNexus",
+  "description": "Keeps TaskNexus in sync by delivering per-agent webhook bindings and secret-free full-roster health snapshots. Disabled until extensions.tasknexus.baseUrl is set.",
+  "version": "1.0.0",
+  "entryAssembly": "BotNexus.Extensions.TaskNexus.dll",
+  "extensionTypes": [
+    "tool"
+  ],
+  "enabled": true,
+  "configSchema": [
+    {
+      "id": "baseUrl",
+      "type": "string",
+      "required": false,
+      "sensitive": false,
+      "description": "Base URL of the TaskNexus instance receiving binding updates and secret-free roster diagnostics. Absent means the extension makes no outbound call at all."
+    },
+    {
+      "id": "callbackOrigin",
+      "type": "string",
+      "required": false,
+      "sensitive": false,
+      "description": "Externally reachable gateway origin TaskNexus should POST back to, prepended to the relative inbound webhook path."
+    }
+  ],
+  "configurationScopes": [
+    "agent"
+  ]
+}

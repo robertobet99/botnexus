@@ -1,0 +1,92 @@
+// BotNexus configuration - annotated example.
+//
+// This file is documentation, not configuration: nothing loads it. The real file is
+// ~/.botnexus/config.json (or $BOTNEXUS_HOME/config.json), which is plain JSON and therefore
+// cannot carry comments - which is why this exists separately.
+//
+// You usually do not need to copy from here. `botnexus init` writes a working config, the portal's
+// Configuration page renders every field with its description, and pointing your editor at the
+// generated schema gives the same descriptions as you type:
+//
+//   { "$schema": "./docs/botnexus-config.schema.json", ... }
+//
+// Regenerate that schema after changing the config model with:  botnexus config schema
+{
+  "$schema": "./docs/botnexus-config.schema.json",
+  "version": 1,
+
+  "gateway": {
+    // Where the gateway listens. Note this OVERRIDES the --urls argument the CLI passes, so if you
+    // set a LAN address here, the gateway will not be reachable on localhost at all.
+    "listenUrl": "http://localhost:5005",
+
+    // Named servers and resources this installation knows about. The key is the name you refer to
+    // the location by; it is case-insensitive and must be unique.
+    "locations": {
+
+      // A filesystem location. Only "path" is required.
+      "shared-docs": {
+        "type": "filesystem",
+        "path": "~/Documents/shared",
+        "description": "Reference material agents may read",
+        "tags": ["docs"]
+      },
+
+      // A remote host reached over HTTP.
+      //
+      // Note what is NOT here: the password. "credentialRef" names where the credential is kept,
+      // and a value with no scheme fails validation - so a pasted password cannot end up in this
+      // file. The credential is resolved when it is used, which also means rotating it does not
+      // need a gateway restart.
+      //
+      // Supported schemes:
+      //   env:<VARIABLE>   read from the process environment (see ~/.botnexus/botnexus.env)
+      //   file:<path>      read from a file holding one credential, mode 0600
+      //
+      // Set the value with, for example:
+      //   echo 'ANTHROPIC_API_KEY=...' >> ~/.botnexus/botnexus.env && chmod 600 ~/.botnexus/botnexus.env
+      //   install -m 600 /dev/null ~/.botnexus/secrets/example && printf '%s' 'TOKEN' > ~/.botnexus/secrets/example
+      "example-host": {
+        "type": "remote-node",
+        "endpoint": "https://host.example.lan:8006",
+        "username": "automation@example",
+        "credentialRef": "env:EXAMPLE_HOST_TOKEN",
+
+        // Verifying is the default. Turn it off only for a target with a self-signed certificate,
+        // and only for that target - which is the point of it being per-location.
+        "verifyTls": true,
+
+        "description": "Example remote host",
+        "tags": ["example"],
+
+        // Extra settings whatever consumes this location understands.
+        "properties": { "node": "example-node" }
+      },
+
+      // A database location. connectionString is held in full in config.json rather than
+      // referenced, so treat the file accordingly; prefer credentialRef where the target supports
+      // separating the credential from the address.
+      "example-db": {
+        "type": "database",
+        "connectionString": "Data Source=/var/lib/example/example.db",
+        "description": "Example database"
+      }
+    }
+  },
+
+  // Provider credentials come from the environment, never from this file:
+  //   ANTHROPIC_API_KEY, OPENAI_API_KEY, ...
+  "providers": {
+    "anthropic": {
+      "defaultModel": "claude-sonnet-5"
+    }
+  },
+
+  "agents": {
+    "assistant": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "systemPrompt": "You are a helpful assistant."
+    }
+  }
+}

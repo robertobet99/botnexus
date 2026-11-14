@@ -9,8 +9,9 @@ namespace BotNexus.Gateway.Tests.Satellites;
 public sealed class SatelliteStaleDetectionServiceTests
 {
     [Fact]
-    public async Task ExecuteAsync_DetectsAndMarksStale()
+    public void DetectAndMarkStale_MarksExpiredSatelliteOffline()
     {
+        var now = DateTimeOffset.Parse("2026-08-21T12:00:00Z");
         var entries = new[]
         {
             new SatelliteConnectionInfo
@@ -20,24 +21,20 @@ public sealed class SatelliteStaleDetectionServiceTests
                 Platform = "windows",
                 OwnerUserId = "jon",
                 Status = SatelliteStatus.Online,
-                LastSeen = DateTimeOffset.UtcNow.AddMinutes(-5),
+                ConnectionId = "stale-connection",
+                LastSeen = now.AddMinutes(-5),
                 StaleTimeoutSeconds = 60
             }
         };
 
-        var registry = new InMemorySatelliteRegistry(entries, NullLogger<InMemorySatelliteRegistry>.Instance);
+        var registry = new InMemorySatelliteRegistry(entries, NullLogger<InMemorySatelliteRegistry>.Instance, new ManualTimeProvider(now));
 
-        using var cts = new CancellationTokenSource();
         var service = new SatelliteStaleDetectionService(
             registry,
             NullLogger<SatelliteStaleDetectionService>.Instance,
-            checkInterval: TimeSpan.FromMilliseconds(50));
+            timeProvider: new ManualTimeProvider(now));
 
-        // Start service and let it run one cycle
-        var task = service.StartAsync(cts.Token);
-        await Task.Delay(200);
-        await cts.CancelAsync();
-        await service.StopAsync(CancellationToken.None);
+        service.DetectAndMarkStale();
 
         var sat = registry.GetById("stale-sat");
         Assert.NotNull(sat);
@@ -45,8 +42,35 @@ public sealed class SatelliteStaleDetectionServiceTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_FreshSatellites_NotMarkedStale()
+    public void DetectAndMarkStale_ReconnectAfterSnapshot_DoesNotTakeReplacementOffline()
     {
+        var now = DateTimeOffset.Parse("2026-08-21T12:00:00Z");
+        var registry = new ReconnectingRegistry(new SatelliteConnectionInfo
+        {
+            Id = "stale-sat",
+            DisplayName = "Stale",
+            Platform = "windows",
+            OwnerUserId = "jon",
+            Status = SatelliteStatus.Online,
+            ConnectionId = "older",
+            LastSeen = now.AddMinutes(-5),
+            StaleTimeoutSeconds = 60
+        });
+        var service = new SatelliteStaleDetectionService(
+            registry,
+            NullLogger<SatelliteStaleDetectionService>.Instance,
+            timeProvider: new ManualTimeProvider(now));
+
+        service.DetectAndMarkStale();
+
+        registry.Satellite.Status.ShouldBe(SatelliteStatus.Online);
+        registry.Satellite.ConnectionId.ShouldBe("replacement");
+    }
+
+    [Fact]
+    public void DetectAndMarkStale_LeavesFreshSatelliteOnline()
+    {
+        var now = DateTimeOffset.Parse("2026-08-21T12:00:00Z");
         var entries = new[]
         {
             new SatelliteConnectionInfo
@@ -56,23 +80,20 @@ public sealed class SatelliteStaleDetectionServiceTests
                 Platform = "windows",
                 OwnerUserId = "jon",
                 Status = SatelliteStatus.Online,
-                LastSeen = DateTimeOffset.UtcNow,
+                ConnectionId = "fresh-connection",
+                LastSeen = now,
                 StaleTimeoutSeconds = 120
             }
         };
 
-        var registry = new InMemorySatelliteRegistry(entries, NullLogger<InMemorySatelliteRegistry>.Instance);
+        var registry = new InMemorySatelliteRegistry(entries, NullLogger<InMemorySatelliteRegistry>.Instance, new ManualTimeProvider(now));
 
-        using var cts = new CancellationTokenSource();
         var service = new SatelliteStaleDetectionService(
             registry,
             NullLogger<SatelliteStaleDetectionService>.Instance,
-            checkInterval: TimeSpan.FromMilliseconds(50));
+            timeProvider: new ManualTimeProvider(now));
 
-        var task = service.StartAsync(cts.Token);
-        await Task.Delay(200);
-        await cts.CancelAsync();
-        await service.StopAsync(CancellationToken.None);
+        service.DetectAndMarkStale();
 
         var sat = registry.GetById("fresh-sat");
         Assert.NotNull(sat);
@@ -96,5 +117,28 @@ public sealed class SatelliteStaleDetectionServiceTests
         await service.StopAsync(CancellationToken.None);
 
         // Should complete without throwing
+    }
+
+    private sealed class ReconnectingRegistry(SatelliteConnectionInfo satellite) : ISatelliteRegistry
+    {
+        public SatelliteConnectionInfo Satellite { get; } = satellite;
+
+        public IReadOnlyList<SatelliteConnectionInfo> GetAll() => [Satellite];
+        public SatelliteConnectionInfo? GetById(string satelliteId) => Satellite.Id == satelliteId ? Satellite : null;
+        public IReadOnlyList<SatelliteConnectionInfo> GetOnlineForUser(string userId) => [];
+        public bool MarkOnline(string satelliteId, string connectionId) => false;
+
+        public bool MarkOffline(string satelliteId, string connectionId)
+        {
+            Satellite.ConnectionId = "replacement";
+            if (!string.Equals(connectionId, Satellite.ConnectionId, StringComparison.Ordinal))
+                return false;
+            Satellite.Status = SatelliteStatus.Offline;
+            Satellite.ConnectionId = null;
+            return true;
+        }
+
+        public bool RecordHeartbeat(string satelliteId, string connectionId) => false;
+        public IReadOnlyList<SatelliteConnectionInfo> GetStaleSatellites() => [Satellite with { }];
     }
 }

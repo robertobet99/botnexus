@@ -10,6 +10,12 @@ namespace BotNexus.Skills.Tests;
 public sealed class SkillsConfigDefaultsTests
 {
     [Fact]
+    public void AllowSymlinkedSkills_DefaultsToFalse()
+    {
+        new SkillsConfig().AllowSymlinkedSkills.ShouldBeFalse();
+    }
+
+    [Fact]
     public void AllowSkillCreation_DefaultsToTrue()
     {
         var config = new SkillsConfig();
@@ -33,9 +39,16 @@ public sealed class SkillsConfigDefaultsTests
     }
 
     [Fact]
-    public void AllowSharedSkillManagement_DefaultsToFalse()
+    public void AllowSharedSkillManagement_DefaultsToTrue()
     {
         var config = new SkillsConfig();
-        Assert.False(config.AllowSharedSkillManagement, "AllowSharedSkillManagement should default to false -- shared writes are opt-in");
+        Assert.True(config.AllowSharedSkillManagement, "shared skill management should be available to every agent by default");
+    }
+
+    [Fact]
+    public void AllowSharedSkillManagement_FalseExplicit_RemainsBlockedForOperations()
+    {
+        var config = new SkillsConfig { AllowSharedSkillManagement = false };
+        Assert.False(config.AllowSharedSkillManagement, "an explicit shared-management opt-out must remain false");
     }
 }

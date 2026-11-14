@@ -27,14 +27,23 @@ public static class ResponsesMessageConverter
     /// <c>function_call_output</c>, or a <c>function_call_output</c> with no prior <c>function_call</c>.
     /// A transcript can carry such a dangling call when a turn was aborted/crashed mid-tool-execution
     /// (the result was never persisted) and the conversation later continued. To keep every replayed
-    /// request well-formed we run a whole-transcript pairing pass first and drop any unpaired tool
-    /// item rather than emit it verbatim, which would permanently wedge the session on this provider.
-    /// Pairing is keyed on the base call id (the segment before <c>|</c>), matching how
-    /// <see cref="SplitToolCallId"/> derives the wire <c>call_id</c>.
+    /// request well-formed we run a whole-transcript pairing pass first and drop any unpaired
+    /// <c>function_call</c> rather than emit it verbatim, which would permanently wedge the session
+    /// on this provider. Pairing is keyed on the base call id (the segment before <c>|</c>), matching
+    /// how <see cref="SplitToolCallId"/> derives the wire <c>call_id</c>.
+    /// <para>
+    /// The <em>inverse</em> direction - a <c>function_call_output</c> whose originating call is absent -
+    /// is no longer handled here (#3014). It now lives in the single shared
+    /// <c>MessageTransformer.TransformMessages</c> seam that every provider converter already calls,
+    /// so Anthropic and the Copilot messages API inherit the same protection instead of this converter
+    /// being the only one with it. Both Responses call sites (<c>ResponsesStreamEngine</c> and
+    /// <c>CopilotResponsesProvider</c>) transform before converting, so behaviour on the wire is
+    /// unchanged.
+    /// </para>
     /// </remarks>
     public static JsonArray ConvertMessages(IReadOnlyList<Message> messages, LlmModel model)
     {
-        var (callIds, resultCallIds) = CollectToolCallPairing(messages);
+        var resultCallIds = CollectResultCallIds(messages);
         var result = new JsonArray();
 
         foreach (var message in messages)
@@ -51,9 +60,6 @@ public static class ResponsesMessageConverter
                     break;
 
                 case ToolResultMessage toolResult:
-                    // Drop an orphan result whose originating call is absent from the transcript.
-                    if (!callIds.Contains(BaseCallId(toolResult.ToolCallId)))
-                        break;
                     result.Add(ConvertToolResultMessage(toolResult, model));
                     break;
             }
@@ -64,35 +70,20 @@ public static class ResponsesMessageConverter
 
     /// <summary>
     /// Walks the whole transcript once and returns the set of base call ids that appear as a
-    /// <c>function_call</c> (from assistant <see cref="ToolCallContent"/>) and the set that appear as
-    /// a <c>function_call_output</c> (from <see cref="ToolResultMessage"/>). The intersection is the
-    /// set of well-paired calls; anything only in one set is unpaired and must be dropped.
+    /// <c>function_call_output</c> (from <see cref="ToolResultMessage"/>). An assistant
+    /// <c>function_call</c> whose base id is not in this set is unpaired and must be dropped.
     /// </summary>
-    private static (HashSet<string> CallIds, HashSet<string> ResultCallIds) CollectToolCallPairing(
-        IReadOnlyList<Message> messages)
+    private static HashSet<string> CollectResultCallIds(IReadOnlyList<Message> messages)
     {
-        var callIds = new HashSet<string>(StringComparer.Ordinal);
         var resultCallIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var message in messages)
         {
-            switch (message)
-            {
-                case AssistantMessage assistant:
-                    foreach (var block in assistant.Content)
-                    {
-                        if (block is ToolCallContent toolCall)
-                            callIds.Add(BaseCallId(toolCall.Id));
-                    }
-                    break;
-
-                case ToolResultMessage toolResult:
-                    resultCallIds.Add(BaseCallId(toolResult.ToolCallId));
-                    break;
-            }
+            if (message is ToolResultMessage toolResult)
+                resultCallIds.Add(BaseCallId(toolResult.ToolCallId));
         }
 
-        return (callIds, resultCallIds);
+        return resultCallIds;
     }
 
     private static string BaseCallId(string id)
@@ -114,13 +105,18 @@ public static class ResponsesMessageConverter
                     new JsonObject
                     {
                         ["type"] = "input_text",
-                        ["text"] = UnicodeSanitizer.SanitizeSurrogates(user.Content.Text ?? "")
+                        ["text"] = (user.Content.Text ?? "").SanitizeSurrogates()
                     }
                 }
             };
         }
 
         var contentArray = new JsonArray();
+        var droppedImageCount = (user.Content.Blocks ?? []).Count(b => b is ImageContent);
+        var supportsImages = ImageModalityGuard.AllowImages(
+            model,
+            droppedImageCount,
+            "responses.user");
         foreach (var block in user.Content.Blocks ?? [])
         {
             switch (block)
@@ -129,11 +125,11 @@ public static class ResponsesMessageConverter
                     contentArray.Add(new JsonObject
                     {
                         ["type"] = "input_text",
-                        ["text"] = UnicodeSanitizer.SanitizeSurrogates(text.Text)
+                        ["text"] = text.Text.SanitizeSurrogates()
                     });
                     break;
 
-                case ImageContent image when model.Input.Contains("image"):
+                case ImageContent image when supportsImages:
                     contentArray.Add(new JsonObject
                     {
                         ["type"] = "input_image",
@@ -142,6 +138,15 @@ public static class ResponsesMessageConverter
                     });
                     break;
             }
+        }
+
+        // #2485 AC4: substitute an in-band notice for the removed images so the drop is visible to
+        // the user through the conversation, not only to an operator reading the log.
+        if (!supportsImages)
+        {
+            var notice = ImageModalityGuard.BuildDropNotice(model, droppedImageCount);
+            if (notice is not null)
+                contentArray.Add(new JsonObject { ["type"] = "input_text", ["text"] = notice });
         }
 
         return new JsonObject
@@ -186,7 +191,7 @@ public static class ResponsesMessageConverter
                             new JsonObject
                             {
                                 ["type"] = "output_text",
-                                ["text"] = UnicodeSanitizer.SanitizeSurrogates(textBlock.Text),
+                                ["text"] = textBlock.Text.SanitizeSurrogates(),
                                 ["annotations"] = new JsonArray()
                             }
                         },
@@ -241,7 +246,9 @@ public static class ResponsesMessageConverter
     {
         var (callId, _) = SplitToolCallId(toolResult.ToolCallId);
         var textResult = string.Join("\n", toolResult.Content.OfType<TextContent>().Select(t => t.Text));
-        var hasImages = toolResult.Content.Any(c => c is ImageContent) && model.Input.Contains("image");
+        var imageParts = toolResult.Content.OfType<ImageContent>().ToList();
+        var hasImages = imageParts.Count > 0 &&
+            ImageModalityGuard.AllowImages(model, imageParts.Count, "responses.tool-result");
         JsonNode output;
 
         if (hasImages)
@@ -252,11 +259,11 @@ public static class ResponsesMessageConverter
                 outputParts.Add(new JsonObject
                 {
                     ["type"] = "input_text",
-                    ["text"] = UnicodeSanitizer.SanitizeSurrogates(textResult)
+                    ["text"] = textResult.SanitizeSurrogates()
                 });
             }
 
-            foreach (var image in toolResult.Content.OfType<ImageContent>())
+            foreach (var image in imageParts)
             {
                 outputParts.Add(new JsonObject
                 {
@@ -270,8 +277,7 @@ public static class ResponsesMessageConverter
         }
         else
         {
-            output = JsonValue.Create(UnicodeSanitizer.SanitizeSurrogates(
-                string.IsNullOrWhiteSpace(textResult) ? "(see attached image)" : textResult))!;
+            output = JsonValue.Create(textResult.SanitizeSurrogates())!;
         }
 
         return new JsonObject

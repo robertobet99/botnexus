@@ -201,11 +201,20 @@ public sealed class DefaultSubAgentManagerTests
         var manager = CreateScaffoldManager(supervisor.Object);
         var spawned = await manager.SpawnAsync(CreateSpawnRequest(timeoutSeconds: 1));
 
-        await WaitUntilAsync(async () =>
-        {
-            var info = await manager.GetAsync(spawned.SubAgentId);
-            return info?.Status == SubAgentStatus.TimedOut;
-        }, TimeSpan.FromSeconds(3));
+        // #2825: the subject under test is the 1s spawn timeout firing at all, not how quickly
+        // the observer notices. A 3s polling window left barely 2s of slack and failed on a
+        // loaded container (1 of 8 identical parallel runs). Widening only the OBSERVATION
+        // window keeps the assertion exact - the status must still become TimedOut, and a
+        // sub-agent that never times out still fails - without making the test a measurement
+        // of container scheduling latency.
+        await TestAwait.EventuallyAsync(
+            async () =>
+            {
+                var info = await manager.GetAsync(spawned.SubAgentId);
+                return info?.Status == SubAgentStatus.TimedOut;
+            },
+            "the subagent status to become timed out",
+            timeout: TimeSpan.FromSeconds(30));
 
         var updated = await manager.GetAsync(spawned.SubAgentId);
         updated.ShouldNotBeNull();
@@ -259,22 +268,6 @@ public sealed class DefaultSubAgentManagerTests
 
     private static ISubAgentManager CreateScaffoldManager(IAgentSupervisor supervisor, SubAgentOptions? options = null)
         => new InterfaceBackedSubAgentManager(supervisor, options ?? new SubAgentOptions());
-
-    private static async Task WaitUntilAsync(Func<Task<bool>> condition, TimeSpan timeout)
-    {
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
-        {
-            if (await condition())
-            {
-                return;
-            }
-
-            await Task.Delay(50);
-        }
-
-        throw new TimeoutException("Condition was not met before timeout.");
-    }
 
     private sealed class InterfaceBackedSubAgentManager : ISubAgentManager
     {
@@ -366,7 +359,11 @@ public sealed class DefaultSubAgentManagerTests
             return true;
         }
 
-        public async Task OnCompletedAsync(string subAgentId, string resultSummary, CancellationToken ct = default)
+        public async Task OnCompletedAsync(
+            string subAgentId,
+            string resultSummary,
+            SubAgentRunOutcome? outcome = null,
+            CancellationToken ct = default)
         {
             if (!entries.TryGetValue(subAgentId, out var runtime))
             {

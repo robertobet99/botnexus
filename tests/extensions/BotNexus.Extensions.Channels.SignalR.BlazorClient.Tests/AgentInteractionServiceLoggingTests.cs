@@ -61,7 +61,7 @@ public sealed class AgentInteractionServiceLoggingTests
         await Should.NotThrowAsync(async () => await _service.SelectConversationAsync("agent-1", "conv-1"));
 
         // The conversation selection still succeeded.
-        agent.ActiveConversationId.ShouldBe("conv-1");
+        (_store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId).ShouldBe("conv-1");
 
         // The swallowed best-effort failure is now diagnosable at Debug (was a silent empty catch).
         var debug = _logger.Entries.FirstOrDefault(e => e.Level == LogLevel.Debug && e.Exception == boom);
@@ -135,10 +135,10 @@ public sealed class AgentInteractionServiceLoggingTests
     private static string ReadServiceSource(string fileName)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "BotNexus.slnx")))
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "Directory.Packages.props")))
             dir = dir.Parent;
         if (dir is null)
-            throw new InvalidOperationException("Could not locate BotNexus.slnx from test base directory.");
+            throw new InvalidOperationException("Could not locate Directory.Packages.props from test base directory.");
 
         var path = Path.Combine(
             dir.FullName,

@@ -141,7 +141,14 @@ public sealed class SqliteMemoryStoreExtendedTests : IDisposable
         var results = await context.Store.SearchAsync("""token' OR 1=1; DROP TABLE memories; --""");
         var stats = await context.Store.GetStatsAsync();
 
-        results.ShouldBeEmpty();
+        // The security property is that the payload is never EXECUTED: the table survives and
+        // no row other than the one legitimately stored can be reached. This test previously
+        // also asserted an EMPTY result set, but that was an accident of FTS5's implicit-AND
+        // default (#2740) - the payload's rare terms could not all match, so the query returned
+        // nothing for a reason unrelated to safety. With the MATCH expression now built
+        // explicitly, the literal term "token" legitimately reaches "safe-content-token".
+        // Asserting emptiness here would pin the recall cliff #2740 exists to remove.
+        results.ShouldHaveSingleItem().Id.ShouldBe("secure-1");
         stats.EntryCount.ShouldBe(1);
     }
 
@@ -205,7 +212,7 @@ public sealed class SqliteMemoryStoreExtendedTests : IDisposable
             loaded.ShouldNotBeNull();
         }
 
-        SqliteConnection.ClearAllPools();
+        SqlitePoolCleanup.ClearPoolFor(dbPath);
         Directory.Delete(tempDirectory, true);
     }
 
@@ -262,6 +269,7 @@ public sealed class SqliteMemoryStoreExtendedTests : IDisposable
 
     public void Dispose()
     {
-        SqliteConnection.ClearAllPools();
+        // No pool cleanup is needed here: the tests in this class either use MemoryStoreTestContext,
+        // which clears its own pool in DisposeAsync, or clear their own ad-hoc database inline.
     }
 }

@@ -73,6 +73,7 @@ public class SlashCommandRegistryTests
 public class SlashCommandDispatcherTests
 {
     private const string AgentId = "agent-x";
+    private const string ConversationId = "conv-1";
 
     private static (SlashCommandDispatcher dispatcher, IAgentInteractionService interaction) CreateSut()
     {
@@ -86,9 +87,9 @@ public class SlashCommandDispatcherTests
         var (sut, interaction) = CreateSut();
         var cmd = SlashCommandRegistry.All.First(c => c.Name == "/new");
 
-        await sut.ExecuteAsync(AgentId, cmd);
+        await sut.ExecuteAsync(AgentId, ConversationId, cmd);
 
-        await interaction.Received(1).ResetSessionAsync(AgentId);
+        await interaction.Received(1).ResetSessionAsync(AgentId, ConversationId);
     }
 
     [Fact]
@@ -97,9 +98,9 @@ public class SlashCommandDispatcherTests
         var (sut, interaction) = CreateSut();
         var cmd = SlashCommandRegistry.All.First(c => c.Name == "/compact");
 
-        await sut.ExecuteAsync(AgentId, cmd);
+        await sut.ExecuteAsync(AgentId, ConversationId, cmd);
 
-        await interaction.Received(1).CompactSessionAsync(AgentId);
+        await interaction.Received(1).CompactSessionAsync(AgentId, ConversationId);
     }
 
     [Fact]
@@ -108,9 +109,9 @@ public class SlashCommandDispatcherTests
         var (sut, interaction) = CreateSut();
         var cmd = SlashCommandRegistry.All.First(c => c.Name == "/clear");
 
-        await sut.ExecuteAsync(AgentId, cmd);
+        await sut.ExecuteAsync(AgentId, ConversationId, cmd);
 
-        interaction.Received(1).ClearLocalMessages(AgentId);
+        interaction.Received(1).ClearLocalMessages(AgentId, ConversationId);
     }
 
     [Fact]
@@ -119,9 +120,9 @@ public class SlashCommandDispatcherTests
         var (sut, interaction) = CreateSut();
         var cmd = SlashCommandRegistry.All.First(c => c.Name == "/prompts");
 
-        await sut.ExecuteAsync(AgentId, cmd);
+        await sut.ExecuteAsync(AgentId, ConversationId, cmd);
 
-        await interaction.Received(1).SendMessageAsync(AgentId, "/prompts");
+        await interaction.Received(1).SendMessageAsync(AgentId, ConversationId, "/prompts");
     }
 
     [Theory]
@@ -131,14 +132,19 @@ public class SlashCommandDispatcherTests
     [InlineData("/context")]
     [InlineData("/model")]
     [InlineData("/reasoning")]
-    public async Task Gateway_commands_are_sent_to_agent(string name)
+    public async Task Gateway_commands_are_dispatched_to_the_command_pipeline(string name)
     {
+        // #2873: this previously asserted the command reached SendMessageAsync, i.e. the model.
+        // That WAS the defect - the gateway command pipeline was never invoked from chat. The
+        // original intent (each gateway command dispatches to exactly one interaction call) is
+        // preserved; only the destination changes, and the negative assertion is strengthened.
         var (sut, interaction) = CreateSut();
         var cmd = SlashCommandRegistry.All.First(c => c.Name == name);
 
-        await sut.ExecuteAsync(AgentId, cmd);
+        await sut.ExecuteAsync(AgentId, ConversationId, cmd);
 
-        await interaction.Received(1).SendMessageAsync(AgentId, name);
+        await interaction.Received(1).ExecuteGatewayCommandAsync(AgentId, ConversationId, name);
+        await interaction.DidNotReceiveWithAnyArgs().SendMessageAsync(default!, default!, default!);
     }
 
     [Fact]
@@ -148,7 +154,7 @@ public class SlashCommandDispatcherTests
         {
             var (sut, interaction) = CreateSut();
 
-            await sut.ExecuteAsync(AgentId, cmd);
+            await sut.ExecuteAsync(AgentId, ConversationId, cmd);
 
             var totalCalls = interaction.ReceivedCalls().Count();
             Assert.True(totalCalls == 1, $"Command {cmd.Name} made {totalCalls} interaction calls, expected exactly 1.");

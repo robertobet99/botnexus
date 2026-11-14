@@ -1,8 +1,11 @@
 using System.CommandLine;
 using System.Diagnostics;
 using System.Reflection;
+using System.IO.Abstractions;
 using System.Xml.Linq;
 using BotNexus.Cli.Services;
+using BotNexus.Gateway.Configuration;
+using BotNexus.Gateway.Contracts.Updates;
 using Spectre.Console;
 
 namespace BotNexus.Cli.Commands;
@@ -12,23 +15,57 @@ namespace BotNexus.Cli.Commands;
 /// </summary>
 internal class UpdateCommand
 {
+    internal const int ExtensionDeploymentFailureExitCode = 2;
     private const int CancelledExitCode = 130;
-    private readonly IGatewayProcessManager _processManager;
 
-    public UpdateCommand(IGatewayProcessManager processManager)
+    /// <summary>
+    /// Distinct exit code for "the deployment repo has uncommitted changes and we refused to touch
+    /// them". Deliberately not 1: cron and scripted callers need to tell a dirty deployment tree
+    /// apart from an auth or network failure without string-matching git output.
+    /// </summary>
+    internal const int DirtyWorkingTreeExitCode = 3;
+
+    private readonly IGatewayProcessManager _processManager;
+    private readonly IFileSystem _fileSystem;
+    private ReleaseTargetRequest? _releaseRequest;
+    private bool _gatewayBuildFailed;
+
+    internal ReleaseTargetRequest? ReleaseRequest
+    {
+        get => _releaseRequest;
+        set => _releaseRequest = value;
+    }
+
+    /// <summary>
+    /// How to handle uncommitted changes in the deployment repo before pulling. Set from the
+    /// <c>--stash</c> / <c>--force</c> options. Defaults to <see cref="DirtyTreeMode.Abort"/> so
+    /// the safe behaviour (never destroy the user's work) is what you get when you say nothing.
+    /// </summary>
+    internal DirtyTreeMode DirtyTreeHandling { get; set; } = DirtyTreeMode.Abort;
+
+    public UpdateCommand(IGatewayProcessManager processManager, IFileSystem? fileSystem = null)
     {
         _processManager = processManager;
+        _fileSystem = fileSystem ?? new FileSystem();
     }
 
     public Command Build(Option<bool> verboseOption, Option<string?> targetOption)
     {
         var sourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
         var portOption = new Option<int>("--port", () => 5005, "Gateway port.");
+        var stashOption = new Option<bool>("--stash", () => false, "If the repo has uncommitted changes, stash them (recoverable) and continue.");
+        var forceOption = new Option<bool>("--force", () => false, "If the repo has uncommitted changes, discard tracked-file changes and continue. Destructive.");
+        var latestOption = new Option<bool>("--latest", "Update to the configured development tip (origin/main) instead of a stable release.");
+        var versionOption = new Option<string?>("--version", () => null, "Update to the exact release tag for this semantic version (for example, 1.2.3).");
 
-        var command = new Command("update", "Pull latest source, build, and restart the BotNexus gateway.")
+        var command = new Command("update", "Apply a selected source release, build, and restart the BotNexus gateway.")
         {
             sourceOption,
-            portOption
+            portOption,
+            stashOption,
+            forceOption,
+            latestOption,
+            versionOption
         };
 
         command.SetHandler(async context =>
@@ -37,15 +74,43 @@ internal class UpdateCommand
             var target = context.ParseResult.GetValueForOption(targetOption);
             var port = context.ParseResult.GetValueForOption(portOption);
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
+            var stash = context.ParseResult.GetValueForOption(stashOption);
+            var force = context.ParseResult.GetValueForOption(forceOption);
             var repoRoot = CliPaths.ResolveSource(source);
             var home = CliPaths.ResolveTarget(target);
+
+            if (stash && force)
+            {
+                AnsiConsole.MarkupLine("[red]✗[/] --stash and --force cannot be combined.");
+                context.ExitCode = 2;
+                return;
+            }
+
+            try
+            {
+                _releaseRequest = ReleaseSelector.ToRequest(
+                    context.ParseResult.GetValueForOption(latestOption),
+                    context.ParseResult.GetValueForOption(versionOption));
+            }
+            catch (ArgumentException ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(ex.Message)}");
+                context.ExitCode = 2;
+                return;
+            }
+
+            DirtyTreeHandling = force ? DirtyTreeMode.Force : stash ? DirtyTreeMode.Stash : DirtyTreeMode.Abort;
             context.ExitCode = await ExecuteAsync(repoRoot, home, port, verbose, context.GetCancellationToken());
         });
 
         var checkSourceOption = new Option<string?>("--source", () => null, "Path to the BotNexus repository root. Defaults to ~/botnexus.");
-        var checkCommand = new Command("check", "Check whether updates are available from origin/main.")
+        var checkLatestOption = new Option<bool>("--latest", "Check against the configured development tip (origin/main) instead of a stable release.");
+        var checkVersionOption = new Option<string?>("--version", () => null, "Check against the exact release tag for this semantic version (for example, 1.2.3).");
+        var checkCommand = new Command("check", "Check source and verified deployment identity (not the running revision).")
         {
-            checkSourceOption
+            checkSourceOption,
+            checkLatestOption,
+            checkVersionOption
         };
 
         checkCommand.SetHandler(async context =>
@@ -53,6 +118,18 @@ internal class UpdateCommand
             var source = context.ParseResult.GetValueForOption(checkSourceOption);
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
             var repoRoot = CliPaths.ResolveSource(source);
+            try
+            {
+                _releaseRequest = ReleaseSelector.ToRequest(
+                    context.ParseResult.GetValueForOption(checkLatestOption),
+                    context.ParseResult.GetValueForOption(checkVersionOption));
+            }
+            catch (ArgumentException ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(ex.Message)}");
+                context.ExitCode = 2;
+                return;
+            }
             context.ExitCode = await CheckAsync(repoRoot, verbose, context.GetCancellationToken());
         });
 
@@ -63,6 +140,33 @@ internal class UpdateCommand
 
     internal async Task<int> CheckAsync(string repoRoot, bool verbose, CancellationToken cancellationToken)
     {
+        if (_releaseRequest is not null)
+        {
+            AnsiConsole.MarkupLine("[blue][[update]][/] Resolving selected release...");
+            try
+            {
+                var status = await ResolveReleaseStatusAsync(repoRoot, _releaseRequest, cancellationToken);
+                if (string.Equals(status.Installed.CommitSha, status.Target.CommitSha, StringComparison.OrdinalIgnoreCase))
+                {
+                    AnsiConsole.MarkupLine($"[green]√[/] Source is current at [dim]{CliText.SafeDisplay(status.Target.SourceName)} ({CliText.SafeDisplay(status.Target.CommitSha)})[/].");
+                    return await ReportDeploymentCheckAsync(repoRoot, cancellationToken);
+                }
+
+                AnsiConsole.MarkupLine($"[yellow]![/] Source update available: [dim]{CliText.SafeDisplay(status.Target.SourceName)} ({CliText.SafeDisplay(status.Target.CommitSha)})[/]. Deployment and running revision not verified.");
+                return 1;
+            }
+            catch (OperationCanceledException)
+            {
+                AnsiConsole.MarkupLine("[yellow]![/] Update check cancelled.");
+                return CancelledExitCode;
+            }
+            catch (ReleaseTargetResolutionException ex)
+            {
+                AnsiConsole.MarkupLine($"[red]x[/] {CliText.SafeDisplay(ex.Message)}");
+                return 2;
+            }
+        }
+
         AnsiConsole.MarkupLine("[blue][[update]][/] Checking for updates...");
 
         var fetchResult = await RunGitFetchAsync(repoRoot, verbose, cancellationToken);
@@ -76,7 +180,7 @@ internal class UpdateCommand
         {
             AnsiConsole.MarkupLine("[red]✗[/] Could not fetch updates from origin/main.");
             if (!string.IsNullOrWhiteSpace(fetchResult.FailureDetail))
-                AnsiConsole.MarkupLine($"[dim]{Markup.Escape(fetchResult.FailureDetail)}[/]");
+                AnsiConsole.MarkupLine($"[dim]{CliText.SafeDisplay(fetchResult.FailureDetail)}[/]");
             return 2;
         }
 
@@ -91,7 +195,7 @@ internal class UpdateCommand
         {
             AnsiConsole.MarkupLine("[red]✗[/] Could not determine update status.");
             if (!string.IsNullOrWhiteSpace(behindResult.FailureDetail))
-                AnsiConsole.MarkupLine($"[dim]{Markup.Escape(behindResult.FailureDetail)}[/]");
+                AnsiConsole.MarkupLine($"[dim]{CliText.SafeDisplay(behindResult.FailureDetail)}[/]");
             return 2;
         }
 
@@ -101,71 +205,339 @@ internal class UpdateCommand
             return 1;
         }
 
-        AnsiConsole.MarkupLine("[green]✓[/] Already up to date.");
-        return 0;
+        AnsiConsole.MarkupLine("[green]✓[/] Source is current with origin/main.");
+        try
+        {
+            return await ReportDeploymentCheckAsync(repoRoot, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return CancelledExitCode;
+        }
+    }
+
+    private async Task<int> ReportDeploymentCheckAsync(string repoRoot, CancellationToken cancellationToken)
+    {
+        var commit = GetCommitSha(repoRoot);
+        var verified = await GetWorkingTreeCleanlinessAsync(repoRoot, cancellationToken) == WorkingTreeCleanliness.Clean
+            && await UpdateDeploymentIdentity.MatchesAsync(ResolveGatewayBinaryPath(repoRoot), commit, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        AnsiConsole.MarkupLine(verified
+            ? $"[green]√[/] Verified deployment on disk matches source {CliText.SafeDisplay(commit)}. Running revision not verified."
+            : "[yellow]![/] Deployment is stale or unverified; run botnexus update to reconcile. Running revision not verified.");
+        return verified ? 0 : 1;
     }
 
     internal async Task<int> ExecuteAsync(string repoRoot, string home, int port, bool verbose, CancellationToken cancellationToken)
     {
+        if (cancellationToken.IsCancellationRequested)
+            return CancelledExitCode;
+
         var interactive = AnsiConsole.Profile.Capabilities.Interactive;
 
-        // Step 1: git pull (safe to do while gateway is running)
-        var pullResult = await RunGitPullStepAsync(repoRoot, verbose, cancellationToken);
-        if (pullResult != 0)
-            return pullResult;
+        // Resolve the immutable target before dirty-tree handling, checkout mutation, or stopping
+        // the gateway. The command-tree path always supplies a request; the null branch preserves
+        // the existing internal test seam while callers migrate to release selection.
+        if (_releaseRequest is not null)
+        {
+            ReleaseUpdateStatus status;
+            try
+            {
+                status = await ResolveReleaseStatusAsync(repoRoot, _releaseRequest, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return CancelledExitCode;
+            }
+            catch (ReleaseTargetResolutionException ex)
+            {
+                AnsiConsole.MarkupLine($"[red]x[/] {CliText.SafeDisplay(ex.Message)}");
+                return 2;
+            }
+
+            var preflight = await EnsureWorkingTreeReadyAsync(repoRoot, cancellationToken);
+            if (preflight != 0)
+                return preflight;
+
+            LastPullWasNoOp = string.Equals(
+                status.Installed.CommitSha,
+                status.Target.CommitSha,
+                StringComparison.OrdinalIgnoreCase);
+            if (!LastPullWasNoOp)
+            {
+                try
+                {
+                    await CheckoutReleaseTargetAsync(repoRoot, status.Target, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return CancelledExitCode;
+                }
+                catch (ReleaseTargetResolutionException ex)
+                {
+                    AnsiConsole.MarkupLine($"[red]x[/] {CliText.SafeDisplay(ex.Message)}");
+                    return 2;
+                }
+                AnsiConsole.MarkupLine($"[green]√[/] Selected source [dim]{CliText.SafeDisplay(status.Target.SourceName)} ({CliText.SafeDisplay(status.Target.CommitSha)})[/].");
+                AnsiConsole.MarkupLine("[dim]HEAD is detached at the selected commit; local main was not advanced. Deployment has not yet been reconciled.[/]");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine($"[green]√[/] Source already at [dim]{CliText.SafeDisplay(status.Target.SourceName)} ({CliText.SafeDisplay(status.Target.CommitSha)})[/]; checking deployment separately.");
+            }
+        }
+        else
+        {
+            var pullResult = await RunGitPullStepAsync(repoRoot, verbose, cancellationToken);
+            if (pullResult != 0)
+                return pullResult;
+        }
+
+        // A failed build can leave unchanged source and an old DLL. Only a matching
+        // successful-update receipt permits the fast path.
+        bool canSkip;
+        try
+        {
+            canSkip = await CanSkipRebuildAsync(repoRoot, cancellationToken)
+                && !await HasEnabledExtensionRepositoriesAsync(home, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        catch (OperationCanceledException)
+        {
+            return CancelledExitCode;
+        }
+        if (canSkip)
+        {
+            // #2772: the old code asserted "gateway left running" from control flow alone. Ask.
+            if (IsGatewayRunning(home, repoRoot))
+            {
+                AnsiConsole.MarkupLine("[green]\u2713[/] Nothing to rebuild; gateway left running. Verified deployment on disk; running revision not verified.");
+                return 0;
+            }
+
+            AnsiConsole.MarkupLine("[yellow]\u26a0[/] Nothing to rebuild, but no gateway is running; starting it.");
+            return await RunRestartAsync(home, port, repoRoot, cancellationToken);
+        }
 
         // Step 2: Stop gateway BEFORE building — releases file locks on Windows
+        var gatewayBinary = ResolveGatewayBinaryPath(repoRoot);
+        // Invalidate before any build can partially replace output. Failed/cancelled attempts
+        // must never reuse prior success evidence at unchanged HEAD.
+        var buildCommit = GetCommitSha(repoRoot);
+        try
+        {
+            UpdateDeploymentIdentity.Invalidate(gatewayBinary);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            AnsiConsole.MarkupLine($"[red]✗[/] Cannot invalidate prior deployment identity; update aborted: {CliText.SafeDisplay(ex.Message)}");
+            return 1;
+        }
+
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(
+            fallbackPort: port,
+            homePath: home);
         GatewayStopResult stopResult;
         if (interactive)
         {
-            GatewayStopResult capturedStop = new(true, "skipped");
+            GatewayStopResult capturedStop = new(true, "skipped", GatewayStopOutcome.NotRunning);
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
                 .SpinnerStyle(Style.Parse("blue"))
                 .StartAsync("Stopping gateway...", async ctx =>
                 {
-                    capturedStop = await _processManager.StopAsync(home, cancellationToken);
+                    capturedStop = await _processManager.StopAsync(home, gatewayBinary, cancellationToken, gatewayUrl);
                 });
             stopResult = capturedStop;
         }
         else
         {
             AnsiConsole.MarkupLine("[blue][[update]][/] Stopping gateway...");
-            stopResult = await _processManager.StopAsync(home, cancellationToken);
+            stopResult = await _processManager.StopAsync(home, gatewayBinary, cancellationToken, gatewayUrl);
         }
 
-        stopResult ??= new GatewayStopResult(false, "no result");
+        stopResult ??= new GatewayStopResult(false, "no result", GatewayStopOutcome.Failed);
 
-        if (!stopResult.Success)
-            AnsiConsole.MarkupLine($"[yellow]\u26a0[/] Could not stop gateway ({Markup.Escape(stopResult.Message ?? "not running")}). Continuing anyway.");
-        else
-            AnsiConsole.MarkupLine("[green]\u2713[/] Gateway stopped");
+        // #2772: render what was OBSERVED. "Stopped" is only printed when a live gateway process
+        // was found and then seen gone; "no gateway found" is a distinct, non-claiming line.
+        switch (stopResult.Outcome)
+        {
+            case GatewayStopOutcome.Stopped when stopResult.Success:
+                AnsiConsole.MarkupLine("[green]\u2713[/] Gateway stopped");
+                break;
+            case GatewayStopOutcome.NotRunning:
+                AnsiConsole.MarkupLine($"[dim]\u2013[/] No running gateway found ({CliText.SafeDisplay(stopResult.Message ?? "not running")}); nothing to stop.");
+                break;
+            default:
+                AnsiConsole.MarkupLine($"[yellow]\u26a0[/] Could not stop gateway ({CliText.SafeDisplay(stopResult.Message ?? "unknown")}). Continuing anyway.");
+                break;
+        }
 
         // Wait for the port to be free — confirms the process has fully released file locks.
         // On Windows this can take several seconds after the process exits.
+        // #2772: a timeout here is NOT advisory. The port was held by the very process that then
+        // locked the DLLs, so proceeding burns a full Release build and fails with misleading
+        // guidance. Abort before the build instead.
+        bool portFree;
         if (interactive)
         {
+            var capturedFree = false;
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
                 .SpinnerStyle(Style.Parse("dim"))
                 .StartAsync("Waiting for gateway to release file handles...", async ctx =>
                 {
-                    await WaitForPortFreeAsync(port, cancellationToken);
+                    capturedFree = await WaitForPortFreeAsync(port, cancellationToken);
                 });
+            portFree = capturedFree;
         }
         else
         {
-            await WaitForPortFreeAsync(port, cancellationToken);
+            portFree = await WaitForPortFreeAsync(port, cancellationToken);
         }
 
-        // Steps 3 & 4: Build and deploy (gateway is now stopped, no file locks)
-        var buildResult = await RunBuildAndDeployAsync(repoRoot, home, verbose, cancellationToken);
-        if (buildResult != 0)
-            return buildResult;
+        if (!portFree)
+        {
+            AnsiConsole.MarkupLine($"[red]\u2717[/] Port {port} is still in use; something is still running the gateway.");
+            AnsiConsole.MarkupLine("[yellow]\u26a0[/] Update aborted before building - a build now would fail on locked files.");
+            AnsiConsole.MarkupLine("  [dim]Find the owning process and stop it, then re-run botnexus update.[/]");
+            return 1;
+        }
 
-        // Step 5: Start
-        return await RunRestartAsync(home, port, repoRoot, cancellationToken);
+        // Preserve before the build can replace even one file. Only an observed successful stop
+        // authorizes automatic recovery; NotRunning and contradictory/failed results do not.
+        using var snapshot = stopResult.Success && stopResult.Outcome == GatewayStopOutcome.Stopped
+            && StoppedDeploymentMatches(stopResult.VerifiedGatewayBinaryPath, gatewayBinary)
+            && !cancellationToken.IsCancellationRequested
+            ? TryPreserveGateway(gatewayBinary)
+            : null;
+
+        // Steps 3 & 4: Build and deploy (gateway is now stopped, no file locks)
+        _gatewayBuildFailed = false;
+        int buildResult;
+        bool buildStartedClean;
+        try
+        {
+            // A clean tree after the build cannot certify output compiled from earlier local
+            // inputs that were removed while the build ran. Require clean source at both ends.
+            buildStartedClean = await GetWorkingTreeCleanlinessAsync(repoRoot, cancellationToken) == WorkingTreeCleanliness.Clean;
+            buildResult = await RunBuildAndDeployAsync(repoRoot, home, verbose, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return CancelledExitCode;
+        }
+        if (buildResult != 0 && (buildResult != ExtensionDeploymentFailureExitCode || _gatewayBuildFailed))
+        {
+            AnsiConsole.MarkupLine($"[red]✗[/] Update build failed (exit code {buildResult}); the update was not applied.");
+            if (buildResult != CancelledExitCode && !cancellationToken.IsCancellationRequested)
+            {
+                if (snapshot is not null)
+                    await RecoverPriorGatewayAsync(snapshot, gatewayBinary, home, gatewayUrl, cancellationToken);
+                else
+                    AnsiConsole.MarkupLine("[yellow]⚠[/] Automatic recovery unavailable: no verified prior output or confirmed stop. Check gateway status before starting it manually.");
+            }
+            return buildResult;
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+            return buildResult == 0 ? CancelledExitCode : buildResult;
+
+        // Step 5: Start even after a controlled deployment failure. Atomic reconciliation has
+        // preserved or restored the usable deployment; leaving the stopped gateway offline would
+        // turn a recoverable update failure into an outage. Preserve the nonzero update result.
+        var restartResult = await RunRestartAsync(home, port, repoRoot, cancellationToken);
+        if (cancellationToken.IsCancellationRequested)
+            return CancelledExitCode;
+        if (restartResult == 0 && buildResult == 0)
+        {
+            try
+            {
+                // Do not certify output if source changed while the build ran.
+                if (buildStartedClean
+                    && string.Equals(buildCommit, GetCommitSha(repoRoot), StringComparison.OrdinalIgnoreCase)
+                    && await GetWorkingTreeCleanlinessAsync(repoRoot, cancellationToken) == WorkingTreeCleanliness.Clean)
+                    await UpdateDeploymentIdentity.RecordAsync(gatewayBinary, buildCommit, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return CancelledExitCode;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                AnsiConsole.MarkupLine($"[yellow]![/] Deployment identity could not be recorded; next update will reconcile: {CliText.SafeDisplay(ex.Message)}");
+            }
+        }
+        return restartResult != 0 ? restartResult : buildResult;
     }
+
+    private static bool StoppedDeploymentMatches(string? stoppedBinary, string gatewayBinary)
+    {
+        if (string.IsNullOrWhiteSpace(stoppedBinary) || !Path.IsPathFullyQualified(stoppedBinary))
+            return false;
+        return GatewayProcessManager.BuildGatewayPathCandidates(gatewayBinary).Contains(
+            Path.GetFullPath(stoppedBinary), OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+    }
+
+    private GatewayBuildSnapshot? TryPreserveGateway(string gatewayBinary)
+    {
+        try
+        {
+            return GatewayBuildSnapshot.Capture(_fileSystem, gatewayBinary);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            AnsiConsole.MarkupLine($"[yellow]⚠[/] Could not preserve prior gateway output; automatic build-failure recovery is unavailable: {CliText.SafeDisplay(ex.Message)}");
+            return null;
+        }
+    }
+
+    private async Task RecoverPriorGatewayAsync(GatewayBuildSnapshot snapshot, string gatewayBinary,
+        string home, string gatewayUrl, CancellationToken cancellationToken)
+    {
+        using var recoveryCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        recoveryCancellation.CancelAfter(TimeSpan.FromSeconds(60));
+        try
+        {
+            await snapshot.RestoreAsync(recoveryCancellation.Token);
+            recoveryCancellation.Token.ThrowIfCancellationRequested();
+            AnsiConsole.MarkupLine("[blue][[update]][/] Prior gateway output restored; attempting recovery once...");
+            var result = await _processManager.StartAsync(new GatewayStartOptions(
+                ExecutablePath: gatewayBinary,
+                Arguments: $"--urls \"{gatewayUrl}\" --environment Development --contentRoot \"{_fileSystem.Path.GetDirectoryName(gatewayBinary)}\"",
+                Attached: false,
+                HomePath: home,
+                HealthUrl: gatewayUrl + "/health",
+                ReadinessTimeout: TimeSpan.FromSeconds(60)), recoveryCancellation.Token);
+            if (result is { Success: true, Pid: not null })
+                AnsiConsole.MarkupLine($"[green]✓[/] Prior gateway recovered (PID {result.Pid}); update still failed.");
+            else
+                AnsiConsole.MarkupLine($"[red]✗[/] Prior gateway recovery failed: {CliText.SafeDisplay(result?.Message ?? "no result")}. Check gateway status and logs before retrying.");
+        }
+        catch (OperationCanceledException)
+        {
+            AnsiConsole.MarkupLine("[yellow]⚠[/] Prior gateway recovery cancelled or timed out. Check gateway status and logs before retrying; update still failed.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            var preserved = snapshot.RetainedForManualRecovery
+                ? $" Preserved output: {CliText.SafeDisplay(snapshot.PreservedDirectory)}."
+                : " Prior output was restored at its original deployment path.";
+            AnsiConsole.MarkupLine($"[red]✗[/] Prior gateway recovery refused or failed: {CliText.SafeDisplay(ex.Message)}.{preserved} Check gateway status and logs before manual recovery.");
+        }
+    }
+
+    protected virtual Task<ReleaseUpdateStatus> ResolveReleaseStatusAsync(
+        string repoRoot,
+        ReleaseTargetRequest request,
+        CancellationToken cancellationToken)
+        => ReleaseTargetGitResolver.ResolveLocalAsync(repoRoot, request, cancellationToken);
+
+    protected virtual Task CheckoutReleaseTargetAsync(
+        string repoRoot,
+        ResolvedReleaseTarget target,
+        CancellationToken cancellationToken)
+        => ReleaseTargetGitResolver.CheckoutAsync(repoRoot, target, cancellationToken);
 
     /// <summary>
     /// Runs git pull. Protected virtual so tests can override it.
@@ -173,6 +545,12 @@ internal class UpdateCommand
     protected virtual async Task<int> RunGitPullStepAsync(string repoRoot, bool verbose, CancellationToken cancellationToken)
     {
         var interactive = AnsiConsole.Profile.Capabilities.Interactive;
+
+        // Step 0: never run `git pull` blind at a deployment repo that has uncommitted work in it.
+        // A raw git abort mid-update leaves the gateway on the old build with no guidance (#2492).
+        var preflight = await EnsureWorkingTreeReadyAsync(repoRoot, cancellationToken);
+        if (preflight != 0)
+            return preflight;
 
         // Step 1: git pull
         string beforeSha;
@@ -236,23 +614,27 @@ internal class UpdateCommand
 
         if (pullResult.ExitCode != 0)
         {
-            AnsiConsole.MarkupLine("[red]✗[/] git pull failed.");
+            var kind = ClassifyPullFailure(pullResult.FailureDetail);
+            AnsiConsole.MarkupLine($"[red]✗[/] {PullFailureHeadline(kind)}");
             if (!string.IsNullOrWhiteSpace(pullResult.FailureDetail))
-                AnsiConsole.MarkupLine($"[dim]{Markup.Escape(pullResult.FailureDetail)}[/]");
-            else
-                AnsiConsole.MarkupLine("[yellow]⚠[/] Check network, auth, or repo path.");
+                AnsiConsole.MarkupLine($"[dim]{CliText.SafeDisplay(pullResult.FailureDetail)}[/]");
+            AnsiConsole.MarkupLine($"[yellow]⚠[/] {PullFailureRemediation(kind, repoRoot)}");
 
             return pullResult.ExitCode;
         }
 
+        // Record whether this pull actually moved HEAD. Only a successful pull that left HEAD
+        // exactly where it was can qualify the update for the no-rebuild fast path.
+        LastPullWasNoOp = beforeSha == afterSha && !string.IsNullOrEmpty(beforeSha);
+
         if (beforeSha == afterSha)
         {
-            AnsiConsole.MarkupLine($"[green]✓[/] Already up to date ([dim]{Markup.Escape(Short(beforeSha))}[/])");
+            AnsiConsole.MarkupLine($"[green]✓[/] Source already up to date ([dim]{CliText.SafeDisplay(Short(beforeSha))}[/]); deployment not yet verified.");
         }
         else
         {
             var countStr = commitCount > 0 ? $"{commitCount} new commit(s)" : "new commit(s)";
-            AnsiConsole.MarkupLine($"[green]✓[/] Pulled {countStr}: [dim]{Markup.Escape(Short(beforeSha))}[/] → [dim]{Markup.Escape(Short(afterSha))}[/]");
+            AnsiConsole.MarkupLine($"[green]✓[/] Pulled {countStr}: [dim]{CliText.SafeDisplay(Short(beforeSha))}[/] → [dim]{CliText.SafeDisplay(Short(afterSha))}[/]");
             if (commitSubjects.Count > 0)
                 PrintChangesApplied(commitSubjects);
         }
@@ -279,49 +661,40 @@ internal class UpdateCommand
                 .SpinnerStyle(Style.Parse("blue"))
                 .StartAsync("Building...", async ctx =>
                 {
-                    capturedBuild = await BuildCommand.BuildSolutionAsync(repoRoot, verbose, cancellationToken);
+                    capturedBuild = await RunGatewayBuildAsync(repoRoot, verbose, cancellationToken);
                 });
             buildResult = capturedBuild;
         }
         else
         {
             AnsiConsole.MarkupLine("[blue][[update]][/] Building...");
-            buildResult = await BuildCommand.BuildSolutionAsync(repoRoot, verbose, cancellationToken);
+            buildResult = await RunGatewayBuildAsync(repoRoot, verbose, cancellationToken);
         }
 
         if (buildResult != 0)
         {
+            // Compiler exits can collide with the legacy deployment-failure code (2).
+            // Only a completed build may use that code to authorize normal candidate startup.
+            _gatewayBuildFailed = true;
             AnsiConsole.MarkupLine("[red]✗[/] Build failed.");
             return buildResult;
         }
         AnsiConsole.MarkupLine("[green]✓[/] Build succeeded");
 
-        // Deploy extensions
-        int deployed = 0;
-        if (interactive)
-        {
-            int capturedDeployed = 0;
-            await AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .SpinnerStyle(Style.Parse("blue"))
-                .StartAsync("Deploying extensions...", async ctx =>
-                {
-                    capturedDeployed = ServeCommand.DeployExtensionsSilent(repoRoot, home, verbose);
-                    await Task.CompletedTask;
-                });
-            deployed = capturedDeployed;
-        }
-        else
-        {
-            AnsiConsole.MarkupLine("[blue][[update]][/] Deploying extensions...");
-            deployed = ServeCommand.DeployExtensionsSilent(repoRoot, home, verbose);
-        }
-        AnsiConsole.MarkupLine($"[green]✓[/] {deployed} extension(s) deployed");
-
+        // Reconcile registered repositories and deployment through the shared failure-isolated pipeline.
+        // Repository failures are reported but remain non-fatal so the gateway can restart with
+        // the last-known-good deployment.
+        await ServeCommand.ReconcileLifecycleAsync(repoRoot, home, verbose, cancellationToken, "update");
         return 0;
     }
 
-    private async Task<int> RunRestartAsync(string home, int port, string repoRoot, CancellationToken cancellationToken)
+    protected virtual Task<int> RunGatewayBuildAsync(string repoRoot, bool verbose, CancellationToken cancellationToken)
+        => BuildCommand.BuildSolutionAsync(repoRoot, verbose, cancellationToken);
+
+    internal static int DeploymentExitCode(ExtensionDeploymentResult result)
+        => result.Failures.Count == 0 ? 0 : ExtensionDeploymentFailureExitCode;
+
+    protected virtual async Task<int> RunRestartAsync(string home, int port, string repoRoot, CancellationToken cancellationToken)
     {
         var interactive = AnsiConsole.Profile.Capabilities.Interactive;
 
@@ -333,14 +706,16 @@ internal class UpdateCommand
             return 1;
         }
 
-        var gatewayDll = Path.Combine(repoRoot, "src", "gateway", "BotNexus.Gateway.Api", "bin", "Release", "net10.0", "BotNexus.Gateway.Api.dll");
+        var gatewayDll = ResolveGatewayBinaryPath(repoRoot);
         if (!File.Exists(gatewayDll))
         {
-            AnsiConsole.MarkupLine($"[red]✗[/] Gateway binary not found: [dim]{Markup.Escape(gatewayDll)}[/]");
+            AnsiConsole.MarkupLine($"[red]✗[/] Gateway binary not found: [dim]{CliText.SafeDisplay(gatewayDll)}[/]");
             return 1;
         }
 
-        var gatewayUrl = $"http://localhost:{port}";
+        // The gateway binds gateway.listenUrl when one is configured, overriding the --urls
+        // argument below, so probe where it will actually listen rather than where we asked.
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(port, home);
         var options = new GatewayStartOptions(
             ExecutablePath: gatewayDll,
             Arguments: $"--urls \"{gatewayUrl}\" --environment Development",
@@ -378,7 +753,7 @@ internal class UpdateCommand
             {
                 var panel = new Panel(
                     $"[green]Update complete![/]\n\n" +
-                    $"[dim]URL:[/]  [green]{Markup.Escape(gatewayUrl)}[/]\n" +
+                    $"[dim]URL:[/]  [green]{CliText.SafeDisplay(gatewayUrl)}[/]\n" +
                     $"[dim]PID:[/]  [yellow]{startResult.Pid.Value}[/]")
                 {
                     Border = BoxBorder.Rounded,
@@ -390,16 +765,275 @@ internal class UpdateCommand
             }
             else
             {
-                AnsiConsole.MarkupLine($"  URL:  [green]{Markup.Escape(gatewayUrl)}[/]");
+                AnsiConsole.MarkupLine($"  URL:  [green]{CliText.SafeDisplay(gatewayUrl)}[/]");
             }
             return 0;
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]✗[/] Failed to start gateway: {Markup.Escape(startResult.Message ?? "Unknown error")}");
+            AnsiConsole.MarkupLine($"[red]✗[/] Failed to start gateway: {CliText.SafeDisplay(startResult.Message ?? "Unknown error")}");
             return 1;
         }
     }
+
+    /// <summary>
+    /// Pre-flight guard for the deployment repo working tree. The deployment repo is a deployed
+    /// artifact, not a dev worktree, so uncommitted changes there are almost always accidental.
+    /// We refuse to run <c>git pull</c> over them and instead report every dirty path plus a
+    /// copy-pasteable remediation. Nothing is ever discarded unless the user explicitly asked
+    /// (via <c>--force</c> or the interactive prompt), and stashes are named and reported so the
+    /// work is always recoverable.
+    /// Returns 0 to continue, otherwise the exit code the update should terminate with.
+    /// </summary>
+    protected virtual async Task<int> EnsureWorkingTreeReadyAsync(string repoRoot, CancellationToken cancellationToken)
+    {
+        var status = await GetWorkingTreeStatusAsync(repoRoot, cancellationToken);
+        if (status.WasCanceled)
+        {
+            AnsiConsole.MarkupLine("[yellow]\u26a0[/] Update cancelled.");
+            return CancelledExitCode;
+        }
+
+        if (status.ExitCode != 0)
+        {
+            // Could not read status (not a repo, git missing). Let the pull path report it.
+            return 0;
+        }
+
+        if (status.DirtyPaths.Count == 0)
+        {
+            if (status.UntrackedPaths.Count > 0)
+                AnsiConsole.MarkupLine($"[dim]{status.UntrackedPaths.Count} untracked file(s) in the repo; these do not block the update.[/]");
+            return 0;
+        }
+
+        var mode = DirtyTreeHandling;
+        if (mode == DirtyTreeMode.Abort && AnsiConsole.Profile.Capabilities.Interactive)
+            mode = PromptDirtyTreeChoice(status.DirtyPaths);
+
+        switch (mode)
+        {
+            case DirtyTreeMode.Stash:
+                return await StashDirtyTreeAsync(repoRoot, status.DirtyPaths, cancellationToken);
+            case DirtyTreeMode.Force:
+                return await DiscardDirtyTreeAsync(repoRoot, status.DirtyPaths, cancellationToken);
+            default:
+                PrintDirtyTreeAbort(repoRoot, status.DirtyPaths);
+                return DirtyWorkingTreeExitCode;
+        }
+    }
+
+    private static void PrintDirtyTreeAbort(string repoRoot, IReadOnlyList<string> dirtyPaths)
+    {
+        AnsiConsole.MarkupLine($"[red]\u2717[/] Update aborted: {dirtyPaths.Count} uncommitted change(s) in the deployment repo.");
+        foreach (var path in dirtyPaths)
+            AnsiConsole.MarkupLine($"  [yellow]{CliText.SafeDisplay(path)}[/]");
+        AnsiConsole.MarkupLine("[yellow]\u26a0[/] Your local changes were left untouched. Choose one:");
+        AnsiConsole.MarkupLine("  [dim]botnexus update --stash[/]   keep them (saved to a named stash, recoverable)");
+        AnsiConsole.MarkupLine("  [dim]botnexus update --force[/]   discard tracked-file changes and update");
+        AnsiConsole.MarkupLine($"  [dim]git -C \"{CliText.SafeDisplay(repoRoot)}\" commit -am \"local changes\"[/]   keep them as a commit");
+    }
+
+    private async Task<int> StashDirtyTreeAsync(string repoRoot, IReadOnlyList<string> dirtyPaths, CancellationToken cancellationToken)
+    {
+        var label = $"botnexus-update-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
+        var result = await StashChangesAsync(repoRoot, label, cancellationToken);
+        if (result.WasCanceled)
+        {
+            AnsiConsole.MarkupLine("[yellow]\u26a0[/] Update cancelled.");
+            return CancelledExitCode;
+        }
+
+        if (result.ExitCode != 0)
+        {
+            AnsiConsole.MarkupLine("[red]\u2717[/] Could not stash local changes; update aborted.");
+            if (!string.IsNullOrWhiteSpace(result.FailureDetail))
+                AnsiConsole.MarkupLine($"[dim]{CliText.SafeDisplay(result.FailureDetail)}[/]");
+            return DirtyWorkingTreeExitCode;
+        }
+
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Stashed {dirtyPaths.Count} local change(s) as [yellow]{CliText.SafeDisplay(label)}[/]");
+        AnsiConsole.MarkupLine($"  [dim]git -C \"{CliText.SafeDisplay(repoRoot)}\" stash apply stash^{{/{CliText.SafeDisplay(label)}}}[/]   to restore them");
+        return 0;
+    }
+
+    private async Task<int> DiscardDirtyTreeAsync(string repoRoot, IReadOnlyList<string> dirtyPaths, CancellationToken cancellationToken)
+    {
+        AnsiConsole.MarkupLine($"[yellow]\u26a0[/] Discarding {dirtyPaths.Count} local change(s) in the deployment repo (--force):");
+        foreach (var path in dirtyPaths)
+            AnsiConsole.MarkupLine($"  [yellow]{CliText.SafeDisplay(path)}[/]");
+
+        var result = await DiscardChangesAsync(repoRoot, cancellationToken);
+        if (result.WasCanceled)
+        {
+            AnsiConsole.MarkupLine("[yellow]\u26a0[/] Update cancelled.");
+            return CancelledExitCode;
+        }
+
+        if (result.ExitCode != 0)
+        {
+            AnsiConsole.MarkupLine("[red]\u2717[/] Could not discard local changes; update aborted.");
+            if (!string.IsNullOrWhiteSpace(result.FailureDetail))
+                AnsiConsole.MarkupLine($"[dim]{CliText.SafeDisplay(result.FailureDetail)}[/]");
+            return DirtyWorkingTreeExitCode;
+        }
+
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Discarded {dirtyPaths.Count} local change(s)");
+        return 0;
+    }
+
+    /// <summary>
+    /// Interactive stash/discard/abort choice. Protected virtual so tests can script the answer
+    /// without a TTY. Defaults to abort, which is the non-destructive answer.
+    /// </summary>
+    protected virtual DirtyTreeMode PromptDirtyTreeChoice(IReadOnlyList<string> dirtyPaths)
+    {
+        AnsiConsole.MarkupLine($"[yellow]\u26a0[/] The deployment repo has {dirtyPaths.Count} uncommitted change(s):");
+        foreach (var path in dirtyPaths)
+            AnsiConsole.MarkupLine($"  [yellow]{CliText.SafeDisplay(path)}[/]");
+
+        const string stash = "Stash them (recoverable) and continue";
+        const string discard = "Discard local changes and continue";
+        const string abort = "Abort the update";
+
+        var choice = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("How do you want to proceed?")
+                .AddChoices(stash, discard, abort));
+
+        return choice switch
+        {
+            stash => DirtyTreeMode.Stash,
+            discard => DirtyTreeMode.Force,
+            _ => DirtyTreeMode.Abort
+        };
+    }
+
+    protected virtual Task<GitStatusResult> GetWorkingTreeStatusAsync(string repoRoot, CancellationToken cancellationToken)
+        => GetWorkingTreeStatusCoreAsync(repoRoot, cancellationToken);
+
+    private static async Task<GitStatusResult> GetWorkingTreeStatusCoreAsync(string repoRoot, CancellationToken cancellationToken)
+    {
+        var result = await RunGitAsync(repoRoot, "status --porcelain", captureOutput: true, cancellationToken);
+        if (result.WasCanceled)
+            return new GitStatusResult(CancelledExitCode, Array.Empty<string>(), Array.Empty<string>(), null, true);
+        if (!result.Started)
+            return new GitStatusResult(1, Array.Empty<string>(), Array.Empty<string>(), "Failed to start git process.", false);
+        if (result.ExitCode != 0)
+        {
+            var details = FirstNonEmptyLine(result.Stderr) ?? FirstNonEmptyLine(result.Stdout);
+            return new GitStatusResult(result.ExitCode, Array.Empty<string>(), Array.Empty<string>(), details, false);
+        }
+
+        return ParsePorcelainStatus(result.Stdout);
+    }
+
+    /// <summary>
+    /// Splits <c>git status --porcelain</c> output into changes that would block a pull (tracked
+    /// modifications, staged changes, deletions, renames) and untracked files, which do not.
+    /// </summary>
+    internal static GitStatusResult ParsePorcelainStatus(string porcelain)
+    {
+        var dirty = new List<string>();
+        var untracked = new List<string>();
+
+        foreach (var raw in porcelain.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (raw.Length < 4)
+                continue;
+
+            var code = raw[..2];
+            var path = raw[3..].Trim();
+            if (path.Length == 0)
+                continue;
+
+            if (code == "??")
+                untracked.Add(path);
+            else
+                dirty.Add(path);
+        }
+
+        return new GitStatusResult(0, dirty, untracked, null, false);
+    }
+
+    protected virtual Task<GitCommandResult> StashChangesAsync(string repoRoot, string label, CancellationToken cancellationToken)
+        => RunGitSimpleAsync(repoRoot, $"stash push -m \"{label}\"", cancellationToken);
+
+    protected virtual Task<GitCommandResult> DiscardChangesAsync(string repoRoot, CancellationToken cancellationToken)
+        => RunGitSimpleAsync(repoRoot, "reset --hard HEAD", cancellationToken);
+
+    private static async Task<GitCommandResult> RunGitSimpleAsync(string repoRoot, string arguments, CancellationToken cancellationToken)
+    {
+        var result = await RunGitAsync(repoRoot, arguments, captureOutput: true, cancellationToken);
+        if (result.WasCanceled)
+            return new GitCommandResult(CancelledExitCode, null, true);
+        if (!result.Started)
+            return new GitCommandResult(1, "Failed to start git process.", false);
+        if (result.ExitCode == 0)
+            return new GitCommandResult(0, null, false);
+
+        var details = FirstNonEmptyLine(result.Stderr) ?? FirstNonEmptyLine(result.Stdout);
+        return new GitCommandResult(result.ExitCode, details, false);
+    }
+
+    /// <summary>
+    /// Classifies a git pull failure so the user gets a remediation rather than a raw git line.
+    /// A dirty tree, a diverged branch, an auth rejection and a network outage need four different
+    /// answers and previously surfaced identically (#2492).
+    /// </summary>
+    internal static GitPullFailureKind ClassifyPullFailure(string? detail)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+            return GitPullFailureKind.Other;
+
+        var text = detail.ToLowerInvariant();
+
+        if (text.Contains("local changes", StringComparison.Ordinal)
+            || text.Contains("would be overwritten", StringComparison.Ordinal)
+            || text.Contains("commit your changes or stash them", StringComparison.Ordinal))
+            return GitPullFailureKind.DirtyTree;
+
+        if (text.Contains("diverged", StringComparison.Ordinal)
+            || text.Contains("non-fast-forward", StringComparison.Ordinal)
+            || text.Contains("automatic merge failed", StringComparison.Ordinal)
+            || text.Contains("fix conflicts", StringComparison.Ordinal))
+            return GitPullFailureKind.Diverged;
+
+        if (text.Contains("authentication failed", StringComparison.Ordinal)
+            || text.Contains("permission denied", StringComparison.Ordinal)
+            || text.Contains("could not read username", StringComparison.Ordinal)
+            || text.Contains("invalid username or password", StringComparison.Ordinal)
+            || text.Contains("access denied", StringComparison.Ordinal))
+            return GitPullFailureKind.Auth;
+
+        if (text.Contains("could not resolve host", StringComparison.Ordinal)
+            || text.Contains("connection timed out", StringComparison.Ordinal)
+            || text.Contains("connection refused", StringComparison.Ordinal)
+            || text.Contains("network is unreachable", StringComparison.Ordinal)
+            || text.Contains("failed to connect", StringComparison.Ordinal)
+            || text.Contains("unable to access", StringComparison.Ordinal))
+            return GitPullFailureKind.Network;
+
+        return GitPullFailureKind.Other;
+    }
+
+    internal static string PullFailureHeadline(GitPullFailureKind kind) => kind switch
+    {
+        GitPullFailureKind.DirtyTree => "git pull failed: local changes would be overwritten.",
+        GitPullFailureKind.Diverged => "git pull failed: the local branch has diverged from origin/main.",
+        GitPullFailureKind.Auth => "git pull failed: the remote rejected authentication.",
+        GitPullFailureKind.Network => "git pull failed: could not reach the remote.",
+        _ => "git pull failed."
+    };
+
+    internal static string PullFailureRemediation(GitPullFailureKind kind, string repoRoot) => kind switch
+    {
+        GitPullFailureKind.DirtyTree => "Re-run with botnexus update --stash to keep your changes, or --force to discard them.",
+        GitPullFailureKind.Diverged => $"Resolve manually: git -C \"{repoRoot}\" status, then merge or reset to origin/main.",
+        GitPullFailureKind.Auth => "Check your git credentials or credential helper for the origin remote.",
+        GitPullFailureKind.Network => "Check network connectivity and that the origin remote is reachable.",
+        _ => "Check network, auth, or repo path."
+    };
 
     protected virtual Task<GitPullResult> RunGitPullAsync(string repoRoot, bool verbose, CancellationToken cancellationToken)
         => RunGitPullCoreAsync(repoRoot, verbose, cancellationToken);
@@ -528,7 +1162,7 @@ internal class UpdateCommand
     {
         AnsiConsole.MarkupLine("[blue][[update]][/] Changes applied:");
         foreach (var subject in commitSubjects)
-            AnsiConsole.MarkupLine($"  - {Markup.Escape(subject)}");
+            AnsiConsole.MarkupLine($"  - {CliText.SafeDisplay(subject)}");
     }
 
     /// <summary>
@@ -713,19 +1347,34 @@ internal class UpdateCommand
 
     /// <summary>
     /// Waits until the given port is available (process released it) or timeout elapses.
-    /// Polls every 250ms for up to 15 seconds.
+    /// Polls every 250ms for up to 15 seconds. Returns true when the port became free.
+    /// Protected virtual so tests can drive both outcomes without binding a real socket.
     /// </summary>
-    private static async Task WaitForPortFreeAsync(int port, CancellationToken cancellationToken)
+    /// <remarks>
+    /// #3738: the 15-second bound is monotonic. A backwards host clock step would otherwise keep this
+    /// poll running past its bound, stalling the update's restart on a port that never frees.
+    /// </remarks>
+    protected virtual async Task<bool> WaitForPortFreeAsync(int port, CancellationToken cancellationToken)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(15);
-        while (DateTime.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
+        var elapsed = Stopwatch.StartNew();
+        while (elapsed.Elapsed < TimeSpan.FromSeconds(15) && !cancellationToken.IsCancellationRequested)
         {
             if (IsPortAvailable(port))
-                return;
+                return true;
             await Task.Delay(250, cancellationToken);
         }
-        // If still not free, proceed anyway — build may still succeed if it's a different process
+
+        return IsPortAvailable(port);
     }
+
+    /// <summary>
+    /// Whether a gateway is actually alive for this deployment. Consults the PID file first and
+    /// falls back to the same binary-path discovery <c>StopAsync</c> uses, so the skip path can
+    /// never claim "gateway left running" about a gateway that is not there (#2772).
+    /// Protected virtual so tests can state the answer without a live process.
+    /// </summary>
+    protected virtual bool IsGatewayRunning(string home, string repoRoot)
+        => _processManager.IsRunning(home, ResolveGatewayBinaryPath(repoRoot));
 
     /// <summary>
     /// Checks if a TCP port is available for binding before starting the new
@@ -734,6 +1383,116 @@ internal class UpdateCommand
     /// (issue #1536) and all CLI call sites share one implementation.
     /// </summary>
     internal static bool IsPortAvailable(int port) => ServeCommand.IsPortAvailable(port);
+
+    private static async Task<bool> HasEnabledExtensionRepositoriesAsync(string home, CancellationToken cancellationToken)
+    {
+        var registry = new ExtensionRepositoryRegistryService(
+            Path.Combine(home, "config.json"),
+            new System.IO.Abstractions.FileSystem());
+        return (await registry.ListAsync(cancellationToken)).Any(item => item.Enabled);
+    }
+
+    /// <summary>
+    /// Whether the update can return without stopping, rebuilding, deploying and restarting the
+    /// gateway. See the call site in <c>ExecuteAsync</c> for the full reasoning; in short this
+    /// returns true only for unchanged clean source and a matching successful deployment receipt.
+    /// Every uncertain case forces reconciliation.
+    /// </summary>
+    protected virtual async Task<bool> CanSkipRebuildAsync(string repoRoot, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // The pull step records whether HEAD moved. If it did, always build.
+        if (!LastPullWasNoOp)
+            return false;
+
+        // An unreadable or dirty working tree means uncommitted source could be waiting to be
+        // compiled into the deployed binary. Build.
+        var status = await GetWorkingTreeCleanlinessAsync(repoRoot, cancellationToken);
+        if (status != WorkingTreeCleanliness.Clean)
+            return false;
+
+        return await UpdateDeploymentIdentity.MatchesAsync(
+            ResolveGatewayBinaryPath(repoRoot), GetCommitSha(repoRoot), cancellationToken);
+    }
+
+    /// <summary>
+    /// Path of the gateway assembly that <c>RunRestartAsync</c> launches. Centralised so the
+    /// skip decision and the start decision can never disagree about which file matters.
+    /// </summary>
+    internal static string ResolveGatewayBinaryPath(string repoRoot)
+        => Path.Combine(repoRoot, "src", "gateway", "BotNexus.Gateway.Api", "bin", "Release", "net10.0", "BotNexus.Gateway.Api.dll");
+
+    /// <summary>
+    /// Set by the pull step: true only when <c>git pull</c> succeeded AND HEAD did not move.
+    /// Defaults to <c>false</c> so a code path that never ran the pull step cannot accidentally
+    /// be treated as "nothing changed".
+    /// </summary>
+    protected bool LastPullWasNoOp { get; set; }
+
+    /// <summary>Tri-state working-tree result; anything other than Clean forces a build.</summary>
+    internal enum WorkingTreeCleanliness
+    {
+        /// <summary>git status succeeded and reported no tracked modifications or untracked files.</summary>
+        Clean,
+
+        /// <summary>git status succeeded and reported tracked modifications or untracked files.</summary>
+        Dirty,
+
+        /// <summary>git status could not be read at all; treated as dirty.</summary>
+        Unknown
+    }
+
+    /// <summary>
+    /// Reads source cleanliness for deployment identity, independently of pull/stash rules.
+    /// SDK projects can include untracked source files. Without a safe include policy, every
+    /// untracked file, tracked modification and failure to read status prevents verification.
+    /// Delegates to <see cref="GetWorkingTreeStatusAsync"/> so there is exactly ONE git-status
+    /// implementation: a second parser would be free to drift from the dirty/untracked split the
+    /// pull path already depends on.
+    /// Protected virtual so tests can script the answer without a real repository.
+    /// </summary>
+    protected virtual async Task<WorkingTreeCleanliness> GetWorkingTreeCleanlinessAsync(string repoRoot, CancellationToken cancellationToken)
+    {
+        var status = await GetWorkingTreeStatusAsync(repoRoot, cancellationToken);
+        if (status.WasCanceled || status.ExitCode != 0)
+            return WorkingTreeCleanliness.Unknown;
+
+        return status.DirtyPaths.Count == 0 && status.UntrackedPaths.Count == 0
+            ? WorkingTreeCleanliness.Clean
+            : WorkingTreeCleanliness.Dirty;
+    }
+
+    /// <summary>How uncommitted changes in the deployment repo should be handled before pulling.</summary>
+    internal enum DirtyTreeMode
+    {
+        /// <summary>Do not touch the user's work; report and exit non-zero.</summary>
+        Abort,
+        /// <summary>Save the work to a named, reported, recoverable stash and continue.</summary>
+        Stash,
+        /// <summary>Explicitly discard tracked-file changes and continue.</summary>
+        Force
+    }
+
+    /// <summary>Classification of a <c>git pull</c> failure, used to pick a remediation message.</summary>
+    internal enum GitPullFailureKind
+    {
+        DirtyTree,
+        Diverged,
+        Auth,
+        Network,
+        Other
+    }
+
+    /// <summary>
+    /// Parsed <c>git status --porcelain</c> result. <paramref name="DirtyPaths"/> are changes that
+    /// would block a pull; <paramref name="UntrackedPaths"/> are reported but never block.
+    /// </summary>
+    internal readonly record struct GitStatusResult(
+        int ExitCode,
+        IReadOnlyList<string> DirtyPaths,
+        IReadOnlyList<string> UntrackedPaths,
+        string? FailureDetail,
+        bool WasCanceled);
 
     internal readonly record struct GitPullResult(int ExitCode, string? FailureDetail, bool WasCanceled);
     internal readonly record struct GitCommandResult(int ExitCode, string? FailureDetail, bool WasCanceled);

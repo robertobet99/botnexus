@@ -12,7 +12,7 @@ The Process Tool enables agents to manage background processes that were started
 
 ## Capabilities
 
-- List all tracked background processes
+- List the launching agent's tracked background processes
 - Check process status (running, exited, exit code)
 - Read process output (stdout + stderr, with tail support)
 - Send input to a process's stdin
@@ -26,21 +26,27 @@ The Process Tool enables agents to manage background processes that were started
 | `pid` | integer | Conditional | Process ID. Required for `status`, `output`, `input`, and `kill`. |
 | `content` | string | Conditional | Content to send to stdin (for `input` action). |
 | `tail` | integer | No | Number of lines from end of output (for `output` action). Default: 50. Values above the configured ceiling (`MaxTail`, default 10,000) are clamped; `tail <= 0` still returns the full captured buffer. |
-| `timeout` | integer | No | For `status` action: wait up to N ms for the process to produce output. Default: 0 (no wait). |
+| `timeoutMs` | integer | No | For `status` action: wait up to N **milliseconds** for process exit and output capture to reach a terminal outcome. Default: 0 (no wait). |
+| `timeout` | integer | No | **Deprecated** alias for `timeoutMs`, interpreted as milliseconds. Use `timeoutMs` instead; the alias is retained for one release. |
 
 ## Actions
 
 ### `list`
 
-Returns all tracked background processes with their PIDs, commands, and running state.
+Returns the launching agent's tracked background processes with their PIDs, commands, and running state.
 
 ### `status`
 
-Returns whether a process is running or exited, its exit code (if exited), and duration. Optionally waits for output with a timeout.
+Returns whether a process is running or exited, its exit code (if exited), and output-capture state. Optionally waits for process exit and both redirected streams to reach a terminal outcome.
+
+> **Unit note.** `timeoutMs` is milliseconds, unlike the `shell` and `watch_file` tools whose `timeout`
+> argument is seconds. The argument was renamed so the unit is unambiguous from the name: the agent
+> runtime previously inferred seconds from the bare name `timeout`, which inflated this tool's
+> cancellation budget by 1000x (issue #2955). Each tool now declares its own unit to the executor.
 
 ### `output`
 
-Returns the most recent output from a process. Use `tail` to limit the number of lines returned.
+Returns the most recent output from a process. Use `tail` to limit the number of lines returned. If either redirected stream cannot be fully drained, the response retains captured bytes and begins with a stable `output capture incomplete` diagnostic rather than presenting partial data as complete.
 
 ### `input`
 
@@ -48,7 +54,7 @@ Writes content to a process's stdin. Useful for interactive processes expecting 
 
 ### `kill`
 
-Terminates a running process and its entire process tree.
+Requests termination of the process tree and reports whether termination was confirmed within the grace period.
 
 ## Configuration
 
@@ -73,7 +79,7 @@ Captured output is bounded two ways:
 {
   "action": "status",
   "pid": 12345,
-  "timeout": 5000
+  "timeoutMs": 5000
 }
 ```
 
@@ -105,10 +111,15 @@ Captured output is bounded two ways:
 
 ## Behavior Notes
 
-- The Process Tool shares its process registry with the Exec Tool — it only manages processes started via `exec` with `background: true`.
-- Process output is buffered in memory. Very long-running processes may accumulate significant output.
-- The `kill` action terminates the entire process tree, not just the root process.
-- Process state persists within a session but does not survive gateway restarts.
+- The Process Tool shares its process registry with the Exec Tool. It manages only processes started via `exec` with `background: true` by the same agent; it never attaches to an unrelated operating-system process.
+- `No tracked process` means that the PID is absent or not owned by the calling agent. It is not proof that the command never ran or that its operating-system process has died.
+- Process output is buffered in memory with the bounds described above.
+- Normal end-of-stream is reported as complete. An unexpected read failure is distinguished from a stream closed during cleanup; either condition marks output capture incomplete while preserving bytes already captured.
+- Capture failure still reaches a terminal lifecycle state, so completed-entry retention remains bounded. Running roots and ordinary pending drains remain protected from reaping.
+- If an unconfirmed tree kill is followed by root exit, status, list, output, and repeated kill requests report **termination unresolved** and require operator intervention. Root exit does not prove descendants stopped. Cleanup releases the OS handle, stdin, and redirected streams, cancels held drains without waiting for descendants, and preserves captured output with an incomplete-capture diagnostic. This is not successful completion.
+- Exited unresolved diagnostics count towards the shared retention cap of 100 entries, oldest first. Eviction or explicit cleanup does not confirm termination. Only an unconfirmed kill whose root is still running remains pinned and retryable through its owned handle; an exited root is never reattached by PID.
+- The `kill` action requests termination of the entire process tree and reports whether termination was confirmed within the grace period.
+- Process state is owned by the agent within the running gateway and does not survive gateway restarts.
 
 ## Related
 

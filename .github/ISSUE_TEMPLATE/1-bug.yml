@@ -1,0 +1,121 @@
+name: 'Bug'
+description: 'Something is broken.'
+labels: [type:bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Bug** — Something is broken.
+        Use a title such as [Portal] describe the problem or outcome. Required fields are enforced by this form; API clients must validate them too.
+        Search existing issues before filing. Never include secrets or private infrastructure details. Report exploitable vulnerabilities through the private security link instead.
+        Agents with the issue-creation skill: use `New-BotNexusIssue.ps1 -Action template -Type type:bug` instead of this form.
+  - type: textarea
+    id: summary
+    attributes:
+      label: 'Summary'
+      description: 'Explain the problem and wanted outcome in two or three short sentences. Use plain language; define technical terms. Do not repeat the title.'
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 'Evidence'
+      description: 'Give numbered reproduction steps or the exact failing test, error, or sanitized log signature. Include actual results, frequency, and the public source revision when known. Distinguish observed facts, source analysis, and unverified reports. If not reproduced, say so.'
+    validations:
+      required: true
+  - type: textarea
+    id: expected_behaviour
+    attributes:
+      label: 'Expected behaviour'
+      description: 'What should happen instead. Without this, ''broken'' is an opinion.'
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 'Environment'
+      description: 'BotNexus version or commit, operating system, and relevant provider, channel, browser, SDK, or dependency version. Separate the affected installation from a test environment. Omit secrets and private infrastructure details.'
+    validations:
+      required: false
+  - type: textarea
+    id: regression_context
+    attributes:
+      label: 'Regression context'
+      description: 'Did this work before? Give a last known good version or suspected change only when supported by evidence. Otherwise say unknown. Record frequency and whether a retry changes the result; a retry is not proof of a repair.'
+    validations:
+      required: false
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: 'Root cause'
+      description: 'The mechanism, if known - which layer is wrong and why. Say so if you have NOT diagnosed it; a guess asserted as fact is worse than an admission. Verify the premise against source before asserting it.'
+    validations:
+      required: false
+  - type: textarea
+    id: impact
+    attributes:
+      label: 'Impact'
+      description: 'Who or what is affected, and how often. Drives priority.'
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_fix
+    attributes:
+      label: 'Proposed fix'
+      description: 'Only if you have a specific one. Name the seam it should reuse.'
+    validations:
+      required: false
+  - type: textarea
+    id: example
+    attributes:
+      label: 'Example'
+      description: 'Optional short user scenario: what someone tries, what happens now, and the wanted outcome. Use fictional names and synthetic data, not private systems or identifiers.'
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: 'Acceptance criteria'
+      description: 'Numbered, independently checkable outcomes. Say what evidence proves each one: a named test, command result, reviewed document, or recorded decision. Separate required outcomes from suggestions. Close only when all required outcomes are verified.'
+      placeholder: |
+        1. First independently checkable clause
+        2. Second clause
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: 'Validation plan'
+      description: 'Name tests, commands, or review evidence that will prove the acceptance criteria. Include failure and boundary cases where relevant. Distinguish planned checks from results already observed; do not claim a test ran when it did not.'
+    validations:
+      required: false
+  - type: textarea
+    id: files
+    attributes:
+      label: 'Files'
+      description: 'Known public repository paths and symbols, one per line. State what you checked against current source and what remains unverified. Do not include private machine paths.'
+    validations:
+      required: false
+  - type: textarea
+    id: related
+    attributes:
+      label: 'Related'
+      description: 'Link related issues and PRs. Identify parent, children, duplicates, blocked-by issues, and required decisions or external prerequisites explicitly. A related link alone does not mean blocked.'
+    validations:
+      required: false
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: 'Optional. Leave blank if unsure. Explain high or critical priority using the impact evidence; do not infer urgency from the issue type.'
+      options: [priority:critical, priority:high, priority:medium, priority:low]
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options: [area:platform, area:channels, area:portal, area:mobile, area:security, area:tooling, area:testing, area:trailguide]
+    validations:
+      required: false

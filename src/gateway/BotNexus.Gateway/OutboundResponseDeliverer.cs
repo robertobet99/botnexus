@@ -27,10 +27,17 @@ internal sealed class OutboundResponseDeliverer(
     /// Channel types that are not deliverable (no adapter exists by design).
     /// Fan-out skips these silently at DEBUG level instead of logging a WARNING.
     /// </summary>
+    /// <remarks>
+    /// <c>webhook</c> belongs here because webhook responses are delivered by the webhook
+    /// subsystem itself via <c>WebhookResponseMode</c> (async / sync / callback), so no channel
+    /// adapter is ever registered for it (#3167). Without the entry, every webhook turn logged
+    /// two WARNINGs and drowned out genuine adapter-outage warnings, which use the same message.
+    /// </remarks>
     internal static readonly HashSet<string> NonDeliverableChannels = new(StringComparer.OrdinalIgnoreCase)
     {
         "cron",
-        "exchange"
+        "exchange",
+        "webhook"
     };
 
     internal static bool IsNonDeliverableChannel(ChannelKey channelType) =>
@@ -84,7 +91,7 @@ internal sealed class OutboundResponseDeliverer(
     {
         try
         {
-            // Cron sessions create conversation bindings with channel type "cron" which
+            // Cron / exchange / webhook sessions create conversation bindings whose channel type
             // has no registered adapter (by design). Skip silently to avoid log noise.
             if (IsNonDeliverableChannel(binding.ChannelType))
             {
@@ -105,12 +112,40 @@ internal sealed class OutboundResponseDeliverer(
                 return;
             }
 
+            // #3518: ask an address-aware adapter whether this binding is deliverable at all
+            // BEFORE building an envelope. A Service Bus binding created by the gateway is
+            // addressed by AGENT ID, which is a session-routing key and never an external wire
+            // address; the adapter's fail-closed #2815 guard then throws once per turn and the
+            // reply is silently lost. Asking first turns a per-turn ERROR into one DEBUG skip.
+            // Adapters that do not implement the probe are treated as always addressable.
+            if (adapter is IAddressableChannelAdapter addressable
+                && !addressable.CanDeliverTo(binding.ChannelAddress, out var undeliverableReason))
+            {
+                _logger.LogDebug(
+                    "Fan-out: skipping binding {BindingId} on {ChannelType} - {Reason}.",
+                    binding.BindingId, binding.ChannelType, undeliverableReason);
+                return;
+            }
+
             await adapter.SendAsync(new OutboundMessage
             {
                 ChannelType = binding.ChannelType,
                 ChannelAddress = binding.ChannelAddress,
                 Content = content,
                 SessionId = sessionId.Value,
+                // #3181: stamp the conversation this fan-out belongs to. Without it every
+                // envelope reached the adapter with ConversationId unset, so the Service Bus
+                // #2815 validity guard fell through its precedence chain to ChannelAddress -
+                // the AGENT ID for a gateway-created binding - and correctly refused to emit
+                // a message certain to dead-letter. The conversation was already in hand as a
+                // parameter; it was simply never wired onto the message.
+                //
+                // Null (not string.Empty) when uninitialized: OutboundMessage.ConversationId
+                // is an opt-in routing key whose consumers test `is { Length: > 0 }`, so an
+                // empty string would be an indistinguishable-but-present value that defeats
+                // that check. Calling .Value on a default-constructed Vogen struct throws,
+                // so the guard is load-bearing rather than defensive tidiness.
+                ConversationId = conversationId.IsInitialized() ? conversationId.Value : null,
                 // Binding-aware fields: let the adapter render prefix decoration when
                 // configured. Native sub-addresses (e.g. Telegram forum topics) are
                 // already encoded in ChannelAddress by the originating adapter.

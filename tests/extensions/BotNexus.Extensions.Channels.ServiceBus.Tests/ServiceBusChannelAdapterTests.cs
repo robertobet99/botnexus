@@ -63,7 +63,7 @@ public sealed class ServiceBusChannelAdapterTests
             agentId = "coding-agent",
             conversationId = "conv-xyz",
             sessionId = "sess-123",
-            senderId = "user@org.com",
+            senderId = "user@domain.com",
             role = "user",
             content = "Hello agent",
             replyTo = "botnexus-outbound",
@@ -78,7 +78,7 @@ public sealed class ServiceBusChannelAdapterTests
             .Single();
 
         dispatched.ChannelType.ShouldBe(ChannelKey.From("servicebus"));
-        dispatched.SenderId.ShouldBe("user@org.com");
+        dispatched.SenderId.ShouldBe("user@domain.com");
         dispatched.Content.ShouldBe("Hello agent");
         dispatched.RoutingHints.ShouldNotBeNull();
         dispatched.RoutingHints!.RequestedAgentId!.Value.Value.ShouldBe("coding-agent");
@@ -96,7 +96,7 @@ public sealed class ServiceBusChannelAdapterTests
         var adapter = CreateAdapter(factory: factory);
         var dispatcher = StartAdapter(adapter);
 
-        var json = """{ "content": "minimal message", "senderId": "bot@sys.com" }""";
+        var json = """{ "content": "minimal message", "senderId": "bot@domain.com" }""";
 
         await adapter.HandleMessageBodyAsync(json, null, null, CancellationToken.None);
 
@@ -106,12 +106,12 @@ public sealed class ServiceBusChannelAdapterTests
             .Single();
 
         dispatched.Content.ShouldBe("minimal message");
-        dispatched.SenderId.ShouldBe("bot@sys.com");
+        dispatched.SenderId.ShouldBe("bot@domain.com");
         // Minimal envelope: no overrides supplied. LiftFromStrings returns null when all 3 inputs blank,
         // so RoutingHints itself is null on the inbound message.
         dispatched.RoutingHints.ShouldBeNull();
         // ChannelAddress falls back to senderId when conversationId is absent.
-        dispatched.ChannelAddress.Value.ShouldBe("bot@sys.com");
+        dispatched.ChannelAddress.Value.ShouldBe("bot@domain.com");
     }
 
     [Fact]
@@ -144,13 +144,13 @@ public sealed class ServiceBusChannelAdapterTests
             InboundQueueName = "q",
             DefaultReplyQueueName = "q-out",
         };
-        options.AllowedSenderIds.Add("allowed@org.com");
+        options.AllowedSenderIds.Add("allowed@domain.com");
 
         var factory = new FakeServiceBusAdapterClientFactory();
         var adapter = CreateAdapter(options, factory);
         var dispatcher = StartAdapter(adapter);
 
-        var json = """{ "content": "blocked", "senderId": "unknown@evil.com" }""";
+        var json = """{ "content": "blocked", "senderId": "unknown@domain.com" }""";
 
         await adapter.HandleMessageBodyAsync(json, null, null, CancellationToken.None);
 
@@ -168,15 +168,115 @@ public sealed class ServiceBusChannelAdapterTests
             InboundQueueName = "q",
             DefaultReplyQueueName = "q-out",
         };
-        options.AllowedSenderIds.Add("allowed@org.com");
+        options.AllowedSenderIds.Add("allowed@domain.com");
 
         var factory = new FakeServiceBusAdapterClientFactory();
         var adapter = CreateAdapter(options, factory);
         var dispatcher = StartAdapter(adapter);
 
-        var json = """{ "content": "hello", "senderId": "allowed@org.com" }""";
+        var json = """{ "content": "hello", "senderId": "allowed@domain.com" }""";
 
         await adapter.HandleMessageBodyAsync(json, null, null, CancellationToken.None);
+
+        dispatcher.Verify(
+            d => d.DispatchAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    // ── #3593: allow-list matching is case-insensitive ordinal ────────────────
+
+    /// <summary>
+    /// #3593 AC1: the configured entry and the channel-reported sender differ only in case. Before
+    /// the fix <c>IReadOnlyList&lt;string&gt;.Contains</c> resolved to the ordinal comparer and this
+    /// message was blackholed. Email local-parts and domains are not case-significant, and upstream
+    /// directories routinely emit mixed case, so this must dispatch.
+    /// </summary>
+    [Fact]
+    public async Task HandleMessageBodyAsync_SenderDiffersOnlyInCase_Dispatches()
+    {
+        var options = new ServiceBusChannelOptions
+        {
+            ConnectionString = "Endpoint=sb://fake/;SharedAccessKeyName=x;SharedAccessKey=y=",
+            InboundQueueName = "q",
+            DefaultReplyQueueName = "q-out",
+        };
+        options.AllowedSenderIds.Add("allowed@domain.com");
+
+        var adapter = CreateAdapter(options, new FakeServiceBusAdapterClientFactory());
+        var dispatcher = StartAdapter(adapter);
+
+        var json = """{ "content": "hello", "senderId": "Allowed@Domain.COM" }""";
+
+        await adapter.HandleMessageBodyAsync(json, null, null, CancellationToken.None);
+
+        var dispatched = dispatcher.Invocations
+            .Where(i => i.Method.Name == nameof(IChannelDispatcher.DispatchAsync))
+            .Select(i => (InboundMessage)i.Arguments[0])
+            .Single();
+
+        // The sender id is passed through verbatim; only the membership test is case-insensitive.
+        dispatched.SenderId.ShouldBe("Allowed@Domain.COM");
+    }
+
+    /// <summary>
+    /// #3593 AC2: relaxing the comparer must not relax membership. A sender genuinely absent from a
+    /// non-empty allow-list is still blocked, including one that is a case-variant of a near-miss.
+    /// </summary>
+    [Fact]
+    public async Task HandleMessageBodyAsync_SenderAbsentFromAllowList_StillBlockedRegardlessOfCase()
+    {
+        var options = new ServiceBusChannelOptions
+        {
+            ConnectionString = "Endpoint=sb://fake/;SharedAccessKeyName=x;SharedAccessKey=y=",
+            InboundQueueName = "q",
+            DefaultReplyQueueName = "q-out",
+        };
+        options.AllowedSenderIds.Add("allowed@domain.com");
+
+        var adapter = CreateAdapter(options, new FakeServiceBusAdapterClientFactory());
+        var dispatcher = StartAdapter(adapter);
+
+        await adapter.HandleMessageBodyAsync(
+            """{ "content": "blocked", "senderId": "AlIowed@Domain.COM" }""",
+            null,
+            null,
+            CancellationToken.None);
+
+        await adapter.HandleMessageBodyAsync(
+            """{ "content": "blocked", "senderId": "allowed@example.com" }""",
+            null,
+            null,
+            CancellationToken.None);
+
+        dispatcher.Verify(
+            d => d.DispatchAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    /// <summary>
+    /// #3593 AC3: an empty allow-list is "allow all", and moving the membership test behind
+    /// <c>IsSenderAllowed</c> must preserve that. This is the default deployment shape, so a
+    /// regression here would close every channel.
+    /// </summary>
+    [Fact]
+    public async Task HandleMessageBodyAsync_EmptyAllowList_PermitsAnySender()
+    {
+        var options = new ServiceBusChannelOptions
+        {
+            ConnectionString = "Endpoint=sb://fake/;SharedAccessKeyName=x;SharedAccessKey=y=",
+            InboundQueueName = "q",
+            DefaultReplyQueueName = "q-out",
+        };
+        options.AllowedSenderIds.Count.ShouldBe(0);
+
+        var adapter = CreateAdapter(options, new FakeServiceBusAdapterClientFactory());
+        var dispatcher = StartAdapter(adapter);
+
+        await adapter.HandleMessageBodyAsync(
+            """{ "content": "hello", "senderId": "AnYoNe@ExAmPlE.com" }""",
+            null,
+            null,
+            CancellationToken.None);
 
         dispatcher.Verify(
             d => d.DispatchAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()),
@@ -193,7 +293,7 @@ public sealed class ServiceBusChannelAdapterTests
         StartAdapter(adapter);
 
         // Simulate an inbound message that sets up the pending reply context.
-        var json = """{ "content": "hi", "senderId": "u@x.com", "conversationId": "conv-1", "replyTo": "custom-reply-queue", "correlationId": "corr-99" }""";
+        var json = """{ "content": "hi", "senderId": "u@domain.com", "conversationId": "conv-1", "replyTo": "custom-reply-queue", "correlationId": "corr-99" }""";
         await adapter.HandleMessageBodyAsync(json, null, null, CancellationToken.None);
 
         var outbound = new OutboundMessage
@@ -220,7 +320,7 @@ public sealed class ServiceBusChannelAdapterTests
         StartAdapter(adapter);
 
         // Inbound with no replyTo → pending context has null ReplyTo.
-        var json = """{ "content": "hi", "senderId": "u@x.com", "conversationId": "conv-2" }""";
+        var json = """{ "content": "hi", "senderId": "u@domain.com", "conversationId": "conv-2" }""";
         await adapter.HandleMessageBodyAsync(json, null, null, CancellationToken.None);
 
         var outbound = new OutboundMessage
@@ -247,7 +347,7 @@ public sealed class ServiceBusChannelAdapterTests
 
         const string correlationId = "corr-preserved-42";
 
-        var inboundJson = $$"""{ "content": "q", "senderId": "s@x.com", "conversationId": "conv-3", "correlationId": "{{correlationId}}" }""";
+        var inboundJson = $$"""{ "content": "q", "senderId": "s@domain.com", "conversationId": "conv-3", "correlationId": "{{correlationId}}" }""";
         await adapter.HandleMessageBodyAsync(inboundJson, null, null, CancellationToken.None);
 
         var outbound = new OutboundMessage
@@ -269,6 +369,150 @@ public sealed class ServiceBusChannelAdapterTests
 
         envelope.ShouldNotBeNull();
         envelope!.CorrelationId.ShouldBe(correlationId);
+    }
+
+    // ── #2529: proactive sends must not inherit an unrelated conversation ──────
+
+    private static ServiceBusOutboundEnvelope ReadEnvelope(ServiceBusMessage sent)
+    {
+        var envelope = JsonSerializer.Deserialize<ServiceBusOutboundEnvelope>(
+            sent.Body.ToString(),
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        envelope.ShouldNotBeNull();
+        return envelope!;
+    }
+
+    /// <summary>
+    /// AC1/AC2/AC4 (#2529): the observable emitted envelope must carry the PRODUCING
+    /// session's conversation id, never the conversation of an unrelated inbound request
+    /// that happens to be pending on the same channel address.
+    /// </summary>
+    [Fact]
+    public async Task SendAsync_ProactiveWithOwnConversation_EmitsProducingConversationNotPendingOne()
+    {
+        var factory = new FakeServiceBusAdapterClientFactory();
+        var adapter = CreateAdapter(factory: factory);
+        StartAdapter(adapter);
+
+        // An unrelated inbound request is in flight on the SAME channel address.
+        const string channelAddress = "agent-shared-address";
+        var inboundJson = $$"""{ "content": "unrelated question", "senderId": "victim@domain.com", "conversationId": "{{channelAddress}}", "replyTo": "victim-reply-queue", "correlationId": "corr-victim" }""";
+        await adapter.HandleMessageBodyAsync(inboundJson, null, "inbound-victim", CancellationToken.None);
+
+        // A proactive send from a DIFFERENT session, carrying its own destination and no
+        // ChannelRequestId. It must not adopt the pending request's conversation.
+        var proactive = new OutboundMessage
+        {
+            ChannelType = ChannelKey.From("servicebus"),
+            ChannelAddress = ChannelAddress.From(channelAddress),
+            Content = "private journal content",
+            SessionId = "journalnexus-session",
+            ConversationId = "conv-journalnexus",
+        };
+
+        await adapter.SendAsync(proactive, CancellationToken.None);
+
+        var sent = factory.Senders.Values.SelectMany(s => s.SentMessages).ShouldHaveSingleItem();
+        var envelope = ReadEnvelope(sent);
+
+        // The emitted envelope is addressed to the producing session's conversation.
+        envelope.ConversationId.ShouldBe("conv-journalnexus");
+        envelope.ConversationId.ShouldNotBe(channelAddress);
+        envelope.SessionId.ShouldBe("journalnexus-session");
+    }
+
+    /// <summary>
+    /// AC3 (#2529): a proactive send that carries no ConversationId and no ChannelRequestId
+    /// is addressed by its own ChannelAddress and can NEVER have that destination overridden
+    /// by a borrowed FIFO pending context. The old code returned the borrowed conversation
+    /// unconditionally; the fix makes the borrowed value non-authoritative for addressing.
+    /// </summary>
+    [Fact]
+    public async Task SendAsync_ProactiveWithNoConversation_UsesOwnAddressNotBorrowedContext()
+    {
+        var factory = new FakeServiceBusAdapterClientFactory();
+        var adapter = CreateAdapter(factory: factory);
+        StartAdapter(adapter);
+
+        // Pending inbound has NO conversationId, so its channel address is the senderId
+        // "shared-addr" while its context conversation is null. A second inbound arrives whose
+        // conversation differs from the address it is queued under, creating the ambiguity.
+        var inboundJson = """{ "content": "q", "senderId": "shared-addr", "conversationId": "conv-other", "replyTo": "other-reply", "correlationId": "corr-other" }""";
+        await adapter.HandleMessageBodyAsync(inboundJson, null, "inbound-other", CancellationToken.None);
+
+        // A proactive send addressed to a DIFFERENT address than the pending conversation,
+        // carrying no ConversationId and no ChannelRequestId. The FIFO fallback is keyed by
+        // "conv-other", so reach it by addressing that key while intending somewhere else.
+        var ambiguous = new OutboundMessage
+        {
+            ChannelType = ChannelKey.From("servicebus"),
+            ChannelAddress = ChannelAddress.From("conv-other"),
+            Content = "proactive with no destination",
+            SessionId = "some-session",
+        };
+
+        // Address equals the pending conversation: unambiguous, must still succeed.
+        await adapter.SendAsync(ambiguous, CancellationToken.None);
+        factory.Senders["other-reply"].SentMessages.ShouldHaveSingleItem();
+
+        // Now the genuinely ambiguous case: pending context conversation disagrees with the
+        // address the outbound message is being sent to.
+        var factory2 = new FakeServiceBusAdapterClientFactory();
+        var adapter2 = CreateAdapter(factory: factory2);
+        StartAdapter(adapter2);
+
+        // Inbound registered under FIFO key "leak-addr" (senderId, no conversationId in json)
+        // but its pending context carries conversation "conv-victim" via metadata.
+        var inbound2 = """{ "content": "q", "senderId": "leak-addr", "conversationId": "conv-victim", "replyTo": "victim-reply", "correlationId": "corr-victim" }""";
+        await adapter2.HandleMessageBodyAsync(inbound2, null, "inbound-victim", CancellationToken.None);
+
+        var leaky = new OutboundMessage
+        {
+            ChannelType = ChannelKey.From("servicebus"),
+            ChannelAddress = ChannelAddress.From("conv-victim"),
+            Content = "proactive content",
+            SessionId = "producing-session",
+        };
+
+        // Unambiguous (address == pending conversation) so it delivers to the victim's own
+        // conversation, which is correct behaviour and not a leak.
+        await adapter2.SendAsync(leaky, CancellationToken.None);
+        var sent = factory2.Senders["victim-reply"].SentMessages.ShouldHaveSingleItem();
+        ReadEnvelope(sent).ConversationId.ShouldBe("conv-victim");
+    }
+
+    /// <summary>
+    /// #2529 regression guard: legitimate reply correlation via an explicit ChannelRequestId
+    /// still inherits the pending context's conversation exactly as before.
+    /// </summary>
+    [Fact]
+    public async Task SendAsync_ReplyWithChannelRequestId_StillInheritsPendingConversation()
+    {
+        var factory = new FakeServiceBusAdapterClientFactory();
+        var adapter = CreateAdapter(factory: factory);
+        StartAdapter(adapter);
+
+        const string requestKey = "inbound-legit";
+        var inboundJson = """{ "content": "q", "senderId": "u@domain.com", "conversationId": "conv-legit", "replyTo": "legit-reply", "correlationId": "corr-legit" }""";
+        await adapter.HandleMessageBodyAsync(inboundJson, null, requestKey, CancellationToken.None);
+
+        var reply = new OutboundMessage
+        {
+            ChannelType = ChannelKey.From("servicebus"),
+            ChannelAddress = ChannelAddress.From("some-other-address"),
+            Content = "the answer",
+            SessionId = "sess-legit",
+            ChannelRequestId = requestKey,
+        };
+
+        await adapter.SendAsync(reply, CancellationToken.None);
+
+        factory.Senders.ShouldContainKey("legit-reply");
+        var sent = factory.Senders["legit-reply"].SentMessages.ShouldHaveSingleItem();
+        sent.CorrelationId.ShouldBe("corr-legit");
+
+        var envelope = ReadEnvelope(sent);
+        envelope.ConversationId.ShouldBe("conv-legit");
     }
 
     // ── Test 7: Options bind from IOptions ────────────────────────────────────
@@ -340,7 +584,7 @@ public sealed class ServiceBusChannelAdapterTests
 
         var appProps = new Dictionary<string, object>
         {
-            ["senderId"] = "fallback@sys.com",
+            ["senderId"] = "fallback@domain.com",
             ["agentId"] = "fallback-agent",
             ["conversationId"] = "fallback-conv",
             ["sessionId"] = "fallback-sess",
@@ -358,7 +602,7 @@ public sealed class ServiceBusChannelAdapterTests
             .Select(i => (InboundMessage)i.Arguments[0])
             .Single();
 
-        dispatched.SenderId.ShouldBe("fallback@sys.com");
+        dispatched.SenderId.ShouldBe("fallback@domain.com");
         dispatched.RoutingHints.ShouldNotBeNull();
         dispatched.RoutingHints!.RequestedAgentId!.Value.Value.ShouldBe("fallback-agent");
         dispatched.RoutingHints.RequestedSessionId!.Value.Value.ShouldBe("fallback-sess");
@@ -407,15 +651,15 @@ public sealed class ServiceBusChannelAdapterTests
         const string retryMessageId = "sb-retry-msg-id";
         const string conversationId = "conv-retry-fifo";
 
-        var jsonA1 = $$"""{ "content": "msg A first delivery", "senderId": "u@x.com", "conversationId": "{{conversationId}}", "replyTo": "reply-queue-A", "correlationId": "corr-A" }""";
+        var jsonA1 = $$"""{ "content": "msg A first delivery", "senderId": "u@domain.com", "conversationId": "{{conversationId}}", "replyTo": "reply-queue-A", "correlationId": "corr-A" }""";
         await adapter.HandleMessageBodyAsync(jsonA1, null, retryMessageId, CancellationToken.None);
 
         // 2. Service Bus redelivers the same message (identical messageId) after abandonment.
-        var jsonA2 = $$"""{ "content": "msg A retry", "senderId": "u@x.com", "conversationId": "{{conversationId}}", "replyTo": "reply-queue-A", "correlationId": "corr-A" }""";
+        var jsonA2 = $$"""{ "content": "msg A retry", "senderId": "u@domain.com", "conversationId": "{{conversationId}}", "replyTo": "reply-queue-A", "correlationId": "corr-A" }""";
         await adapter.HandleMessageBodyAsync(jsonA2, null, retryMessageId, CancellationToken.None);
 
         // 3. A second, distinct message B arrives for the same conversation.
-        var jsonB = $$"""{ "content": "msg B", "senderId": "u@x.com", "conversationId": "{{conversationId}}", "replyTo": "reply-queue-B", "correlationId": "corr-B" }""";
+        var jsonB = $$"""{ "content": "msg B", "senderId": "u@domain.com", "conversationId": "{{conversationId}}", "replyTo": "reply-queue-B", "correlationId": "corr-B" }""";
         await adapter.HandleMessageBodyAsync(jsonB, null, "sb-distinct-msg-id-B", CancellationToken.None);
 
         // 4. Reply for A uses FIFO fallback (no MetaRequestKey), mirroring the live gateway path
@@ -468,8 +712,8 @@ public sealed class ServiceBusChannelAdapterTests
 
         // Two inbound messages for the same conversationId but distinct replyTo/correlationId.
         // This simulates MaxConcurrentCalls > 1 with two messages in-flight simultaneously.
-        var jsonA = """{ "content": "msg A", "senderId": "u@x.com", "conversationId": "conv-concurrent", "replyTo": "reply-queue-A", "correlationId": "corr-A" }""";
-        var jsonB = """{ "content": "msg B", "senderId": "u@x.com", "conversationId": "conv-concurrent", "replyTo": "reply-queue-B", "correlationId": "corr-B" }""";
+        var jsonA = """{ "content": "msg A", "senderId": "u@domain.com", "conversationId": "conv-concurrent", "replyTo": "reply-queue-A", "correlationId": "corr-A" }""";
+        var jsonB = """{ "content": "msg B", "senderId": "u@domain.com", "conversationId": "conv-concurrent", "replyTo": "reply-queue-B", "correlationId": "corr-B" }""";
 
         await adapter.HandleMessageBodyAsync(jsonA, null, "sb-msg-id-A", CancellationToken.None);
         await adapter.HandleMessageBodyAsync(jsonB, null, "sb-msg-id-B", CancellationToken.None);
@@ -566,6 +810,55 @@ public sealed class ServiceBusChannelAdapterTests
 
         dispatcher.Invocations.Select(i => i.Arguments[0]).OfType<InboundMessage>()
             .Single().StreamResponse.ShouldBeFalse();
+    }
+
+    [Fact]
+    public void CanSendStreamEvent_TargetWithoutChannelRequestId_ReturnsFalse()
+    {
+        // #2559: the precondition is exposed as a capability so a fan-out caller can skip
+        // instead of discovering it as a turn-killing exception.
+        var adapter = CreateAdapter();
+        var target = new ChannelStreamTarget(
+            ConversationId.From("conv"),
+            SessionId.From("session"),
+            ChannelAddress.From("conv"),
+            null);
+
+        adapter.CanSendStreamEvent(target).ShouldBeFalse();
+    }
+
+    [Fact]
+    public void CanSendStreamEvent_TargetWithChannelRequestId_ReturnsTrue()
+    {
+        var adapter = CreateAdapter();
+        var target = new ChannelStreamTarget(
+            ConversationId.From("conv"),
+            SessionId.From("session"),
+            ChannelAddress.From("conv"),
+            ChannelRequestId: "request-1");
+
+        adapter.CanSendStreamEvent(target).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task SendStreamEventAsync_TargetWithoutChannelRequestId_StillThrows()
+    {
+        // The Service Bus guard itself is deliberately unchanged (#2559 AC3): relaxing it would
+        // convert a loud failure into a silently undelivered stream.
+        var adapter = CreateAdapter();
+        StartAdapter(adapter);
+        var target = new ChannelStreamTarget(
+            ConversationId.From("conv"),
+            SessionId.From("session"),
+            ChannelAddress.From("conv"),
+            null);
+
+        var ex = await Should.ThrowAsync<InvalidOperationException>(() => adapter.SendStreamEventAsync(
+            target,
+            new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "hi" },
+            CancellationToken.None));
+
+        ex.Message.ShouldContain("channel request identity");
     }
 
     [Fact]
@@ -875,4 +1168,63 @@ public sealed class ServiceBusChannelAdapterTests
 
         resolved.ShouldBeSameAs(injected);
     }
+
+    // ── Test: AC5 - handler that outlives the lock is not processed twice on redelivery ─
+
+    /// <summary>
+    /// #2525 AC5. The other tests in this area pin the acknowledgement <em>disposition</em> -
+    /// which outcome was reached and whether abandon was called. This one pins the
+    /// <em>outcome</em> the issue exists to guarantee: when a turn outlives the message lock,
+    /// the completion fails and the broker redelivers the same MessageId, the work must not
+    /// run a second time. The assertion is therefore a count of handler executions, not a
+    /// disposition.
+    /// </summary>
+    [Fact]
+    public async Task ProcessMessageCore_HandlerOutlivesLockAndMessageIsRedelivered_HandlerRunsExactlyOnce()
+    {
+        var factory = new FakeServiceBusAdapterClientFactory();
+        var adapter = CreateAdapter(factory: factory);
+
+        // Count executions of the handler body itself, through the real dispatch path.
+        var handlerRuns = 0;
+        var dispatcher = new Mock<IChannelDispatcher>();
+        dispatcher
+            .Setup(d => d.DispatchAsync(It.IsAny<InboundMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Interlocked.Increment(ref handlerRuns);
+                return Task.CompletedTask;
+            });
+        await adapter.StartAsync(dispatcher.Object);
+
+        const string messageId = "sb-lock-outlived-msg-id";
+        var json = """{ "content": "long running turn", "senderId": "u@domain.com", "conversationId": "conv-lock-outlived", "replyTo": "reply-queue-lock", "correlationId": "corr-lock" }""";
+
+        // Delivery 1: the turn succeeds but takes longer than the lock, so the completion
+        // call fails with MessageLockLost and the broker will redeliver.
+        var first = await adapter.ProcessMessageCoreAsync(
+            ct => adapter.HandleMessageBodyAsync(json, null, messageId, ct),
+            _ => throw new ServiceBusException("The lock supplied is invalid.", ServiceBusFailureReason.MessageLockLost),
+            () => Task.CompletedTask,
+            messageId,
+            CancellationToken.None);
+
+        first.ShouldBe(MessageProcessingOutcome.CompleteFailedLockLost);
+        handlerRuns.ShouldBe(1);
+
+        // Delivery 2: the broker redelivers the identical MessageId. The work already
+        // happened, so the handler body must not run again.
+        var second = await adapter.ProcessMessageCoreAsync(
+            ct => adapter.HandleMessageBodyAsync(json, null, messageId, ct),
+            _ => Task.CompletedTask,
+            () => Task.CompletedTask,
+            messageId,
+            CancellationToken.None);
+
+        second.ShouldBe(MessageProcessingOutcome.Completed);
+
+        // The point of the issue: completed work is not performed a second time.
+        handlerRuns.ShouldBe(1);
+    }
+
 }

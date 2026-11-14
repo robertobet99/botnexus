@@ -1,4 +1,5 @@
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Gateway.Abstractions.Models;
 
 namespace BotNexus.Gateway.Sessions;
@@ -26,7 +27,9 @@ public static class SessionContextProjector
     /// <item><see cref="SessionEntry.IsCrashSentinel"/> = true (recovery placeholder).</item>
     /// <item>Raw <see cref="MessageRole.System"/> entries (the agent's system prompt is
     /// rebuilt separately by <c>SystemPromptBuilder</c>); compaction-summary system
-    /// entries are kept because they carry the folded context.</item>
+    /// entries are kept because they carry the folded context, and #3046 restart-replay
+    /// banners are kept because they carry the only signal telling the agent its prior
+    /// work was interrupted at an unknown point.</item>
     /// <item><see cref="MessageRole.Tool"/> entries. On cold-start resume, the
     /// Assistant <see cref="SessionEntry"/> only persists the response text and not
     /// the structured <c>tool_use</c> blocks, so the following Tool entry would
@@ -43,7 +46,7 @@ public static class SessionContextProjector
 
         return entry.Role.Equals(MessageRole.User)
             || entry.Role.Equals(MessageRole.Assistant)
-            || (entry.Role.Equals(MessageRole.System) && entry.IsCompactionSummary);
+            || (entry.Role.Equals(MessageRole.System) && (entry.IsCompactionSummary || entry.IsReplayBanner));
     }
 
     /// <summary>
@@ -51,12 +54,86 @@ public static class SessionContextProjector
     /// <em>next</em> call in a continuous session. Counts every entry that will be
     /// sent on that call — Tool and non-summary System entries included, because in
     /// a continuous run they sit beside their paired Assistant <c>tool_use</c> (and
-    /// the agent's system prompt) in the live message list. Only entries that the
-    /// compactor itself or a crash has already removed from the LLM view are
-    /// excluded.
+    /// the agent's system prompt) in the live message list. Excludes folded entries,
+    /// crash placeholders, notifications, and host-owned tool-result budget notices
+    /// that are retained only for transcript presentation.
     /// </summary>
     public static bool IsVisibleInLiveContext(SessionEntry entry) =>
-        !entry.IsHistory && !entry.IsCrashSentinel && !entry.Role.Equals(MessageRole.Notification);
+        !entry.IsHistory && !entry.IsCrashSentinel && !entry.Role.Equals(MessageRole.Notification)
+        && !string.Equals(entry.Kind?.Value, ToolResultBudgetNotice.Kind, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The billable character cost of a single entry: every field of it that is serialised into the
+    /// LLM message list, not just its rendered text (#3536).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This exists because <see cref="IsVisibleInLiveContext"/> and the cost of what it selects were
+    /// previously decided in different places. The predicate correctly selected Tool entries - which
+    /// a continuous session really does send - while the compaction estimator summed
+    /// <see cref="SessionEntry.Content"/> alone. On the session that motivated this,
+    /// <see cref="SessionEntry.ToolArgs"/> was 69% of the visible context: the estimator reported
+    /// ~403,891 tokens where ~1,290,071 were present, a 3.19x undercount, and a
+    /// <c>tool-start</c> row carrying 27,354 characters of arguments and no content was costed at
+    /// zero.
+    /// </para>
+    /// <para>
+    /// Keeping this beside the visibility predicate is the point: <b>selecting an entry and costing
+    /// it are one decision</b>. Any consumer that filters on <c>IsVisibleInLiveContext</c> must size
+    /// entries with this helper, so a field added to <see cref="SessionEntry"/> that reaches the
+    /// provider is accounted for in exactly one place instead of being silently free in some
+    /// callers. <c>ToolArgsAndContentFenceArchitectureTests</c> enforces that pairing.
+    /// </para>
+    /// <para>
+    /// <see cref="SessionEntry.ThinkingContent"/> is included for the same reason: providers that
+    /// echo reasoning blocks back into the transcript charge for them. It was zero on the motivating
+    /// session, so this is correctness for the general case rather than a fix for observed mass.
+    /// </para>
+    /// </remarks>
+    /// <param name="entry">The entry to size. Null-safe on every field.</param>
+    /// <returns>Total characters this entry contributes to the next provider call.</returns>
+    public static long GetLiveContextCharCost(SessionEntry entry)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+
+        return (long)(entry.Content?.Length ?? 0)
+            + (entry.ToolArgs?.Length ?? 0)
+            + (entry.ThinkingContent?.Length ?? 0);
+    }
+
+    /// <summary>
+    /// The script-weighted token cost of a single entry, in <see cref="TokenEstimator"/> quarter-token
+    /// units (#3655).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the same selection-and-cost pairing as <see cref="GetLiveContextCharCost"/> - the same
+    /// three payload-bearing fields, charged in the same one place - measured in a unit that is not
+    /// blind to script. A raw character count treats a Han ideograph and an ASCII letter as equal,
+    /// which under-counts a CJK transcript by roughly four times and lets it exhaust its real context
+    /// window while the estimate still reads as comfortably under threshold.
+    /// </para>
+    /// <para>
+    /// Units, not tokens: callers sum across every visible entry and convert once with
+    /// <see cref="TokenEstimator.TokensFromUnits"/>. Rounding per entry would discard up to three
+    /// quarter-tokens each time and reintroduce a systematic under-count.
+    /// </para>
+    /// <para>
+    /// <see cref="GetLiveContextCharCost"/> is retained rather than replaced: the #1599 bloat trigger
+    /// measures a single entry's raw size, which is a genuinely different question from what a
+    /// transcript costs in tokens.
+    /// </para>
+    /// </remarks>
+    /// <param name="entry">The entry to size. Null-safe on every field.</param>
+    /// <returns>Weighted token units this entry contributes to the next provider call.</returns>
+    public static long GetLiveContextTokenUnits(SessionEntry entry)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+
+        return TokenEstimator.WeightedCharUnits(entry.Content)
+            + TokenEstimator.WeightedCharUnits(entry.ToolArgs)
+            + TokenEstimator.WeightedCharUnits(entry.ThinkingContent);
+    }
 
     /// <summary>
     /// Eager projection used by isolation strategies to build the initial LLM
@@ -87,9 +164,11 @@ public static class SessionContextProjector
     /// context should not be replayed to the agent.
     /// </summary>
     /// <remarks>
-    /// A ToolStart entry is identified by having <see cref="SessionEntry.ToolArgs"/> set
+    /// A ToolStart entry is identified by <see cref="SessionEntry.IsToolStartRow"/> - the typed
+    /// <c>MessageKind.ToolStart</c> stamp added in #2906, falling back for legacy rows to the old
+    /// heuristic of having <see cref="SessionEntry.ToolArgs"/> set
     /// (populated from the <c>AgentStreamEventType.ToolStart</c> event). A matching ToolEnd
-    /// shares the same <see cref="SessionEntry.ToolCallId"/> but has no <c>ToolArgs</c>.
+    /// shares the same <see cref="SessionEntry.ToolCallId"/>.
     /// The detection scans backward from the most recent user message and checks all tool
     /// entries in the preceding turn for unmatched starts.
     /// </remarks>
@@ -131,6 +210,9 @@ public static class SessionContextProjector
         // Scan the entries between prevUserIndex and lastUserIndex for dangling tool starts.
         // A ToolStart has ToolArgs set; a ToolEnd for the same call has the same ToolCallId
         // but no ToolArgs.
+        // #2906: BOTH rows now carry ToolArgs, so the discriminator is the typed row kind
+        // (SessionEntry.IsToolStartRow), which falls back to the old ToolArgs heuristic for rows
+        // persisted before #2906.
         var toolStarts = new HashSet<string>(StringComparer.Ordinal);
         var toolEnds = new HashSet<string>(StringComparer.Ordinal);
         int abandonedCount = 0;
@@ -147,7 +229,7 @@ public static class SessionContextProjector
             if (entry.ToolCallId is null)
                 continue;
 
-            if (entry.ToolArgs is not null)
+            if (entry.IsToolStartRow())
             {
                 // This is a ToolStart entry
                 toolStarts.Add(entry.ToolCallId);

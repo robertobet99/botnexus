@@ -8,10 +8,16 @@
 
   <ItemGroup>
     <Compile Include="CronJob.cs" />
+    <Compile Include="CronJobExpiry.cs" />
+    <Compile Include="CronWebhookUrl.cs" />
     <Compile Include="CronRun.cs" />
+    <Compile Include="CronRunCost.cs" />
+    <Compile Include="CronJobCostRollup.cs" />
+    <Compile Include="CronRunActivity.cs" />
     <Compile Include="CronRunStatus.cs" />
     <Compile Include="ICronAction.cs" />
     <Compile Include="ICronStore.cs" />
+    <Compile Include="IPlannedShutdownState.cs" />
     <Compile Include="SqliteCronStore.cs" />
     <Compile Include="CronOptions.cs" />
     <Compile Include="HeartbeatCronProvisioner.cs" />
@@ -19,17 +25,20 @@
     <Compile Include="SkillReviewCronProvisioner.cs" />
     <Compile Include="ISkillReviewProvisioner.cs" />
     <Compile Include="CronScheduler.cs" />
+    <Compile Include="CronTimeZoneResolver.cs" />
+    <Compile Include="CronExpressionExtensions.cs" />
+    <Compile Include="CronTimeoutResolver.cs" />
     <Compile Include="Prompts\IPromptTemplateResolver.cs" />
     <Compile Include="Prompts\CronOptionsPromptTemplateResolver.cs" />
     <Compile Include="Prompts\PromptTemplateRenderer.cs" />
     <Compile Include="Actions\CommandCronAction.cs" />
+    <Compile Include="Actions\CommandCronAuthorizer.cs" />
     <Compile Include="Actions\AgentConverseCronAction.cs" />
      <Compile Include="Actions\MemoryDreamingCronAction.cs" />
     <Compile Include="Actions\SkillReviewCronAction.cs" />
     <Compile Include="Actions\SkillReviewConfig.cs" />
     <Compile Include="Properties\InternalsVisibleTo.cs" />
     <Compile Include="Actions\HeartbeatAction.cs" />
-    <Compile Include="Actions\TimeZoneHelper.cs" />
     <Compile Include="ActionStubs\AgentPromptActionStub.cs" />
     <Compile Include="ActionStubs\WebhookActionStub.cs" />
     <Compile Include="Extensions\CronServiceCollectionExtensions.cs" />
@@ -37,6 +46,18 @@
     <Compile Include="CronRunRetentionOptions.cs" />
     <Compile Include="CronRunRetentionHostedService.cs" />
     <Compile Include="MissedRunDetectionService.cs" />
+    <Compile Include="CronExternalDeliveryRedactor.cs" />
+    <Compile Include="CronFailureAlert.cs" />
+    <Compile Include="CronAlertTarget.cs" />
+    <Compile Include="CronModelPreflight.cs" />
+    <Compile Include="CronModelRouting.cs" />
+    <Compile Include="CronAgentPreflight.cs" />
+    <Compile Include="CronConversationDefault.cs" />
+    <Compile Include="CronSelfPacingBound.cs" />
+    <Compile Include="CronErrorProjection.cs" />
+    <Compile Include="CronJobOwnership.cs" />
+    <Compile Include="CronJobOwnershipExpectation.cs" />
+    <Compile Include="CronJobOwnershipChangedException.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -44,6 +65,15 @@
     <ProjectReference Include="..\..\agent\BotNexus.Agent.Core\BotNexus.Agent.Core.csproj" />
     <ProjectReference Include="..\..\domain\BotNexus.Domain\BotNexus.Domain.csproj" />
     <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Contracts\BotNexus.Gateway.Contracts.csproj" />
+    <!--
+      #2819: the cron store's home directory is resolved through BotNexusHome BY TYPE. This was
+      previously a Type.GetType("..., BotNexus.Gateway") string, which silently began returning
+      null when #2765/#2777 moved the type into this project - and the resolver then fell back to
+      the shared live ~/.botnexus store, ignoring any isolated home. A real reference makes a
+      future move a BUILD failure rather than a production redirect. Not circular:
+      BotNexus.Gateway.Configuration does not reference BotNexus.Cron.
+    -->
+    <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Configuration\BotNexus.Gateway.Configuration.csproj" />
     <ProjectReference Include="..\..\agent\BotNexus.Agent.Providers.Core\BotNexus.Agent.Providers.Core.csproj" />
     <ProjectReference Include="..\..\gateway\BotNexus.Memory\BotNexus.Memory.csproj" />
   </ItemGroup>

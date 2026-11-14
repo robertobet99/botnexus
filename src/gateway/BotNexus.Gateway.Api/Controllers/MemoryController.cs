@@ -1,4 +1,5 @@
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Memory;
 using BotNexus.Memory.Models;
@@ -79,20 +80,42 @@ public sealed class MemoryController(
 
         try
         {
-            var store = memoryStoreFactory.Create(agentId);
+            var store = memoryStoreFactory.Create(AgentId.From(agentId));
             await store.InitializeAsync(ct).ConfigureAwait(false);
 
-            var entries = await store.SearchAsync(query, limit, ct: ct).ConfigureAwait(false);
+            var result = await store.SearchWithReportAsync(query, limit, ct: ct).ConfigureAwait(false);
 
-            var dtos = entries.Select(e => new MemoryEntryDto(
-                Id: e.Id,
-                CreatedAt: e.CreatedAt,
-                SourceType: e.SourceType,
-                SessionId: e.SessionId,
-                ContentPreview: e.Content.Length > 200 ? e.Content[..200] + "..." : e.Content
+            var dtos = result.Entries.Select(scored => new MemoryEntryDto(
+                Id: scored.Entry.Id,
+                CreatedAt: scored.Entry.CreatedAt,
+                SourceType: scored.Entry.SourceType,
+                SessionId: scored.Entry.SessionId,
+                ContentPreview: TextTruncation.SafeTruncate(scored.Entry.Content, 200, "...")!
             )).ToList();
 
-            return Ok(new { agentId, query, entries = dtos, count = dtos.Count });
+            // #3244: the scan report travels with the results, so "no older match" and "older rows
+            // were never scored" are distinguishable in the UI instead of looking identical.
+            return Ok(new
+            {
+                agentId,
+                query,
+                entries = dtos,
+                count = dtos.Count,
+                temporalDecay = new
+                {
+                    enabled = result.TemporalDecay?.Enabled ?? true,
+                    halfLifeDays = result.TemporalDecay?.HalfLifeDays ?? MemoryTemporalDecayPolicy.Default.HalfLifeDays
+                },
+                vectorScan = new
+                {
+                    status = result.VectorScan.Status.ToString(),
+                    possiblyTruncated = result.VectorScan.IsPossiblyTruncated,
+                    rowsScanned = result.VectorScan.RowsScanned,
+                    scanCeiling = result.VectorScan.ScanCeiling,
+                    lexicalUnionRowsScanned = result.VectorScan.LexicalUnionRowsScanned,
+                    explanation = result.VectorScan.Explain()
+                }
+            });
         }
         catch (Exception ex)
         {
@@ -105,14 +128,17 @@ public sealed class MemoryController(
     {
         try
         {
-            var store = memoryStoreFactory.Create(agentId);
+            var store = memoryStoreFactory.Create(AgentId.From(agentId));
             await store.InitializeAsync(ct).ConfigureAwait(false);
             var stats = await store.GetStatsAsync(ct).ConfigureAwait(false);
             return new MemoryStoreDto(
                 AgentId: agentId,
                 EntryCount: stats.EntryCount,
                 DatabaseSizeBytes: stats.DatabaseSizeBytes,
-                LastIndexedAt: stats.LastIndexedAt);
+                LastIndexedAt: stats.LastIndexedAt,
+                EmbeddedEntryCount: stats.EmbeddedEntryCount,
+                VectorScanCeiling: stats.VectorScanCeiling,
+                ExceedsVectorScanCeiling: stats.ExceedsVectorScanCeiling);
         }
         catch (Exception ex)
         {
@@ -122,11 +148,23 @@ public sealed class MemoryController(
     }
 }
 
+/// <summary>
+/// Per-agent memory store row for the Memory tab.
+/// </summary>
+/// <remarks>
+/// The vector-scan trio (#3244) is rendered so an operator can see silent recall truncation as a
+/// store property. <c>EmbeddedEntryCount</c> alone would be meaningless without the ceiling it is
+/// compared against, and <c>ExceedsVectorScanCeiling</c> is projected server-side so the UI cannot
+/// invent a second, drifting definition of the condition.
+/// </remarks>
 internal sealed record MemoryStoreDto(
     string AgentId,
     int EntryCount,
     long DatabaseSizeBytes,
-    DateTimeOffset? LastIndexedAt);
+    DateTimeOffset? LastIndexedAt,
+    int EmbeddedEntryCount,
+    int? VectorScanCeiling,
+    bool ExceedsVectorScanCeiling);
 
 internal sealed record MemoryEntryDto(
     string Id,

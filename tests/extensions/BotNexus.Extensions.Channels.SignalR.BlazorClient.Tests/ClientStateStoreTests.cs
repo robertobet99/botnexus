@@ -31,6 +31,20 @@ public sealed class ClientStateStoreTests
     }
 
     [Fact]
+    public void SeedAgents_preserves_agent_summary_and_null()
+    {
+        var store = new ClientStateStore();
+
+        store.SeedAgents([
+            new AgentSummary("a-1", "Alpha", Summary: "Current platform work"),
+            new AgentSummary("a-2", "Beta", Summary: null)
+        ]);
+
+        store.GetAgent("a-1")?.Summary.ShouldBe("Current platform work");
+        store.GetAgent("a-2")?.Summary.ShouldBeNull();
+    }
+
+    [Fact]
     public void SeedAgents_updates_existing_agent()
     {
         var store = new ClientStateStore();
@@ -58,7 +72,7 @@ public sealed class ClientStateStoreTests
         var store = new ClientStateStore();
         store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         store.SeedConversations("a-1", [CreateConversation("c-1", "a-1", "General")]);
-        store.SetActiveConversation("a-1", "c-1");
+        store.SelectView("a-1", "c-1", SelectionSource.RouteNavigation);
 
         // Simulate a refresh that upserts with updated metadata
         store.UpsertAgent(new AgentState { AgentId = "a-1", DisplayName = "Alpha Updated", Emoji = "\ud83d\ude80", IsConnected = true });
@@ -70,7 +84,26 @@ public sealed class ClientStateStoreTests
         Assert.True(agent.IsConnected);
         // Critical: conversations and active selection must be preserved
         Assert.Single(agent.Conversations);
-        Assert.Equal("c-1", agent.ActiveConversationId);
+        Assert.Equal("c-1", (store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId));
+    }
+
+    [Fact]
+    public void UpsertAgent_merges_summary_without_destroying_local_state()
+    {
+        var store = new ClientStateStore();
+        store.SeedAgents([new AgentSummary("a-1", "Alpha", Summary: "Old summary")]);
+        store.SeedConversations("a-1", [CreateConversation("c-1", "a-1", "General")]);
+
+        store.UpsertAgent(new AgentState
+        {
+            AgentId = "a-1",
+            DisplayName = "Alpha",
+            Summary = "New summary",
+            IsConnected = true
+        });
+
+        store.GetAgent("a-1")?.Summary.ShouldBe("New summary");
+        store.GetAgent("a-1")?.Conversations.ShouldHaveSingleItem();
     }
 
     [Fact]
@@ -86,7 +119,7 @@ public sealed class ClientStateStoreTests
     }
 
     [Fact]
-    public void SeedConversations_populates_agent_conversations_and_selects_default()
+    public void SeedConversations_populates_agent_conversations_without_selecting_a_default()
     {
         var store = CreateSeededStore();
 
@@ -98,7 +131,7 @@ public sealed class ClientStateStoreTests
         var agent = store.GetAgent("a-1");
         Assert.NotNull(agent);
         Assert.Equal(2, agent.Conversations.Count);
-        Assert.Equal("c-2", agent.ActiveConversationId);
+        Assert.Null((store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId));
     }
 
     [Fact]
@@ -107,10 +140,15 @@ public sealed class ClientStateStoreTests
         var store = CreateSeededStore();
         store.SeedConversations("a-1", [CreateConversation("c-1", "a-1", "General")]);
         store.GetAgent("a-1")!.Conversations["c-1"].UnreadCount = 3;
+        // #3212 MIGRATION (not a relaxation): unread now clears only when the conversation becomes
+        // DISPLAYED, which is a route question. This test previously relied on the unconditional
+        // clear, so it now states the route that makes a-1 the displayed agent. The assertion that
+        // unread reaches 0 is unchanged.
+        store.SelectView("a-1", string.Empty, SelectionSource.RouteNavigation);
 
-        store.SetActiveConversation("a-1", "c-1");
+        store.SelectView("a-1", "c-1", SelectionSource.RouteNavigation);
 
-        Assert.Equal("c-1", store.GetAgent("a-1")?.ActiveConversationId);
+        Assert.Equal("c-1", (store as IDisplayedConversation)?.DisplayedConversationIdFor("a-1"));
         Assert.Equal(0, store.GetConversation("c-1")?.UnreadCount);
     }
 
@@ -169,6 +207,7 @@ public sealed class ClientStateStoreTests
     public void SetStreaming_updates_conversation_and_agent_state()
     {
         var store = CreateConversationStore();
+        store.SelectView("a-1", "c-1", SelectionSource.RouteNavigation);
 
         store.SetStreaming("c-1", true);
 
@@ -265,10 +304,10 @@ public sealed class ClientStateStoreTests
     {
         var store = CreateSeededStore();
         store.SeedConversations("a-1", [CreateConversation("c-1", "a-1", "One")]);
-        store.ActiveAgentId = "a-1";
-        store.SetActiveConversation("a-1", "c-1");
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+        store.SelectView("a-1", "c-1", SelectionSource.RouteNavigation);
 
-        Assert.Equal("c-1", store.ActiveConversationId);
+        Assert.Equal("c-1", (store as IDisplayedConversation)?.DisplayedConversationIdFor(store.ActiveAgentId));
     }
 
     [Fact]
@@ -286,7 +325,7 @@ public sealed class ClientStateStoreTests
     public void RemoveAgent_resets_active_agent_if_removed()
     {
         var store = CreateSeededStore();
-        store.ActiveAgentId = "a-1";
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         store.RemoveAgent("a-1");
 
@@ -320,7 +359,7 @@ public sealed class ClientStateStoreTests
             CreateConversation("conv-active", "a-1", "Active", activeSessionId: "sess-active"),
             CreateConversation("conv-other", "a-1", "Other", activeSessionId: "sess-other")
         ]);
-        store.SetActiveConversation("a-1", "conv-active");
+        store.SelectView("a-1", "conv-active", SelectionSource.RouteNavigation);
 
         // A bulk refresh registers the OTHER conversation's session while conv-active is displayed.
         store.RegisterSession("a-1", "sess-other", "signalr", "user-agent", conversationId: "conv-other");
@@ -341,7 +380,7 @@ public sealed class ClientStateStoreTests
             CreateConversation("conv-active", "a-1", "Active", activeSessionId: "sess-active"),
             CreateConversation("conv-other", "a-1", "Other", activeSessionId: "sess-other")
         ]);
-        store.SetActiveConversation("a-1", "conv-active"); // sets agent.SessionId = sess-active
+        store.SelectView("a-1", "conv-active", SelectionSource.RouteNavigation); // sets agent.SessionId = sess-active
 
         // Registering a non-active conversation's session must NOT move the agent-global SessionId.
         store.RegisterSession("a-1", "sess-other", "signalr", "user-agent", conversationId: "conv-other");
@@ -365,7 +404,7 @@ public sealed class ClientStateStoreTests
             CreateConversation("conv-active", "a-1", "Active", activeSessionId: "sess-active"),
             CreateConversation("conv-idle", "a-1", "Idle", activeSessionId: "sess-idle")
         ]);
-        store.SetActiveConversation("a-1", "conv-active");
+        store.SelectView("a-1", "conv-active", SelectionSource.RouteNavigation);
 
         // Simulate RefreshConversationsForAgentAsync's loop. Order matters: the idle session is
         // iterated LAST (this is what poisoned agent.SessionId in production).
@@ -378,7 +417,7 @@ public sealed class ClientStateStoreTests
             customMessage: "After a full refresh, the agent-global session must still point at the " +
                 "DISPLAYED conversation's session, not the last-iterated one.");
         // The displayed conversation's resolved session (used by steer/abort/compact) is correct.
-        store.GetAgent("a-1")!.ActiveConversationSessionId.ShouldBe("sess-active");
+        store.GetConversation("conv-active")!.ActiveSessionId.ShouldBe("sess-active");
     }
 
     [Fact]
@@ -388,7 +427,7 @@ public sealed class ClientStateStoreTests
         store.SeedConversations("a-1", [
             CreateConversation("conv-active", "a-1", "Active", activeSessionId: "sess-active")
         ]);
-        store.SetActiveConversation("a-1", "conv-active");
+        store.SelectView("a-1", "conv-active", SelectionSource.RouteNavigation);
 
         // A cron session must never poison the user-facing session/binding.
         store.RegisterSession("a-1", "cron:job-1:run-1", "internal", "cron", conversationId: "conv-active");
@@ -407,12 +446,271 @@ public sealed class ClientStateStoreTests
         store.SeedConversations("a-1", [
             CreateConversation("conv-new", "a-1", "New", activeSessionId: null)
         ]);
-        store.SetActiveConversation("a-1", "conv-new");
+        store.SelectView("a-1", "conv-new", SelectionSource.RouteNavigation);
 
         store.RegisterSession("a-1", "sess-new");
 
         store.GetConversation("conv-new")!.ActiveSessionId.ShouldBe("sess-new");
         store.GetAgent("a-1")!.SessionId.ShouldBe("sess-new");
+    }
+
+    // ── #2243 active-view anti-hijack guard ────────────────────────────────────
+
+    [Fact]
+    public void SelectView_rejects_switching_onto_a_read_only_sub_agent()
+    {
+        // #2243: a SubAgentSpawned or streaming event that lands around send time must never be
+        // able to promote the sub-agent's read-only virtual session to the active view. The store
+        // setter is the single choke point every non-user-click assignment flows through, so it
+        // silently rejects a switch onto a read-only agent.
+        var store = CreateSeededStore();
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+        store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub-agent",
+            SessionType = "agent-subagent", // => IsReadOnly == true
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+
+        store.SelectView("sub-1", string.Empty, SelectionSource.UserClick);
+
+        store.ActiveAgentId.ShouldBe("a-1",
+            customMessage: "A concurrent event must not hijack the active view onto a read-only " +
+                "sub-agent session; the user's own agent stays active.");
+    }
+
+    [Fact]
+    public void SelectView_rejects_marked_sub_agent_before_its_state_or_session_type_exists()
+    {
+        // #2243 race hardening, PORTED from the #2254 quick-patch to the #2246 SelectView seam.
+        // The derived-IsReadOnly half of the guard only rejects a switch when the target's
+        // SessionType is ALREADY stamped "agent-subagent". But HandleSubAgentSpawned registers the
+        // sub-agent asynchronously, so around send time there is often NO AgentState for the
+        // sub-agent yet (or one still carrying the default "user-agent" SessionType) when a
+        // concurrent, non-user-initiated selection lands. MarkSubAgent records the id at spawn so the
+        // SelectView guard rejects the switch independent of that SessionType-stamp ordering. Here we
+        // deliberately do NOT create an AgentState for "sub-1", and drive the selection with a
+        // NON-SubAgentView source (RouteNavigation) to model the background assignment.
+        var store = CreateSeededStore();
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+
+        store.MarkSubAgent("sub-1"); // spawn-time marking, before any AgentState/SessionType exists
+        store.SelectView("sub-1", string.Empty, SelectionSource.RouteNavigation); // background switch
+
+        store.ActiveAgentId.ShouldBe("a-1",
+            customMessage: "A sub-agent marked at spawn time must be rejected by the guard even before " +
+                "its AgentState exists or its SessionType has been stamped read-only.");
+
+        // And once its AgentState is later registered (still not via SubAgentView), it stays rejected.
+        store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub-agent",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+        store.SelectView("sub-1", string.Empty, SelectionSource.Bootstrap);
+        store.ActiveAgentId.ShouldBe("a-1");
+
+        // The explicit user "view sub-agent" interaction (SubAgentView source) still promotes it.
+        store.SelectView("sub-1", string.Empty, SelectionSource.SubAgentView);
+        store.ActiveAgentId.ShouldBe("sub-1");
+    }
+
+    [Fact]
+    public void SelectView_allows_switching_between_user_agents()
+    {
+        var store = CreateSeededStore();
+
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+        store.SelectView("a-2", string.Empty, SelectionSource.UserClick);
+
+        store.ActiveAgentId.ShouldBe("a-2");
+    }
+
+    [Fact]
+    public void SelectView_promotes_read_only_sub_agent_on_explicit_SubAgentView_source()
+    {
+        // The explicit "view sub-agent" user click is the ONE source allowed to switch the active
+        // view onto a read-only session. It calls SelectView with SelectionSource.SubAgentView, which
+        // bypasses the anti-hijack guard.
+        var store = CreateSeededStore();
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+        store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub-agent",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+
+        store.SelectView("sub-1", string.Empty, SelectionSource.SubAgentView);
+
+        store.ActiveAgentId.ShouldBe("sub-1");
+    }
+
+    [Fact]
+    public void SubAgentView_selection_does_not_leave_the_guard_open_for_later_events()
+    {
+        // The SubAgentView allowance must be scoped to the single SelectView call: a subsequent
+        // background event switching onto another read-only sub-agent must still be rejected.
+        var store = CreateSeededStore();
+        store.UpsertAgent(new AgentState { AgentId = "sub-1", DisplayName = "Sub 1", SessionType = "agent-subagent", IsObserverAgent = true, IsConnected = true });
+        store.UpsertAgent(new AgentState { AgentId = "sub-2", DisplayName = "Sub 2", SessionType = "agent-subagent", IsObserverAgent = true, IsConnected = true });
+
+        store.SelectView("sub-1", string.Empty, SelectionSource.SubAgentView);
+        store.SelectView("sub-2", string.Empty, SelectionSource.UserClick); // simulates a background SubAgentSpawned assignment
+
+        store.ActiveAgentId.ShouldBe("sub-1",
+            customMessage: "The sub-agent activation allowance must not persist past the explicit " +
+                "SelectView(SubAgentView) call.");
+    }
+
+    // ── #2246 single SelectView seam ───────────────────────────────────────────
+
+    [Fact]
+    public void SelectView_sets_agent_and_conversation_atomically()
+    {
+        var store = CreateSeededStore();
+        store.SeedConversations("a-1", [CreateConversation("c-1", "a-1", "One", activeSessionId: "sess-1")]);
+
+        store.SelectView("a-1", "c-1", SelectionSource.UserClick);
+
+        store.ActiveAgentId.ShouldBe("a-1");
+        (store as IDisplayedConversation)?.DisplayedConversationIdFor(store.ActiveAgentId).ShouldBe("c-1",
+            customMessage: "SelectView must set the active agent and its conversation in one atomic step.");
+        store.GetAgent("a-1")!.SessionId.ShouldBe("sess-1");
+    }
+
+    [Fact]
+    public void SelectView_with_empty_agent_clears_the_active_view()
+    {
+        var store = CreateSeededStore();
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+
+        store.SelectView(string.Empty, string.Empty, SelectionSource.Bootstrap);
+
+        store.ActiveAgentId.ShouldBeNull();
+    }
+
+    [Fact]
+    public void ActiveAgentId_has_no_public_setter()
+    {
+        // Compile-time contract made explicit: the projection is read-only. Reflection asserts the
+        // interface exposes no setter so a future edit cannot silently reintroduce the mutable seam.
+        var prop = typeof(IClientStateStore).GetProperty(nameof(IClientStateStore.ActiveAgentId));
+        prop.ShouldNotBeNull();
+        prop!.CanWrite.ShouldBeFalse(
+            customMessage: "ActiveAgentId must have NO public setter; the sole mutation path is SelectView (#2246).");
+    }
+
+    [Fact]
+    public void Inbound_SubAgentSpawned_style_mutation_leaves_selection_unchanged()
+    {
+        // Inbound event handlers mutate data + NotifyChanged only; they never call SelectView. This
+        // asserts that the kind of state churn a SubAgentSpawned handler performs (adding a read-only
+        // sub-agent, registering its session, notifying) leaves the active-view selection byte-for-byte
+        // unchanged — an event can never make a sub-agent the active view (#2243/#2246).
+        var store = CreateSeededStore();
+        store.SeedConversations("a-1", [CreateConversation("c-1", "a-1", "One")]);
+        store.SelectView("a-1", "c-1", SelectionSource.UserClick);
+
+        var agentBefore = store.ActiveAgentId;
+        var convBefore = (store as IDisplayedConversation)?.DisplayedConversationIdFor(store.ActiveAgentId);
+
+        // Simulate the data-only mutations an inbound SubAgentSpawned handler performs.
+        store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub-agent",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+        store.RegisterSession("sub-1", "sub-1");
+        store.NotifyChanged();
+
+        store.ActiveAgentId.ShouldBe(agentBefore,
+            customMessage: "An inbound event must not change the active agent.");
+        (store as IDisplayedConversation)?.DisplayedConversationIdFor(store.ActiveAgentId).ShouldBe(convBefore,
+            customMessage: "An inbound event must not change the active conversation.");
+    }
+
+    [Fact]
+    public void Route_owned_selection_survives_a_storm_of_inbound_events_without_a_navigation_call()
+    {
+        // #2247 seam test: once the view is route-owned via SelectView(RouteNavigation), a burst of
+        // inbound events (new sub-agent, session churn, message append, streaming, notify) must not
+        // move the active agent/conversation. Only a subsequent SelectView call (a navigation) can -
+        // proving an inbound event cannot change the URL-backed selection on its own.
+        var store = CreateSeededStore();
+        store.SeedConversations("a-1", [CreateConversation("c-1", "a-1", "One")]);
+        store.SelectView("a-1", "c-1", SelectionSource.RouteNavigation);
+
+        var agentBefore = store.ActiveAgentId;
+        var convBefore = (store as IDisplayedConversation)?.DisplayedConversationIdFor(store.ActiveAgentId);
+
+        // A storm of purely inbound, data-only churn - none of it a navigation call.
+        store.MarkSubAgent("sub-9");
+        store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-9",
+            DisplayName = "Sub 9",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+        store.RegisterSession("sub-9", "sub-9");
+        store.SelectView("sub-9", string.Empty, SelectionSource.RouteNavigation); // rejected: read-only target
+        store.AppendMessage("c-1", new ChatMessage("assistant", "hi", DateTimeOffset.UtcNow));
+        store.SetStreaming("c-1", true);
+        store.AppendStreamBuffer("c-1", "streamed token");
+        store.NotifyChanged();
+
+        store.ActiveAgentId.ShouldBe(agentBefore,
+            customMessage: "Inbound event storm must not change the route-owned active agent.");
+        (store as IDisplayedConversation)?.DisplayedConversationIdFor(store.ActiveAgentId).ShouldBe(convBefore,
+            customMessage: "Inbound event storm must not change the route-owned active conversation.");
+
+        // A real navigation (SelectView) is the only thing that can move it.
+        store.SeedConversations("a-2", [CreateConversation("c-2", "a-2", "Two")]);
+        store.SelectView("a-2", "c-2", SelectionSource.RouteNavigation);
+        store.ActiveAgentId.ShouldBe("a-2");
+        (store as IDisplayedConversation)?.DisplayedConversationIdFor(store.ActiveAgentId).ShouldBe("c-2");
+    }
+
+    [Fact]
+    public void RemoveAgent_of_active_agent_flags_pending_selection_invalid_without_auto_selecting()
+    {
+        // #2246: RemoveAgent is a data mutation. Removing the active agent must NOT auto-pick a
+        // replacement view (that would be a second writer); it clears the selection and raises
+        // PendingSelectionInvalid so the UI resolves a fresh selection on next render.
+        var store = CreateSeededStore();
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+
+        store.RemoveAgent("a-1");
+
+        store.ActiveAgentId.ShouldBeNull();
+        store.PendingSelectionInvalid.ShouldBeTrue(
+            customMessage: "Removing the active agent must flag the selection invalid for UI resolution.");
+    }
+
+    [Fact]
+    public void MarkSelectionInvalid_sets_pending_flag_and_next_SelectView_clears_it()
+    {
+        var store = CreateSeededStore();
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+
+        store.MarkSelectionInvalid();
+        store.PendingSelectionInvalid.ShouldBeTrue();
+
+        store.SelectView("a-2", string.Empty, SelectionSource.RouteNavigation);
+        store.PendingSelectionInvalid.ShouldBeFalse(
+            customMessage: "Resolving the selection via SelectView must clear the pending-invalid flag.");
     }
 
     private static ClientStateStore CreateSeededStore()
@@ -423,6 +721,84 @@ public sealed class ClientStateStoreTests
             new AgentSummary("a-2", "Beta")
         ]);
         return store;
+    }
+
+    // ── #2248 session-type poisoning immunity ──────────────────────────────────
+
+    [Fact]
+    public void RegisterSession_agent_subagent_on_a_seeded_user_agent_does_not_make_it_read_only()
+    {
+        // #2248 root-cause guard: a real USER agent seeded from /api/agents has the immutable
+        // IsObserverAgent=false. A concurrent inbound sub-agent session event stamping its mutable
+        // SessionType="agent-subagent" must NOT make it read-only, because IsReadOnly now derives
+        // from the immutable kind, not the churning SessionType.
+        var store = CreateSeededStore();
+        var agent = store.GetAgent("a-1")!;
+        agent.IsReadOnly.ShouldBeFalse(customMessage: "A seeded user agent starts interactive.");
+
+        store.RegisterSession("a-1", "sess-poison", sessionType: "agent-subagent");
+
+        store.GetAgent("a-1")!.IsReadOnly.ShouldBeFalse(
+            customMessage: "RegisterSession(agent-subagent) must NOT poison a real user agent into " +
+                "read-only — IsReadOnly keys on the immutable IsObserverAgent, not SessionType (#2248).");
+    }
+
+    [Fact]
+    public void RegisterSession_agent_subagent_does_not_remove_a_user_agent_from_the_roster_projection()
+    {
+        // The roster projection filters on !IsReadOnly (the immutable kind). A sub-agent session
+        // event on a user agent must never drop it from the roster.
+        var store = CreateSeededStore();
+
+        store.RegisterSession("a-1", "sess-poison", sessionType: "agent-subagent");
+
+        var roster = store.Agents.Values.Where(a => !a.IsReadOnly).Select(a => a.AgentId).ToList();
+        roster.ShouldContain("a-1",
+            customMessage: "A RegisterSession(agent-subagent) on a user agent must not remove it from " +
+                "the roster projection (#2248).");
+    }
+
+    [Fact]
+    public void SelectView_user_click_is_accepted_after_session_type_poisoning()
+    {
+        // #2248 leak site 3: the anti-hijack guard previously keyed on derived IsReadOnly from the
+        // mutable SessionType, so a poisoned user agent's UserClick was rejected and the view
+        // reverted. With IsReadOnly keyed on the immutable kind, a UserClick onto a real user agent
+        // is always accepted — the selection actually changes.
+        var store = CreateSeededStore();
+        store.SelectView("a-2", string.Empty, SelectionSource.UserClick);
+
+        // An inbound sub-agent session event poisons a-1's SessionType.
+        store.RegisterSession("a-1", "sess-poison", sessionType: "agent-subagent");
+
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+
+        store.ActiveAgentId.ShouldBe("a-1",
+            customMessage: "A UserClick onto a real user agent must be ACCEPTED even after its " +
+                "SessionType was stamped agent-subagent by an inbound event (#2248).");
+    }
+
+    [Fact]
+    public void ActiveSelectionSource_projects_the_source_of_the_current_view()
+    {
+        // #2248: read-only becomes a view concern. The store surfaces the active SelectionSource as
+        // a read-only projection so the chat panel can gate read-only on SubAgentView.
+        var store = CreateSeededStore();
+        store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub-agent",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+
+        store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+        store.ActiveSelectionSource.ShouldBe(SelectionSource.UserClick);
+
+        store.SelectView("sub-1", string.Empty, SelectionSource.SubAgentView);
+        store.ActiveSelectionSource.ShouldBe(SelectionSource.SubAgentView,
+            customMessage: "ActiveSelectionSource must project the source of the current view (#2248).");
     }
 
     [Fact]
@@ -459,9 +835,8 @@ public sealed class ClientStateStoreTests
         agent.Conversations.ShouldNotContainKey("sa-1",
             customMessage: "AgentSubAgent supervision sessions are internal and must not appear in " +
                 "the portal's conversation drawer.");
-        agent.ActiveConversationId.ShouldBe("user-1",
-            customMessage: "Active tab must be the HumanAgent conversation -- not the more-recently " +
-                "updated AgentAgent conversation. Auto-hijack guard.");
+        (store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId).ShouldBeNull(
+            customMessage: "Seeding filters the roster but must not select any conversation; the route owns selection.");
     }
 
     private static ClientStateStore CreateConversationStore()
