@@ -2,6 +2,7 @@ using System.CommandLine;
 using System.Net.Http.Json;
 using System.Reflection;
 using System.Text.Json;
+using BotNexus.Cli.Services;
 using BotNexus.Cron;
 using BotNexus.Cron.Prompts;
 using BotNexus.Domain.Primitives;
@@ -70,6 +71,10 @@ internal sealed class PromptCommands
 
         var sessionOption = new Option<string?>("--session", () => null, "Optional session ID when invoking the gateway.");
         var gatewayUrlOption = new Option<string?>("--gateway-url", () => null, "Override gateway URL (defaults to gateway.listenUrl).");
+        // #2747 clause 1: an overridden --gateway-url is an operator-supplied host, so it needs a
+        // credential named for THAT host. Without this option the only honest outcome for a remote
+        // target is a refusal, because the local gateway's credential must never follow the URL.
+        var tokenOption = new Option<string?>("--token", () => null, "API key for the target gateway. Required when --gateway-url is not loopback.");
         var runCommand = new Command("run", "Render and run a prompt template.")
         {
             templateArgument,
@@ -77,7 +82,8 @@ internal sealed class PromptCommands
             agentOption,
             parameterOption,
             sessionOption,
-            gatewayUrlOption
+            gatewayUrlOption,
+            tokenOption
         };
         runCommand.SetHandler(async context =>
         {
@@ -89,6 +95,7 @@ internal sealed class PromptCommands
             var agentId = context.ParseResult.GetValueForOption(agentOption);
             var sessionId = context.ParseResult.GetValueForOption(sessionOption);
             var gatewayUrl = context.ParseResult.GetValueForOption(gatewayUrlOption);
+            var token = context.ParseResult.GetValueForOption(tokenOption);
             context.ExitCode = await ExecuteRunAsync(
                 configPath,
                 agentId,
@@ -97,7 +104,8 @@ internal sealed class PromptCommands
                 sessionId,
                 gatewayUrl,
                 verbose,
-                CancellationToken.None);
+                CancellationToken.None,
+                token);
         });
 
         var createCommand = new Command("create", "Create prompt templates.");
@@ -170,15 +178,15 @@ internal sealed class PromptCommands
         _ = verbose;
         _ = runMode;
 
-        if (!File.Exists(configPath))
+        if (!ConfigPresence.Exists(configPath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Config file not found at [dim]{Markup.Escape(configPath)}[/].");
+            AnsiConsole.MarkupLine(configPath.NotFoundMessage());
             return 1;
         }
 
         if (!TryParseParameters(rawParameters, out var parameters, out var parseError))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(parseError ?? "Invalid parameter format.")}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(parseError ?? "Invalid parameter format.")}");
             return 1;
         }
 
@@ -202,7 +210,7 @@ internal sealed class PromptCommands
             if (!resolver.TryRender(AgentId.From(resolvedAgentId!), templateName, parameters, out var rendered, out var error))
             {
                 if (!string.IsNullOrWhiteSpace(error))
-                    AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(error)}");
+                    AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(error)}");
                 return 1;
             }
 
@@ -223,9 +231,9 @@ internal sealed class PromptCommands
     {
         _ = verbose;
         _ = cancellationToken;
-        if (!File.Exists(configPath))
+        if (!ConfigPresence.Exists(configPath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Config file not found at [dim]{Markup.Escape(configPath)}[/].");
+            AnsiConsole.MarkupLine(configPath.NotFoundMessage());
             return 1;
         }
 
@@ -265,8 +273,21 @@ internal sealed class PromptCommands
         string? sessionId,
         string? gatewayUrlOverride,
         bool verbose,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? token = null)
     {
+        // #3739: a present-but-blank selector is a caller error (typically an unset shell variable
+        // expanding to ""), not an omission. Both fall through IsNullOrWhiteSpace fallbacks further
+        // down -- --agent into gateway.defaultAgentId, --session into a freshly minted gateway
+        // session -- so the turn silently runs somewhere the caller never sees. Reject here, before
+        // any config load, template render or gateway call. null still means "omitted".
+        if (!TryValidateSelector(agentId, "--agent", out var selectorError)
+            || !TryValidateSelector(sessionId, "--session", out selectorError))
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(selectorError)}");
+            return 1;
+        }
+
         var config = await LoadConfigAsync(configPath, cancellationToken);
         if (config is null)
             return 1;
@@ -280,7 +301,7 @@ internal sealed class PromptCommands
 
         if (!TryParseParameters(rawParameters, out var parameters, out var parseError))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(parseError ?? "Invalid parameter format.")}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(parseError ?? "Invalid parameter format.")}");
             return 1;
         }
 
@@ -294,7 +315,7 @@ internal sealed class PromptCommands
             if (!resolver.TryRender(AgentId.From(resolvedAgentId!), templateName, parameters, out renderedPrompt, out var renderError))
             {
                 if (!string.IsNullOrWhiteSpace(renderError))
-                    AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(renderError)}");
+                    AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(renderError)}");
                 return 1;
             }
         }
@@ -306,11 +327,29 @@ internal sealed class PromptCommands
         var gatewayUrl = string.IsNullOrWhiteSpace(gatewayUrlOverride)
             ? config.Gateway?.ListenUrl
             : gatewayUrlOverride;
+        // #2858-family drift fix: this used to fall back to localhost:5000 while the gateway binds
+        // 5005, so an operator with no gateway.listenUrl got a connection-refused that looked like a
+        // dead gateway. The default gateway target has exactly one spelling.
         if (string.IsNullOrWhiteSpace(gatewayUrl))
-            gatewayUrl = "http://localhost:5000";
+            gatewayUrl = GatewayClientFactory.DefaultUrl;
 
         var endpoint = $"{gatewayUrl.TrimEnd('/')}/api/chat";
-        using var httpClient = new HttpClient();
+
+        // #2747 clause 1: the credential policy is defined once, in GatewayClientFactory. This
+        // call site previously built a bare HttpClient, which sent an unauthenticated POST to
+        // whatever host --gateway-url named.
+        var resolution = GatewayClientFactory.Resolve(
+            gatewayUrl,
+            TimeSpan.FromMinutes(5),
+            token,
+            GatewayClientFactory.DefaultCredentialSource());
+        if (resolution.IsRefused)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(resolution.RefusalMessage!)}");
+            return 1;
+        }
+
+        using var httpClient = resolution.Client!;
         var response = await httpClient.PostAsJsonAsync(
             endpoint,
             new ChatRequestPayload(resolvedAgentId, renderedPrompt, sessionId),
@@ -325,7 +364,7 @@ internal sealed class PromptCommands
         }
 
         if (verbose)
-            AnsiConsole.MarkupLine($"[dim]Rendered template {Markup.Escape(templateName)} and invoked {Markup.Escape(endpoint)}[/]");
+            AnsiConsole.MarkupLine($"[dim]Rendered template {CliText.SafeDisplay(templateName)} and invoked {CliText.SafeDisplay(endpoint)}[/]");
 
         var chatResponse = JsonSerializer.Deserialize<ChatResponsePayload>(responseText, new JsonSerializerOptions
         {
@@ -359,12 +398,12 @@ internal sealed class PromptCommands
                 copied++;
             }
 
-            AnsiConsole.MarkupLine($"[green]✓[/] Copied {copied} sample template(s) to [dim]{Markup.Escape(promptsDir)}[/]");
+            AnsiConsole.MarkupLine($"[green]✓[/] Copied {copied} sample template(s) to [dim]{CliText.SafeDisplay(promptsDir)}[/]");
             return 0;
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Failed to copy samples: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Failed to copy samples: {CliText.SafeDisplay(ex.Message)}");
             return 1;
         }
     }
@@ -406,6 +445,24 @@ internal sealed class PromptCommands
     private static string ResolveHomePath(string configPath)
         => Path.GetDirectoryName(Path.GetFullPath(configPath))
            ?? PlatformConfigLoader.DefaultHomePath;
+
+    /// <summary>
+    /// Distinguishes an omitted selector flag (<c>null</c>, legitimate) from one that was supplied
+    /// with a blank or whitespace-only value (a caller error). #3739: without this the two cases are
+    /// indistinguishable downstream, because every consumer tests <c>IsNullOrWhiteSpace</c> and
+    /// silently substitutes a fallback target.
+    /// </summary>
+    internal static bool TryValidateSelector(string? value, string flagName, out string error)
+    {
+        if (value is not null && string.IsNullOrWhiteSpace(value))
+        {
+            error = $"{flagName} was supplied but is blank. Pass a value, or omit the flag entirely.";
+            return false;
+        }
+
+        error = string.Empty;
+        return true;
+    }
 
     private static string? ResolveAgentId(string? agentId, PlatformConfig config)
         => string.IsNullOrWhiteSpace(agentId) ? config.Gateway?.DefaultAgentId : agentId;
@@ -452,7 +509,7 @@ internal sealed class PromptCommands
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {CliText.SafeDisplay(ex.Message)}");
             return null;
         }
     }

@@ -1,5 +1,6 @@
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Activity;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Channels;
 using BotNexus.Gateway.Abstractions.Models;
@@ -25,7 +26,7 @@ public sealed class InterruptedTurnScanOrderingTests
 {
     /// <summary>
     /// A hosted service that registers an agent during its own StartAsync - modelling
-    /// BuiltInAgentRegistrationService / AgentConfigurationHostedService, which populate the
+    /// AgentConfigurationHostedService, which populate the
     /// registry only once the host starts hosted services.
     /// </summary>
     private sealed class LateAgentRegistrationService(IAgentRegistry registry, string agentId) : IHostedService
@@ -65,13 +66,14 @@ public sealed class InterruptedTurnScanOrderingTests
         });
 
         var store = new Mock<ISessionStore>();
-        store.Setup(s => s.ListAsync(It.IsAny<AgentId?>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((AgentId? id, CancellationToken _) =>
-                (!id.HasValue || session.AgentId == id.Value)
-                    ? new List<GatewaySession> { session }
-                    : new List<GatewaySession>());
-        store.Setup(s => s.SaveAsync(It.IsAny<GatewaySession>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+        store.Setup(s => s.ListUnresolvedCrashSentinelsAsync(
+                It.IsAny<int>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new UnresolvedCrashSentinelPage([new UnresolvedCrashSentinelRow(session.SessionId, session.AgentId)], null));
+        store.Setup(s => s.GetAsync(session.SessionId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(session);
+        store.Setup(s => s.SaveAsync(
+                It.IsAny<GatewaySession>(), It.IsAny<SessionWriteFence>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SessionSaveOutcome.Persisted);
 
         // A real registry that starts EMPTY - agents are added only when the late hosted
         // service's StartAsync runs, exactly as production does.
@@ -91,8 +93,10 @@ public sealed class InterruptedTurnScanOrderingTests
             sp.GetRequiredService<ISessionStore>(),
             sp.GetRequiredService<IAgentRegistry>(),
             sp.GetRequiredService<IActivityBroadcaster>(),
-            sp.GetRequiredService<IChannelManager>(),
-            NullLogger<InterruptedTurnNotificationService>.Instance));
+            Mock.Of<IConversationEventPublisher>(),
+            NullLogger<InterruptedTurnNotificationService>.Instance,
+            orchestrator: null,
+            options: null));
 
         using var host = builder.Build();
         await host.StartAsync();
@@ -102,6 +106,7 @@ public sealed class InterruptedTurnScanOrderingTests
         // it, and appended a notification - proving it ran after registration.
         session.History.ShouldNotContain(e => e.IsCrashSentinel);
         session.History.ShouldContain(e => e.Role == MessageRole.Notification);
-        store.Verify(s => s.SaveAsync(session, It.IsAny<CancellationToken>()), Times.Once);
+        store.Verify(s => s.SaveAsync(
+            session, It.IsAny<SessionWriteFence>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 }

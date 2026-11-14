@@ -1,4 +1,4 @@
-﻿using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Primitives;
 using BotNexus.Domain.World;
 using BotNexus.Gateway.Abstractions.Security;
 
@@ -12,6 +12,13 @@ public sealed record AgentDescriptor : ICitizen
 {
     /// <summary>Unique agent identifier (e.g., "coding-agent", "chat-assistant").</summary>
     public required AgentId AgentId { get; init; }
+
+    /// <summary>
+    /// Whether new runtime work may be admitted. Null on a submitted update preserves the
+    /// current state; new registrations default to enabled. Disabled agents remain administrable
+    /// and already-admitted work is not cancelled.
+    /// </summary>
+    public bool? Enabled { get; init; }
 
     /// <summary>Human-readable display name.</summary>
     public required string DisplayName { get; init; }
@@ -39,11 +46,50 @@ public sealed record AgentDescriptor : ICitizen
     /// </summary>
     CitizenId ICitizen.Id => CitizenId.Of(AgentId);
 
+    /// <summary>
+    /// The stable, opaque pseudonym for this agent, for use in security-event payloads and any
+    /// other correlation surface that must not carry the raw <see cref="AgentId"/> (#2442).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Computed, never stored or settable: it is a pure function of <see cref="AgentId"/>, so two
+    /// independently constructed descriptors for the same agent - in the same process, or in
+    /// different processes across a restart - always agree. A settable property would reopen
+    /// exactly the drift this centralisation closes, and would let a caller inject a raw id.
+    /// </para>
+    /// <para>
+    /// Delegates to <see cref="ActorPseudonym.For"/>, the single source of truth. The digest form
+    /// is a compatibility contract with already-emitted security events - see that type.
+    /// </para>
+    /// </remarks>
+    public string Pseudonym => ActorPseudonym.For(AgentId.Value);
+
     /// <summary>Optional emoji that visually identifies this agent in user interfaces.</summary>
     public string? Emoji { get; init; }
 
     /// <summary>Optional description of the agent's purpose.</summary>
     public string? Description { get; init; }
+
+    /// <summary>
+    /// Optional agent-maintained account of what this agent is currently doing (#3596).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately <b>settable</b> where <see cref="Description"/> is init-only, because the two
+    /// have different owners. <see cref="Description"/> is human-written intent fixed at
+    /// registration; <c>Summary</c> is written by the agent about itself as its capability drifts,
+    /// so peer agents discovering it through <c>list_agents</c> read something current rather than
+    /// whatever was typed once at creation time.
+    /// </para>
+    /// <para>
+    /// Null means "no summary", and every projection omits the field entirely in that case - an
+    /// empty string or placeholder would put noise into every peer's system prompt for agents that
+    /// never write one. Length is bounded at the write seam
+    /// (<c>UpdateAgentTool</c> / <c>AgentSummaryOptions.MaxLength</c>) rather than here, so the
+    /// descriptor stays a plain carrier and configuration remains the single place the bound lives.
+    /// </para>
+    /// </remarks>
+    public string? Summary { get; set; }
 
     /// <summary>
     /// Optional display order. Lower values sort first. When null the agent sorts
@@ -58,26 +104,23 @@ public sealed record AgentDescriptor : ICitizen
     public required string ModelId { get; init; }
 
     /// <summary>
-    /// The API provider key (e.g., "anthropic", "openai", "copilot").
-    /// Resolved through <c>ApiProviderRegistry</c> at runtime.
+    /// The provider <b>instance</b> key this agent's model is registered under (e.g.
+    /// "github-copilot", "anthropic"), NOT an API contract name such as
+    /// "github-copilot-messages".
     /// </summary>
+    /// <remarks>
+    /// #2649: this field is resolved against <c>ModelRegistry</c> - <c>InProcessIsolationStrategy</c>
+    /// calls <c>GetModel(descriptor.ApiProvider, modelId)</c> at spawn - and is <b>not</b> an
+    /// <c>ApiProviderRegistry</c> key; the API contract lives on <c>LlmModel.Api</c> instead. The
+    /// two namespaces overlap in shape but not in content, and validating writes against the
+    /// contract registry while reads went to the model registry is what allowed unspawnable agents
+    /// to be persisted. Serialises to <c>agents.&lt;id&gt;.provider</c> in config.json (paired with
+    /// <see cref="ModelId"/> as <c>model</c>).
+    /// </remarks>
     public required string ApiProvider { get; init; }
 
     /// <summary>System prompt template for the agent.</summary>
     public string? SystemPrompt { get; init; }
-
-    /// <summary>
-    /// Path to a file containing the system prompt (alternative to <see cref="SystemPrompt" />).
-    /// Relative paths are resolved from the agent configuration directory.
-    /// </summary>
-    public string? SystemPromptFile { get; init; }
-
-    /// <summary>
-    /// Ordered list of system prompt file paths to load and concatenate.
-    /// Resolved relative to the agent's workspace directory.
-    /// If empty, uses default load order: AGENTS.md, SOUL.md, TOOLS.md, BOOTSTRAP.md, IDENTITY.md, USER.md.
-    /// </summary>
-    public IReadOnlyList<string> SystemPromptFiles { get; init; } = [];
 
     /// <summary>
     /// Tool identifiers this agent has access to.
@@ -150,6 +193,10 @@ public sealed record AgentDescriptor : ICitizen
     [ConfigField(Widget = ConfigFieldWidget.Select, Group = "agent", Order = 5)]
     public int? ContextWindow { get; init; }
 
+    /// <summary>Optional positive compaction trigger ceiling in tokens; null inherits the enclosing scope. Not model capacity.</summary>
+    [System.Text.Json.Serialization.JsonNumberHandling(System.Text.Json.Serialization.JsonNumberHandling.Strict)]
+    public int? CompactionTokenCeiling { get; init; }
+
     /// <summary>
     /// Maximum concurrent sessions allowed for this agent.
     /// Zero means unlimited.
@@ -210,6 +257,10 @@ public sealed record AgentDescriptor : ICitizen
     /// Example: <c>ExtensionConfig["botnexus-skills"]</c> for skills config.
     /// </summary>
     public IReadOnlyDictionary<string, System.Text.Json.JsonElement> ExtensionConfig { get; init; } =
+        new Dictionary<string, System.Text.Json.JsonElement>();
+
+    /// <summary>Raw <c>agents.defaults.extensions</c> values, kept separate from named-agent values.</summary>
+    public IReadOnlyDictionary<string, System.Text.Json.JsonElement> DefaultExtensionConfig { get; init; } =
         new Dictionary<string, System.Text.Json.JsonElement>();
 /// <summary>Conversation retention policy override for this agent. Null means world default applies.</summary>
     public AgentConversationRetentionConfig? ConversationRetention { get; init; }

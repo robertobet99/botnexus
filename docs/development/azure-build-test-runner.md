@@ -1,6 +1,8 @@
 # Azure build and test runner
 
-BotNexus worktrees are validated authoritatively on an Azure Container Apps Job instead of consuming CPU and memory on the development machine. The runner captures the worktree as it exists—including staged, unstaged, and untracked files—without requiring a commit or push.
+For developers running validation and operators maintaining its infrastructure. BotNexus validates worktrees remotely on an Azure Container Apps Job, and **remote is the default gate** (#2158). The runner captures the worktree as it exists—including staged, unstaged, and untracked files—without requiring a commit or push.
+
+The #5140 compatibility implementation requires a current external operator qualification before upload or launch. Read [Qualify a remote runner release](runner-release-contract.md) for the manifest schema, capabilities, input digest, release lifecycle and trust limits. That contract keeps the immutable image, qualified execution inputs and exact candidate snapshot separate. It does **not** approve the currently installed image or authorize installation or deployment.
 
 ## Security model
 
@@ -16,7 +18,9 @@ The storage and registry endpoints remain publicly routable but require Entra au
 
 ## Run validation
 
-Authenticate with Azure CLI and configure your deployment through environment variables. Do not commit subscription-specific values:
+Before running, obtain the trusted coordinator-selected `BOTNEXUS_RUNNER_RELEASE_MANIFEST` launch-environment setting. It must name an absolute local profile file outside the repository under ordinary existing user-profile permissions. The coordinator and local shell are trusted. Native peer tool restrictions remain applicable, but provide no OS/shell isolation or operator-only ACL/nonreplacement guarantee. A missing, revoked or incompatible release blocks validation; neither a source tag nor a cached receipt supplies approval. Qualification and any required installation are separate operator-reviewed actions, not steps performed by validation.
+
+The existing Azure CLI setup below requires authorized access. Configure your deployment through environment variables. Do not commit subscription-specific values:
 
 ```powershell
 az login
@@ -24,32 +28,125 @@ $env:BOTNEXUS_BUILDTEST_SUBSCRIPTION_ID = '<subscription-id>'
 $env:BOTNEXUS_BUILDTEST_RESOURCE_GROUP = '<resource-group>'
 $env:BOTNEXUS_BUILDTEST_STORAGE_ACCOUNT = '<storage-account>'
 $env:BOTNEXUS_BUILDTEST_JOB_NAME = '<container-apps-job>'
-./scripts/repo/Validate-PreCommit.ps1
+$env:BOTNEXUS_VALIDATION_MODE = 'remote'
+./scripts/repo/Invoke-PreCommitValidation.ps1
 ```
 
 Set these as user-level environment variables when the runner should survive shell restarts and reboots. On Windows, use `[Environment]::SetEnvironmentVariable('<name>', '<value>', 'User')`, then open a new shell. Explicit script parameters remain available for one-off overrides.
 
-The standard hook command uses strict mode. It accepts an exact-content receipt or invokes Azure automatically. Use the lower-level runner to select a diagnostic mode:
+The current canonical gate remains `scripts/repo/Invoke-PreCommitValidation.ps1`. Its remote mode defaults to `core`; the gate's “strict gate” label is not the lower-level `-Mode strict`. When `BOTNEXUS_VALIDATION_MODE=remote`, it accepts a qualifying v2 exact-content receipt or invokes Azure. Current operator approval is required in both paths. Use the lower-level runner for focused diagnostics:
 
 Modes:
 
 ```powershell
-# Default authoritative gate: full build, impacted/architecture/scenario, and strict Playwright
+# Recommended for ordinary non-portal work: full tree build, then every test project
+# EXCEPT the quarantined browser/E2E ones. Carries a 12,000 minimum test total.
+./scripts/repo/Invoke-AzureBuildTest.ps1 -Mode core
+
+# Every test project including the quarantined browser/E2E ones. Also floors at 12,000,
+# but those projects are what push a run into the replica timeout described below.
+./scripts/repo/Invoke-AzureBuildTest.ps1 -Mode full
+
+# Full build, impacted/architecture/scenario, and strict Playwright.
+# Minimum test total is 0 - see the note below before treating it as authoritative.
 ./scripts/repo/Invoke-AzureBuildTest.ps1 -Mode strict
 
 # Full solution build plus impacted, architecture, and scenario tests
 ./scripts/repo/Invoke-AzureBuildTest.ps1 -Mode impacted
 
-# Full solution test suite
-./scripts/repo/Invoke-AzureBuildTest.ps1 -Mode full
-
 # Integration E2E suite with Playwright Chromium available
 ./scripts/repo/Invoke-AzureBuildTest.ps1 -Mode playwright
 ```
 
+The runner also accepts `diagnostic` for a single named test project. This mode is not an authoritative validation gate and never writes a validation receipt. Other values are rejected by the `ValidateSet` on the `-Mode` parameter in `scripts/repo/Invoke-AzureBuildTest.ps1`.
+
+### Diagnose one test project
+
+For maintainers investigating a hung test host, use a literal repository-relative project path:
+
+```powershell
+./scripts/repo/Invoke-AzureBuildTest.ps1 -Mode diagnostic -DiagnosticProject tests/gateway/BotNexus.Gateway.Conversations.Tests/BotNexus.Gateway.Conversations.Tests.csproj -DiagnosticHangSeconds 120
+```
+
+The source snapshot is verified before building. The sender requires an externally qualified immutable image, matching execution-input digest and requested mode. Diagnostic runs also require `diagnostic-containment-v1` as well as `exact-source-v1`. A source-tag difference is advisory, not automatic grounds for rebuilding or redeploying. Changing a worktree does not deploy its runner image. See the [release contract](runner-release-contract.md) for blockers and separate operator qualification.
+
+The diagnostic project must exist below `tests/`, explicitly reference the test SDK, and not opt out of test execution. Absolute paths, wildcards, traversal, links, and build-output paths are rejected. No test filter is added. The existing generated run settings and isolated test home are preserved.
+
+The event collector flushes each observed test start and end to a JSON Lines journal, including identity, name, assembly, UTC observation time, and per-journal sequence. Observation time is not an adapter-provided execution timestamp. Pairing is checked within each journal using test identity, assembly, and name; malformed timestamps, duplicate ends, or missing starts cannot certify complete evidence.
+
+The per-test inactivity timer requests mini hang dumps. An independent absolute watchdog also attempts native capture 90 seconds before the remaining outer test deadline, even if every test has ended but the host is stuck during shutdown. Each dump subprocess has a 60-second bound, inside the unchanged outer deadline. Native absolute capture uses the Linux test host's own runtime `createdump`, with an exact kernel process-start token and ownership checks. Unsupported platforms, unavailable tools, attach failures, and missing targets are recorded rather than treated as successful captures.
+
+Diagnostic commands and dump tools start behind a gated ownership boundary: a Windows job or Linux session. That boundary remains alive if the launcher exits first, so descendants and inherited output pipes can still be terminated and drained. Cleanup, reader closure, and pipe-drain failures remain incomplete evidence. Live journal reads permit the collector's write handle and defer only an unfinished trailing record; final evidence parsing remains strict.
+
+Supplementary VSTest traces, event journals, dump-attempt records, and source/runner identities are retained in the diagnostic artifacts. `diagnostic-evidence.json` checks native dump container and payload ranges, not decoded or symbolized stacks. A hang without structurally valid dump evidence remains incomplete; requesting a dump is not proof that it was produced. Inspect the private dump with an appropriate debugger to establish the actual stack. Diagnostic success does not replace a complete CORE run.
+
+**Treat these artifacts as sensitive.** Dumps and traces can contain credentials or test data. Diagnostic mode retains remote artifacts on failure instead of deleting the evidence. Storage remains authenticated and private; choose a private local output directory with `-OutputPath`. Do not attach raw artifacts to public issues or pull requests. Retention and deletion require the existing authorized storage controls.
+
+**`core` excludes exactly two projects.** The runner filters on
+`FullyQualifiedName!~BotNexus.Integration.E2E&FullyQualifiedName!~BotNexus.E2E`, so
+`BotNexus.Integration.E2E` and `BotNexus.E2E` are the only things `core` drops relative to
+`full`. They are quarantined rather than deleted, and they are passed to the completeness
+check as known exclusions so a filtered run never accuses a project it deliberately skipped.
+
+**`strict` validates less than its name suggests, and is not the mode to reach for by default.**
+The runner's minimum-test-total map is `full = 12000`, `core = 12000`, `strict = 0`,
+`playwright = 0`. A `core` or `full` run therefore fails closed when the executed count
+collapses; a `strict` run has no floor at all and cannot detect that failure. Prefer `core`
+for non-portal changes and `full` when the browser/E2E projects genuinely need to run.
+
 Results are downloaded to `artifacts/azure-buildtest/<run-id>/`. The script returns a failing exit status when the Azure execution or test process fails.
 
-A successful `strict`, `impacted`, or `full` run writes a receipt under the worktree's Git metadata. The receipt records a SHA-256 fingerprint over the current HEAD, resolved base commit, and exact Git tree containing staged, unstaged, and untracked files. The pre-commit hook recalculates that fingerprint. It skips redundant validation only when the receipt matches exactly; any content or base-ref change invalidates it and starts a new remote run. Only a strict receipt satisfies the authoritative pre-commit gate because it additionally proves the Playwright safety net. The client refuses to issue a strict receipt unless the downloaded artifacts include `playwright.log`; this fails safely when an older deployed runner treats the mode as impacted-only. Impacted, full, and Playwright-only receipts remain useful diagnostic evidence but do not bypass strict validation. When Azure is unavailable, `./scripts/repo/Validate-PreCommit.ps1 -LocalFallback` runs the same strict gate under a per-worktree lock. The fallback is never automatic or concurrent. For a Git hook invocation, set `BOTNEXUS_VALIDATION_LOCAL_FALLBACK=1` explicitly for that process.
+### Phase timings
+
+Each run records how long every phase took, in `runner-timing.log` and in the `timings` object inside `result.json` (#2889):
+
+```
+source-download        12.40s  ok
+payload-extract         8.10s  ok
+restore                63.20s  ok
+tool-restore            4.80s  ok
+build                 141.60s  ok
+test                  502.30s  ok
+artifact-upload         6.90s  ok
+```
+
+Without this the only derivable number was total wall clock, so a twelve-minute run might have been three minutes of restore plus nine of test, or seven plus five - and those call for entirely different fixes. Any proposed change to gate performance should quote a measured before and after from this artifact rather than argue from structure.
+
+Three properties are deliberate:
+
+- **It is an artifact, not console output.** Runner stdout is not uploaded and `az containerapp job logs show` hangs against this environment, so a diagnostic that only reaches the console cannot be read afterwards.
+- **It cannot fail a run.** Every timing write is best-effort and swallows its own errors. A measurement bug turning a green suite red would be worse than having no measurement.
+- **A phase that did not run is marked `skipped`, never `0.00s`.** A phase that was absent and a phase that was genuinely instant are different findings.
+
+Because artifacts are deleted after each run, pass `-KeepRemoteArtifacts` when the timings are the point of the run.
+
+### Timeouts produce evidence, not an empty directory
+
+The Container Apps replica timeout is a **hard kill**: when it expires the replica is destroyed, the entrypoint's `finally` block never executes, and the artifact upload that lives in that block never happens. Before #3305 a run that overran therefore produced an **empty** artifact directory — no `result.json`, no TRX, no timing log. That outcome cannot distinguish a genuine hang from a suite that is merely slow, and it attributes the cost to nothing at all. Two measured `-Mode full` runs on one worktree died exactly that way at 20.1 minutes against a 20-minute budget.
+
+The runner now keeps **its own deadline, set strictly inside the platform budget**, and ends the run on a path it controls:
+
+- The client passes the budget through `REPLICA_TIMEOUT_SECONDS`, derived from `-ReplicaTimeoutMinutes`, so the runner's deadline cannot drift from `replicaTimeout` in `main.bicep`.
+- `Get-RunnerDeadlineSeconds` subtracts a 90-second reserve. That reserve is what pays for writing `result.json` and completing the upload; landing exactly on the platform budget would reproduce the original defect.
+- The test phase runs through `Invoke-BoundedProcess` rather than a blocking `& dotnet test | Tee-Object` pipeline. A pipeline returns only when the child exits, so there is no instant at which the runner could notice it is about to be killed. The child is killed with its whole process tree, because testhost processes outlive their parent and a survivor would keep writing into the results directory during the upload.
+- `result.json` gains a `timeout` object — `null` on an ordinary run — carrying the elapsed time, the deadline, the assemblies that did report, and the projects that did not.
+
+The attribution is derived from the TRX that exist **at the moment of the deadline**, not from filenames: `dotnet test` writes every project's TRX into one directory under the same prefix, so the names carry no project identity. The assembly is read out of each row's `storage` attribute by text scan rather than an XML parse, because a TRX truncated by a kill is frequently not well-formed and refusing to read it would discard the only evidence the run produced.
+
+Two properties are deliberate:
+
+- **A filtered run never accuses a project it was not going to run.** `core` excludes the browser/E2E projects, so their absence from the results is by design. A confidently wrong attribution is worse than none.
+- **An empty outstanding set is stated, not filled in.** "Every project reported and the phase still overran" is a real and different finding — the overrun is outside test execution — and inventing a culprit would hide it.
+
+`infra/buildtest/runner/tests/RunnerTimeout.Tests.ps1` pins all of this, including the truncated-TRX case and the sensitivity of the derivation to the budget; `RunnerDeadlineConsistencyTests` fails the build if the budget stops being passed through or the bound is removed.
+
+**The budget itself was deliberately not raised.** A larger number would hide the defect rather than remove it: the failure mode was "killed, no evidence", not "killed too early". Whether `-Mode full` genuinely needs more than 20 minutes is a separate question, answerable only once a timed-out run produces attribution — which is what this change delivers.
+
+A successful non-diagnostic run can write a v2 receipt under the worktree's Git metadata only after provider, release, exact-source and complete-test checks pass. Its fingerprint covers HEAD, resolved base commit, candidate tree and raw source-manifest digest, including staged, unstaged and untracked candidate content. `Invoke-PreCommitValidation.ps1` recomputes that identity and rereads current external approval before reuse. The receipt mode must equal the requested remote mode (`core` by default); other modes do not substitute. Legacy receipts cannot self-upgrade.
+
+No git hook consumes this receipt: #2841 removed the pre-commit hook, and `scripts/repo/install-hooks.ps1` activates only the `pre-push` `core.bare` guard (#1602). Lower-level `strict` still requires a fresh `playwright.log`; this does not change the browser quarantine or make it the ordinary gate. See [receipt reuse and interrupted-run recovery](validation-receipts.md).
+
+**Remote is the default and local is opt-in (#2158).** With nothing configured, `Resolve-BotNexusValidationMode` returns `remote`. Local validation spawns real gateway processes on the development host; when their parent dies the children survive, and because every gateway opens the shared cron store they claim scheduled jobs belonging to the live gateway and fail them. On 2026-08-06 three such orphans - two of them 30+ hours old - starved the live gateway until the portal would not load. To choose local deliberately, set `BOTNEXUS_VALIDATION_MODE=local` at process, user, or machine scope (process scope wins), pass `-ValidationMode local`, or use the `-LocalFallback` / `BOTNEXUS_VALIDATION_LOCAL_FALLBACK=1` aliases.
 
 Deployment-specific settings come from the environment:
 
@@ -65,7 +162,7 @@ The deployed job uses 4 vCPU, 8 GiB, and a two-hour timeout. All identifiers can
 
 ## Provision or update infrastructure
 
-The Bicep template and runner image live under `infra/buildtest/`. Deployment requires Owner or equivalent resource and RBAC permissions:
+The Bicep template and runner image live under `infra/buildtest/`. The existing deployment procedure below is a separate operator action; reading this guide or passing compatibility checks does not authorize it. Deployment alone does not publish an approved release manifest. Review the [qualification lifecycle](runner-release-contract.md#operator-prerequisites-and-lifecycle) separately. Deployment requires Owner or equivalent resource and RBAC permissions:
 
 ```powershell
 $env:BOTNEXUS_BUILDTEST_SUBSCRIPTION_ID = '<subscription-id>'
@@ -76,15 +173,28 @@ $env:BOTNEXUS_BUILDTEST_LOCATION = '<azure-region>'
 
 The script uses the current Azure CLI user as the operator identity and builds the runner image through ACR Tasks. The subscription used for the shared deployment does not permit Basic or Standard ACR, so the template uses Premium. Container Apps compute scales to zero, but the registry has a standing charge.
 
+### Runner image tags are content-addressed
+
+Do not pick a version number for the runner image. The tag is **derived from a SHA-256 over the contents of `infra/buildtest/runner/`** and looks like `src-1bc35f62d232` (#2900). This build/source attribution is distinct from the immutable registry digest and the broader qualified execution-input digest. It does not confer operator approval.
+
+This is a correctness guard, not a convenience. **ACR tags are mutable**: `az acr build` against an existing tag republishes over it with exit 0 and no warning. On 2026-08-09 a hand-picked "next" version destroyed the existing `0.1.12` image, because the default in the deploy script read `0.1.11` while the deployed job was actually running `0.1.15` and `main.bicep` claimed `0.1.4` — three sources of truth, all disagreeing.
+
+Content addressing removes the failure mode rather than documenting it:
+
+- Identical content always yields the same tag, so a redundant deploy is a **skipped no-op** instead of an overwrite.
+- Different content always yields a different tag, so a change can never land on an existing one.
+- There is no number left to drift, and `main.bicep` now requires the parameter instead of defaulting.
+
+Passing `-RunnerImageTag` explicitly is still allowed for pinning a historical image during a rollback, but the script **refuses to publish over a tag that already exists**. Deleting a tag has to be a deliberate, separate act.
+
+Files under `infra/buildtest/runner/tests/` are excluded from the hash — they never enter the image, so editing them must not force a rebuild. `infra/buildtest/tests/DeployTagGuard.Tests.ps1` pins all of these properties and is mutation-verified.
+
 ## Snapshot format
 
-The local script uploads a small payload containing:
-
-1. a Git bundle with repository history and refs, needed by `dotnet-affected`; and
-2. a tar overlay containing all tracked and untracked, non-ignored worktree files.
-
-The runner clones the bundle, applies the overlay, commits a temporary snapshot, and then invokes the repository's canonical build and test scripts. The temporary commit exists only inside the ephemeral job replica.
+The local script uploads a payload with exactly four regular entries: `repository.bundle`, `workspace.zip`, `source-manifest.json` and the sender's `SourceSnapshot.psm1` verifier. The runner clones without checkout, restores the exact candidate files, and verifies their names and raw bytes before restore/build. It does not create a synthetic pre-validation commit. See [Exact-source remote validation snapshots](remote-source-snapshots.md) for the complete transport and proof contract. Release qualification never replaces that proof.
 
 ## Maintenance and PR automation
 
-All agents, maintenance jobs, PR workflows, and human development flows must call `scripts/repo/Validate-PreCommit.ps1` once for the final candidate. Record the Azure run ID and mode in Merge Notes. Do not schedule or run an additional local build/test when the exact-content receipt qualifies. Do not hand-run `dotnet build`, `dotnet test`, or `test-impacted.ps1` as an extra pre-push gate. If Azure is blocked, use `-LocalFallback`, identify the blocker, and do not describe the candidate as remotely production-ready. Local fallback is serialized per worktree to prevent two linker/build processes from writing the same `bin`/`obj` outputs.
+All agents, maintenance jobs, PR workflows, and human development flows call `scripts/repo/Invoke-PreCommitValidation.ps1` once for the final candidate. Record the selected mode and gate evidence in Merge Notes. Hand-run `dotnet build` freely - compiling the projects you changed before spending a remote gate is expected practice, and a build starts no test host or gateway process - but a build is not an extra pre-push gate and does not substitute for one. Do not run `dotnet test` or `test-impacted.ps1` on the development host at all: the test host boots gateway processes that outlive their parent, and that is the leak path #2158 exists to close. Remote mode retains exact-content receipt reuse; local mode, when explicitly requested, is globally serialized across BotNexus worktrees.
+
+**Do not run this gate for a documentation-only change.** When a change touches nothing but `*.md`, `docs/**`, or `mkdocs.yml`, the remote suite exercises no part of the diff: it costs a container run and roughly twelve minutes to prove something unrelated. Build the documentation instead with `npm run docs:build` (about twenty seconds, and it exits non-zero on a dead link). `ci-build-test.yml` takes the same position already, listing `docs/**` and `**/*.md` under `paths-ignore` so a docs-only PR never triggers the test workflow. A change that touches documentation *and* code is a code change and takes the full gate.

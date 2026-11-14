@@ -2,6 +2,7 @@ using System.CommandLine;
 using System.Net.Http.Json;
 using System.Text.Json;
 using BotNexus.Cron;
+using BotNexus.Cli.Services;
 using Spectre.Console;
 
 namespace BotNexus.Cli.Commands;
@@ -37,70 +38,119 @@ internal sealed class CronCommands
     {
         var command = new Command("cron", "Manage cron jobs on a running BotNexus gateway.");
 
-        var urlOption = new Option<string>("--url", () => "http://localhost:5005", "Gateway base URL.");
+        var urlOption = new Option<string>("--url", () => GatewayClientFactory.DefaultUrl, "Gateway base URL.");
+        var tokenOption = new Option<string?>("--token", "Gateway API credential. Required when --url is not the local gateway.");
 
         // ── list ──────────────────────────────────────────────────────────
-        var listCommand = new Command("list", "List all cron jobs.") { urlOption };
+        var listCommand = new Command("list", "List all cron jobs.") { urlOption, tokenOption };
         listCommand.SetHandler(async context =>
         {
             var url = context.ParseResult.GetValueForOption(urlOption)!;
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
-            _http.BaseAddress ??= new Uri(url);
+            var refusal = GatewayClientFactory.ApplyPolicy(
+                _http, url, context.ParseResult.GetValueForOption(tokenOption), GatewayClientFactory.DefaultCredentialSource());
+            if (refusal is not null)
+            {
+                AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(refusal));
+                context.ExitCode = 1;
+                return;
+            }
+
             context.ExitCode = await ExecuteListAsync(verbose, context.GetCancellationToken());
         });
 
         // ── get ───────────────────────────────────────────────────────────
         var jobIdArg = new Argument<string>("job-id", "Cron job ID.");
-        var getCommand = new Command("get", "Show details for a single cron job.") { jobIdArg, urlOption };
+        var getCommand = new Command("get", "Show details for a single cron job.") { jobIdArg, urlOption, tokenOption };
         getCommand.SetHandler(async context =>
         {
             var id = context.ParseResult.GetValueForArgument(jobIdArg);
             var url = context.ParseResult.GetValueForOption(urlOption)!;
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
-            _http.BaseAddress ??= new Uri(url);
+            var refusal = GatewayClientFactory.ApplyPolicy(
+                _http, url, context.ParseResult.GetValueForOption(tokenOption), GatewayClientFactory.DefaultCredentialSource());
+            if (refusal is not null)
+            {
+                AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(refusal));
+                context.ExitCode = 1;
+                return;
+            }
+
             context.ExitCode = await ExecuteGetAsync(id, verbose, context.GetCancellationToken());
         });
 
         // ── delete ────────────────────────────────────────────────────────
-        var deleteCommand = new Command("delete", "Delete a cron job.") { jobIdArg, urlOption };
+        var deleteCommand = new Command("delete", "Delete a cron job.") { jobIdArg, urlOption, tokenOption };
         deleteCommand.SetHandler(async context =>
         {
             var id = context.ParseResult.GetValueForArgument(jobIdArg);
             var url = context.ParseResult.GetValueForOption(urlOption)!;
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
-            _http.BaseAddress ??= new Uri(url);
+            var refusal = GatewayClientFactory.ApplyPolicy(
+                _http, url, context.ParseResult.GetValueForOption(tokenOption), GatewayClientFactory.DefaultCredentialSource());
+            if (refusal is not null)
+            {
+                AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(refusal));
+                context.ExitCode = 1;
+                return;
+            }
+
             context.ExitCode = await ExecuteDeleteAsync(id, verbose, context.GetCancellationToken());
         });
 
         // ── run ───────────────────────────────────────────────────────────
-        var runCommand = new Command("run", "Trigger a cron job immediately.") { jobIdArg, urlOption };
+        var runCommand = new Command("run", "Trigger a cron job immediately.") { jobIdArg, urlOption, tokenOption };
         runCommand.SetHandler(async context =>
         {
             var id = context.ParseResult.GetValueForArgument(jobIdArg);
             var url = context.ParseResult.GetValueForOption(urlOption)!;
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
-            _http.BaseAddress ??= new Uri(url);
+            var refusal = GatewayClientFactory.ApplyPolicy(
+                _http, url, context.ParseResult.GetValueForOption(tokenOption), GatewayClientFactory.DefaultCredentialSource());
+            if (refusal is not null)
+            {
+                AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(refusal));
+                context.ExitCode = 1;
+                return;
+            }
+
             context.ExitCode = await ExecuteRunAsync(id, verbose, context.GetCancellationToken());
         });
 
         // ── enable / disable ──────────────────────────────────────────────
-        var enableCommand = new Command("enable", "Enable a cron job.") { jobIdArg, urlOption };
+        var enableCommand = new Command("enable", "Enable a cron job.") { jobIdArg, urlOption, tokenOption };
         enableCommand.SetHandler(async context =>
         {
             var id = context.ParseResult.GetValueForArgument(jobIdArg);
             var url = context.ParseResult.GetValueForOption(urlOption)!;
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
-            _http.BaseAddress ??= new Uri(url);
+            var refusal = GatewayClientFactory.ApplyPolicy(
+                _http, url, context.ParseResult.GetValueForOption(tokenOption), GatewayClientFactory.DefaultCredentialSource());
+            if (refusal is not null)
+            {
+                AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(refusal));
+                context.ExitCode = 1;
+                return;
+            }
+
             context.ExitCode = await ExecuteEnableAsync(id, enable: true, verbose, context.GetCancellationToken());
         });
 
-        var disableCommand = new Command("disable", "Disable a cron job.") { jobIdArg, urlOption };
+        var disableCommand = new Command("disable", "Disable a cron job.") { jobIdArg, urlOption, tokenOption };
         disableCommand.SetHandler(async context =>
         {
             var id = context.ParseResult.GetValueForArgument(jobIdArg);
             var url = context.ParseResult.GetValueForOption(urlOption)!;
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
-            _http.BaseAddress ??= new Uri(url);
+            var refusal = GatewayClientFactory.ApplyPolicy(
+                _http, url, context.ParseResult.GetValueForOption(tokenOption), GatewayClientFactory.DefaultCredentialSource());
+            if (refusal is not null)
+            {
+                AnsiConsole.MarkupLine("[red]{0}[/]", CliText.SafeDisplay(refusal));
+                context.ExitCode = 1;
+                return;
+            }
+
             context.ExitCode = await ExecuteEnableAsync(id, enable: false, verbose, context.GetCancellationToken());
         });
 
@@ -139,14 +189,7 @@ internal sealed class CronCommands
             var table = new Table().AddColumn("ID").AddColumn("Name").AddColumn("Schedule").AddColumn("Agent").AddColumn("Enabled").AddColumn("Type");
             foreach (var job in jobs)
             {
-                var enabledMark = job.Enabled ? "[green]\u2713[/]" : "[red]\u2717[/]";
-                table.AddRow(
-                    Markup.Escape(job.Id.Value),
-                    Markup.Escape(job.Name ?? "-"),
-                    Markup.Escape(job.Schedule ?? "-"),
-                    Markup.Escape(job.AgentId?.Value ?? "-"),
-                    enabledMark,
-                    Markup.Escape(job.ActionType ?? "-"));
+                table.AddRow(BuildListRow(job));
             }
 
             AnsiConsole.Write(table);
@@ -154,7 +197,7 @@ internal sealed class CronCommands
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {CliText.SafeDisplay(ex.Message)}");
             if (verbose)
                 AnsiConsole.WriteException(ex);
             return 1;
@@ -174,7 +217,7 @@ internal sealed class CronCommands
             var response = await _http.GetAsync($"api/cron/{Uri.EscapeDataString(jobId)}", ct);
             if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
-                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{Markup.Escape(jobId)}[/] not found.");
+                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{CliText.SafeDisplay(jobId)}[/] not found.");
                 return 1;
             }
 
@@ -196,7 +239,7 @@ internal sealed class CronCommands
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {CliText.SafeDisplay(ex.Message)}");
             if (verbose)
                 AnsiConsole.WriteException(ex);
             return 1;
@@ -216,7 +259,7 @@ internal sealed class CronCommands
             var response = await _http.DeleteAsync($"api/cron/{Uri.EscapeDataString(jobId)}", ct);
             if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
-                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{Markup.Escape(jobId)}[/] not found.");
+                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{CliText.SafeDisplay(jobId)}[/] not found.");
                 return 1;
             }
 
@@ -226,12 +269,12 @@ internal sealed class CronCommands
                 return 1;
             }
 
-            AnsiConsole.MarkupLine($"[green]\u2713[/] Cron job [yellow]{Markup.Escape(jobId)}[/] deleted.");
+            AnsiConsole.MarkupLine($"[green]\u2713[/] Cron job [yellow]{CliText.SafeDisplay(jobId)}[/] deleted.");
             return 0;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {CliText.SafeDisplay(ex.Message)}");
             if (verbose)
                 AnsiConsole.WriteException(ex);
             return 1;
@@ -251,7 +294,7 @@ internal sealed class CronCommands
             var response = await _http.PostAsync($"api/cron/{Uri.EscapeDataString(jobId)}/run", null, ct);
             if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
-                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{Markup.Escape(jobId)}[/] not found.");
+                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{CliText.SafeDisplay(jobId)}[/] not found.");
                 return 1;
             }
 
@@ -262,12 +305,12 @@ internal sealed class CronCommands
             }
 
             var run = await response.Content.ReadFromJsonAsync<CronRun>(JsonOpts, ct);
-            AnsiConsole.MarkupLine($"[green]\u2713[/] Cron job [yellow]{Markup.Escape(jobId)}[/] triggered. Run ID: [dim]{Markup.Escape(run?.Id.Value ?? "?")}[/]");
+            AnsiConsole.MarkupLine($"[green]\u2713[/] Cron job [yellow]{CliText.SafeDisplay(jobId)}[/] triggered. Run ID: [dim]{CliText.SafeDisplay(run?.Id.Value ?? "?")}[/]");
             return 0;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {CliText.SafeDisplay(ex.Message)}");
             if (verbose)
                 AnsiConsole.WriteException(ex);
             return 1;
@@ -288,7 +331,7 @@ internal sealed class CronCommands
             var getResponse = await _http.GetAsync($"api/cron/{Uri.EscapeDataString(jobId)}", ct);
             if (getResponse.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
-                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{Markup.Escape(jobId)}[/] not found.");
+                AnsiConsole.MarkupLine($"[red]Error:[/] Cron job [yellow]{CliText.SafeDisplay(jobId)}[/] not found.");
                 return 1;
             }
 
@@ -316,12 +359,12 @@ internal sealed class CronCommands
             }
 
             var verb = enable ? "enabled" : "disabled";
-            AnsiConsole.MarkupLine($"[green]\u2713[/] Cron job [yellow]{Markup.Escape(jobId)}[/] {verb}.");
+            AnsiConsole.MarkupLine($"[green]\u2713[/] Cron job [yellow]{CliText.SafeDisplay(jobId)}[/] {verb}.");
             return 0;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Could not connect to gateway \u2014 {CliText.SafeDisplay(ex.Message)}");
             if (verbose)
                 AnsiConsole.WriteException(ex);
             return 1;
@@ -332,18 +375,39 @@ internal sealed class CronCommands
     //  Helpers
     // ──────────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Projects one <c>cron list</c> table row, sanitising every stored value through
+    /// <see cref="CliText.SafeDisplay"/>.
+    /// </summary>
+    /// <remarks>
+    /// Extracted as a pure function so the sanitisation is directly assertable (#3208 AC3).
+    /// Every field here except the enabled glyph originates in <c>cron.sqlite</c> and is
+    /// agent-writable via <c>CronTool</c>, so a job name may legitimately contain OSC-52 or a
+    /// bare carriage return; <c>Markup.Escape</c> alone would forward both to the operator's
+    /// terminal. The enabled glyph is CLI-authored markup and is deliberately NOT sanitised.
+    /// </remarks>
+    internal static string[] BuildListRow(CronJob job) =>
+    [
+        CliText.SafeDisplay(job.Id.Value),
+        CliText.SafeDisplay(job.Name ?? "-"),
+        CliText.SafeDisplay(job.Schedule ?? "-"),
+        CliText.SafeDisplay(job.AgentId?.Value ?? "-"),
+        job.Enabled ? "[green]\u2713[/]" : "[red]\u2717[/]",
+        CliText.SafeDisplay(job.ActionType ?? "-"),
+    ];
+
     private static void PrintJob(CronJob job)
     {
-        AnsiConsole.MarkupLine($"[bold]ID:[/]       {Markup.Escape(job.Id.Value)}");
-        AnsiConsole.MarkupLine($"[bold]Name:[/]     {Markup.Escape(job.Name ?? "-")}");
-        AnsiConsole.MarkupLine($"[bold]Schedule:[/] {Markup.Escape(job.Schedule ?? "-")}");
-        AnsiConsole.MarkupLine($"[bold]Type:[/]     {Markup.Escape(job.ActionType ?? "-")}");
-        AnsiConsole.MarkupLine($"[bold]Agent:[/]    {Markup.Escape(job.AgentId?.Value ?? "-")}");
+        AnsiConsole.MarkupLine($"[bold]ID:[/]       {CliText.SafeDisplay(job.Id.Value)}");
+        AnsiConsole.MarkupLine($"[bold]Name:[/]     {CliText.SafeDisplay(job.Name ?? "-")}");
+        AnsiConsole.MarkupLine($"[bold]Schedule:[/] {CliText.SafeDisplay(job.Schedule ?? "-")}");
+        AnsiConsole.MarkupLine($"[bold]Type:[/]     {CliText.SafeDisplay(job.ActionType ?? "-")}");
+        AnsiConsole.MarkupLine($"[bold]Agent:[/]    {CliText.SafeDisplay(job.AgentId?.Value ?? "-")}");
         AnsiConsole.MarkupLine($"[bold]Enabled:[/]  {(job.Enabled ? "[green]yes[/]" : "[red]no[/]")}");
         if (!string.IsNullOrWhiteSpace(job.TimeZone))
-            AnsiConsole.MarkupLine($"[bold]TimeZone:[/] {Markup.Escape(job.TimeZone)}");
+            AnsiConsole.MarkupLine($"[bold]TimeZone:[/] {CliText.SafeDisplay(job.TimeZone)}");
         if (!string.IsNullOrWhiteSpace(job.Message))
-            AnsiConsole.MarkupLine($"[bold]Message:[/]  {Markup.Escape(job.Message)}");
+            AnsiConsole.MarkupLine($"[bold]Message:[/]  {CliText.SafeDisplay(job.Message)}");
         if (job.CreatedAt != default)
             AnsiConsole.MarkupLine($"[bold]Created:[/]  {job.CreatedAt:u}");
     }

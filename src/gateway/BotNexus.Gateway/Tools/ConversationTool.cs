@@ -25,10 +25,14 @@ public sealed class ConversationTool(
     IReadOnlyList<string>? allowedAgents = null,
     ISessionStore? sessionStore = null,
     IInboundMessageOrchestrator? messageOrchestrator = null,
-    IConversationChangeNotifier? changeNotifier = null) : IAgentTool
+    IConversationChangeNotifier? changeNotifier = null,
+    IConversationRouter? conversationRouter = null) : IAgentTool
 {
     public string Name => "conversation";
     public string Label => "Conversation Context";
+
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Gateway-owned conversation store.</summary>
+    public string ContentSource => ToolContentSource.Local;
 
     public Tool Definition => new(
         Name,
@@ -137,47 +141,40 @@ public sealed class ConversationTool(
         if (string.IsNullOrWhiteSpace(message))
             throw new ArgumentException("message must not be empty.");
 
+        var conversation = await ResolveConversationAsync(arguments, ct).ConfigureAwait(false);
+        // This is denial guidance, not an access grant: never route, reactivate or dispatch a
+        // child conversation, even for an Own-scoped parent that cannot otherwise read it.
+        if (conversation.Kind == ConversationKind.AgentSubAgent)
+            throw new NotSupportedException("Child conversations do not support live messaging or steering. From the original parent session use manage_subagent action=status/wait/result/history; use spawn_subagent for a new bounded task. Session rollover does not grant retained inspection access.");
+        EnsureCanAccess(conversation.AgentId);
+
         if (messageOrchestrator is null)
             throw new InvalidOperationException("Message orchestrator is required to send a message to a conversation.");
 
         if (sessionStore is null)
             throw new InvalidOperationException("Session store is required to send a message to a conversation.");
 
-        var conversation = await ResolveConversationAsync(arguments, ct).ConfigureAwait(false);
-        EnsureCanAccess(conversation.AgentId);
+        var router = conversationRouter ?? new DefaultConversationRouter(
+            conversationStore,
+            sessionStore,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DefaultConversationRouter>.Instance);
 
-        // Reuse active session if present, otherwise create a fresh one.
-        GatewaySession session;
-        if (conversation.ActiveSessionId is { } existingSessionId)
-        {
-            var existing = await sessionStore.GetAsync(existingSessionId, ct).ConfigureAwait(false);
-            if (existing is not null)
-            {
-                session = existing;
-            }
-            else
-            {
-                session = await sessionStore.GetOrCreateAsync(SessionId.Create(), conversation.AgentId, ct).ConfigureAwait(false);
-                session.ConversationId = conversation.ConversationId;
-                conversation.ActiveSessionId = session.SessionId;
-                conversation.UpdatedAt = DateTimeOffset.UtcNow;
-                await conversationStore.SaveAsync(conversation, ct).ConfigureAwait(false);
-            }
-        }
-        else
-        {
-            session = await sessionStore.GetOrCreateAsync(SessionId.Create(), conversation.AgentId, ct).ConfigureAwait(false);
-            session.ConversationId = conversation.ConversationId;
-            conversation.ActiveSessionId = session.SessionId;
-            conversation.UpdatedAt = DateTimeOffset.UtcNow;
-            await conversationStore.SaveAsync(conversation, ct).ConfigureAwait(false);
-        }
-
+        // Route through the canonical inbound lifecycle seam. The router reactivates archived
+        // conversations and persists the active-session assignment before dispatch.
+        var routing = await router.ResolveInboundAsync(
+            conversation.AgentId,
+            ChannelKey.From("internal"),
+            ChannelAddress.From(conversation.AgentId.Value),
+            conversation.ConversationId,
+            ct,
+            CitizenId.Of(agentId)).ConfigureAwait(false);
+        conversation = routing.Conversation;
+        var sessionId = routing.SessionId;
         // Carry the parsed speak_as override (if any) onto the inbound message so
         // GatewayHost derives the recorded role from it -- and from the agent-kind
         // sender when it is absent -- rather than re-deriving or hardcoding.
         var speakAs = ReadSpeakAs(arguments);
-        messageOrchestrator.Post(
+        var admission = await messageOrchestrator.PostAsync(
             new InboundMessage
             {
                 ChannelType = ChannelKey.From("internal"),
@@ -188,19 +185,25 @@ public sealed class ConversationTool(
                 SpeakAs = speakAs,
                 RoutingHints = new InboundMessageRoutingHints(
                     RequestedAgentId: conversation.AgentId,
-                    RequestedSessionId: session.SessionId,
+                    RequestedSessionId: sessionId,
                     RequestedConversationId: conversation.ConversationId),
                 Metadata = new Dictionary<string, object?>
                 {
                     ["messageType"] = "message",
                     ["source"] = "conversation-tool-message"
                 }
-            });
+            }, ct).ConfigureAwait(false);
+
+        if (admission is not (InboundDispatchStatus.Accepted or InboundDispatchStatus.Steered))
+        {
+            throw new InvalidOperationException(
+                $"Message could not be admitted to conversation '{conversation.ConversationId.Value}' ({admission}).");
+        }
 
         return TextResult(JsonSerializer.Serialize(new
         {
             conversationId = conversation.ConversationId.Value,
-            sessionId = session.SessionId.Value
+            sessionId = sessionId.Value
         }, JsonOptions));
     }
 
@@ -287,19 +290,18 @@ public sealed class ConversationTool(
             throw new ArgumentException(newPurposeError);
         var message = ReadString(arguments, "message");
         var now = DateTimeOffset.UtcNow;
-        var conversation = new Conversation
-        {
-            ConversationId = ConversationId.Create(),
-            AgentId = targetAgentId,
-            Title = string.IsNullOrWhiteSpace(title) ? "New conversation" : title.Trim(),
-            Purpose = string.IsNullOrWhiteSpace(purpose) ? null : purpose.Trim(),
-            Status = ConversationStatus.Active,
-            CreatedAt = now,
-            UpdatedAt = now,
+        var conversation = ConversationFactory.CreateForAgent(
+            // Kind stays HumanAgent because the agent is minting a user-facing conversation, not a
+            // peer/sub-agent pairing.
+            ConversationKind.HumanAgent,
+            ConversationId.Create(),
+            targetAgentId,
+            title: string.IsNullOrWhiteSpace(title) ? null : title.Trim(),
             // The conversation_new tool is invoked by an agent (the caller of this tool), so the
             // initiating citizen is always the calling agent.
-            Initiator = CitizenId.Of(agentId)
-        };
+            initiator: CitizenId.Of(agentId),
+            purpose: string.IsNullOrWhiteSpace(purpose) ? null : purpose.Trim(),
+            timestamp: now);
 
         var created = await conversationStore.CreateAsync(conversation, ct).ConfigureAwait(false);
         if (!string.IsNullOrWhiteSpace(message))
@@ -353,7 +355,12 @@ public sealed class ConversationTool(
             // the spawned agent turn to complete (fixes #728).
             if (messageOrchestrator is not null)
             {
-                messageOrchestrator.Post(inbound);
+                var admission = await messageOrchestrator.PostAsync(inbound, ct).ConfigureAwait(false);
+                if (admission is not (InboundDispatchStatus.Accepted or InboundDispatchStatus.Steered))
+                {
+                    throw new InvalidOperationException(
+                        $"Initial message could not be admitted to conversation '{created.ConversationId.Value}' ({admission}).");
+                }
             }
         }
 
@@ -381,7 +388,7 @@ public sealed class ConversationTool(
     {
         var conversation = await ResolveConversationAsync(arguments, ct).ConfigureAwait(false);
         EnsureCanAccess(conversation.AgentId);
-        await conversationStore.ArchiveAsync(conversation.ConversationId, ct).ConfigureAwait(false);
+        await conversationStore.ArchiveAsync(conversation.ConversationId, "conversation-tool", currentConversationId?.Value, agentId.Value, ct).ConfigureAwait(false);
         await NotifyBestEffortAsync("archived", conversation, ct).ConfigureAwait(false);
         return TextResult(JsonSerializer.Serialize(new
         {

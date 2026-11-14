@@ -2,6 +2,7 @@
 @inject IClientStateStore Store
 @inject IGatewayRestClient Rest
 @inject NavigationManager Nav
+@inject IServiceProvider Services
 @implements IDisposable
 
 <div class="activity-dashboard" data-testid="activity-dashboard">
@@ -22,10 +23,15 @@
                 <span class="activity-summary-value">@summary.ConversationCount</span>
                 <span class="activity-summary-label">@(summary.ConversationCount == 1 ? "conversation" : "conversations")</span>
             </button>
-            <div class="activity-summary-stat" data-testid="activity-summary-agents">
+            <button type="button"
+                    class="activity-summary-stat activity-summary-stat--action @(_filter.AgentId is not null ? "active" : "")"
+                    data-testid="activity-summary-agents"
+                    aria-label="Jump to the agent filter"
+                    title="Filter by a specific agent"
+                    @onclick="FocusAgentPicker">
                 <span class="activity-summary-value">@summary.AgentCount</span>
                 <span class="activity-summary-label">@(summary.AgentCount == 1 ? "agent" : "agents")</span>
-            </div>
+            </button>
             <button type="button"
                     class="activity-summary-stat activity-summary-stat--action @(_filter.IncludeCron ? "active" : "")"
                     data-testid="activity-summary-scheduled"
@@ -34,6 +40,15 @@
                     @onclick="ToggleCron">
                 <span class="activity-summary-value">@summary.ScheduledCount</span>
                 <span class="activity-summary-label">scheduled</span>
+            </button>
+            <button type="button"
+                    class="activity-summary-stat activity-summary-stat--action activity-summary-stat--live @(_filter.Live == ActivityLiveFilter.Live ? "active" : "")"
+                    data-testid="activity-summary-live"
+                    aria-pressed="@(_filter.Live == ActivityLiveFilter.Live)"
+                    title="@(_filter.Live == ActivityLiveFilter.Live ? "Show conversations in any state" : "Show only conversations running right now")"
+                    @onclick="ToggleLive">
+                <span class="activity-summary-value">@summary.LiveCount</span>
+                <span class="activity-summary-label">live now</span>
             </button>
             <div class="activity-summary-stat activity-summary-stat--freshness" data-testid="activity-summary-freshness">
                 <span class="activity-summary-value" title="@(summary.LatestActivity?.ToString("o"))">@FreshnessLabel(summary.LatestActivity)</span>
@@ -51,6 +66,7 @@
                 @onclick="ToggleCron">@(_filter.IncludeCron ? "\u2611" : "\u2610") Cron</button>
 
         <select class="activity-filter-select" data-testid="activity-filter-agent"
+                @ref="_agentSelect"
                 aria-label="Filter by agent"
                 value="@(_filter.AgentId ?? "")"
                 @onchange="OnAgentFilterChanged">
@@ -74,10 +90,39 @@
                 aria-label="Filter by recency"
                 value="@_filter.Recency"
                 @onchange="OnRecencyFilterChanged">
+            <option value="@ActivityRecencyWindow.Last24Hours">Last 24 hours</option>
             <option value="@ActivityRecencyWindow.Any">Any time</option>
             <option value="@ActivityRecencyWindow.Today">Today</option>
             <option value="@ActivityRecencyWindow.Week">Last 7 days</option>
             <option value="@ActivityRecencyWindow.Month">Last 30 days</option>
+        </select>
+        <select class="activity-filter-select" data-testid="activity-filter-origin"
+                aria-label="Filter by origin"
+                value="@_filter.Origin"
+                @onchange="OnOriginFilterChanged">
+            <option value="@ActivityOriginFilter.All">Any origin</option>
+            <option value="@ActivityOriginFilter.Human">Human</option>
+            <option value="@ActivityOriginFilter.Scheduled">Scheduled</option>
+            <option value="@ActivityOriginFilter.Webhook">Webhook</option>
+            <option value="@ActivityOriginFilter.Agent">Agent-initiated</option>
+            <option value="@ActivityOriginFilter.SubAgent">Sub-agent</option>
+            <option value="@ActivityOriginFilter.AgentToAgent">Agent-to-agent</option>
+        </select>
+        <select class="activity-filter-select" data-testid="activity-filter-pinned"
+                aria-label="Filter by pin state"
+                value="@_filter.Pinned"
+                @onchange="OnPinFilterChanged">
+            <option value="@ActivityPinFilter.All">Any pin state</option>
+            <option value="@ActivityPinFilter.Pinned">Pinned only</option>
+            <option value="@ActivityPinFilter.Unpinned">Unpinned only</option>
+        </select>
+        <select class="activity-filter-select" data-testid="activity-filter-live"
+                aria-label="Filter by live state"
+                value="@_filter.Live"
+                @onchange="OnLiveFilterChanged">
+            <option value="@ActivityLiveFilter.All">Any live state</option>
+            <option value="@ActivityLiveFilter.Live">Live now</option>
+            <option value="@ActivityLiveFilter.Idle">Idle only</option>
         </select>
     </div>
 
@@ -97,6 +142,7 @@
     }
     else if (_rows is { } rows)
     {
+        <div class="activity-table-scroll" data-testid="activity-table-scroll" tabindex="0" role="region" aria-label="Activity table">
         <table class="activity-table" data-testid="activity-table">
             <thead>
                 <tr>
@@ -110,24 +156,100 @@
             <tbody>
                 @foreach (var row in rows)
                 {
-                    <tr class="activity-row @(row.IsCron ? "activity-row-cron" : "")"
+                    <tr class="activity-row @(row.IsCron ? "activity-row-cron" : "") @(row.IsPinned ? "activity-row-pinned" : "") @(row.IsLive ? "activity-row-live" : "")"
                         data-testid="activity-row"
                         data-conversation-id="@row.ConversationId"
+                        data-session-id="@row.ActiveSessionId"
+                        title="@SessionPointerTooltip(row)"
                         tabindex="0"
                         role="link"
                         @onclick="() => NavigateToConversation(row)"
                         @onkeydown="e => OnRowKeyDown(e, row)">
                         <td class="activity-cell-title">
-                            <span class="activity-conversation-title">@row.Title</span>
-                            @if (row.IsCron)
-                            {
-                                <span class="activity-badge activity-badge-cron">Scheduled</span>
-                            }
+                            <div class="activity-title-content">
+                                <span class="activity-conversation-title" title="@row.Title">@DisplayTitle(row)</span>
+                                @if (row.IsLive)
+                                {
+                                    @* #1888: the row's only present-tense signal. Rendered FIRST so the
+                                       "is anything happening?" answer reads before the historical badges. *@
+                                    <span class="activity-badge activity-badge-live"
+                                          data-testid="activity-live-badge"
+                                          title="@LiveTooltip(row)"
+                                          aria-label="Live">Live</span>
+                                }
+                                @if (row.IsPinned)
+                                {
+                                    <span class="activity-badge activity-badge-pinned"
+                                          data-testid="activity-pin-badge"
+                                          title="@PinTooltip(row)"
+                                          aria-label="Pinned"><Icon Name="pin" Size="13" /> Pinned</span>
+                                }
+                                @if (ActivityDashboardProjection.ReadOnlyLabel(row) is { } readOnlyLabel)
+                                {
+                                    @* #2692: InspectableReadOnly rows are kept but marked, so the reader can
+                                       tell an observer/audit row from one they own. Reuses .activity-badge. *@
+                                    <span class="activity-badge activity-badge-readonly"
+                                          data-testid="activity-readonly-badge"
+                                          title="Read-only: you can inspect this conversation but not participate in it."
+                                          aria-label="Read-only">@readOnlyLabel</span>
+                                }
+                                @if (ActivityDashboardProjection.OriginLabel(row) is { } originLabel)
+                                {
+                                    <span class="activity-badge activity-badge-@ActivityDashboardProjection.OriginModifier(row)"
+                                          data-testid="activity-origin-badge"
+                                          data-origin="@ActivityDashboardProjection.OriginModifier(row)"
+                                          title="@OriginTooltip(row)">@originLabel</span>
+                                }
+                                @if (ActivityDashboardProjection.SourceLabel(row) is { } sourceLabel)
+                                {
+                                    @* #3105: WHICH job or registration minted this row, as opposed to the
+                                       origin badge's WHAT KIND. Rendered immediately after the origin badge
+                                       it qualifies, and only ever when that badge is present.
+                                       #3421: when the cron registry resolves the id to a job NAME, the name
+                                       is shown instead - the id is not lost, it moves to the tooltip. *@
+                                    var cronName = ActivityDashboardProjection.CronHealthLabel(row);
+                                    <span class="activity-source-id"
+                                          data-testid="activity-source-id"
+                                          data-source-id="@row.SourceId"
+                                          title="@OriginTooltip(row)">@(cronName ?? sourceLabel)</span>
+                                }
+                                @if (ActivityDashboardProjection.CronHealthModifier(row) is { } cronHealthModifier)
+                                {
+                                    var cronLiveness = ActivityDashboardProjection.CronLiveness(row.CronHealth!, _projectionNow);
+                                    var cronModifier = cronLiveness ?? cronHealthModifier;
+                                    @* #3421/#3563: last outcome and future liveness are independent. Liveness
+                                       wins the glanceable colour while the tooltip preserves both facts. *@
+                                    <span class="activity-cron-health activity-cron-health--@cronModifier"
+                                          data-testid="activity-cron-health"
+                                          data-health="@cronModifier"
+                                          title="@CronHealthTooltip(row, cronLiveness)"
+                                          aria-label="@CronHealthTooltip(row, cronLiveness)"></span>
+                                }
+                                @if (ActivityDashboardProjection.PurposeLabel(row) is { } purposeLabel)
+                                {
+                                    @* #3204: the author's own words for why this conversation exists.
+                                       Its own block-level line BELOW the title and badges, deliberately
+                                       NOT a badge - badges are one-glance classifiers drawn from bounded
+                                       value sets, and prose in that idiom would swamp the badge row. *@
+                                    <span class="activity-purpose"
+                                          data-testid="activity-purpose"
+                                          title="@row.Purpose">@purposeLabel</span>
+                                }
+                            </div>
                         </td>
                         <td class="activity-cell-agents">
-                            @foreach (var agentId in row.InvolvedAgents)
+                            @foreach (var agent in row.InvolvedAgents)
                             {
-                                <span class="activity-agent-chip">@AgentLabel(agentId)</span>
+                                var roleLabel = ActivityDashboardProjection.RoleLabel(agent);
+                                var roleModifier = ActivityDashboardProjection.RoleModifier(agent);
+                                <span class="activity-agent-chip @(roleModifier is null ? null : $"activity-agent-chip--{roleModifier}")"
+                                      data-testid="activity-agent-chip"
+                                      data-role="@roleLabel"
+                                      title="@AgentChipTooltip(agent)"
+                                      aria-label="@AgentChipTooltip(agent)">@AgentLabel(agent.AgentId)@if (roleLabel is not null)
+                                    {
+                                        <span class="activity-agent-role">@roleLabel</span>
+                                    }</span>
                             }
                         </td>
                         <td class="activity-cell-status">
@@ -141,6 +263,7 @@
                 }
             </tbody>
         </table>
+        </div>
     }
 </div>
 
@@ -149,11 +272,20 @@
     // later evolution (see #1888). Kept as a field so a future enhancement can make it configurable.
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(15);
 
-    private ActivityDashboardFilter _filter = new();
+    private static ActivityDashboardFilter DefaultFilter => new(Recency: ActivityRecencyWindow.Last24Hours);
+    private ActivityDashboardFilter _filter = DefaultFilter;
+
+    // #3421: resolved optionally rather than @inject'ed so a host that has not registered the cron
+    // client (and every existing bUnit fixture) renders the dashboard exactly as before instead of
+    // throwing at construction. Mirrors the Mobile Chat.razor precedent for the same client.
+    private CronApiClient? CronApi => Services.GetService(typeof(CronApiClient)) as CronApiClient;
+    private ElementReference _agentSelect;
     private IReadOnlyList<ActivityRow>? _rows;
     private ActivitySummary? _summary;
+    private DateTimeOffset _projectionNow;
     private bool _isLoading;
     private bool _loadError;
+    private long _loadGeneration;
     private CancellationTokenSource? _pollCts;
 
     protected override async Task OnInitializedAsync()
@@ -167,21 +299,76 @@
 
     private async Task LoadAsync()
     {
+        var generation = ++_loadGeneration;
+        var filter = _filter;
         _isLoading = true;
         try
         {
-            var conversations = await Rest.GetAllConversationsAsync();
-            _rows = ActivityDashboardProjection.Project(conversations, _filter, DateTimeOffset.UtcNow);
+            var now = DateTimeOffset.UtcNow;
+            DateTimeOffset? cutoff = filter.Recency switch
+            {
+                ActivityRecencyWindow.Last24Hours => now.AddHours(-24),
+                ActivityRecencyWindow.Today => new DateTimeOffset(now.ToLocalTime().Date),
+                ActivityRecencyWindow.Week => now.AddDays(-7),
+                ActivityRecencyWindow.Month => now.AddDays(-30),
+                _ => null
+            };
+            var conversations = await Rest.GetAllConversationsAsync(cutoff);
+
+            // #3421: cron health is a SEPARATE, non-fatal fetch. CronApiClient.ListAsync already
+            // swallows its own transport errors into an (empty, error) result, so a dead cron API
+            // degrades the dashboard to its pre-#3421 rendering rather than failing the whole load -
+            // the conversation table is the page's reason to exist and must not depend on it.
+            IReadOnlyDictionary<string, ActivityCronHealth> cronHealth;
+            try
+            {
+                var (jobs, error) = CronApi is null
+                    ? ((IReadOnlyList<CronJobDto>)[], "cron client not registered")
+                    : await CronApi.ListAsync();
+                cronHealth = ActivityDashboardProjection.CronHealthById(error is null ? jobs : null);
+            }
+            catch
+            {
+                cronHealth = ActivityDashboardProjection.CronHealthById(null);
+            }
+
+            // #3713: session liveness is another separate, non-fatal fetch. A successful roster,
+            // including an empty one, is authoritative. A failed fetch remains null so the
+            // projection deliberately preserves its compatibility fallback.
+            IReadOnlyDictionary<string, string?>? sessionStatus = null;
+            try
+            {
+                var sessions = await SessionRosterLoader.LoadAllAsync(Rest);
+                sessionStatus = ActivityDashboardProjection.SessionStatusById(sessions);
+            }
+            catch
+            {
+                // Conversation data is the page contract; unavailable corroboration must not hide it.
+            }
+
+            // A newer filter load or poll owns all visible state, even if this request finishes last.
+            if (generation != _loadGeneration)
+                return;
+
+            _projectionNow = now;
+            _rows = ActivityDashboardProjection.Project(
+                conversations,
+                filter,
+                _projectionNow,
+                cronHealth,
+                sessionStatus);
             _summary = ActivityDashboardProjection.Summarize(_rows);
             _loadError = false;
         }
         catch
         {
-            _loadError = true;
+            if (generation == _loadGeneration)
+                _loadError = true;
         }
         finally
         {
-            _isLoading = false;
+            if (generation == _loadGeneration)
+                _isLoading = false;
         }
     }
 
@@ -221,11 +408,41 @@
         StateHasChanged();
     }
 
-    private bool HasActiveFilters => _filter != new ActivityDashboardFilter();
+    private bool HasActiveFilters => _filter != DefaultFilter;
 
-    private Task ResetFilters() => ApplyFilterAsync(new ActivityDashboardFilter());
+    private Task ResetFilters() => ApplyFilterAsync(DefaultFilter);
 
     private Task ToggleCron() => ApplyFilterAsync(_filter with { IncludeCron = !_filter.IncludeCron });
+
+    /// <summary>
+    /// Turns the live stat card into a filter action (#1888), mirroring the scheduled card: clicking
+    /// the number narrows the table to exactly the rows it counted, and clicking again clears the
+    /// facet. Toggles between <see cref="ActivityLiveFilter.Live"/> and
+    /// <see cref="ActivityLiveFilter.All"/> only - the card counts live rows, so it must never land
+    /// the user on <see cref="ActivityLiveFilter.Idle"/>, which is the select's job.
+    /// </summary>
+    private Task ToggleLive() => ApplyFilterAsync(_filter with
+    {
+        Live = _filter.Live == ActivityLiveFilter.Live ? ActivityLiveFilter.All : ActivityLiveFilter.Live
+    });
+
+    /// <summary>
+    /// Turns the agents stat card into navigation: focuses the agent-filter dropdown so a click on the
+    /// number takes the user straight to picking an agent, mirroring the interactive treatment the
+    /// conversations and scheduled cards already have. Keeps the picker as the single source of truth for
+    /// the agent facet rather than duplicating agent-selection state on the card.
+    /// </summary>
+    private async Task FocusAgentPicker()
+    {
+        try
+        {
+            await _agentSelect.FocusAsync();
+        }
+        catch
+        {
+            // Focus is a best-effort affordance; a missing element (e.g. during teardown) must not surface.
+        }
+    }
 
     private Task OnAgentFilterChanged(ChangeEventArgs e)
     {
@@ -247,6 +464,71 @@
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Applies the origin facet (#2385). Mirrors the status/recency handlers exactly - it swaps one
+    /// facet on the existing immutable filter and re-projects, rather than introducing a second
+    /// query path. An unparseable value is ignored so a stale DOM value cannot blank the table.
+    /// </summary>
+    private Task OnOriginFilterChanged(ChangeEventArgs e)
+    {
+        if (Enum.TryParse<ActivityOriginFilter>(e.Value?.ToString(), out var origin))
+            return ApplyFilterAsync(_filter with { Origin = origin });
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Applies the pin facet (#2619). Mirrors the origin/status/recency handlers exactly - it swaps
+    /// one facet on the existing immutable filter and re-projects, rather than introducing a second
+    /// query path. An unparseable value is ignored so a stale DOM value cannot blank the table.
+    /// </summary>
+    private Task OnPinFilterChanged(ChangeEventArgs e)
+    {
+        if (Enum.TryParse<ActivityPinFilter>(e.Value?.ToString(), out var pinned))
+            return ApplyFilterAsync(_filter with { Pinned = pinned });
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Applies the liveness facet (#1888). Mirrors the pin/origin/status/recency handlers exactly -
+    /// it swaps one facet on the existing immutable filter and re-projects, rather than introducing
+    /// a second query path. An unparseable value is ignored so a stale DOM value cannot blank the
+    /// table.
+    /// </summary>
+    private Task OnLiveFilterChanged(ChangeEventArgs e)
+    {
+        if (Enum.TryParse<ActivityLiveFilter>(e.Value?.ToString(), out var live))
+            return ApplyFilterAsync(_filter with { Live = live });
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Hover detail behind the live badge: which session is running, so the badge stays a one-glance
+    /// mark while the underlying server value remains inspectable without lengthening the row.
+    /// Mirrors <see cref="PinTooltip"/>.
+    /// </summary>
+    private static string LiveTooltip(ActivityRow row) =>
+        row.ActiveSessionId is { Length: > 0 } sessionId
+            ? $"Session running: {sessionId}"
+            : "Session running";
+
+    /// <summary>
+    /// Keeps the routing pointer inspectable even when its session is stopped and therefore has no
+    /// Live badge. The row owns this neutral diagnostic metadata; it does not imply liveness.
+    /// </summary>
+    private static string? SessionPointerTooltip(ActivityRow row) =>
+        row.ActiveSessionId is { Length: > 0 } sessionId
+            ? $"Session pointer: {sessionId}"
+            : null;
+
+    /// <summary>
+    /// Hover detail behind the pin badge: when the pin was stamped, so the badge stays a one-glance
+    /// mark while the underlying server value remains inspectable without lengthening the row.
+    /// </summary>
+    private static string PinTooltip(ActivityRow row) =>
+        row.PinnedAt is { } pinnedAt
+            ? $"Pinned {pinnedAt:o}"
+            : "Pinned";
+
     private void NavigateToConversation(ActivityRow row) =>
         Nav.NavigateTo(
             $"/chat/{Uri.EscapeDataString(row.OwningAgentId)}/{Uri.EscapeDataString(row.ConversationId)}");
@@ -257,13 +539,88 @@
             NavigateToConversation(row);
     }
 
-    /// <summary>Resolve an agent id to its display name via the store, falling back to a title-cased id.</summary>
+    /// <summary>
+    /// The bounded, human-meaningful label rendered in the title cell (#2528). A conversation whose
+    /// title is a raw routing/session token gets a derived label instead; every title is length
+    /// capped so a pathological id can never grow the row. The <c>title</c> attribute on the same
+    /// span keeps the full untruncated value available on hover, mirroring the existing
+    /// last-activity pattern.
+    /// </summary>
+    private static string DisplayTitle(ActivityRow row) =>
+        ConversationLabel.FullDisplayTitle(row.Title, row.ConversationId, row.OwningAgentId);
+
+    /// <summary>
+    /// Resolve an agent id to the same normalized emoji/name label used by the portal shell.
+    /// Unknown agents keep their bare id and blank emoji never contributes spacing or a placeholder.
+    /// </summary>
     private string AgentLabel(string agentId)
     {
         var agent = Store.GetAgent(agentId);
-        if (agent is { DisplayName.Length: > 0 })
-            return agent.DisplayName;
-        return agentId;
+        if (agent is not { DisplayName.Length: > 0 })
+            return agentId;
+
+        return PortalText.SingleLine(
+            string.IsNullOrWhiteSpace(agent.Emoji)
+                ? agent.DisplayName
+                : $"{agent.Emoji} {agent.DisplayName}");
+    }
+
+    /// <summary>
+    /// Hover/screen-reader detail for an agent chip (#2857). Names the agent and, when the gateway
+    /// stamped one, the role it played - so the direction of an agent-to-agent or sub-agent exchange
+    /// is available to assistive tech, not only to sighted readers of the small role suffix.
+    /// </summary>
+    private string AgentChipTooltip(ActivityAgentRef agent)
+    {
+        var label = AgentLabel(agent.AgentId);
+        var role = ActivityDashboardProjection.RoleLabel(agent);
+        return role is null ? label : $"{label} - {role}";
+    }
+
+    /// <summary>
+    /// Full <c>(source, kind)</c> pair as hover detail behind the short badge, plus the untruncated
+    /// originator id when the row is attributable (#3105). The badge answers the question at a
+    /// glance; the tooltip keeps the underlying typed values inspectable without lengthening the row.
+    /// The originator joins the <em>existing</em> tooltip rather than getting a second hover target,
+    /// so a reader has one place to look for a row's provenance.
+    /// </summary>
+    private static string OriginTooltip(ActivityRow row)
+    {
+        var pair = $"Source: {row.Source} \u00b7 Kind: {row.Kind}";
+
+        // Gated on SourceLabel, not on SourceId, so the tooltip can never attribute a row the badge
+        // declined to attribute - one rule, evaluated once.
+        return ActivityDashboardProjection.SourceLabel(row) is null
+            ? pair
+            : $"{pair} \u00b7 Originator: {row.SourceId}";
+    }
+
+    /// <summary>
+    /// Hover detail for the cron-health dot (#3421): the job's name and its last-run outcome, plus
+    /// when it last ran. Deliberately its OWN tooltip rather than another clause appended to
+    /// <see cref="OriginTooltip"/>, because it hangs off a separate element - a reader hovering the
+    /// dot is asking "is this job healthy?", not "where did this row come from?".
+    /// </summary>
+    private static string CronHealthTooltip(ActivityRow row, string? liveness)
+    {
+        var health = row.CronHealth;
+        if (health is null)
+            return string.Empty;
+
+        var name = string.IsNullOrWhiteSpace(health.Name) ? health.JobId : health.Name;
+        var status = string.IsNullOrWhiteSpace(health.LastRunStatus) ? "never run" : health.LastRunStatus;
+        var when = health.LastRunAt is { } at ? $" \u00b7 Last run: {at:u}" : string.Empty;
+        var livenessDetail = liveness switch
+        {
+            "disabled" => " \u00b7 Disabled",
+            "expired" => $" \u00b7 Expired: {health.ExpiresAt:u}",
+            _ => string.Empty
+        };
+        var errorDetail = ActivityDashboardProjection.CronHealthErrorSummary(row) is { } error
+            ? $" \u00b7 Error: {error}"
+            : string.Empty;
+
+        return $"Cron job: {name} \u00b7 Job id: {health.JobId} \u00b7 Last run status: {status}{when}{livenessDetail}{errorDetail}";
     }
 
     private static string FormatRelative(DateTimeOffset ts)
@@ -283,6 +640,7 @@
 
     public void Dispose()
     {
+        ++_loadGeneration;
         Store.OnChanged -= HandleStateChanged;
         _pollCts?.Cancel();
         _pollCts?.Dispose();

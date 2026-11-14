@@ -3,24 +3,122 @@ window.BotNexus = window.BotNexus || {};
 var codeCopyFeedbackDurationMs = 2000;
 
 /**
+ * HTML-escapes a string so it can never be interpreted as markup.
+ * Deliberately hand-written: this is the fallback used precisely when
+ * third-party libraries are missing, so it must not depend on any of them.
+ */
+window.BotNexus.escapeHtml = function (value) {
+    if (value === null || value === undefined) {
+        return "";
+    }
+
+    return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+};
+
+/**
  * Renders a markdown string to sanitized HTML.
- * Falls back to returning the raw markdown if libraries are not loaded.
+ * Fails CLOSED: if either `marked` or `DOMPurify` is unavailable the original
+ * text is returned HTML-escaped (readable, but inert) and a console warning
+ * names the missing dependency. Unsanitized HTML is never returned.
  */
 window.BotNexus.renderMarkdown = function (markdown) {
-    if (typeof marked !== 'undefined') {
-        var renderer = new marked.Renderer();
-        var linkRenderer = renderer.link.bind(renderer);
-        renderer.link = function (token) {
-            var html = linkRenderer(token);
-            return html.replace(/^<a /, '<a target="_blank" rel="noopener noreferrer" ');
-        };
+    return window.BotNexus.renderMarkdownWithLinks(markdown, null);
+};
 
-        var html = marked.parse(markdown, { breaks: true, gfm: true, renderer: renderer });
-        return typeof DOMPurify !== 'undefined'
-            ? DOMPurify.sanitize(html, { ADD_ATTR: ["target", "rel"] })
-            : html;
+/**
+ * Renders Guide markdown while translating links to indexed Guide documents into
+ * in-app routes. Unknown and external targets retain the shared renderer's safe
+ * new-tab behaviour; fragment-only links stay within the current article.
+ */
+window.BotNexus.renderGuideMarkdown = function (markdown, currentFile, pages) {
+    var pageByFile = Object.create(null);
+    (pages || []).forEach(function (page) {
+        if (page && page.file && page.id) {
+            pageByFile[window.BotNexus.normalizeGuidePath(page.file).toLowerCase()] = page.id;
+        }
+    });
+
+    return window.BotNexus.renderMarkdownWithLinks(markdown, function (href) {
+        if (!href || href.charAt(0) === "#") {
+            return { href: href, external: false };
+        }
+
+        // Absolute, protocol-relative, root-relative and non-HTTP schemes are not
+        // Guide document references. The shared external-link policy applies.
+        if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.indexOf("//") === 0 || href.charAt(0) === "/") {
+            return { href: href, external: true };
+        }
+
+        var hashIndex = href.indexOf("#");
+        var fragment = hashIndex >= 0 ? href.substring(hashIndex) : "";
+        var pathAndQuery = hashIndex >= 0 ? href.substring(0, hashIndex) : href;
+        var queryIndex = pathAndQuery.indexOf("?");
+        var path = queryIndex >= 0 ? pathAndQuery.substring(0, queryIndex) : pathAndQuery;
+        var baseSegments = window.BotNexus.normalizeGuidePath(currentFile || "").split("/");
+        baseSegments.pop();
+        var resolvedFile = window.BotNexus.normalizeGuidePath(baseSegments.concat(path.split("/")).join("/"));
+        var sectionId = pageByFile[resolvedFile.toLowerCase()];
+
+        return sectionId
+            ? { href: "/guide/" + encodeURIComponent(sectionId) + fragment, external: false }
+            : { href: href, external: true };
+    });
+};
+
+window.BotNexus.normalizeGuidePath = function (path) {
+    var segments = String(path || "").replace(/\\/g, "/").split("/");
+    var normalized = [];
+    segments.forEach(function (segment) {
+        if (!segment || segment === ".") {
+            return;
+        }
+        if (segment === "..") {
+            normalized.pop();
+            return;
+        }
+        normalized.push(segment);
+    });
+    return normalized.join("/");
+};
+
+window.BotNexus.renderMarkdownWithLinks = function (markdown, resolveLink) {
+    var markedAvailable = typeof marked !== 'undefined';
+    var purifyAvailable = typeof DOMPurify !== 'undefined';
+
+    if (!markedAvailable || !purifyAvailable) {
+        var missing = [];
+        if (!markedAvailable) { missing.push("marked"); }
+        if (!purifyAvailable) { missing.push("DOMPurify"); }
+
+        if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
+            console.warn(
+                "[BotNexus] Markdown rendering degraded: missing " + missing.join(", ") +
+                ". Falling back to HTML-escaped plain text.");
+        }
+
+        return window.BotNexus.escapeHtml(markdown);
     }
-    return markdown;
+
+    var renderer = new marked.Renderer();
+    var linkRenderer = renderer.link.bind(renderer);
+    renderer.link = function (token) {
+        var resolution = resolveLink
+            ? resolveLink(token.href)
+            : { href: token.href, external: true };
+        var resolvedToken = Object.assign({}, token, { href: resolution.href });
+        var html = linkRenderer(resolvedToken);
+        return resolution.external
+            ? html.replace(/^<a /, '<a target="_blank" rel="noopener noreferrer" ')
+            : html;
+    };
+
+    var parsed = marked.parse(markdown, { breaks: true, gfm: true, renderer: renderer });
+    return DOMPurify.sanitize(parsed, { ADD_ATTR: ["target", "rel"] });
 };
 
 window.BotNexus.copyToClipboard = function (text) {

@@ -9,7 +9,7 @@ The existing process-based integration tests (`BotNexus.Integration.Tests` witho
 1. A multi-stage `Dockerfile` at the repo root builds `BotNexus.Gateway.Api` and produces a small runtime image.
 2. A `docker-compose.yml` wraps it for local developer use — mount your `~/.botnexus` directory and the gateway starts with your existing configuration.
 3. The integration test runner (`BotNexus.Integration.Tests`) accepts a `--gateway-url` flag. When set it skips spawning a local gateway process and connects directly to the container.
-4. A GitHub Actions workflow (`container-integration.yml`) builds the image in CI, starts the container with secrets injected as environment variables, then runs the scenario suite.
+4. A GitHub Actions workflow (`ci-container-integration.yml`) builds the image in CI, starts the container with secrets injected as environment variables, then runs the scenario suite.
 
 ## Quick Start (Local)
 
@@ -26,21 +26,28 @@ docker compose up --build
 
 The gateway starts on `http://localhost:5000`. Open a browser and navigate to that URL to confirm it is running.
 
+> **Why this page says 5000 while a host-run gateway uses a different default port.** The container
+> is the one place the gateway does *not* fall back to its default. The shipped `Dockerfile` sets
+> `ASPNETCORE_URLS=http://+:5000` and `EXPOSE 5000`, and `docker-compose.yml` publishes `5000:5000`,
+> so the container listens on 5000 by explicit configuration. The port numbers on this page are the
+> container's and are correct as written; see `docs/user-guide/troubleshooting.md` for the host-run
+> default (issue #2929).
+
 Stop it with `Ctrl+C` or `docker compose down`.
 
 ### Run scenarios against the container
 
 ```bash
 # From the repo root — .NET SDK required for the test runner
-dotnet run --project tests/BotNexus.Integration.Tests -- --gateway-url=http://localhost:5000
+dotnet run --project tests/scenarios/BotNexus.Integration.Tests -- --gateway-url=http://localhost:5000
 
 # Or run only the smoke test (no LLM calls)
-dotnet run --project tests/BotNexus.Integration.Tests -- \
+dotnet run --project tests/scenarios/BotNexus.Integration.Tests -- \
   --gateway-url=http://localhost:5000 \
-  --scenario-dir=tests/container/scenarios
+  --scenario-dir=tests/scenarios/container/scenarios
 
 # Filter to a specific scenario by name fragment
-dotnet run --project tests/BotNexus.Integration.Tests -- \
+dotnet run --project tests/scenarios/BotNexus.Integration.Tests -- \
   --gateway-url=http://localhost:5000 agent-lifecycle
 ```
 
@@ -48,7 +55,7 @@ Alternatively, pass the gateway URL as an environment variable:
 
 ```bash
 BOTNEXUS_GATEWAY_URL=http://localhost:5000 \
-  dotnet run --project tests/BotNexus.Integration.Tests
+  dotnet run --project tests/scenarios/BotNexus.Integration.Tests
 ```
 
 ## Starting the Container Manually (without Compose)
@@ -130,33 +137,33 @@ Or add them to a `.env` file and reference it with `docker run --env-file .env`.
 
 ## Container Config Template
 
-`tests/container/config.json` is a minimal gateway config committed to the repository. It declares the supported providers but contains no credentials — safe to commit. Use it as a starting point when you do not want to mount your personal `~/.botnexus` directory:
+`tests/scenarios/container/config.json` is a minimal gateway config committed to the repository. It declares the supported providers but contains no credentials — safe to commit. Use it as a starting point when you do not want to mount your personal `~/.botnexus` directory:
 
 ```bash
 docker run -d --name botnexus-gateway \
   -p 5000:5000 \
-  -v "$(pwd)/tests/container":/app/config:ro \
+  -v "$(pwd)/tests/scenarios/container":/app/config:ro \
   -e GITHUB_TOKEN="${GITHUB_TOKEN}" \
   botnexus:dev
 ```
 
 ## Smoke Scenarios (No LLM Required)
 
-`tests/container/scenarios/smoke.json` validates the gateway API surface without making LLM calls. These run in CI on every push without provider secrets:
+`tests/scenarios/container/scenarios/smoke.json` validates the gateway API surface without making LLM calls. They need no provider secrets, so they can run anywhere - but nothing runs them automatically: in CI they execute only via the manually dispatched `container-smoke` job (see [CI](#ci) below). To run them locally:
 
 ```bash
-dotnet run --project tests/BotNexus.Integration.Tests -- \
+dotnet run --project tests/scenarios/BotNexus.Integration.Tests -- \
   --gateway-url=http://localhost:5000 \
-  --scenario-dir=tests/container/scenarios
+  --scenario-dir=tests/scenarios/container/scenarios
 ```
 
 ## CI
 
-The `container-integration.yml` workflow has two jobs:
+The `ci-container-integration.yml` workflow has two jobs. It is `workflow_dispatch`-only - neither job is triggered by a push or a pull request:
 
 | Job | Trigger | Requires secrets |
 |---|---|---|
-| `container-smoke` | Every push/PR to `main` | No — uses `tests/container/scenarios/smoke.json` |
+| `container-smoke` | Manual (`workflow_dispatch`) | No — uses `tests/scenarios/container/scenarios/smoke.json` |
 | `container-scenarios` | When repo variable `CONTAINER_INTEGRATION_ENABLED=true` and not a fork | Yes — `GH_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` |
 
 To enable full scenario runs in CI, set the repository variable `CONTAINER_INTEGRATION_ENABLED` to `true` in **Settings → Variables → Actions**, then add the required secrets.

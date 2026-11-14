@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
+using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Agent.Providers.Core.Models;
 
 namespace BotNexus.Extensions.ProcessTool;
@@ -15,7 +16,10 @@ public sealed class ProcessTool : IAgentTool
     private readonly ProcessManager _manager;
     private readonly ProcessToolOptions _options;
 
-    public ProcessTool() : this(ProcessManager.Instance, ProcessToolOptions.Default) { }
+    internal ProcessTool() : this(ProcessManager.Instance, ProcessToolOptions.Default) { }
+
+    /// <summary>Requires a contributor-supplied owner, preventing an unscoped DI singleton.</summary>
+    public ProcessTool(string owner) : this(new ProcessManager(BackgroundProcessRegistry.Instance, owner)) { }
 
     internal ProcessTool(ProcessManager manager) : this(manager, ProcessToolOptions.Default) { }
 
@@ -28,9 +32,12 @@ public sealed class ProcessTool : IAgentTool
     public string Name => "process";
     public string Label => "Process Manager";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Output of a locally started process.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     public Tool Definition => new(
         Name,
-        "Manage background processes by PID. List, inspect, send input, read output, or kill processes.",
+        "Manage background processes launched by this agent through exec. List, inspect, send input, read output, or kill registered children. Unknown PIDs are never attached. Exited roots after an unconfirmed kill are unresolved, not successful termination; operator intervention is required. No automatic completion wake is provided.",
         JsonDocument.Parse("""
             {
               "type": "object",
@@ -52,14 +59,28 @@ public sealed class ProcessTool : IAgentTool
                   "type": "integer",
                   "description": "Number of lines from end of output (for output action). Default: 50. Values above the configured ceiling are clamped."
                 },
+                "timeoutMs": {
+                  "type": "integer",
+                  "description": "For status action: wait up to N milliseconds for process exit and output drain. Cancelling this wait does not kill the child. Default: 0 (no wait)."
+                },
                 "timeout": {
                   "type": "integer",
-                  "description": "For status action: wait up to N ms for process to produce output before returning. Default: 0 (no wait)."
+                  "description": "Deprecated alias for timeoutMs, interpreted as milliseconds. Use timeoutMs instead."
                 }
               },
               "required": ["action"]
             }
             """).RootElement.Clone());
+
+    /// <summary>
+    /// The status action's wait is expressed in milliseconds. Declaring the unit stops
+    /// <c>ToolExecutor</c> reading the legacy <c>timeout</c> spelling as seconds, which inflated the
+    /// cancellation budget 1000x (issue #2955).
+    /// </summary>
+    public ToolTimeoutArgument? TimeoutArgument => new(
+        "timeoutMs",
+        ToolTimeoutUnit.Milliseconds,
+        DeprecatedAliasName: "timeout");
 
     public Task<IReadOnlyDictionary<string, object?>> PrepareArgumentsAsync(
         IReadOnlyDictionary<string, object?> arguments,
@@ -69,25 +90,39 @@ public sealed class ProcessTool : IAgentTool
         return Task.FromResult(arguments);
     }
 
-    public Task<AgentToolResult> ExecuteAsync(
+    public async Task<AgentToolResult> ExecuteAsync(
         string toolCallId,
         IReadOnlyDictionary<string, object?> arguments,
         CancellationToken cancellationToken = default,
         AgentToolUpdateCallback? onUpdate = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var action = ReadString(arguments, "action") ?? string.Empty;
+        if (action.Equals("status", StringComparison.OrdinalIgnoreCase))
+        {
+            var pid = ReadInt(arguments, "pid");
+            var child = pid.HasValue ? _manager.Get(pid.Value) : null;
+            var waitMs = ReadInt(arguments, "timeoutMs") ?? ReadInt(arguments, "timeout") ?? 0;
+            if (child is not null && waitMs > 0)
+            {
+                using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                wait.CancelAfter(waitMs);
+                try { await child.WaitForCompletionAsync(wait.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
+            }
+        }
 
         var result = action.ToLowerInvariant() switch
         {
             "list" => HandleList(),
             "status" => HandleStatus(arguments),
             "output" => HandleOutput(arguments),
-            "input" => HandleInput(arguments),
+            "input" => await HandleInputAsync(arguments, cancellationToken).ConfigureAwait(false),
             "kill" => HandleKill(arguments),
             _ => TextResult($"Unknown action: {action}. Valid actions: list, status, output, input, kill.")
         };
 
-        return Task.FromResult(result);
+        return result;
     }
 
     private AgentToolResult HandleList()
@@ -101,7 +136,7 @@ public sealed class ProcessTool : IAgentTool
         sb.AppendLine("--- | ------- | ------ | ------- | ---------");
         foreach (var p in processes)
         {
-            var status = p.IsRunning ? "running" : "exited";
+            var status = p.Status + (p.OutputCaptureIncomplete ? " (output incomplete)" : string.Empty);
             var exitCode = p.ExitCode?.ToString() ?? "-";
             sb.AppendLine($"{p.Pid} | {p.Command} | {status} | {p.StartedAt:u} | {exitCode}");
         }
@@ -119,11 +154,11 @@ public sealed class ProcessTool : IAgentTool
         if (process is null)
             return TextResult($"No tracked process with PID {pid}.");
 
-        var timeout = ReadInt(arguments, "timeout") ?? 0;
-        if (timeout > 0 && process.IsRunning)
-            process.WaitForExit(timeout);
+        // timeoutMs is canonical; the bare `timeout` spelling remains accepted as a deprecated
+        // alias with identical millisecond semantics (issue #2955).
+        // The cancellable async wait occurs before dispatch; status formatting never blocks.
 
-        var status = process.IsRunning ? "running" : "exited";
+        var status = process.Status;
         var exitCode = process.ExitCode;
 
         var sb = new StringBuilder();
@@ -133,6 +168,7 @@ public sealed class ProcessTool : IAgentTool
         sb.AppendLine($"Started: {process.StartedAt:u}");
         if (exitCode is not null)
             sb.AppendLine($"Exit Code: {exitCode}");
+        sb.AppendLine($"Output Capture: {process.OutputCaptureStatus}");
 
         return TextResult(sb.ToString());
     }
@@ -154,11 +190,13 @@ public sealed class ProcessTool : IAgentTool
         var output = process.GetOutput(tail);
 
         return TextResult(string.IsNullOrEmpty(output)
-            ? $"No output captured for PID {pid}."
+            ? $"No output captured for PID {pid}. Output Capture: {process.OutputCaptureStatus}."
             : output);
     }
 
-    private AgentToolResult HandleInput(IReadOnlyDictionary<string, object?> arguments)
+    private async Task<AgentToolResult> HandleInputAsync(
+        IReadOnlyDictionary<string, object?> arguments,
+        CancellationToken cancellationToken)
     {
         var pid = ReadInt(arguments, "pid");
         if (pid is null)
@@ -174,7 +212,7 @@ public sealed class ProcessTool : IAgentTool
 
         try
         {
-            process.WriteInput(content);
+            await process.WriteInputAsync(content, cancellationToken).ConfigureAwait(false);
             return TextResult($"Sent {content.Length} characters to PID {pid}.");
         }
         catch (InvalidOperationException ex)
@@ -194,13 +232,22 @@ public sealed class ProcessTool : IAgentTool
             return TextResult($"No tracked process with PID {pid}.");
 
         // Already exited — report as no-op.
-        if (!process.IsRunning)
+        if (!process.IsRunning && !process.KillUnconfirmed)
         {
             var code = process.ExitCode;
             return TextResult($"Process {pid} already exited (code {code}).");
         }
 
-        process.Kill();
+        // Retry is safe only through the still-owned live root, never by attaching to a stale PID.
+        if (!process.Kill())
+        {
+            return TextResult(
+                $"Process {pid} ({process.ProcessName}) did NOT confirm termination within the grace period. " +
+                (process.IsUnresolved
+                    ? "Termination is unresolved: the root exited, but descendants may still be running. " +
+                      "Operator intervention is required; this bounded diagnostic cannot be killed again or reattached by PID."
+                    : "Part of its process tree may still be running; the live root remains tracked and can be killed again."));
+        }
 
         var exitCode = process.ExitCode;
         return TextResult($"Process {pid} terminated (exit code {exitCode}).");
@@ -247,4 +294,19 @@ public sealed class ProcessTool : IAgentTool
 
     private static AgentToolResult TextResult(string text)
         => new([new AgentToolContent(AgentToolContentType.Text, text)]);
+}
+
+/// <summary>Builds an owner-bound process tool; a global singleton would leak other agents' children.</summary>
+public sealed class ProcessToolContributor : IAgentToolContributor
+{
+    /// <inheritdoc />
+    public Task<AgentToolContribution> ContributeAsync(AgentToolContributionContext context, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var ids = context.Descriptor.ToolIds;
+        var allowed = ids.Count == 0 || (ids.Count == 1 && ids[0] == "*")
+            || ids.Contains("process", StringComparer.OrdinalIgnoreCase);
+        IReadOnlyList<IAgentTool> tools = allowed ? [new ProcessTool(context.Descriptor.AgentId.Value)] : [];
+        return Task.FromResult(new AgentToolContribution(tools));
+    }
 }

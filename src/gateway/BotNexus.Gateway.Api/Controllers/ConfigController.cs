@@ -1,6 +1,8 @@
 using BotNexus.Gateway.Api.Configuration;
 using BotNexus.Gateway.Api.Models;
 using BotNexus.Gateway.Configuration;
+using BotNexus.Gateway.Abstractions.Extensions;
+using BotNexus.Gateway.Extensions;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
@@ -69,6 +71,82 @@ public sealed class ConfigController : ControllerBase
     }
 
     /// <summary>
+    /// Get the raw platform configuration together with the revision token it was read at
+    /// (issue #2059).
+    /// </summary>
+    /// <remarks>
+    /// The settings UI must be able to prove that nothing else committed between the snapshot it
+    /// rendered and the save it submits. It therefore loads through this endpoint and returns the
+    /// revision with its patch; see <see cref="PatchConfig"/>.
+    /// </remarks>
+    [HttpGet("snapshot")]
+    public async Task<ActionResult<ConfigSnapshotResponse>> GetSnapshot(
+        [FromServices] PlatformConfigWriter writer,
+        CancellationToken ct)
+    {
+        var (config, revision) = await writer.ReadWithRevisionAsync(ct);
+        RedactSecrets(config);
+        return Ok(new ConfigSnapshotResponse(revision, config));
+    }
+
+    /// <summary>
+    /// Applies a batch of addressed config changes as one atomic, optimistically-concurrent save
+    /// (issue #2059).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Replaces the settings UI's previous save shape, which PUT every materialised top-level
+    /// section of a snapshot loaded minutes earlier. That reverted concurrent edits to sections the
+    /// operator never touched, could not materialise a section absent from the raw document, and
+    /// half-committed when a later section failed.
+    /// </para>
+    /// <para>
+    /// A stale <c>expectedRevision</c> returns <c>409 Conflict</c> so the client can reload and
+    /// re-apply rather than silently overwriting the other writer. A rejected batch writes nothing.
+    /// </para>
+    /// </remarks>
+    [HttpPatch]
+    public async Task<ActionResult<ConfigPatchResponse>> PatchConfig(
+        [FromBody] ConfigPatchRequest request,
+        [FromServices] PlatformConfigWriter writer,
+        [FromServices] IExtensionLoader extensionLoader,
+        CancellationToken ct)
+    {
+        if (request?.Operations is null || request.Operations.Count == 0)
+            return BadRequest(new ConfigPatchResponse(false, null, ["A config patch must contain at least one operation."]));
+
+        // agents remain owned by /api/agents; a patch must not become a side door into that tree.
+        foreach (var operation in request.Operations)
+        {
+            var root = ConfigPatchApplier.Tokenize(operation.Path).FirstOrDefault();
+            if (string.Equals(root, "agents", StringComparison.OrdinalIgnoreCase))
+                return BadRequest(new ConfigPatchResponse(false, null, ["Use /api/agents for agent management."]));
+        }
+
+        var operations = request.Operations
+            .Select(o => new ConfigPatchOperation(o.Path, o.Value, o.Remove))
+            .ToList();
+
+        try
+        {
+            var result = await writer.ApplyPatchAsync(
+                operations,
+                "before-config-patch",
+                request.ExpectedRevision,
+                ct,
+                ScopeValidation(extensionLoader));
+            if (!result.Success)
+                return BadRequest(new ConfigPatchResponse(false, null, result.Errors));
+
+            return Ok(new ConfigPatchResponse(true, result.Revision, []));
+        }
+        catch (PlatformConfigConcurrencyException ex)
+        {
+            return Conflict(new ConfigPatchResponse(false, ex.ActualRevision, [ex.Message]));
+        }
+    }
+
+    /// <summary>
     /// Get a specific config section.
     /// </summary>
     [HttpGet("{section}")]
@@ -108,14 +186,22 @@ public sealed class ConfigController : ControllerBase
         string section,
         [FromBody] JsonNode value,
         [FromServices] PlatformConfigWriter writer,
+        [FromServices] IExtensionLoader extensionLoader,
         CancellationToken ct)
     {
         // Prevent updating agents via this endpoint (use /api/agents instead)
         if (section.Equals("agents", StringComparison.OrdinalIgnoreCase))
             return BadRequest("Use /api/agents for agent management.");
 
-        await writer.UpdateSectionAsync(section, value, ct);
-        return Ok(new { message = $"Section '{section}' updated. Changes will be applied automatically." });
+        try
+        {
+            await writer.UpdateSectionAsync(section, value, ct, additionalValidation: ScopeValidation(extensionLoader));
+            return Ok(new { message = $"Section '{section}' updated. Changes will be applied automatically." });
+        }
+        catch (PlatformConfigSectionGuardException ex)
+        {
+            return BadRequest(ex.Message);
+        }
     }
 
     /// <summary>
@@ -127,10 +213,21 @@ public sealed class ConfigController : ControllerBase
         string key,
         [FromBody] JsonNode value,
         [FromServices] PlatformConfigWriter writer,
+        [FromServices] IExtensionLoader extensionLoader,
         CancellationToken ct)
     {
-        await writer.UpdateSectionEntryAsync(section, key, value, ct);
-        return Ok(new { message = $"Entry '{key}' in section '{section}' updated." });
+        if (section.Equals("agents", StringComparison.OrdinalIgnoreCase))
+            return BadRequest("Use /api/agents for agent management.");
+
+        try
+        {
+            await writer.UpdateSectionEntryAsync(section, key, value, ct, ScopeValidation(extensionLoader));
+            return Ok(new { message = $"Entry '{key}' in section '{section}' updated." });
+        }
+        catch (PlatformConfigSectionGuardException ex)
+        {
+            return BadRequest(ex.Message);
+        }
     }
 
     /// <summary>
@@ -141,9 +238,20 @@ public sealed class ConfigController : ControllerBase
         string section,
         string key,
         [FromServices] PlatformConfigWriter writer,
+        [FromServices] IExtensionLoader extensionLoader,
         CancellationToken ct)
     {
-        await writer.RemoveSectionEntryAsync(section, key, ct);
+        if (section.Equals("agents", StringComparison.OrdinalIgnoreCase))
+            return BadRequest("Use /api/agents for agent management.");
+
+        var result = await writer.ApplyPatchAsync(
+            [new ConfigPatchOperation($"{section}.{key}", Remove: true)],
+            $"before-{section}-remove",
+            ct: ct,
+            additionalValidation: ScopeValidation(extensionLoader));
+        if (!result.Success)
+            return BadRequest(string.Join("; ", result.Errors));
+
         return Ok(new { message = $"Entry '{key}' removed from section '{section}'." });
     }
 
@@ -166,7 +274,10 @@ public sealed class ConfigController : ControllerBase
         if (config.Agents is null || !config.Agents.TryGetValue(agentId, out var agentConfig))
         {
             var fallbackPath = ResolveConfiguredPath(configuration);
-            var fallbackConfig = await new PlatformConfigWriter(
+            // Read-only use, so the backend set does not affect the result - routed through the
+            // factory anyway so "never construct PlatformConfigWriter directly" stays a rule with no
+            // exceptions to remember (#3527).
+            var fallbackConfig = await BotNexus.Gateway.Configuration.Writers.ConfigWriterFactory.Create(
                 fallbackPath,
                 new System.IO.Abstractions.FileSystem()).ReadPlatformConfigAsync(ct);
             if (System.IO.File.Exists(fallbackPath))
@@ -184,18 +295,21 @@ public sealed class ConfigController : ControllerBase
         }
 
         var defaults = config.AgentDefaults;
-        var rawElementNullable = config.AgentRawElements is not null && config.AgentRawElements.TryGetValue(agentId, out var re)
-            ? re
-            : (JsonElement?)null;
 
-        var effective = AgentConfigMerger.Merge(defaults, agentConfig, rawElementNullable);
+        // #3515: no merge. The agent block is reported as authored, so this endpoint stays truthful
+        // about what the gateway actually runs - PlatformConfigAgentSource no longer merges either.
+        // Reporting a merged view here while the platform used the unmerged one is precisely the
+        // split-brain that made the portal show values the gateway was not using.
+        var effective = agentConfig;
 
-        var sources = BuildSources(defaults, agentConfig, rawElementNullable);
+        var sources = BuildSources(agentConfig);
 
         return Ok(new EffectiveAgentConfigResponse
         {
             AgentId = agentId,
-            DefaultsApplied = defaults is not null,
+            // Defaults exist in the document but are not applied while inheritance is being
+            // redesigned (#3503), so this reports false rather than implying they took effect.
+            DefaultsApplied = false,
             Config = new EffectiveAgentConfigDto
             {
                 ToolIds = effective.ToolIds,
@@ -207,34 +321,41 @@ public sealed class ConfigController : ControllerBase
         });
     }
 
-    private static Dictionary<string, string> BuildSources(
-        AgentDefaultsConfig? defaults,
-        AgentDefinitionConfig agent,
-        JsonElement? rawElement)
+    /// <summary>
+    /// Reports which layer supplied each field of the effective config.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #3515: every field now comes from the agent, because nothing merges. This previously resolved
+    /// per-field provenance across <c>agents.defaults</c> and the agent block using the raw JSON to
+    /// tell "absent" from "explicitly null" - roughly a hundred lines of layer arithmetic whose only
+    /// purpose was describing a merge.
+    /// </para>
+    /// <para>
+    /// Kept as a method rather than inlined because the shape of the response is part of the API
+    /// contract, and provenance becomes meaningful again when defaults return (#3503). Reporting
+    /// "agent" for everything is the honest answer today; reporting a layered view for a merge that
+    /// does not happen would be the split-brain this work exists to remove.
+    /// </para>
+    /// </remarks>
+    private static Dictionary<string, string> BuildSources(AgentDefinitionConfig agent)
     {
-        var sources = new Dictionary<string, string>(StringComparer.Ordinal);
+        ArgumentNullException.ThrowIfNull(agent);
 
-        // toolIds
-        sources["toolIds"] = ResolveListSource("toolIds", defaults?.ToolIds, agent.ToolIds, rawElement);
+        const string Agent = "agent";
 
-        // memory.*
-        var agentMemObj = GetNestedObject(rawElement, "memory");
-        sources["memory.enabled"] = ResolveBoolSource("enabled", defaults?.Memory?.Enabled, agent.Memory?.Enabled, agentMemObj, agent.Memory is null);
-        sources["memory.indexing"] = ResolveStringSource("indexing", defaults?.Memory?.Indexing, agent.Memory?.Indexing, agentMemObj, agent.Memory is null);
-        sources["memory.promptInjection"] = ResolveStringSource("promptInjection", defaults?.Memory?.PromptInjection, agent.Memory?.PromptInjection, agentMemObj, agent.Memory is null);
-
-        // heartbeat.*
-        var agentHbObj = GetNestedObject(rawElement, "heartbeat");
-        sources["heartbeat.enabled"] = ResolveBoolSource("enabled", defaults?.Heartbeat?.Enabled, agent.Heartbeat?.Enabled, agentHbObj, agent.Heartbeat is null);
-        sources["heartbeat.intervalMinutes"] = ResolveIntSource("intervalMinutes", defaults?.Heartbeat?.IntervalMinutes, agent.Heartbeat?.IntervalMinutes, agentHbObj, agent.Heartbeat is null);
-
-        // fileAccess.*
-        var agentFaObj = GetNestedObject(rawElement, "fileAccess");
-        sources["fileAccess.allowedReadPaths"] = ResolveListSource("allowedReadPaths", defaults?.FileAccess?.AllowedReadPaths, agent.FileAccess?.AllowedReadPaths, agentFaObj);
-        sources["fileAccess.allowedWritePaths"] = ResolveListSource("allowedWritePaths", defaults?.FileAccess?.AllowedWritePaths, agent.FileAccess?.AllowedWritePaths, agentFaObj);
-        sources["fileAccess.deniedPaths"] = ResolveListSource("deniedPaths", defaults?.FileAccess?.DeniedPaths, agent.FileAccess?.DeniedPaths, agentFaObj);
-
-        return sources;
+        return new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["toolIds"] = Agent,
+            ["memory.enabled"] = Agent,
+            ["memory.indexing"] = Agent,
+            ["memory.promptInjection"] = Agent,
+            ["heartbeat.enabled"] = Agent,
+            ["heartbeat.intervalMinutes"] = Agent,
+            ["fileAccess.allowedReadPaths"] = Agent,
+            ["fileAccess.allowedWritePaths"] = Agent,
+            ["fileAccess.deniedPaths"] = Agent,
+        };
     }
 
     private static JsonElement? GetNestedObject(JsonElement? parent, string key)
@@ -363,7 +484,7 @@ public sealed class ConfigController : ControllerBase
                 .ToArray();
             return Ok(new ConfigValidationResponse(errors.Length == 0, resolvedPath, warnings, errors));
         }
-        catch (Exception ex) when (ex is JsonException or InvalidDataException or FormatException)
+        catch (Exception ex) when (ex is JsonException or InvalidDataException or FormatException or OptionsValidationException)
         {
             var parseMessage = ex.GetBaseException() is JsonException jsonException
                 ? jsonException.Message
@@ -382,13 +503,16 @@ public sealed class ConfigController : ControllerBase
 
     private static PlatformConfig LoadConfigFromPath(string path)
     {
-        var fileConfiguration = new ConfigurationBuilder()
-            .AddJsonFile(path, optional: false, reloadOnChange: false)
+        // This endpoint validates the explicitly requested document, not the host's provider graph.
+        // Use the exact-document stream provider so objects, arrays, nulls, and legacy root shape
+        // survive without introducing a second direct PlatformConfig loader in production code.
+        var bytes = System.IO.File.ReadAllBytes(path);
+        var configuration = new ConfigurationBuilder()
+            .AddAcceptedRawJsonStream(new MemoryStream(bytes))
             .Build();
-
         var config = new PlatformConfig();
-        fileConfiguration.Bind(config);
-        new PlatformConfigPostConfigure(fileConfiguration, path).PostConfigure(Options.DefaultName, config);
+        configuration.Bind(config);
+        PlatformConfigPostConfigure.ApplyAuthoritativeRawShape(configuration, config);
         return config;
     }
 
@@ -404,9 +528,143 @@ public sealed class ConfigController : ControllerBase
     private static JsonObject SerializeConfig(PlatformConfig config)
         => JsonSerializer.SerializeToNode(config, WriteOptions)?.AsObject() ?? new JsonObject();
 
+    private static Func<JsonObject, JsonObject, IReadOnlyList<string>> ScopeValidation(IExtensionLoader extensionLoader)
+    {
+        ArgumentNullException.ThrowIfNull(extensionLoader);
+        var loadedExtensions = extensionLoader.GetLoaded();
+        return (before, candidate) =>
+        [
+            .. ExtensionConfigurationScopeValidator.ValidateChanges(before, candidate, loadedExtensions),
+            .. ValidateProviderAssignmentChanges(before, candidate)
+        ];
+    }
+
+    private static IReadOnlyList<string> ValidateProviderAssignmentChanges(JsonObject before, JsonObject candidate)
+    {
+        if (TryGetObject(before, "providers") is not { } previousProviders)
+            return [];
+
+        var candidateProviders = TryGetObject(candidate, "providers");
+        var affectedProviders = previousProviders
+            .Where(entry => entry.Value is JsonObject previous && IsEnabled(previous))
+            .Where(entry =>
+                !TryGetProperty(candidateProviders, entry.Key, out var current) ||
+                current is not JsonObject currentProvider ||
+                !IsEnabled(currentProvider))
+            .Select(entry => entry.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (affectedProviders.Count == 0)
+            return [];
+
+        var dependencies = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        if (TryGetObject(candidate, "agents") is { } agents)
+        {
+            foreach (var (agentId, agentNode) in agents)
+            {
+                if (agentNode is not JsonObject agent ||
+                    !TryGetString(agent, "provider", out var provider))
+                {
+                    continue;
+                }
+
+                var affectedProvider = affectedProviders.FirstOrDefault(candidateProvider =>
+                    string.Equals(candidateProvider, provider, StringComparison.OrdinalIgnoreCase));
+                if (affectedProvider is null)
+                    continue;
+
+                if (!dependencies.TryGetValue(affectedProvider, out var agentIds))
+                {
+                    agentIds = [];
+                    dependencies[affectedProvider] = agentIds;
+                }
+                agentIds.Add(agentId);
+            }
+        }
+
+        return dependencies
+            .OrderBy(entry => entry.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(entry =>
+            {
+                entry.Value.Sort(StringComparer.OrdinalIgnoreCase);
+                var noun = entry.Value.Count == 1 ? "dependent agent" : "dependent agents";
+                return $"Provider '{entry.Key}' cannot be removed or disabled while assigned to {entry.Value.Count} {noun}: " +
+                    $"{string.Join(", ", entry.Value)}. Reassign the agents before changing the provider.";
+            })
+            .ToList();
+    }
+
+    private static bool IsEnabled(JsonObject provider) =>
+        !TryGetProperty(provider, "enabled", out var enabledNode) ||
+        enabledNode is not JsonValue enabledValue ||
+        !enabledValue.TryGetValue<bool>(out var enabled) ||
+        enabled;
+
+    private static JsonObject? TryGetObject(JsonObject root, string name) =>
+        TryGetProperty(root, name, out var node) ? node as JsonObject : null;
+
+    private static bool TryGetString(JsonObject root, string name, out string value)
+    {
+        value = string.Empty;
+        if (!TryGetProperty(root, name, out var node) || node is not JsonValue jsonValue ||
+            !jsonValue.TryGetValue<string>(out var resolved) || string.IsNullOrWhiteSpace(resolved))
+        {
+            return false;
+        }
+
+        value = resolved;
+        return true;
+    }
+
+    private static bool TryGetProperty(JsonObject? root, string name, out JsonNode? value)
+    {
+        value = null;
+        if (root is null)
+            return false;
+
+        foreach (var property in root)
+        {
+            if (!string.Equals(property.Key, name, StringComparison.OrdinalIgnoreCase))
+                continue;
+            value = property.Value;
+            return true;
+        }
+
+        return false;
+    }
+
     private static void RedactSecrets(JsonObject config)
-        => ConfigSecretMerge.Redact(config);
+        => config.Redact();
 }
+
+/// <summary>
+/// A raw configuration snapshot plus the revision token it was read at (issue #2059).
+/// </summary>
+/// <param name="Revision">Compare-and-swap token to send back with a patch.</param>
+/// <param name="Config">The raw configuration document, secrets redacted.</param>
+public sealed record ConfigSnapshotResponse(string Revision, JsonObject Config);
+
+/// <summary>
+/// One addressed change in a config patch request (issue #2059).
+/// </summary>
+/// <param name="Path">Dotted path with optional <c>[index]</c> segments, e.g. <c>gateway.port</c>.</param>
+/// <param name="Value">The value to write; ignored when <paramref name="Remove"/> is true.</param>
+/// <param name="Remove">Remove the addressed node instead of setting it.</param>
+public sealed record ConfigPatchOperationDto(string Path, JsonNode? Value = null, bool Remove = false);
+
+/// <summary>
+/// An atomic batch of config changes with an optional optimistic-concurrency token (issue #2059).
+/// </summary>
+/// <param name="Operations">The changes to apply, in order. All or nothing.</param>
+/// <param name="ExpectedRevision">Revision the client's snapshot was read at, or null to skip the check.</param>
+public sealed record ConfigPatchRequest(IReadOnlyList<ConfigPatchOperationDto> Operations, string? ExpectedRevision = null);
+
+/// <summary>
+/// Outcome of a config patch (issue #2059).
+/// </summary>
+/// <param name="Success">Whether the batch committed.</param>
+/// <param name="Revision">The revision now on disk: the new one on success, the current one on conflict.</param>
+/// <param name="Errors">Rejection messages; empty on success.</param>
+public sealed record ConfigPatchResponse(bool Success, string? Revision, IReadOnlyList<string> Errors);
 
 /// <summary>
 /// Result of a platform configuration validation check.

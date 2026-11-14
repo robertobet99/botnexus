@@ -10,6 +10,12 @@ public sealed class SkillsConfig
     /// <summary>Whether the skills system is enabled for this agent. Default: true.</summary>
     public bool Enabled { get; set; } = true;
 
+    /// <summary>
+    /// Allow skill directories or their ancestors to be symbolic links to operator-trusted
+    /// repositories. Defaults to false. Child paths must still resolve inside the physical skill root.
+    /// </summary>
+    public bool AllowSymlinkedSkills { get; set; }
+
     /// <summary>Skill names to always load for this agent.</summary>
     public List<string>? AutoLoad { get; set; }
 
@@ -51,9 +57,17 @@ public sealed class SkillsConfig
 
     /// <summary>
     /// Allow the agent to create, edit, and delete SHARED (all-agent) skills under the global
-    /// skills directory via the skill_manage tool with scope "shared". Defaults to FALSE.
-    /// Shared skills are visible to every agent, so a change here has a wide blast radius --
-    /// this gate is opt-in. Deleting shared skills additionally requires <see cref="AllowSkillDeletion"/>.
+    /// skills directory via the skill_manage tool with scope "shared". Defaults to true so fresh
+    /// installations can maintain their shared procedures. Operators can explicitly set false at
+    /// agent-default or named-agent scope. Deleting shared skills additionally requires <see cref="AllowSkillDeletion"/>.
     /// </summary>
-    public bool AllowSharedSkillManagement { get; set; }
+    public bool AllowSharedSkillManagement { get; set; } = true;
+
+    /// <summary>
+    /// Operator-recorded acknowledgements of specific critical security-scan findings (#3355).
+    /// Each entry clears exactly one <c>skill + ruleId + relative file path</c> triple, optionally
+    /// pinned to a <c>sha256</c> of the reviewed file. This is intentionally NOT a "disable
+    /// scanning" switch: any critical finding without a matching entry still skips the skill.
+    /// </summary>
+    public List<SkillSecurityAcknowledgement>? SecurityAcknowledgements { get; set; }
 }

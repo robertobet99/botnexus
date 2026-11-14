@@ -111,6 +111,30 @@ public sealed class SqliteSessionStoreMigrationTests : IDisposable
         return result is DBNull or null ? null : (string)result;
     }
 
+    private static async Task<bool> SchemaObjectExistsAsync(
+        string connectionString,
+        string type,
+        string name)
+    {
+        await using var conn = new SqliteConnection(connectionString);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE type = $type AND name = $name";
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$name", name);
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync()) == 1;
+    }
+
+    private static async Task<bool> ColumnExistsAsync(string connectionString, string table, string column)
+    {
+        await using var conn = new SqliteConnection(connectionString);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = $column";
+        cmd.Parameters.AddWithValue("$column", column);
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync()) == 1;
+    }
+
     // ─── tests ───────────────────────────────────────────────────────────────
 
     [Fact]
@@ -187,6 +211,69 @@ public sealed class SqliteSessionStoreMigrationTests : IDisposable
     }
 
     [Fact]
+    public async Task LegacyAgentIdDrop_TwoStoresSerializeAndTreatPeerCompletionAsSuccess()
+    {
+        var connectionString = $"Data Source={_sessionDbPath};Pooling=False";
+        await InsertOrphanedSessionAsync(
+            connectionString,
+            "s-race-1",
+            "agent-race",
+            DateTimeOffset.UtcNow);
+
+        var first = CreateSessionStore(CreateConversationStore());
+        var second = CreateSessionStore(CreateConversationStore());
+        var bothReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var readyCount = 0;
+        Task WaitAtTransactionBoundaryAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref readyCount) == 2)
+                bothReady.SetResult();
+            return bothReady.Task.WaitAsync(cancellationToken);
+        }
+
+        first.BeforeLegacyAgentIdMigrationTransactionAsync = WaitAtTransactionBoundaryAsync;
+        second.BeforeLegacyAgentIdMigrationTransactionAsync = WaitAtTransactionBoundaryAsync;
+
+        await Task.WhenAll(
+            first.GetAsync(SessionId.From("probe-first"), CancellationToken.None),
+            second.GetAsync(SessionId.From("probe-second"), CancellationToken.None));
+
+        (await ColumnExistsAsync(connectionString, "sessions", "agent_id")).ShouldBeFalse();
+        (await SchemaObjectExistsAsync(connectionString, "index", "idx_sessions_agent_id")).ShouldBeFalse();
+        (await SchemaObjectExistsAsync(connectionString, "index", "idx_sessions_conversation_agent")).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task LegacyAgentIdDrop_FailureBeforeColumnDropRollsBackAndRetryCompletes()
+    {
+        var connectionString = $"Data Source={_sessionDbPath};Pooling=False";
+        await InsertOrphanedSessionAsync(
+            connectionString,
+            "s-recovery-1",
+            "agent-recovery",
+            DateTimeOffset.UtcNow);
+
+        var interrupted = CreateSessionStore(CreateConversationStore());
+        interrupted.BeforeLegacyAgentIdColumnDropAsync = _ =>
+            throw new InvalidOperationException("injected migration interruption");
+
+        var exception = await Should.ThrowAsync<InvalidOperationException>(
+            interrupted.GetAsync(SessionId.From("probe-interrupted"), CancellationToken.None));
+        exception.Message.ShouldBe("injected migration interruption");
+
+        (await ColumnExistsAsync(connectionString, "sessions", "agent_id")).ShouldBeTrue();
+        (await SchemaObjectExistsAsync(connectionString, "index", "idx_sessions_agent_id")).ShouldBeTrue();
+        (await SchemaObjectExistsAsync(connectionString, "index", "idx_sessions_conversation_agent")).ShouldBeTrue();
+
+        var retry = CreateSessionStore(CreateConversationStore());
+        _ = await retry.GetAsync(SessionId.From("probe-retry"), CancellationToken.None);
+
+        (await ColumnExistsAsync(connectionString, "sessions", "agent_id")).ShouldBeFalse();
+        (await SchemaObjectExistsAsync(connectionString, "index", "idx_sessions_agent_id")).ShouldBeFalse();
+        (await SchemaObjectExistsAsync(connectionString, "index", "idx_sessions_conversation_agent")).ShouldBeFalse();
+    }
+
+    [Fact]
     public async Task Migration_IsIdempotent_RunningTwiceHasNoEffect()
     {
         var agentId = AgentId.From("agent-idem");
@@ -220,5 +307,104 @@ public sealed class SqliteSessionStoreMigrationTests : IDisposable
         // Same conversation id, no duplicate default conversations.
         cidAfterSecond.ShouldBe(cidAfterFirst);
         convsAfterSecond.Count.ShouldBe(convsAfterFirst.Count);
+    }
+
+    // ─── #3046: is_replay_banner column ────────────────────────────────────
+
+    /// <summary>
+    /// #3046 clause 1. The flag must survive a real write/read cycle against SQLite - an in-memory-only
+    /// flag would be lost on the cold resume that is the entire scenario it exists to serve.
+    /// </summary>
+    [Fact]
+    public async Task ReplayBanner_RoundTripsThroughStore()
+    {
+        var convStore = CreateConversationStore();
+        var sessionStore = CreateSessionStore(convStore);
+
+        var session = new GatewaySession
+        {
+            SessionId = SessionId.From("s-banner-1"),
+            AgentId = AgentId.From("agent-banner"),
+            Status = SessionStatus.Active,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        session.AddEntry(new SessionEntry { Role = MessageRole.User, Content = "do the thing" });
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.System,
+            Content = "[PLATFORM RESTART - AUTOMATIC REPLAY 1 of 2]",
+            IsReplayBanner = true
+        });
+        await sessionStore.SaveAsync(session, CancellationToken.None);
+
+        var reloaded = await sessionStore.GetAsync(SessionId.From("s-banner-1"), CancellationToken.None);
+
+        reloaded.ShouldNotBeNull();
+        var banner = reloaded.History.SingleOrDefault(e => e.IsReplayBanner);
+        banner.ShouldNotBeNull("is_replay_banner must persist and read back as true");
+        banner.Role.ShouldBe(MessageRole.System);
+
+        // Non-banner rows must not be contaminated by the new column's default.
+        reloaded.History.Single(e => e.Role == MessageRole.User).IsReplayBanner.ShouldBeFalse();
+    }
+
+    /// <summary>
+    /// #3046 clause 2. A database created before this change has no <c>is_replay_banner</c> column.
+    /// Opening it must add the column via the idempotent ALTER list rather than throwing, and every
+    /// pre-existing row must read back as <c>false</c> - not as a spurious banner.
+    /// </summary>
+    [Fact]
+    public async Task ReplayBanner_PreExistingDatabase_GainsColumnAndReadsFalse()
+    {
+        var connectionString = $"Data Source={_sessionDbPath};Pooling=False";
+
+        // Bootstrap a pre-#3046 session_history table: same shape, minus is_replay_banner.
+        await using (var conn = new SqliteConnection(connectionString))
+        {
+            await conn.OpenAsync();
+            await using var schemaCmd = conn.CreateCommand();
+            schemaCmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS session_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    role TEXT,
+                    content TEXT,
+                    timestamp TEXT,
+                    tool_name TEXT,
+                    tool_call_id TEXT,
+                    is_compaction_summary INTEGER NOT NULL DEFAULT 0,
+                    is_crash_sentinel INTEGER NOT NULL DEFAULT 0,
+                    is_history INTEGER NOT NULL DEFAULT 0,
+                    trigger_type TEXT,
+                    message_kind TEXT
+                );
+                """;
+            await schemaCmd.ExecuteNonQueryAsync();
+
+            await using var insertCmd = conn.CreateCommand();
+            insertCmd.CommandText = """
+                INSERT INTO session_history (session_id, role, content, timestamp)
+                VALUES ('s-legacy-1', 'user', 'legacy turn', $ts)
+                """;
+            insertCmd.Parameters.AddWithValue("$ts", DateTimeOffset.UtcNow.ToString("O"));
+            await insertCmd.ExecuteNonQueryAsync();
+        }
+
+        // Opening the store runs MigrateAsync, which must add the missing column.
+        var convStore = CreateConversationStore();
+        var sessionStore = CreateSessionStore(convStore);
+        _ = await sessionStore.GetAsync(SessionId.From("probe"), CancellationToken.None);
+
+        await using var verifyConn = new SqliteConnection(connectionString);
+        await verifyConn.OpenAsync();
+        await using var pragma = verifyConn.CreateCommand();
+        pragma.CommandText = "SELECT COUNT(*) FROM pragma_table_info('session_history') WHERE name = 'is_replay_banner'";
+        Convert.ToInt32(await pragma.ExecuteScalarAsync()).ShouldBe(1,
+            "MigrateAsync must add is_replay_banner to a pre-#3046 database on first open");
+
+        await using var valueCmd = verifyConn.CreateCommand();
+        valueCmd.CommandText = "SELECT is_replay_banner FROM session_history WHERE session_id = 's-legacy-1'";
+        Convert.ToInt32(await valueCmd.ExecuteScalarAsync()).ShouldBe(0,
+            "a pre-existing row must not read back as a restart banner");
     }
 }

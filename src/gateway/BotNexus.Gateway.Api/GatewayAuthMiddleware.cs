@@ -13,7 +13,7 @@ namespace BotNexus.Gateway.Api;
 /// </summary>
 public sealed class GatewayAuthMiddleware
 {
-    internal const string CallerIdentityItemKey = "BotNexus.Gateway.CallerIdentity";
+    internal const string CallerIdentityItemKey = GatewayAuthHttpContext.CallerIdentityItemKey;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -59,6 +59,13 @@ public sealed class GatewayAuthMiddleware
         {
             Headers = context.Request.Headers.ToDictionary(h => h.Key, h => h.Value.ToString(), StringComparer.OrdinalIgnoreCase),
             QueryParameters = context.Request.Query.ToDictionary(q => q.Key, q => q.Value.ToString(), StringComparer.OrdinalIgnoreCase),
+            // Deliberately NOT routed through RequestLogText (#3260). These two values are the
+            // auth handler's INPUT, not log output: a handler matches on the exact path and
+            // method it was asked about. Escaping them here would change what is being
+            // authenticated, which is a correctness defect dressed up as hardening. The
+            // sanitisation belongs at the point of logging, and the architecture fence
+            // GatewayRequestLogSanitisationFenceArchitectureTests scopes itself to logging and
+            // telemetry calls for exactly this reason.
             Path = context.Request.Path.Value ?? string.Empty,
             Method = context.WebSockets.IsWebSocketRequest ? "WS" : context.Request.Method
         };
@@ -66,7 +73,12 @@ public sealed class GatewayAuthMiddleware
         var authResult = await _authHandler.AuthenticateAsync(authContext, context.RequestAborted);
         if (!authResult.IsAuthenticated)
         {
-            _logger.LogWarning("Gateway request denied: {Path}. Reason: {Reason}", context.Request.Path, authResult.FailureReason);
+            // Sanitised at the seam (#3260): this is the line a reviewer reads to establish what
+            // an UNAUTHENTICATED caller attempted, so its path is hostile by construction.
+            _logger.LogWarning(
+                "Gateway request denied: {Path}. Reason: {Reason}",
+                RequestLogText.SafePath(context.Request.Path.Value),
+                authResult.FailureReason);
             await WriteErrorAsync(
                 context,
                 StatusCodes.Status401Unauthorized,
@@ -131,7 +143,9 @@ public sealed class GatewayAuthMiddleware
         return fileInfo.Exists && !fileInfo.IsDirectory;
     }
 
-    private static bool IsAgentAuthorized(GatewayCallerIdentity identity, string? requestedAgentId)
+    // Controllers that consume body selectors must authorize the bound value too: a query
+    // selector checked by middleware is not proof of access to the agent actually executed.
+    internal static bool IsAgentAuthorized(GatewayCallerIdentity identity, string? requestedAgentId)
     {
         if (identity.IsAdmin || identity.AllowedAgents.Count == 0 || string.IsNullOrWhiteSpace(requestedAgentId))
             return true;
@@ -142,8 +156,11 @@ public sealed class GatewayAuthMiddleware
 
     private static async Task<string?> ExtractRequestedAgentIdAsync(HttpRequest request, CancellationToken cancellationToken)
     {
-        if (request.Query.TryGetValue("agent", out var agentQueryValue))
+        foreach (var queryName in new[] { "agent", "agentId" })
         {
+            if (!request.Query.TryGetValue(queryName, out var agentQueryValue))
+                continue;
+
             var agentId = agentQueryValue.ToString();
             if (!string.IsNullOrWhiteSpace(agentId))
                 return agentId;

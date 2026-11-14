@@ -22,13 +22,14 @@ else if (_showDetailPanel && AgentId is not null && AgentId != "new")
 else
 {
     <header class="agents-toolbar">
-        <h2>&#x1F916; Agents</h2>
+        <h2 class="page-heading"><Icon Name="agents" Size="24" /><span>Agents</span></h2>
+        <a class="help-link" href="guide/agents" title="About agents" aria-label="About agents" data-testid="help-link-agents">?</a>
         <div class="agents-toolbar-actions">
             @if (!string.IsNullOrEmpty(_statusMessage))
             {
                 <span class="agents-status @_statusClass" role="status">@_statusMessage</span>
             }
-            <button class="toolbar-btn" @onclick="LoadAgentsAsync" disabled="@_loading" title="Refresh agent list">&#x21BB; Reload</button>
+            <button class="toolbar-btn" @onclick="LoadAgentsAsync" disabled="@_loading" title="Refresh agent list"><Icon Name="refresh" Size="14" Class="bn-icon-inherit" /> Reload</button>
             <button class="toolbar-btn primary" @onclick="ShowAddForm" title="Add a new agent">+ Add Agent</button>
         </div>
     </header>
@@ -42,7 +43,7 @@ else
     }
     else if (_error is not null)
     {
-        <div class="agents-error" role="alert">&#x26A0;&#xFE0F; @_error</div>
+        <div class="agents-error" role="alert"><Icon Name="warning" Size="15" /> @_error</div>
     }
     else
     {
@@ -80,6 +81,7 @@ else
                         <th>Display Name</th>
                         <th>Provider</th>
                         <th>Model</th>
+                        <th>Status</th>
                         <th><span class="sr-only">Actions</span></th>
                     </tr>
                 </thead>
@@ -91,10 +93,11 @@ else
                             <td>@agent.DisplayName</td>
                             <td>@agent.ApiProvider</td>
                             <td>@agent.ModelId</td>
+                            <td>@(agent.Enabled ? "Enabled" : "Disabled")</td>
                             <td class="agents-actions">
-                                <button class="agents-btn-edit" @onclick="() => EditAgent(agent)" title="Edit @agent.AgentId" aria-label="Edit @agent.AgentId">&#x270F;&#xFE0F;</button>
-                                <button class="agents-btn-clone" @onclick="() => CloneAgent(agent)" title="Clone @agent.AgentId" aria-label="Clone @agent.AgentId">&#x1F4CB;</button>
-                                <button class="agents-btn-delete" @onclick="() => RequestDelete(agent.AgentId!)" title="Delete @agent.AgentId" aria-label="Delete @agent.AgentId">&#x1F5D1;&#xFE0F;</button>
+                                <button class="agents-btn-edit" @onclick="() => EditAgent(agent)" title="Edit @agent.AgentId" aria-label="Edit @agent.AgentId"><Icon Name="edit" Size="14" Class="bn-icon-inherit" /></button>
+                                <button class="agents-btn-clone" @onclick="() => CloneAgent(agent)" title="Clone @agent.AgentId" aria-label="Clone @agent.AgentId"><Icon Name="copy" Size="14" Class="bn-icon-inherit" /></button>
+                                <button class="agents-btn-delete" @onclick="() => RequestDelete(agent.AgentId!)" title="Delete @agent.AgentId" aria-label="Delete @agent.AgentId"><Icon Name="delete" Size="14" Class="bn-icon-inherit" /></button>
                             </td>
                         </tr>
                     }
@@ -116,13 +119,16 @@ else
     private string _editorMode = "create";
     private string? _editorAgentId;
 
+    // #2755: bound to the lean GET /api/agents projection (AgentListItem). SystemPrompt was
+    // declared here but never rendered or read; it is no longer served on the list endpoint.
+    // ApiProvider/ModelId are rendered as grid columns above and are projected for that reason.
     private record AgentRow(
         string? AgentId,
         string DisplayName,
         string? Description,
         string ApiProvider,
         string ModelId,
-        string? SystemPrompt);
+        bool Enabled = true);
 
     private List<AgentRow> _agents = [];
     private bool _loading = true;
@@ -194,7 +200,7 @@ else
 
         try
         {
-            var apiUrl = Nav.BaseUri.TrimEnd('/') + "/api/agents";
+            var apiUrl = Nav.BaseUri.TrimEnd('/') + "/api/agents?includeDisabled=true";
             var rows = await Http.GetFromJsonAsync<List<AgentRow>>(apiUrl,
                 new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             _agents = rows ?? [];

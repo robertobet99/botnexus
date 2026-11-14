@@ -1,0 +1,571 @@
+// @ts-check
+/**
+ * Unit tests for the PR conventions guard.
+ * Run with:  node --test .github/scripts/pr-conventions-guard.test.mjs
+ *
+ * Covers the pure decision logic: title parsing, UI-path detection, evidence
+ * detection, per-type required sections, and the bot exemption / warning-mode
+ * behaviour of `run()` with stubbed `github`/`context`/`core`.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  parseTitle,
+  matchUiPaths,
+  extractHeadings,
+  hasIssueLink,
+  hasVisualEvidence,
+  hasNoVisibleChangeDeclaration,
+  hasNumericEvidence,
+  requiredSections,
+  evaluate,
+  parseApprovalSha,
+  shaMatchesHead,
+  stripComments,
+  run,
+  parseClosesIssues,
+  hasUntickedAcceptanceCriteria,
+  resolveOpenCriteriaIssues,
+  EXEMPT_AUTHORS,
+  APPROVE_COMMAND,
+} from "./pr-conventions-guard.mjs";
+
+// ---------------------------------------------------------------- title
+
+test("parseTitle accepts a conventional subject with an issue scope", () => {
+  const r = parseTitle("fix(#2293): latch the route guard on the fallback branch");
+  assert.equal(r.ok, true);
+  assert.equal(r.type, "fix");
+  assert.equal(r.scope, "#2293");
+  assert.equal(r.breaking, false);
+});
+
+test("parseTitle accepts a breaking-change marker", () => {
+  const r = parseTitle("feat(api)!: drop the legacy tool descriptor shape");
+  assert.equal(r.ok, true);
+  assert.equal(r.breaking, true);
+});
+
+test("parseTitle rejects a missing type", () => {
+  assert.equal(parseTitle("just fix the thing").ok, false);
+});
+
+test("parseTitle rejects an unknown type", () => {
+  const r = parseTitle("wibble: do a thing");
+  assert.equal(r.ok, false);
+  assert.match(String(r.reason), /Unknown type/);
+});
+
+test("parseTitle rejects a trailing period", () => {
+  const r = parseTitle("fix: correct the off-by-one.");
+  assert.equal(r.ok, false);
+  assert.match(String(r.reason), /period/);
+});
+
+test("parseTitle rejects a Sentence-cased description", () => {
+  const r = parseTitle("fix: Correct the off-by-one");
+  assert.equal(r.ok, false);
+  assert.match(String(r.reason), /lowercase/);
+});
+
+test("parseTitle allows a legitimately capitalized acronym or identifier", () => {
+  assert.equal(parseTitle("fix(cli): CLI wizard skips the prompt").ok, true);
+  assert.equal(parseTitle("fix: SignalR reconnect drops the queue").ok, true);
+});
+
+test("parseTitle rejects an empty title", () => {
+  assert.equal(parseTitle("").ok, false);
+});
+
+// ------------------------------------------------------------- UI paths
+
+test("matchUiPaths flags razor, scss and wwwroot assets", () => {
+  const paths = matchUiPaths([
+    "src/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient/Pages/Home.razor",
+    "src/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient.Mobile/wwwroot/app.css",
+    "src/styles/theme.scss",
+  ]);
+  assert.equal(paths.length, 3);
+});
+
+test("matchUiPaths ignores backend-only source", () => {
+  assert.deepEqual(
+    matchUiPaths([
+      "src/gateway/BotNexus.Gateway/GatewayHost.cs",
+      "docs/development/README.md",
+    ]),
+    []
+  );
+});
+
+test("matchUiPaths excludes bUnit test files — a test renders no user-visible UI", () => {
+  assert.deepEqual(
+    matchUiPaths([
+      "tests/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient.Tests/ChatPanelTests.cs",
+      "tests/extensions/Foo.Tests/Thing.razor",
+    ]),
+    []
+  );
+});
+
+test("matchUiPaths normalizes windows separators and de-duplicates", () => {
+  const paths = matchUiPaths([
+    "src\\extensions\\BotNexus.Extensions.Channels.SignalR.BlazorClient\\Pages\\Home.razor",
+    "src/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient/Pages/Home.razor",
+  ]);
+  assert.equal(paths.length, 1);
+});
+
+// -------------------------------------------------------------- body bits
+
+test("stripComments removes template guidance so boilerplate is not counted", () => {
+  assert.equal(stripComments("a <!-- hidden --> b").trim(), "a  b".trim());
+});
+
+test("stripComments leaves no comment opener behind when one pass forms a new one", () => {
+  // "<!" + "<!-- -->" + "-- ...": removing the inner comment splices the surrounding
+  // fragments into a brand-new "<!--" opener that a single replace pass never sees.
+  // (CodeQL: incomplete multi-character sanitization.)
+  const stripped = stripComments("a <!<!-- -->-- hidden");
+  assert.equal(stripped.includes("<!--"), false);
+});
+
+test("stripComments treats an unterminated comment as commenting out the rest", () => {
+  const stripped = stripComments("## Summary\nreal\n<!-- ## Changes\nhidden");
+  assert.equal(stripped.includes("<!--"), false);
+  assert.equal(stripped.includes("hidden"), false);
+  assert.equal(stripped.includes("real"), true);
+});
+
+test("extractHeadings ignores a heading smuggled behind a spliced comment opener", () => {
+  // Without fixed-point stripping the residual "<!--" would leave "## Changes"
+  // visible to the guard even though a markdown renderer keeps it commented out.
+  const headings = extractHeadings("## Summary\n<!<!-- -->--\n## Changes");
+  assert.equal(headings.has("summary"), true);
+  assert.equal(headings.has("changes"), false);
+});
+
+test("extractHeadings ignores headings that live inside HTML comments", () => {
+  const headings = extractHeadings("<!--\n## Summary\n-->\n## Changes");
+  assert.equal(headings.has("changes"), true);
+  assert.equal(headings.has("summary"), false);
+});
+
+test("hasIssueLink accepts Closes/Fixes/Refs", () => {
+  assert.equal(hasIssueLink("Closes #2317"), true);
+  assert.equal(hasIssueLink("Refs #12"), true);
+  assert.equal(hasIssueLink("related to 2317"), false);
+});
+
+test("hasVisualEvidence detects markdown images, uploads and video tags", () => {
+  assert.equal(hasVisualEvidence("![demo](https://example.com/a.png)"), true);
+  assert.equal(
+    hasVisualEvidence("https://github.com/sytone/botnexus/assets/1/abc-def"),
+    true
+  );
+  assert.equal(hasVisualEvidence("<video src='x.mp4'></video>"), true);
+  assert.equal(hasVisualEvidence("recording: demo.mov"), true);
+  assert.equal(hasVisualEvidence("I promise it looks fine"), false);
+});
+
+test("hasNoVisibleChangeDeclaration recognises an explicit opt-out", () => {
+  assert.equal(hasNoVisibleChangeDeclaration("Pure refactor, no visible UI change"), true);
+  assert.equal(hasNoVisibleChangeDeclaration("looks great"), false);
+});
+
+test("hasNumericEvidence distinguishes counts from claims", () => {
+  assert.equal(hasNumericEvidence("Gateway.Tests 4026/0/1"), true);
+  assert.equal(hasNumericEvidence("all tests pass"), false);
+});
+
+// --------------------------------------------------------- required sections
+
+test("requiredSections asks fix PRs for a root cause and tests", () => {
+  const s = requiredSections("fix");
+  assert.equal(s.includes("root cause"), true);
+  assert.equal(s.includes("tests"), true);
+});
+
+test("requiredSections does not ask docs PRs for tests or root cause", () => {
+  const s = requiredSections("docs");
+  assert.equal(s.includes("tests"), false);
+  assert.equal(s.includes("root cause"), false);
+});
+
+test("requiredSections asks feat PRs for tests but not a root cause", () => {
+  const s = requiredSections("feat");
+  assert.equal(s.includes("tests"), true);
+  assert.equal(s.includes("root cause"), false);
+});
+
+// ---------------------------------------------------------------- evaluate
+
+const goodFeatBody = `
+## Summary
+Adds a thing. Closes #10
+## Changes
+- did it
+## Anti-reinvention
+- reused the existing seam
+## Tests
+- covered it
+## Validation
+- Gateway.Tests 100/0
+## Risk & rollback
+- low
+## Merge notes
+- no migration
+`;
+
+test("evaluate passes a well-formed non-UI feat PR", () => {
+  const { violations } = evaluate({
+    title: "feat(portal): add a thing",
+    body: goodFeatBody,
+    changedPaths: ["src/gateway/Thing.cs"],
+  });
+  assert.deepEqual(violations, []);
+});
+
+test("evaluate flags a UI PR with no screenshot or recording", () => {
+  const { violations, uiPaths } = evaluate({
+    title: "feat(portal): add a thing",
+    body: goodFeatBody,
+    changedPaths: [
+      "src/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient/Pages/Home.razor",
+    ],
+  });
+  assert.equal(uiPaths.length, 1);
+  assert.equal(violations.some((v) => v.rule === "ui-evidence"), true);
+});
+
+test("evaluate accepts a UI PR that attaches a recording", () => {
+  const { violations } = evaluate({
+    title: "feat(portal): add a thing",
+    body: `${goodFeatBody}\n## UI evidence\n![streaming](https://example.com/demo.gif)`,
+    changedPaths: [
+      "src/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient/Pages/Home.razor",
+    ],
+  });
+  assert.equal(violations.some((v) => v.rule === "ui-evidence"), false);
+});
+
+test("evaluate accepts a UI PR that declares no visible delta", () => {
+  const { violations } = evaluate({
+    title: "refactor(portal): extract a component",
+    body: `${goodFeatBody}\nPure refactor, no visible UI change.`,
+    changedPaths: [
+      "src/extensions/BotNexus.Extensions.Channels.SignalR.BlazorClient/Pages/Home.razor",
+    ],
+  });
+  assert.equal(violations.some((v) => v.rule === "ui-evidence"), false);
+});
+
+test("evaluate flags a missing root cause on a fix PR", () => {
+  const { violations } = evaluate({
+    title: "fix(portal): stop the recursion",
+    body: goodFeatBody,
+    changedPaths: ["src/gateway/Thing.cs"],
+  });
+  assert.equal(
+    violations.some((v) => v.rule === "sections" && /root cause/.test(v.message)),
+    true
+  );
+});
+
+
+
+test("evaluate blocks the exact malformed PR #4144 body shape", () => {
+  const body = `## Summary
+- changed behavior
+
+Closes #4066
+
+## Validation
+- Gateway.Tests 100/0
+
+## Risk
+Low.`;
+  const { violations } = evaluate({
+    title: "fix(gateway): respect host path case semantics",
+    body,
+    changedPaths: ["src/gateway/Thing.cs"],
+  });
+  const blocking = violations.filter((v) => !v.advisory);
+  assert.equal(blocking.some((v) => /root cause/.test(v.message)), true);
+  assert.equal(blocking.some((v) => /risk & rollback/.test(v.message)), true);
+  assert.equal(blocking.some((v) => /anti-reinvention/.test(v.message)), true);
+  assert.equal(blocking.some((v) => /merge notes/.test(v.message)), true);
+});
+
+test("evaluate rejects empty and placeholder sections", () => {
+  const body = `${goodFeatBody.replace("- reused the existing seam", "<Name the existing seams>")}
+## Root cause
+`;
+  const { violations } = evaluate({
+    title: "fix(gateway): stop the defect",
+    body,
+    changedPaths: ["src/gateway/Thing.cs"],
+  });
+  assert.equal(violations.some((v) => /Placeholder section/.test(v.message)), true);
+  assert.equal(violations.some((v) => /Empty section/.test(v.message)), true);
+});
+
+test("evaluate marks weak validation evidence advisory, not blocking", () => {
+  const { violations } = evaluate({
+    title: "feat(portal): add a thing",
+    body: goodFeatBody.replace("Gateway.Tests 100/0", "all tests pass"),
+    changedPaths: ["src/gateway/Thing.cs"],
+  });
+  const ev = violations.find((v) => v.rule === "evidence");
+  assert.ok(ev);
+  assert.equal(ev.advisory, true);
+});
+
+test("evaluate flags an over-long title", () => {
+  const { violations } = evaluate({
+    title: `feat(portal): ${"x".repeat(80)}`,
+    body: goodFeatBody,
+    changedPaths: ["src/gateway/Thing.cs"],
+  });
+  assert.equal(violations.some((v) => v.rule === "title-length"), true);
+});
+
+// ---------------------------------------------------------------- waivers
+
+test("parseApprovalSha requires the command at a line start", () => {
+  const sha = "abcdef1234567890";
+  assert.equal(parseApprovalSha(`${APPROVE_COMMAND} ${sha}`), sha);
+  assert.equal(parseApprovalSha(`please ${APPROVE_COMMAND} ${sha}`), null);
+});
+
+test("shaMatchesHead accepts a prefix but rejects a mismatch", () => {
+  assert.equal(shaMatchesHead("abcdef1", "abcdef1234567890"), true);
+  assert.equal(shaMatchesHead("beef123", "abcdef1234567890"), false);
+});
+
+// -------------------------------------------------------------------- run
+
+/** Minimal `core` stub capturing the outcome. */
+function makeCore() {
+  const state = { failed: null, warnings: [], notices: [], infos: [] };
+  const summary = {
+    addHeading() { return summary; },
+    addRaw() { return summary; },
+    async write() {},
+  };
+  return {
+    state,
+    core: {
+      summary,
+      setFailed: (m) => { state.failed = m; },
+      warning: (m) => state.warnings.push(m),
+      notice: (m) => state.notices.push(m),
+      info: (m) => state.infos.push(m),
+    },
+  };
+}
+
+function makeGithub({ files = [], comments = [] } = {}) {
+  return {
+    paginate: async (fn) => fn(),
+    rest: {
+      pulls: { listFiles: async () => files },
+      issues: { listComments: async () => comments },
+      repos: {
+        getCollaboratorPermissionLevel: async () => ({ data: { permission: "admin" } }),
+      },
+    },
+  };
+}
+
+function makeContext(pr) {
+  return { payload: { pull_request: pr }, repo: { owner: "sytone", repo: "botnexus" } };
+}
+
+test("run skips exempt automated bot authors", async () => {
+  const { state, core } = makeCore();
+  await run({
+    github: makeGithub(),
+    context: makeContext({
+      number: 1,
+      title: "garbage title",
+      body: "",
+      head: { sha: "abc" },
+      user: { login: EXEMPT_AUTHORS[0] },
+    }),
+    core,
+  });
+  assert.equal(state.failed, null);
+  assert.match(state.infos.join(" "), /exempt automated bot/);
+});
+
+test("run does NOT exempt agent-farnsworth[bot]", async () => {
+  const { state, core } = makeCore();
+  await run({
+    github: makeGithub({ files: [{ filename: "src/gateway/Thing.cs" }] }),
+    context: makeContext({
+      number: 2,
+      title: "garbage title",
+      body: "",
+      head: { sha: "abc" },
+      user: { login: "agent-farnsworth[bot]" },
+    }),
+    core,
+  });
+  // Blocking mode: non-advisory violations fail; bot-authored PRs are not exempt.
+  assert.match(String(state.failed), /convention/i);
+});
+
+test("run in blocking mode fails non-advisory violations", async () => {
+  const { state, core } = makeCore();
+  await run({
+    github: makeGithub({ files: [{ filename: "src/gateway/Thing.cs" }] }),
+    context: makeContext({
+      number: 3,
+      title: "nope",
+      body: "no sections here",
+      head: { sha: "abc123def456" },
+      user: { login: "someone" },
+    }),
+    core,
+  });
+  assert.match(String(state.failed), /convention/i);
+});
+
+test("run reports a clean pass with no warnings", async () => {
+  const { state, core } = makeCore();
+  await run({
+    github: makeGithub({ files: [{ filename: "src/gateway/Thing.cs" }] }),
+    context: makeContext({
+      number: 4,
+      title: "feat(portal): add a thing",
+      body: goodFeatBody,
+      head: { sha: "abc123def456" },
+      user: { login: "sytone" },
+    }),
+    core,
+  });
+  assert.equal(state.failed, null);
+  assert.equal(state.warnings.length, 0);
+  assert.match(state.notices.join(" "), /passed/i);
+});
+
+// ------------------------------------------------- clause-by-clause (#2437)
+test("parseClosesIssues picks up closing keywords only, not Refs", () => {
+  assert.deepEqual(parseClosesIssues("Closes #12 and fixes #13. Resolved #14."), [12, 13, 14]);
+  assert.deepEqual(parseClosesIssues("Refs #99"), []);
+  assert.deepEqual(parseClosesIssues("Related to #99 but see #100"), []);
+});
+
+test("parseClosesIssues dedupes and ignores commented-out text", () => {
+  assert.deepEqual(parseClosesIssues("Closes #7\nCloses #7"), [7]);
+  assert.deepEqual(parseClosesIssues("<!-- Closes #8 -->"), []);
+});
+
+test("hasUntickedAcceptanceCriteria finds an unticked box in the criteria section", () => {
+  const body = "## Summary\ns\n## Acceptance criteria\n- [x] one\n- [ ] two\n";
+  assert.equal(hasUntickedAcceptanceCriteria(body), true);
+});
+
+test("hasUntickedAcceptanceCriteria is false when every criterion is ticked", () => {
+  const body = "## Acceptance criteria\n- [x] one\n- [x] two\n## Out of scope\n- [ ] later\n";
+  assert.equal(hasUntickedAcceptanceCriteria(body), false);
+});
+
+test("hasUntickedAcceptanceCriteria ignores unticked boxes outside the section", () => {
+  const body = "## Notes\n- [ ] stray\n## Acceptance criteria\n- [x] done\n";
+  assert.equal(hasUntickedAcceptanceCriteria(body), false);
+});
+
+test("hasUntickedAcceptanceCriteria keeps deeper subheadings inside the section", () => {
+  const body = "## Acceptance criteria\n### Phase 2\n- [ ] not yet\n";
+  assert.equal(hasUntickedAcceptanceCriteria(body), true);
+});
+
+test("evaluate raises the clause-coverage finding as ADVISORY, never blocking", () => {
+  const { violations } = evaluate({
+    title: "feat(portal): add a thing",
+    body: goodFeatBody,
+    changedPaths: ["src/gateway/Thing.cs"],
+    openCriteriaIssues: [10],
+  });
+  const finding = violations.find((v) => v.rule === "clause-coverage");
+  assert.ok(finding, "expected a clause-coverage finding");
+  assert.equal(finding.advisory, true);
+  assert.match(finding.message, /#10/);
+  assert.equal(violations.filter((v) => !v.advisory).length, 0);
+});
+
+test("evaluate stays silent on clause coverage when no issue is flagged", () => {
+  const { violations } = evaluate({
+    title: "feat(portal): add a thing",
+    body: goodFeatBody,
+    changedPaths: ["src/gateway/Thing.cs"],
+    openCriteriaIssues: [],
+  });
+  assert.equal(violations.some((v) => v.rule === "clause-coverage"), false);
+});
+
+test("resolveOpenCriteriaIssues flags only issues with unticked criteria", async () => {
+  const issues = {
+    10: { body: "## Acceptance criteria\n- [ ] pending\n" },
+    11: { body: "## Acceptance criteria\n- [x] done\n" },
+  };
+  const github = {
+    rest: { issues: { get: async ({ issue_number }) => ({ data: issues[issue_number] }) } },
+  };
+  const flagged = await resolveOpenCriteriaIssues({
+    github, owner: "o", repo: "r", issueNumbers: [10, 11], core: makeCore().core, prNumber: 1,
+  });
+  assert.deepEqual(flagged, [10]);
+});
+
+test("resolveOpenCriteriaIssues skips numbers that resolve to a pull request", async () => {
+  const github = {
+    rest: {
+      issues: {
+        get: async () => ({
+          data: { body: "## Acceptance criteria\n- [ ] pending\n", pull_request: { url: "x" } },
+        }),
+      },
+    },
+  };
+  const flagged = await resolveOpenCriteriaIssues({
+    github, owner: "o", repo: "r", issueNumbers: [10], core: makeCore().core, prNumber: 1,
+  });
+  assert.deepEqual(flagged, []);
+});
+
+test("resolveOpenCriteriaIssues FAILS OPEN when the issue cannot be read", async () => {
+  const github = {
+    rest: { issues: { get: async () => { throw new Error("404 not found"); } } },
+  };
+  const { state, core } = makeCore();
+  const flagged = await resolveOpenCriteriaIssues({
+    github, owner: "o", repo: "r", issueNumbers: [10], core, prNumber: 1,
+  });
+  assert.deepEqual(flagged, []);
+  assert.match(state.infos.join(" "), /clause coverage/i);
+});
+
+test("run surfaces the clause-coverage advisory without failing the check", async () => {
+  const { state, core } = makeCore();
+  const github = makeGithub({ files: [{ filename: "src/gateway/Thing.cs" }] });
+  github.rest.issues.get = async () => ({
+    data: { body: "## Acceptance criteria\n- [ ] the second clause\n" },
+  });
+  await run({
+    github,
+    context: makeContext({
+      number: 5,
+      title: "feat(portal): add a thing",
+      body: goodFeatBody,
+      head: { sha: "abc123def456" },
+      user: { login: "sytone" },
+    }),
+    core,
+  });
+  assert.equal(state.failed, null);
+  assert.match(state.warnings.join(" "), /convention/i);
+});

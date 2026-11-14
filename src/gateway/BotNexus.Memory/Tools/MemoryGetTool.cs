@@ -1,7 +1,9 @@
+using BotNexus.Domain.Text;
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Memory.Models;
+using BotNexus.Gateway.Contracts.Memory;
 using BotNexus.Agent.Providers.Core.Models;
 
 namespace BotNexus.Memory.Tools;
@@ -13,16 +15,21 @@ public sealed class MemoryGetTool : IAgentTool
 
     private readonly IMemoryStore _memoryStore;
     private readonly int _maxLimit;
+    private readonly IMemoryEnablementProvider? _enablement;
 
-    public MemoryGetTool(IMemoryStore memoryStore, int maxLimit = DefaultMaxLimit)
+    public MemoryGetTool(IMemoryStore memoryStore, int maxLimit = DefaultMaxLimit, IMemoryEnablementProvider? enablement = null)
     {
         _memoryStore = memoryStore;
         _maxLimit = Math.Max(1, maxLimit);
+        _enablement = enablement;
     }
 
     public string Name => "memory_get";
 
     public string Label => "Memory Get";
+
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Reads the agent's own memory store. Entries quarantined at write time carry their own untrusted marker in the content (#2519), so trust is conveyed by the entry, not by this tool.</summary>
+    public string ContentSource => ToolContentSource.Local;
 
     public Tool Definition => new(
         Name,
@@ -86,6 +93,11 @@ public sealed class MemoryGetTool : IAgentTool
     {
         cancellationToken.ThrowIfCancellationRequested();
 
+        // #3361: live revocation. Checked before any store access so a disabled agent makes zero
+        // calls into IMemoryStore, not merely a call whose result is discarded.
+        if (MemoryEnablementGate.Refuse(_enablement) is { } refusal)
+            return refusal;
+
         if (arguments.TryGetValue("id", out var idValue) && !string.IsNullOrWhiteSpace(ToStringValue(idValue)))
         {
             var memory = await _memoryStore.GetByIdAsync(ToStringValue(idValue)!, cancellationToken).ConfigureAwait(false);
@@ -120,14 +132,18 @@ public sealed class MemoryGetTool : IAgentTool
 
     private static string FormatMemory(MemoryEntry entry)
     {
-        var preview = entry.Content.Length > 400
-            ? $"{entry.Content[..400]}..."
-            : entry.Content;
+        var preview = TextTruncation.SafeTruncate(entry.Content, 400, "...")!;
 
         return string.Join(Environment.NewLine,
             $"ID: {entry.Id}",
             $"Timestamp: {entry.CreatedAt:O}",
             $"Source: {entry.SourceType}",
+            // Normalized, never raw: a pre-provenance row must render as `unknown` rather than
+            // as a blank field the model could read as an absence of concern (#2480).
+            $"Provenance: {entry.NormalizedProvenance}",
+            // #3232: the derived consequence of that provenance, rendered alongside it so a reader
+            // sees not just where the row came from but how retrieval treated it.
+            $"Trust: {MemoryTrust.ToWireValue(entry.TrustTier)}",
             $"Session: {entry.SessionId ?? "(none)"}",
             $"Content: {preview}");
     }

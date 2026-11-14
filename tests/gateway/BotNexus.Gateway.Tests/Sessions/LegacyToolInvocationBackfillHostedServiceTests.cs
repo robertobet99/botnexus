@@ -1,0 +1,512 @@
+using System.Diagnostics.Metrics;
+using BotNexus.Gateway.Sessions;
+using BotNexus.Gateway.Telemetry;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Data.Sqlite;
+
+namespace BotNexus.Gateway.Tests.Sessions;
+
+public sealed class LegacyToolInvocationBackfillHostedServiceTests
+{
+    [Fact]
+    public async Task ExecuteAsync_ProductionMigration_CompletesOneBulkPassWithoutBatchDelays()
+    {
+        var calls = 0;
+        var delays = new List<TimeSpan>();
+        var store = new SqliteSessionStore("Data Source=:memory:", NullLogger<SqliteSessionStore>.Instance,
+            new InMemoryConversationStore());
+        using var service = new LegacyToolInvocationBackfillHostedService(store,
+            _ =>
+            {
+                calls++;
+                return new(new(600,600,300,false,true),new(300,600,12000,-1,-1,false));
+            },
+            (delay, _) => { delays.Add(delay); return Task.CompletedTask; }, new BotNexusMetrics(),
+            NullLogger<LegacyToolInvocationBackfillHostedService>.Instance);
+        await service.StartAsync(CancellationToken.None);
+        await service.ExecuteTask.ShouldNotBeNull().WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+        calls.ShouldBe(1);
+        delays.ShouldBe([LegacyToolInvocationBackfillHostedService.InitialDelay]);
+    }
+
+    [Fact]
+    public async Task StartAsync_InitialDelayIsPending_DoesNotBlockStartup()
+    {
+        var delayReached = NewSignal();
+        var releaseDelay = NewSignal();
+        var calls = 0;
+        var service = CreateSqliteService(
+            (_, _) => { calls++; return new(0, 0, 0, false, true); },
+            (_, _, _) => new(0, 0, 0, 0, 0, false),
+            (_, _) => { delayReached.TrySetResult(); return releaseDelay.Task; });
+
+        await service.StartAsync(CancellationToken.None);
+        await delayReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        calls.ShouldBe(0);
+        releaseDelay.TrySetResult();
+
+        await service.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_HasMore_RunsBoundedBatchesWithDelayBetweenThem()
+    {
+        var calls = 0;
+        var delays = new List<TimeSpan>();
+        var completed = NewSignal();
+        var service = CreateSqliteService(
+            (_, batchSize) =>
+            {
+                batchSize.ShouldBe(LegacyToolInvocationBackfillHostedService.BatchSize);
+                calls++;
+                if (calls == 3) completed.TrySetResult();
+                return new(1, 1, 1, calls < 3, true);
+            },
+            (_, _, _) => new(0, 0, 0, 0, 0, false),
+            (delay, _) => { delays.Add(delay); return Task.CompletedTask; });
+
+        await service.StartAsync(CancellationToken.None);
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        calls.ShouldBe(3);
+        delays.ShouldBe([
+            LegacyToolInvocationBackfillHostedService.InitialDelay,
+            LegacyToolInvocationBackfillHostedService.BatchDelay,
+            LegacyToolInvocationBackfillHostedService.BatchDelay]);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_BackfillComplete_RunsCleanupUntilEligibleWorkIsExhausted()
+    {
+        var cleanupCalls = 0;
+        var delays = new List<TimeSpan>();
+        var completed = NewSignal();
+        var service = CreateSqliteService(
+            (_, _) => new(0, 0, 0, false, true),
+            (_, batchSize, afterInvocationId) =>
+            {
+                batchSize.ShouldBe(LegacyToolInvocationBackfillHostedService.BatchSize);
+                afterInvocationId.ShouldBe(cleanupCalls == 0 ? 0 : 100);
+                cleanupCalls++;
+                if (cleanupCalls == 2) completed.TrySetResult();
+                return new(1, 2, 10, -1, -1, cleanupCalls < 2, cleanupCalls * 100);
+            },
+            (delay, _) => { delays.Add(delay); return Task.CompletedTask; });
+
+        await service.StartAsync(CancellationToken.None);
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        cleanupCalls.ShouldBe(2);
+        delays.ShouldBe([
+            LegacyToolInvocationBackfillHostedService.InitialDelay,
+            LegacyToolInvocationBackfillHostedService.BatchDelay]);
+    }
+
+    [Fact]
+    public async Task StopAsync_DuringInitialDelay_CancelsWithoutRunningBatch()
+    {
+        var delayReached = NewSignal();
+        var calls = 0;
+        var service = CreateSqliteService(
+            (_, _) => { calls++; return new(0, 0, 0, false, true); },
+            (_, _, _) => new(0, 0, 0, 0, 0, false),
+            async (_, cancellationToken) =>
+            {
+                delayReached.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            });
+
+        await service.StartAsync(CancellationToken.None);
+        await delayReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        calls.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_BatchFails_RetriesAfterRetryDelay()
+    {
+        var calls = 0;
+        var delays = new List<TimeSpan>();
+        var completed = NewSignal();
+        var service = CreateSqliteService(
+            (_, _) =>
+            {
+                calls++;
+                if (calls == 1) throw new InvalidOperationException("transient");
+                completed.TrySetResult();
+                return new(0, 0, 0, false, true);
+            },
+            (_, _, _) => new(0, 0, 0, 0, 0, false),
+            (delay, _) => { delays.Add(delay); return Task.CompletedTask; });
+
+        await service.StartAsync(CancellationToken.None);
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        calls.ShouldBe(2);
+        delays.ShouldBe([
+            LegacyToolInvocationBackfillHostedService.InitialDelay,
+            LegacyToolInvocationBackfillHostedService.RetryDelay]);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_ReportsPayloadFreeProgressAndFailures()
+    {
+        using var meter = new Meter("legacy-backfill-test");
+        var measurements = new List<(string Name, long Value, string? Outcome, bool? HasMore)>();
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, activeListener) =>
+            {
+                if (instrument.Meter == meter)
+                    activeListener.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
+        {
+            string? outcome = null;
+            bool? hasMore = null;
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "outcome") outcome = tag.Value?.ToString();
+                if (tag.Key == "has_more" && tag.Value is bool current) hasMore = current;
+            }
+            measurements.Add((instrument.Name, value, outcome, hasMore));
+        });
+        listener.Start();
+
+        var calls = 0;
+        var completed = NewSignal();
+        var service = CreateSqliteService(
+            (_, _) =>
+            {
+                calls++;
+                if (calls == 1) throw new InvalidOperationException("payload must not escape");
+                completed.TrySetResult();
+                return new(7, 5, 3, false, true);
+            },
+            (_, _, _) => new(0, 0, 0, 0, 0, false),
+            (_, _) => Task.CompletedTask,
+            new BotNexusMetrics(meter));
+
+        await service.StartAsync(CancellationToken.None);
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        measurements.ShouldContain((LegacyToolInvocationBackfillMetrics.BatchesInstrumentName, 1, "failed", null));
+        measurements.ShouldContain((LegacyToolInvocationBackfillMetrics.BatchesInstrumentName, 1, "committed", false));
+        measurements.ShouldContain((LegacyToolInvocationBackfillMetrics.ScannedRowsInstrumentName, 7, null, null));
+        measurements.ShouldContain((LegacyToolInvocationBackfillMetrics.LinkedRowsInstrumentName, 5, null, null));
+        measurements.ShouldContain((LegacyToolInvocationBackfillMetrics.InvocationsInstrumentName, 3, null, null));
+        measurements.SelectMany(item => new[] { item.Name, item.Outcome }).ShouldNotContain("payload must not escape");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_CleanupReportsCommittedCountsAndFailureWithoutPayloadTags()
+    {
+        using var meter = new Meter("legacy-cleanup-test");
+        var measurements = new List<(string Name, long Value, string? Outcome, bool? HasMore, int TagCount)>();
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, activeListener) =>
+            {
+                if (instrument.Meter == meter)
+                    activeListener.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
+        {
+            string? outcome = null;
+            bool? hasMore = null;
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "outcome") outcome = tag.Value?.ToString();
+                if (tag.Key == "has_more" && tag.Value is bool current) hasMore = current;
+            }
+            measurements.Add((instrument.Name, value, outcome, hasMore, tags.Length));
+        });
+        listener.Start();
+
+        var calls = 0;
+        var delays = new List<TimeSpan>();
+        var finished = NewSignal();
+        var service = CreateSqliteService(
+            (_, _) => new(0, 0, 0, false, true),
+            (_, _, _) =>
+            {
+                calls++;
+                if (calls == 1) throw new InvalidOperationException("secret cleanup result");
+                finished.TrySetResult();
+                return new(2, 4, 35, 3, 3, false);
+            },
+            (delay, _) => { delays.Add(delay); return Task.CompletedTask; },
+            new BotNexusMetrics(meter));
+
+        await service.StartAsync(CancellationToken.None);
+        await finished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+        listener.RecordObservableInstruments();
+
+        delays.ShouldBe([LegacyToolInvocationBackfillHostedService.InitialDelay, LegacyToolInvocationBackfillHostedService.RetryDelay]);
+        measurements.ShouldContain((LegacyToolPayloadCleanupMetrics.BatchesInstrumentName, 1, "failed", null, 1));
+        measurements.ShouldContain((LegacyToolPayloadCleanupMetrics.BatchesInstrumentName, 1, "committed", false, 2));
+        measurements.ShouldContain((LegacyToolPayloadCleanupMetrics.CleanedInvocationsInstrumentName, 2, null, null, 0));
+        measurements.ShouldContain((LegacyToolPayloadCleanupMetrics.CleanedRowsInstrumentName, 4, null, null, 0));
+        measurements.ShouldContain((LegacyToolPayloadCleanupMetrics.ClearedBytesInstrumentName, 35, null, null, 0));
+        measurements.ShouldContain((LegacyToolPayloadCleanupMetrics.ProtectedInvocationsInstrumentName, 3, null, null, 0));
+        measurements.ShouldContain((LegacyToolPayloadCleanupMetrics.RemainingInvocationsInstrumentName, 3, null, null, 0));
+        measurements.SelectMany(item => new[] { item.Name, item.Outcome }).ShouldNotContain("secret cleanup result");
+        measurements.Where(item => item.Name == LegacyToolInvocationBackfillMetrics.BatchesInstrumentName && item.Outcome == "failed").ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task StartAsync_NonSqliteStore_DoesNothing()
+    {
+        var calls = 0;
+        var delays = 0;
+        var service = new LegacyToolInvocationBackfillHostedService(
+            new InMemorySessionStore(),
+            (_, _) => { calls++; return new(0, 0, 0, false, true); },
+            (_, _, _) => new(0, 0, 0, 0, 0, false),
+            (_, _) => { delays++; return Task.CompletedTask; },
+            new BotNexusMetrics(),
+            NullLogger<LegacyToolInvocationBackfillHostedService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+        await service.StopAsync(CancellationToken.None);
+
+        calls.ShouldBe(0);
+        delays.ShouldBe(0);
+    }
+
+    [Fact]
+    public void CleanupMetrics_UnknownCounts_DoNotDecrementCountersAndGaugeStartsUnknown()
+    {
+        using var meter = new Meter("legacy-cleanup-unknown-test");
+        using var capture = new CleanupMetricCapture(meter);
+        var metrics = new LegacyToolPayloadCleanupMetrics(new BotNexusMetrics(meter));
+        capture.Listener.RecordObservableInstruments();
+        metrics.RecordFailure();
+        capture.Listener.RecordObservableInstruments();
+        metrics.RecordCommitted(new(2, 4, 35, 3, 3, true));
+        capture.Listener.RecordObservableInstruments();
+        metrics.RecordFailure();
+        capture.Listener.RecordObservableInstruments();
+        metrics.RecordCommitted(new(0, 0, 0, -1, -1, true));
+        capture.Listener.RecordObservableInstruments();
+        metrics.RecordCommitted(new(0, 0, 0, -1, -1, false));
+        capture.Listener.RecordObservableInstruments();
+        metrics.RecordCommitted(new(0, 0, 0, 0, 0, false));
+        capture.Listener.RecordObservableInstruments();
+
+        capture.CommittedHasMore(LegacyToolPayloadCleanupMetrics.BatchesInstrumentName).ShouldBe([true, true, false, false]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.ProtectedInvocationsInstrumentName).ShouldBe([3L, 0L]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.RemainingInvocationsInstrumentName)
+            .ShouldBe([-1L, -1L, 3L, 3L, -1L, -1L, 0L]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.CleanedInvocationsInstrumentName).ShouldBe([2L, 0L, 0L, 0L]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.CleanedRowsInstrumentName).ShouldBe([4L, 0L, 0L, 0L]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.ClearedBytesInstrumentName).ShouldBe([35L, 0L, 0L, 0L]);
+        capture.AssertFixedTags();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_CleanupFailure_KeepsCursorAndAttributesFailuresOnce()
+    {
+        using var meter = new Meter("legacy-cleanup-cursor-test");
+        using var capture = new CleanupMetricCapture(meter);
+        var cursors = new List<long>();
+        var delays = new List<TimeSpan>();
+        var backfillCalls = 0;
+        var finished = NewSignal();
+        using var service = CreateSqliteService(
+            (_, _) =>
+            {
+                backfillCalls++;
+                if (backfillCalls == 4) throw new InvalidOperationException("secret backfill payload");
+                return new(0, 0, 0, false, true);
+            },
+            (_, batchSize, cursor) =>
+            {
+                batchSize.ShouldBe(LegacyToolInvocationBackfillHostedService.BatchSize);
+                cursors.Add(cursor);
+                if (cursors.Count == 2) throw new InvalidOperationException("secret cleanup payload");
+                if (cursors.Count == 4) finished.TrySetResult();
+                return new(1, 2, 10, -1, -1, cursors.Count < 4,
+                    cursors.Count == 1 ? 100 : cursors.Count == 3 ? 200 : 300);
+            },
+            (delay, _) => { delays.Add(delay); return Task.CompletedTask; },
+            new BotNexusMetrics(meter));
+
+        await service.StartAsync(CancellationToken.None);
+        await finished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var execution = service.ExecuteTask;
+        _ = execution.ShouldNotBeNull();
+        await execution.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        cursors.ShouldBe([0L, 100L, 100L, 200L]);
+        backfillCalls.ShouldBe(5);
+        delays.ShouldBe([
+            LegacyToolInvocationBackfillHostedService.InitialDelay,
+            LegacyToolInvocationBackfillHostedService.BatchDelay,
+            LegacyToolInvocationBackfillHostedService.RetryDelay,
+            LegacyToolInvocationBackfillHostedService.BatchDelay,
+            LegacyToolInvocationBackfillHostedService.RetryDelay]);
+        capture.BatchOutcomes(LegacyToolPayloadCleanupMetrics.BatchesInstrumentName)
+            .ShouldBe(["committed", "failed", "committed", "committed"]);
+        capture.BatchOutcomes(LegacyToolInvocationBackfillMetrics.BatchesInstrumentName)
+            .ShouldBe(["committed", "committed", "committed", "failed", "committed"]);
+        capture.CommittedHasMore(LegacyToolPayloadCleanupMetrics.BatchesInstrumentName).ShouldBe([true, true, false]);
+        capture.CommittedHasMore(LegacyToolInvocationBackfillMetrics.BatchesInstrumentName).ShouldBe([false, false, false, false]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.CleanedInvocationsInstrumentName).ShouldBe([1L, 1L, 1L]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.CleanedRowsInstrumentName).ShouldBe([2L, 2L, 2L]);
+        capture.Values(LegacyToolPayloadCleanupMetrics.ClearedBytesInstrumentName).ShouldBe([10L, 10L, 10L]);
+        capture.AssertFixedTags();
+    }
+
+    private sealed class CleanupMetricCapture : IDisposable
+    {
+        private readonly List<(string Name, long Value, KeyValuePair<string, object?>[] Tags)> _measurements = [];
+        public MeterListener Listener { get; } = new();
+
+        public CleanupMetricCapture(Meter meter)
+        {
+            Listener.InstrumentPublished = (instrument, listener) =>
+            {
+                if (instrument.Meter == meter) listener.EnableMeasurementEvents(instrument);
+            };
+            Listener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
+                _measurements.Add((instrument.Name, value, tags.ToArray())));
+            Listener.Start();
+        }
+
+        public IEnumerable<long> Values(string name) =>
+            _measurements.Where(item => item.Name == name).Select(item => item.Value);
+
+        public IEnumerable<string?> BatchOutcomes(string name) =>
+            _measurements.Where(item => item.Name == name)
+                .Select(item => item.Tags.Single(tag => tag.Key == "outcome").Value as string);
+
+        public IEnumerable<bool> CommittedHasMore(string name) =>
+            _measurements.Where(item => item.Name == name &&
+                item.Tags.Any(tag => tag.Key == "outcome" && Equals(tag.Value, "committed")))
+                .Select(item => item.Tags.Single(tag => tag.Key == "has_more").Value.ShouldBeOfType<bool>());
+
+        public void AssertFixedTags()
+        {
+            foreach (var item in _measurements)
+            {
+                if (item.Name == LegacyToolPayloadCleanupMetrics.BatchesInstrumentName ||
+                    item.Name == LegacyToolInvocationBackfillMetrics.BatchesInstrumentName)
+                {
+                    item.Value.ShouldBe(1);
+                    var outcome = item.Tags.Single(tag => tag.Key == "outcome").Value;
+                    if (Equals(outcome, "failed"))
+                        item.Tags.ShouldBe([new KeyValuePair<string, object?>("outcome", "failed")]);
+                    else
+                    {
+                        outcome.ShouldBe("committed");
+                        var hasMore = item.Tags.Single(tag => tag.Key == "has_more").Value.ShouldBeOfType<bool>();
+                        item.Tags.ShouldBe([
+                            new KeyValuePair<string, object?>("outcome", "committed"),
+                            new KeyValuePair<string, object?>("has_more", hasMore)]);
+                    }
+                }
+                else
+                    item.Tags.ShouldBeEmpty();
+            }
+        }
+
+        public void Dispose() => Listener.Dispose();
+    }
+
+    private static LegacyToolInvocationBackfillHostedService CreateSqliteService(
+        Func<SqliteSessionStore, int, LegacyToolInvocationBackfillReport> runBatch,
+        Func<SqliteSessionStore, int, long, LegacyToolPayloadCleanupReport> runCleanupBatch,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        IMetrics? metrics = null)
+    {
+        var store = new SqliteSessionStore(
+            "Data Source=:memory:",
+            NullLogger<SqliteSessionStore>.Instance,
+            new InMemoryConversationStore());
+        return new(
+            store,
+            runBatch,
+            runCleanupBatch,
+            delay,
+            metrics ?? new BotNexusMetrics(),
+            NullLogger<LegacyToolInvocationBackfillHostedService>.Instance);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExecuteAsync_SqliteFull_ReportsPayloadFreeCapacityAndKeepsRetryDelay(bool cleanupFails)
+    {
+        var store = new SqliteSessionStore(
+            "Data Source=:memory:",
+            NullLogger<SqliteSessionStore>.Instance,
+            new InMemoryConversationStore());
+        var logger = new CapacityLogger();
+        var failed = new SqliteException("secret payload /private/database/path", 13);
+        var retryReached = NewSignal();
+        var calls = 0;
+        using var service = new LegacyToolInvocationBackfillHostedService(
+            store,
+            (_, _) =>
+            {
+                calls++;
+                if (!cleanupFails) throw failed;
+                return new(0, 0, 0, false, true);
+            },
+            (_, _, _) => throw failed,
+            async (delay, token) =>
+            {
+                if (delay == LegacyToolInvocationBackfillHostedService.InitialDelay) return;
+                delay.ShouldBe(TimeSpan.FromMinutes(5));
+                retryReached.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            },
+            new BotNexusMetrics(), logger);
+        await service.StartAsync(CancellationToken.None);
+        await retryReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+        calls.ShouldBe(1);
+        var warning = logger.Messages.ShouldHaveSingleItem();
+        warning.ShouldContain("SQLITE_FULL");
+        warning.ShouldContain("observed");
+        warning.ShouldContain("PageCount");
+        warning.ShouldContain("MaxPageCount");
+        warning.ShouldContain("MainVolumeAvailableBytes");
+        warning.ShouldContain("TempVolumeAvailableBytes");
+        warning.ShouldContain("unknown");
+        warning.ShouldContain("300");
+        warning.ShouldNotContain("secret payload");
+        warning.ShouldNotContain("/private/database/path");
+        logger.Exceptions.ShouldAllBe(exception => exception == null);
+    }
+
+    private sealed class CapacityLogger : ILogger<LegacyToolInvocationBackfillHostedService>
+    {
+        public List<string> Messages { get; } = [];
+        public List<Exception?> Exceptions { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel != LogLevel.Warning) return;
+            Messages.Add(formatter(state, exception));
+            Exceptions.Add(exception);
+        }
+    }
+
+    private static TaskCompletionSource NewSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+}

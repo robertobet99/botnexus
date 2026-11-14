@@ -16,6 +16,15 @@
   ```
 - Then delete the temporary worktree after merging/pushing the PR.
 
+## PR and Commit Messages
+
+- **The PR title is the squash-commit subject** and must be a valid Conventional Commit: `<type>(<scope>): <lowercase imperative, no trailing period>`.
+- **PR bodies must follow `.github/pull_request_template.md`** — Summary (+ `Closes #N`), Root cause (fixes), Changes, Anti-reinvention, Tests, Validation, Risk & rollback, Merge notes.
+- **Validation evidence must be numeric** (`Gateway.Tests 4026/0/1`), never "all tests pass".
+- **Never weaken CI** to go green — no removed, renamed, or skipped tests and no lowered thresholds.
+- **UI changes require visual evidence.** Any PR touching `*.razor`, `*.scss`, `wwwroot/**` or the BlazorClient projects must include a **UI evidence** section with a screenshot or recording of the capability exercised with real generating agents and live conversations — not an empty shell. Prefer a recording for streaming or animated behaviour. State `No visible UI change — pure refactor` if there is genuinely no rendered delta.
+- Full rules, squash-body trailers (`Refs`, `Validated-by`, `Co-authored-by`), and the reviewer inspection order: [`docs/development/pr-and-commit-conventions.md`](../docs/development/pr-and-commit-conventions.md).
+
 ## Dev Environment
 
 - **BotNexus user config:** `C:\Users\<ALIAS>\.botnexus\config.json`

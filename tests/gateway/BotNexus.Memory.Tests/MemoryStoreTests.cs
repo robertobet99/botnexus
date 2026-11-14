@@ -84,6 +84,43 @@ public sealed class MemoryStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task SearchAsync_ExcludesExpiredEntries_UsingChronologicalOffsetComparison()
+    {
+        await using var context = await MemoryStoreTestContext.CreateAsync();
+        var now = DateTimeOffset.UtcNow;
+        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry(
+            "expired", "agent-a", "expirykeyword expired", sessionId: "session-1",
+            expiresAt: now.AddMinutes(-30).ToOffset(TimeSpan.FromHours(5.5))));
+        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry(
+            "future", "agent-a", "expirykeyword future", expiresAt: now.AddHours(1)));
+        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry(
+            "permanent", "agent-a", "expirykeyword permanent"));
+
+        var results = await context.Store.SearchAsync("expirykeyword", 10);
+        var byId = await context.Store.GetByIdAsync("expired");
+        var bySession = await context.Store.GetBySessionAsync("session-1", 10);
+
+        results.Select(entry => entry.Id).OrderBy(id => id).ShouldBe(["future", "permanent"]);
+        byId.ShouldNotBeNull();
+        bySession.Select(entry => entry.Id).ShouldContain("expired");
+    }
+
+    [Fact]
+    public async Task ExplainSearchAsync_ExcludesExpiredEntriesFromLiveRowCount()
+    {
+        await using var context = await MemoryStoreTestContext.CreateAsync();
+        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry(
+            "expired", "agent-a", "diagnostickeyword", expiresAt: DateTimeOffset.UtcNow.AddMinutes(-1)));
+        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry(
+            "live", "agent-a", "diagnostickeyword"));
+
+        var diagnostics = await context.Store.ExplainSearchAsync("diagnostickeyword");
+
+        diagnostics.LiveRowCount.ShouldBe(1);
+        diagnostics.MatchedRowCount.ShouldBe(1);
+    }
+
+    [Fact]
     public async Task SearchAsync_ReturnsEmptyForNoMatch()
     {
         await using var context = await MemoryStoreTestContext.CreateAsync();
@@ -99,8 +136,8 @@ public sealed class MemoryStoreTests : IDisposable
     {
         await using var context = await MemoryStoreTestContext.CreateAsync();
         var now = DateTimeOffset.UtcNow;
-        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry("entry-old", "agent-a", "rankingkeyword", createdAt: now.AddDays(-90)));
-        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry("entry-recent", "agent-a", "rankingkeyword", createdAt: now.AddHours(-1)));
+        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry("entry-old", "agent-a", "rankingkeyword about the old release", createdAt: now.AddDays(-90)));
+        await context.Store.InsertAsync(MemoryStoreTestContext.CreateEntry("entry-recent", "agent-a", "rankingkeyword regarding fresh telemetry", createdAt: now.AddHours(-1)));
 
         var results = await context.Store.SearchAsync("rankingkeyword", 2);
 
@@ -196,6 +233,8 @@ public sealed class MemoryStoreTests : IDisposable
 
     public void Dispose()
     {
-        SqliteConnection.ClearAllPools();
+        // No pool cleanup is needed here: every test in this class owns a MemoryStoreTestContext,
+        // which clears the pool for its own database in DisposeAsync. A class-level clear would be
+        // redundant, and the process-global form would break siblings (#3392).
     }
 }

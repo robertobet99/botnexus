@@ -4,7 +4,6 @@ using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Models;
 using Microsoft.Extensions.Logging;
-using AgentUserMessage = BotNexus.Agent.Core.Types.UserMessage;
 
 namespace BotNexus.Gateway.Isolation;
 
@@ -70,7 +69,9 @@ internal sealed class DockerSandboxAgentHandle : IAgentHandle
 
     /// <inheritdoc />
     public Task<AgentResponse> PromptAsync(AgentUserMessage message, CancellationToken cancellationToken = default)
-        => PromptAsync(message.Content ?? string.Empty, cancellationToken);
+        => PromptAsync(
+            AgentHandleImageDropGuard.DegradeToText(this, message, AgentHandleImageDropGuard.PromptSite, _logger),
+            cancellationToken);
 
     /// <inheritdoc />
     public IAsyncEnumerable<AgentStreamEvent> StreamAsync(string message, CancellationToken cancellationToken = default)
@@ -78,7 +79,14 @@ internal sealed class DockerSandboxAgentHandle : IAgentHandle
 
     /// <inheritdoc />
     public IAsyncEnumerable<AgentStreamEvent> StreamAsync(AgentUserMessage message, CancellationToken cancellationToken = default)
-        => ThrowNotSupportedStream(cancellationToken);
+    {
+        AgentHandleImageDropGuard.ReportDropped(
+            nameof(DockerSandboxAgentHandle),
+            message.Images?.Count ?? 0,
+            AgentHandleImageDropGuard.StreamSite,
+            _logger);
+        return ThrowNotSupportedStream(cancellationToken);
+    }
 
     /// <inheritdoc />
     public Task AbortAsync(CancellationToken cancellationToken = default)
@@ -92,6 +100,17 @@ internal sealed class DockerSandboxAgentHandle : IAgentHandle
         => Task.CompletedTask;
 
     /// <inheritdoc />
+    /// <remarks>
+    /// The sandbox has no typed steering queue yet (#1071/#1072), so the vision payload cannot be
+    /// carried. #2495: report the loss through the shared guard instead of inheriting the interface
+    /// default's silent degrade.
+    /// </remarks>
+    public Task SteerAsync(AgentUserMessage message, CancellationToken cancellationToken = default)
+        => SteerAsync(
+            AgentHandleImageDropGuard.DegradeToText(this, message, AgentHandleImageDropGuard.SteerSite, _logger),
+            cancellationToken);
+
+    /// <inheritdoc />
     public Task InterruptAndSteerAsync(string message, CancellationToken cancellationToken = default)
     {
         _isRunning = false;
@@ -99,11 +118,18 @@ internal sealed class DockerSandboxAgentHandle : IAgentHandle
     }
 
     /// <inheritdoc />
+    /// <remarks>#2495: report the vision-payload loss rather than degrading silently.</remarks>
+    public Task InterruptAndSteerAsync(AgentUserMessage message, CancellationToken cancellationToken = default)
+        => InterruptAndSteerAsync(
+            AgentHandleImageDropGuard.DegradeToText(this, message, AgentHandleImageDropGuard.RedirectSite, _logger),
+            cancellationToken);
+
+    /// <inheritdoc />
     public Task FollowUpAsync(string message, CancellationToken cancellationToken = default)
         => Task.CompletedTask;
 
     /// <inheritdoc />
-    public Task FollowUpAsync(AgentMessage message, CancellationToken cancellationToken = default)
+    public Task FollowUpAsync(AgentTranscriptMessage message, CancellationToken cancellationToken = default)
         => Task.CompletedTask;
 
     /// <inheritdoc />

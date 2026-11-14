@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
@@ -6,6 +6,7 @@ using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Configuration;
+using BotNexus.Gateway.Agents;
 using BotNexus.Agent.Providers.Core.Models;
 
 namespace BotNexus.Gateway.Tools;
@@ -23,6 +24,9 @@ public sealed class ListAgentsTool(
     public string Name => "list_agents";
     public string Label => "List Agents";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Gateway-owned agent registry metadata.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     public Tool Definition => new(
         Name,
         "List registered agents and their capabilities. Use to discover available specialists before calling agent_converse or spawn_subagent.",
@@ -32,7 +36,7 @@ public sealed class ListAgentsTool(
               "properties": {
                 "filter": {
                   "type": "string",
-                  "description": "Optional free-text filter applied to agent ID, display name, or description (case-insensitive)."
+                  "description": "Optional free-text filter applied to agent ID, display name, description, or agent-maintained summary (case-insensitive)."
                 },
                 "capability": {
                   "type": "string",
@@ -63,9 +67,7 @@ public sealed class ListAgentsTool(
         var capability = ReadString(arguments, "capability");
 
         var callerDescriptor = agentRegistry.Get(callerAgentId);
-        var subAgentIds = callerDescriptor?.SubAgentIds ?? [];
-        var subAgentRoles = callerDescriptor?.SubAgentRoles ?? [];
-        var isOpenPolicy = exchangeOptions?.IsOpen ?? true;
+        var peerOptions = exchangeOptions ?? new AgentExchangeOptions();
 
         var agents = agentRegistry.GetAll()
             .Where(d => MatchesFilter(d, filter))
@@ -74,11 +76,10 @@ public sealed class ListAgentsTool(
                 AgentId: d.AgentId.ToString(),
                 DisplayName: d.DisplayName,
                 Description: d.Description,
+                Summary: d.Summary,
                 Emoji: d.Emoji,
                 Capabilities: ResolveCapabilities(d),
-                CanConverse: isOpenPolicy
-                    || subAgentIds.Contains(d.AgentId.Value, StringComparer.OrdinalIgnoreCase)
-                    || IsRoleGranted(subAgentRoles, d)))
+                CanConverse: PeerAccessPolicy.IsAllowed(peerOptions, callerDescriptor, d.AgentId, d)))
             .OrderBy(e => e.AgentId, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -93,7 +94,8 @@ public sealed class ListAgentsTool(
             return true;
         return d.AgentId.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
             || d.DisplayName.Contains(filter, StringComparison.OrdinalIgnoreCase)
-            || (d.Description?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false);
+            || (d.Description?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)
+            || (d.Summary?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false);
     }
 
     private static bool MatchesCapability(AgentDescriptor d, string? capability)
@@ -102,7 +104,8 @@ public sealed class ListAgentsTool(
             return true;
         var caps = ResolveCapabilities(d);
         return caps.Any(c => c.Contains(capability, StringComparison.OrdinalIgnoreCase))
-            || (d.Description?.Contains(capability, StringComparison.OrdinalIgnoreCase) ?? false);
+            || (d.Description?.Contains(capability, StringComparison.OrdinalIgnoreCase) ?? false)
+            || (d.Summary?.Contains(capability, StringComparison.OrdinalIgnoreCase) ?? false);
     }
 
     private static IReadOnlyList<string> ResolveCapabilities(AgentDescriptor d)
@@ -123,22 +126,6 @@ public sealed class ListAgentsTool(
                 return [single];
         }
         return [];
-    }
-
-    private static bool IsRoleGranted(IReadOnlyList<string> subAgentRoles, AgentDescriptor target)
-    {
-        if (subAgentRoles.Count == 0)
-            return false;
-
-        if (!target.Metadata.TryGetValue("role", out var roleRaw) || roleRaw is null)
-            return false;
-
-        var targetRole = roleRaw is JsonElement je
-            ? je.GetString()
-            : roleRaw.ToString();
-
-        return !string.IsNullOrWhiteSpace(targetRole)
-            && subAgentRoles.Contains(targetRole, StringComparer.OrdinalIgnoreCase);
     }
 
     private static string? ReadString(IReadOnlyDictionary<string, object?> args, string key)
@@ -163,6 +150,10 @@ public sealed class ListAgentsTool(
         string AgentId,
         string DisplayName,
         string? Description,
+        // #3596: the agent-maintained account of current capability, alongside the static
+        // human-written description. Serialised with WhenWritingNull, so an agent that has never
+        // written one renders exactly as it did before this field existed.
+        string? Summary,
         string? Emoji,
         IReadOnlyList<string> Capabilities,
         bool CanConverse);

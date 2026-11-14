@@ -3,6 +3,7 @@ using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Agents;
+using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Agent.Providers.Core.Models;
 
 namespace BotNexus.Gateway.Tools;
@@ -13,6 +14,9 @@ public sealed class SubAgentListTool(
 {
     public string Name => "list_subagents";
     public string Label => "List Sub-Agents";
+
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Gateway-owned sub-agent registry.</summary>
+    public string ContentSource => ToolContentSource.Local;
 
     public Tool Definition => new(
         Name,
@@ -39,7 +43,9 @@ public sealed class SubAgentListTool(
         AgentToolUpdateCallback? onUpdate = null)
     {
         var subAgents = await subAgentManager.ListAsync(sessionId, cancellationToken).ConfigureAwait(false);
-        var result = JsonSerializer.Serialize(new { SubAgents = subAgents }, JsonOptions);
+        var projected = subAgents.Select(info => SubAgentRunDetail.FromLive(info) with { ResultSummary = null, Result = null }).ToArray();
+
+        var result = JsonSerializer.Serialize(new { SubAgents = projected }, JsonOptions);
         return new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, result)]);
     }
 

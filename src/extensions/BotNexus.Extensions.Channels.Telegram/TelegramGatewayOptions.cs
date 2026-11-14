@@ -166,6 +166,19 @@ public sealed class TelegramGatewayOptions
     public bool ShowToolActivity { get; set; } = true;
 
     /// <summary>
+    /// When true (default), user messages persisted from another surface are echoed to the
+    /// applicable Telegram chat. Mirrored into the synthesised default bot.
+    /// </summary>
+    [Display(
+        Name = "Echo foreign user messages",
+        Description = "When on (default), user messages sent from another conversation surface are echoed to Telegram.",
+        GroupName = "Telegram",
+        Order = 10)]
+    [DefaultValue(true)]
+    [ConfigField(Widget = ConfigFieldWidget.Toggle, Group = "telegram", Order = 10)]
+    public bool EchoForeignUserMessages { get; set; } = true;
+
+    /// <summary>
     /// Maximum Rich Message length before payload splitting. Rich Messages allow up to 32768
     /// characters; the default (32000) stays safely below that. Only used when
     /// <see cref="RichMessages"/> is enabled.
@@ -205,6 +218,36 @@ public sealed class TelegramGatewayOptions
     [ConfigField(Widget = ConfigFieldWidget.Number, Group = "telegram", Order = 11)]
     public int ErrorCooldownMs { get; set; } = 60_000;
 
+    // ── Inbound media bounds (issue #2724) ────────────────────────────────────
+
+    /// <summary>
+    /// Hard ceiling, in bytes, on any single inbound media attachment for a single-bot deployment.
+    /// See <see cref="TelegramBotConfig.MaxMediaBytes"/> for why 20 MB and why the bound is applied
+    /// twice. Mirrored into the synthesised default bot.
+    /// </summary>
+    [Display(
+        Name = "Max media bytes",
+        Description = "Hard ceiling, in bytes, on any single inbound media attachment. Default 20 MB matches the Telegram Bot API download limit. Mirrored into the synthesised default bot.",
+        GroupName = "Telegram",
+        Order = 12)]
+    [DefaultValue(20L * 1024 * 1024)]
+    [ConfigField(Widget = ConfigFieldWidget.Number, Group = "telegram", Order = 12)]
+    public long MaxMediaBytes { get; set; } = 20L * 1024 * 1024;
+
+    /// <summary>
+    /// Wall-clock budget, in seconds, for downloading a single inbound media attachment for a
+    /// single-bot deployment. See <see cref="TelegramBotConfig.MediaDownloadTimeoutSeconds"/> for the
+    /// reasoning. Mirrored into the synthesised default bot.
+    /// </summary>
+    [Display(
+        Name = "Media download timeout (seconds)",
+        Description = "Wall-clock budget, in seconds, for downloading a single inbound media attachment. Mirrored into the synthesised default bot.",
+        GroupName = "Telegram",
+        Order = 13)]
+    [DefaultValue(30)]
+    [ConfigField(Widget = ConfigFieldWidget.Number, Group = "telegram", Order = 13)]
+    public int MediaDownloadTimeoutSeconds { get; set; } = 30;
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -229,9 +272,12 @@ public sealed class TelegramGatewayOptions
             MaxMessageLength = MaxMessageLength,
             RichMessages = RichMessages,
             ShowToolActivity = ShowToolActivity,
+            EchoForeignUserMessages = EchoForeignUserMessages,
             MaxRichMessageLength = MaxRichMessageLength,
             ErrorCooldownMs = ErrorCooldownMs,
-            ProcessEditedMessages = ProcessEditedMessages
+            ProcessEditedMessages = ProcessEditedMessages,
+            MaxMediaBytes = MaxMediaBytes,
+            MediaDownloadTimeoutSeconds = MediaDownloadTimeoutSeconds
         };
         foreach (var id in AllowedChatIds)
             single.AllowedChatIds.Add(id);

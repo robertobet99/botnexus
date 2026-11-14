@@ -1,4 +1,5 @@
 using BotNexus.Domain.Primitives;
+using BotNexus.Gateway.Abstractions.Models;
 
 namespace BotNexus.Gateway.Abstractions.Triggers;
 
@@ -43,6 +44,29 @@ public sealed record InternalTriggerRequest
     /// </summary>
     public string? ModelOverride { get; init; }
 
+    /// <summary>Original winning cron model token; null for non-scheduler callers.</summary>
+    public string? CronRequestedModel { get; init; }
+
+    /// <summary>Winning cron precedence layer, used for session audit.</summary>
+    public string? CronModelSource { get; init; }
+
+    /// <summary>Stamps occurrence-local routing audit onto the trigger's in-memory session before execution.</summary>
+    public void ApplyCronModelMetadata(GatewaySession session)
+    {
+        if (CronModelSource is null || string.IsNullOrWhiteSpace(ModelOverride))
+        {
+            foreach (var key in new[] { "cronModelOverride", "cronRequestedModel", "cronModelSource", "cronEffectiveProvider", "cronEffectiveModel" })
+                session.Metadata.Remove(key);
+            return;
+        }
+        var separator = ModelOverride.LastIndexOf('/');
+        session.Metadata["cronModelOverride"] = ModelOverride;
+        session.Metadata["cronRequestedModel"] = CronRequestedModel;
+        session.Metadata["cronModelSource"] = CronModelSource;
+        session.Metadata["cronEffectiveProvider"] = separator > 0 ? ModelOverride[..separator] : null;
+        session.Metadata["cronEffectiveModel"] = separator > 0 ? ModelOverride[(separator + 1)..] : ModelOverride;
+    }
+
     /// <summary>
     /// Optional explicit conversation ID to route this trigger run into.
     /// When null, the trigger determines the conversation (e.g. per-job stable conversation for cron).
@@ -60,6 +84,68 @@ public sealed record InternalTriggerRequest
     /// Callers can read this value to persist the conversation ID for fast-path reuse on subsequent runs.
     /// </summary>
     public ConversationId? ResolvedConversationId { get; set; }
+
+    /// <summary>
+    /// Optional callback invoked immediately after a trigger durably creates its session, before
+    /// the potentially long-running turn begins. Cron uses this to persist run ownership while the
+    /// row is still running, so a crash or sealed session can be reconciled without waiting for an
+    /// age-only orphan threshold (#4283).
+    /// </summary>
+    public Func<SessionId, CancellationToken, Task>? SessionCreatedAsync { get; init; }
+
+    /// <summary>
+    /// Written back by the trigger after the turn completes: the number of tool invocations the
+    /// turn performed (#2985). <c>null</c> means the trigger never reported one - e.g. the turn
+    /// was interrupted and re-surfaced as a cancellation, in which case the run has its own
+    /// terminal outcome already and the zero-tool rule must not second-guess it.
+    ///
+    /// <para>
+    /// Consumed by <c>AgentPromptAction</c>, which forwards it to
+    /// <c>CronExecutionContext.RecordToolInvocationCount</c> so the scheduler can apply the
+    /// execution-class zero-tool rule at the existing run-outcome seam.
+    /// </para>
+    /// </summary>
+    public int? ToolInvocationCount { get; set; }
+
+    /// <summary>
+    /// #2641: model turns the run consumed, written back by the trigger after the turn completes.
+    /// <c>null</c> means the trigger reported nothing - "not measured", never zero.
+    /// </summary>
+    public int? TurnCount { get; set; }
+
+    /// <summary>
+    /// #2641: provider-reported prompt tokens summed across every turn of the run, or <c>null</c>
+    /// when the provider reported no usage. Distinct from the per-request figure the session
+    /// compactor stores, which is deliberately the LAST request only.
+    /// </summary>
+    public long? PromptTokens { get; set; }
+
+    /// <summary>
+    /// #2641: provider-reported completion tokens summed across every turn, or <c>null</c> when
+    /// unmeasured.
+    /// </summary>
+    public long? CompletionTokens { get; set; }
+
+    /// <summary>
+    /// Written back by the trigger when the run's <b>primary delivery</b> could not be honoured
+    /// (#3161) - for example the job's pinned destination conversation no longer resolves, so the
+    /// output was routed somewhere the operator is not reading. <c>null</c> means the trigger
+    /// reported no delivery problem.
+    ///
+    /// <para>
+    /// Consumed by <c>AgentPromptAction</c>, which forwards it to
+    /// <c>CronExecutionContext.RecordDeliveryFailure</c> so the scheduler can fold it into the
+    /// terminal run status instead of recording <c>ok</c> for a run nobody received.
+    /// </para>
+    /// </summary>
+    public string? DeliveryError { get; set; }
+
+    /// <summary>
+    /// Authoritative completion disposition written back by the trigger after the agent run settles.
+    /// Cron uses this to prevent an execution-class run with unfinished checklist work from being
+    /// persisted as successful merely because the action returned normally.
+    /// </summary>
+    public RunCompletionSignal? Completion { get; set; }
 
     /// <summary>
     /// Identifier (raw string from <see cref="BotNexus.Cron.CronJob.CreatedBy"/>) of the

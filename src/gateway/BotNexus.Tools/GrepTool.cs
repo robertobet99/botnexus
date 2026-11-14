@@ -1,3 +1,4 @@
+using BotNexus.Domain.Text;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -51,31 +52,23 @@ public sealed class GrepTool : IAgentTool
 
     public string Label => "Grep Search";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Matches from local files.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     /// <summary>
     /// Executes new.
     /// </summary>
     /// <param name="Name">The name.</param>
     /// <param name="arguments">The arguments.</param>
     /// <returns>The new result.</returns>
+    /// <remarks>
+    /// The schema is GENERATED from <see cref="GrepToolSchema"/> (#3320), not hand-written here. It is
+    /// the same declaration that drives <see cref="PrepareArgumentsAsync"/>, so the two cannot disagree.
+    /// </remarks>
     public Tool Definition => new(
         Name,
         "Search file contents using pattern matching. Returns matching lines with file paths and line numbers.",
-        JsonDocument.Parse("""
-            {
-              "type": "object",
-              "properties": {
-                "pattern": { "type": "string", "description": "Search pattern (supports regex)" },
-                "path": { "type": "string", "description": "Directory or file to search (default: working directory)" },
-                "glob": { "type": "string", "description": "Glob pattern to include files (e.g., *.cs, *.ts)" },
-                "ignore_case": { "type": "boolean", "description": "Perform case-insensitive matching (default: false)" },
-                "ignoreCase": { "type": "boolean", "description": "Case-insensitive matching alias." },
-                "literal": { "type": "boolean", "description": "Treat pattern as literal string (default: false)" },
-                "context": { "type": "integer", "description": "Number of lines to show before and after each match (default: 0)" },
-                "limit": { "type": "integer", "description": "Maximum results to return (default: 100)" }
-              },
-              "required": ["pattern"]
-            }
-            """).RootElement.Clone());
+        JsonDocument.Parse(GrepToolSchema.SchemaJson).RootElement.Clone());
 
     /// <summary>
     /// Executes prepare arguments async.
@@ -88,24 +81,46 @@ public sealed class GrepTool : IAgentTool
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var pattern = ReadRequiredString(arguments, "pattern");
+        // The copy list is the GENERATED declaration order, not a hand-written sequence of
+        // TryGetValue calls. Adding a parameter to GrepToolSchema makes it available here with no
+        // second edit - the #2641 defect (declared in the schema, forgotten in the copy list) has no
+        // representation. First writer wins, so a canonical key always beats its aliases.
+        var prepared = new Dictionary<string, object?>(StringComparer.Ordinal);
+        var sourceKeys = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var parameter in GrepToolSchema.Parameters)
+        {
+            if (!arguments.TryGetValue(parameter.Name, out var raw) || raw is null)
+            {
+                if (parameter.Required)
+                {
+                    throw new ArgumentException($"Missing required argument: {parameter.Name}.");
+                }
+
+                continue;
+            }
+
+            if (prepared.ContainsKey(parameter.TargetKey))
+            {
+                continue;
+            }
+
+            prepared[parameter.TargetKey] = parameter.JsonType switch
+            {
+                "boolean" => ReadBool(raw, parameter.Name),
+                "integer" => ReadInt(raw, parameter.Name),
+                _ => ReadString(raw, parameter.Name)
+            };
+            sourceKeys[parameter.TargetKey] = parameter.Name;
+        }
+
+        var pattern = (string)prepared["pattern"]!;
         if (string.IsNullOrWhiteSpace(pattern))
         {
             throw new ArgumentException("pattern cannot be empty.");
         }
 
-        var prepared = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["pattern"] = pattern
-        };
-
-        var literal = false;
-        if (arguments.TryGetValue("literal", out var literalObj) && literalObj is not null)
-        {
-            literal = ReadBool(literalObj, "literal");
-            prepared["literal"] = literal;
-        }
-
+        var literal = prepared.TryGetValue("literal", out var literalObj) && literalObj is bool parsedLiteralArg && parsedLiteralArg;
         var effectivePattern = literal ? Regex.Escape(pattern) : pattern;
         try
         {
@@ -116,59 +131,24 @@ public sealed class GrepTool : IAgentTool
             throw new ArgumentException($"Invalid regex pattern: {ex.Message}", nameof(arguments), ex);
         }
 
-        if (arguments.TryGetValue("path", out var pathObj) && pathObj is not null)
+        // Range rules stay hand-written: they are per-parameter semantics, not schema shape, and the
+        // spike deliberately does not try to generate them. The originating spelling is reported so
+        // an alias caller still sees its own key name in the error.
+        if (prepared.TryGetValue("context", out var contextObj) && contextObj is int contextLines && contextLines < 0)
         {
-            prepared["path"] = ReadString(pathObj, "path");
+            throw new ArgumentOutOfRangeException(nameof(arguments), "context must be >= 0.");
         }
 
-        if (arguments.TryGetValue("glob", out var globObj) && globObj is not null)
+        if (prepared.TryGetValue("limit", out var limitObj) && limitObj is int limit)
         {
-            prepared["glob"] = ReadString(globObj, "glob");
-        }
-        else if (arguments.TryGetValue("include", out var includeObj) && includeObj is not null)
-        {
-            prepared["glob"] = ReadString(includeObj, "include");
-        }
-
-        if (arguments.TryGetValue("ignore_case", out var ignoreCaseObj) && ignoreCaseObj is not null)
-        {
-            prepared["ignore_case"] = ReadBool(ignoreCaseObj, "ignore_case");
-        }
-        else if (arguments.TryGetValue("ignoreCase", out var ignoreCaseAliasObj) && ignoreCaseAliasObj is not null)
-        {
-            prepared["ignore_case"] = ReadBool(ignoreCaseAliasObj, "ignoreCase");
-        }
-
-        if (arguments.TryGetValue("context", out var contextObj) && contextObj is not null)
-        {
-            var contextLines = ReadInt(contextObj, "context");
-            if (contextLines < 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(arguments), "context must be >= 0.");
-            }
-
-            prepared["context"] = contextLines;
-        }
-
-        if (arguments.TryGetValue("limit", out var limitObj) && limitObj is not null)
-        {
-            var limit = ReadInt(limitObj, "limit");
             if (limit <= 0)
             {
-                throw new ArgumentOutOfRangeException(nameof(arguments), "limit must be greater than 0.");
+                throw new ArgumentOutOfRangeException(
+                    nameof(arguments),
+                    $"{sourceKeys["limit"]} must be greater than 0.");
             }
 
             prepared["limit"] = Math.Min(limit, MaxLimit);
-        }
-        else if (arguments.TryGetValue("max_results", out var maxResultsObj) && maxResultsObj is not null)
-        {
-            var maxResults = ReadInt(maxResultsObj, "max_results");
-            if (maxResults <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(arguments), "max_results must be greater than 0.");
-            }
-
-            prepared["limit"] = Math.Min(maxResults, MaxLimit);
         }
 
         return Task.FromResult<IReadOnlyDictionary<string, object?>>(prepared);
@@ -219,6 +199,12 @@ public sealed class GrepTool : IAgentTool
         }
 
         targetPath ??= PathUtils.ResolvePath(rawPath, _workingDirectory, _fileSystem);
+
+        // Resolution above may have swapped a symlinked prefix for the link's real target. That resolution
+        // is the containment check and stays exactly as-is, but returning the resolved path would hand the
+        // agent paths outside the tree it actually named. Capture the requested root so display paths can
+        // be re-anchored onto it after enumeration. See issue #2384.
+        var requestedRoot = ResolveRequestedRoot(rawPath);
 
         if (!_fileSystem.Directory.Exists(targetPath) && !_fileSystem.File.Exists(targetPath))
         {
@@ -271,7 +257,9 @@ public sealed class GrepTool : IAgentTool
                         continue;
                     }
 
-                    var relativePath = PathUtils.GetRelativePath(file, _workingDirectory);
+                    var relativePath = PathUtils.GetRelativePath(
+                        ReanchorToRequestedRoot(file, targetPath, requestedRoot),
+                        _workingDirectory);
                     if (contextLines == 0)
                     {
                         matches.Add($"{relativePath}:{lineNumber}: {TruncateLine(allLines[lineNumber - 1])}");
@@ -364,6 +352,72 @@ public sealed class GrepTool : IAgentTool
         return new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, builder.ToString().TrimEnd())]);
     }
 
+    /// <summary>
+    /// Computes the absolute form of the caller's requested path <em>without</em> following symlinks, so
+    /// result paths can be reported under the prefix the caller named. Returns <c>null</c> when the raw
+    /// path uses a form this re-anchoring cannot faithfully mirror (home-relative <c>~</c> paths, or a
+    /// path that does not exist as written), in which case the resolved path is reported unchanged.
+    /// </summary>
+    private string? ResolveRequestedRoot(string rawPath)
+    {
+        if (string.IsNullOrWhiteSpace(rawPath) || rawPath.TrimStart().StartsWith('~'))
+        {
+            return null;
+        }
+
+        string candidate;
+        try
+        {
+            candidate = Path.GetFullPath(
+                Path.IsPathRooted(rawPath) ? rawPath : Path.Combine(_workingDirectory, rawPath));
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+        catch (NotSupportedException)
+        {
+            return null;
+        }
+        catch (PathTooLongException)
+        {
+            return null;
+        }
+
+        return _fileSystem.Directory.Exists(candidate) || _fileSystem.File.Exists(candidate)
+            ? candidate
+            : null;
+    }
+
+    /// <summary>
+    /// Maps a file discovered under the symlink-resolved <paramref name="targetPath"/> back onto the prefix
+    /// the caller asked about. Only the reported path changes - reading, access validation, and gitignore
+    /// checks all continue to use the resolved path. The file is returned unchanged when resolution did not
+    /// alter the prefix, when no requested root was captured, or when the file sits outside the resolved root.
+    /// </summary>
+    private static string ReanchorToRequestedRoot(string file, string targetPath, string? requestedRoot)
+    {
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        if (requestedRoot is null || string.Equals(targetPath, requestedRoot, comparison))
+        {
+            return file;
+        }
+
+        var relative = Path.GetRelativePath(targetPath, file);
+        if (Path.IsPathRooted(relative) || relative.StartsWith("..", StringComparison.Ordinal))
+        {
+            return file;
+        }
+
+        // A single-file request resolves targetPath to the file itself; anchor onto the requested file path.
+        return relative == "."
+            ? requestedRoot
+            : Path.Combine(requestedRoot, relative);
+    }
+
     private IEnumerable<string> EnumerateCandidateFiles(string targetPath, string? include)
     {
         if (_fileSystem.File.Exists(targetPath))
@@ -433,16 +487,6 @@ public sealed class GrepTool : IAgentTool
                relative.Contains($"{Path.DirectorySeparatorChar}.git{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string ReadRequiredString(IReadOnlyDictionary<string, object?> arguments, string key)
-    {
-        if (!arguments.TryGetValue(key, out var value) || value is null)
-        {
-            throw new ArgumentException($"Missing required argument: {key}.");
-        }
-
-        return ReadString(value, key);
-    }
-
     private static string ReadString(object value, string key)
     {
         return value switch
@@ -491,6 +535,6 @@ public sealed class GrepTool : IAgentTool
             return line;
         }
 
-        return $"{line[..MaxLineLength]}... [truncated]";
+        return $"{TextTruncation.SafeTruncate(line, MaxLineLength)}... [truncated]";
     }
 }

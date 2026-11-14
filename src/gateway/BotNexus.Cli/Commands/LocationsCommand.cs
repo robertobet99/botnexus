@@ -1,7 +1,11 @@
 using System.CommandLine;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using BotNexus.Domain.World;
 using BotNexus.Gateway.Configuration;
 using Spectre.Console;
+using BotNexus.Cli.Services;
 
 namespace BotNexus.Cli.Commands;
 
@@ -138,13 +142,13 @@ internal sealed class LocationsCommand
         {
             var path = ResolveSafeDisplayPath(location);
             var description = TryFindDictionaryKey(declaredLocations, location.Name, out var matchedName)
-                ? Markup.Escape(declaredLocations[matchedName].Description ?? "(declared)")
+                ? CliText.SafeDisplay(declaredLocations[matchedName].Description ?? "(declared)")
                 : "[dim](auto-derived)[/]";
 
             table.AddRow(
-                Markup.Escape(location.Name),
-                Markup.Escape(location.Type.Value),
-                Markup.Escape(path),
+                CliText.SafeDisplay(location.Name),
+                CliText.SafeDisplay(location.Type.Value),
+                CliText.SafeDisplay(path),
                 description);
         }
 
@@ -154,7 +158,7 @@ internal sealed class LocationsCommand
         var autoDerivedCount = locations.Length - declaredCount;
         AnsiConsole.MarkupLine($"\n{locations.Length} locations ([green]{declaredCount} declared[/], [dim]{autoDerivedCount} auto-derived[/])");
         if (verbose)
-            AnsiConsole.MarkupLine($"[dim]Loaded from: {Markup.Escape(configPath)}[/]");
+            AnsiConsole.MarkupLine($"[dim]Loaded from: {CliText.SafeDisplay(configPath)}[/]");
 
         return 0;
     }
@@ -195,7 +199,7 @@ internal sealed class LocationsCommand
         var normalizedType = type.Trim().ToLowerInvariant();
         if (!ValidTypes.Contains(normalizedType, StringComparer.OrdinalIgnoreCase))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Location type [green]{Markup.Escape(type)}[/] is invalid. Valid values: {string.Join(", ", ValidTypes)}.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Location type [green]{CliText.SafeDisplay(type)}[/] is invalid. Valid values: {string.Join(", ", ValidTypes)}.");
             return 1;
         }
 
@@ -204,7 +208,7 @@ internal sealed class LocationsCommand
 
         if (ContainsDictionaryKey(config.Gateway.Locations, normalizedName))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{Markup.Escape(normalizedName)}[/] already exists.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{CliText.SafeDisplay(normalizedName)}[/] already exists.");
             return 1;
         }
 
@@ -214,7 +218,7 @@ internal sealed class LocationsCommand
             .Any(location => string.Equals(location.Name, normalizedName, StringComparison.OrdinalIgnoreCase));
         if (autoDerivedCollision)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{Markup.Escape(normalizedName)}[/] conflicts with an existing auto-derived location.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{CliText.SafeDisplay(normalizedName)}[/] conflicts with an existing auto-derived location.");
             return 1;
         }
 
@@ -229,7 +233,7 @@ internal sealed class LocationsCommand
 
         if (!TryValidateLocationConfig(normalizedName, locationConfig, out var validationError))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(validationError)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(validationError)}");
             return 1;
         }
 
@@ -238,15 +242,22 @@ internal sealed class LocationsCommand
             && !Directory.Exists(locationConfig.Path)
             && !File.Exists(locationConfig.Path))
         {
-            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Filesystem path [dim]{Markup.Escape(locationConfig.Path)}[/] does not exist.");
+            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Filesystem path [dim]{CliText.SafeDisplay(locationConfig.Path)}[/] does not exist.");
         }
 
-        config.Gateway.Locations[normalizedName] = locationConfig;
-        var saveCode = await SaveAndValidateAsync(config, configPath, verbose, cancellationToken);
+        var saveCode = await CliConfigMutation.ApplyAsync(
+            configPath,
+            document => document.TrySetEntryFrom(LocationsPath, normalizedName, locationConfig, out var error)
+                ? null
+                : error,
+            "before-locations-update",
+            verbose,
+            cancellationToken);
         if (saveCode != 0)
             return saveCode;
 
-        AnsiConsole.MarkupLine($"[green]\u2713[/] Added location [green]{Markup.Escape(normalizedName)}[/].");
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Added location [green]{CliText.SafeDisplay(normalizedName)}[/].");
+        saveCode.PrintReceipt();
         return 0;
     }
 
@@ -281,7 +292,7 @@ internal sealed class LocationsCommand
         var declaredLocations = config.Gateway?.Locations;
         if (declaredLocations is null || !TryFindDictionaryKey(declaredLocations, name.Trim(), out var matchedName))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{Markup.Escape(name)}[/] was not found in declared gateway.locations.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{CliText.SafeDisplay(name)}[/] was not found in declared gateway.locations.");
             return 1;
         }
 
@@ -301,15 +312,32 @@ internal sealed class LocationsCommand
 
         if (!TryValidateLocationConfig(matchedName, existing, out var validationError))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(validationError)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(validationError)}");
             return 1;
         }
 
-        var saveCode = await SaveAndValidateAsync(config, configPath, verbose, cancellationToken);
+        // PATCH only the supplied fields so unknown child keys on the location entry survive.
+        var locationPatch = new ConfigValueMap();
+        if (path is not null)
+            locationPatch.Set("path", NullIfWhiteSpace(path));
+        if (endpoint is not null)
+            locationPatch.Set("endpoint", NullIfWhiteSpace(endpoint));
+        if (description is not null)
+            locationPatch.Set("description", NullIfWhiteSpace(description));
+
+        var saveCode = await CliConfigMutation.ApplyAsync(
+            configPath,
+            document => document.TryPatchEntry(LocationsPath, matchedName, locationPatch, out var error)
+                ? null
+                : error,
+            "before-locations-update",
+            verbose,
+            cancellationToken);
         if (saveCode != 0)
             return saveCode;
 
-        AnsiConsole.MarkupLine($"[green]\u2713[/] Updated location [green]{Markup.Escape(matchedName)}[/].");
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Updated location [green]{CliText.SafeDisplay(matchedName)}[/].");
+        saveCode.PrintReceipt();
         return 0;
     }
 
@@ -331,24 +359,29 @@ internal sealed class LocationsCommand
         var declaredLocations = config.Gateway?.Locations;
         if (declaredLocations is null || !TryFindDictionaryKey(declaredLocations, name.Trim(), out var matchedName))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{Markup.Escape(name)}[/] was not found in declared gateway.locations.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Location [green]{CliText.SafeDisplay(name)}[/] was not found in declared gateway.locations.");
             return 1;
         }
 
         var references = FindFileAccessReferences(config, matchedName);
         if (references.Count > 0)
         {
-            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Location [green]{Markup.Escape(matchedName)}[/] is referenced by fileAccess policies:");
+            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Location [green]{CliText.SafeDisplay(matchedName)}[/] is referenced by fileAccess policies:");
             foreach (var reference in references)
-                AnsiConsole.MarkupLine($"  [yellow]\u2022[/] {Markup.Escape(reference)}");
+                AnsiConsole.MarkupLine($"  [yellow]\u2022[/] {CliText.SafeDisplay(reference)}");
         }
 
-        declaredLocations.Remove(matchedName);
-        var saveCode = await SaveAndValidateAsync(config, configPath, verbose, cancellationToken);
+        var saveCode = await CliConfigMutation.ApplyAsync(
+            configPath,
+            document => document.TryRemoveEntry(LocationsPath, matchedName, out var error) ? null : error,
+            "before-locations-update",
+            verbose,
+            cancellationToken);
         if (saveCode != 0)
             return saveCode;
 
-        AnsiConsole.MarkupLine($"[green]\u2713[/] Deleted location [green]{Markup.Escape(matchedName)}[/].");
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Deleted location [green]{CliText.SafeDisplay(matchedName)}[/].");
+        saveCode.PrintReceipt();
         return 0;
     }
 
@@ -467,54 +500,25 @@ internal sealed class LocationsCommand
 
     private static async Task<PlatformConfig?> LoadConfigRequiredAsync(string configPath, CancellationToken cancellationToken)
     {
-        if (!File.Exists(configPath))
+        if (!ConfigPresence.Exists(configPath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Config file not found at [dim]{Markup.Escape(configPath)}[/]. Run [green]botnexus init[/] first.");
+            AnsiConsole.MarkupLine(configPath.NotFoundMessage());
             return null;
         }
 
         try
         {
-            return await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
+            return PlatformConfigAccessor.Shared.Get(configPath);
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {CliText.SafeDisplay(ex.Message)}");
             return null;
         }
     }
 
-    private static async Task<int> SaveAndValidateAsync(PlatformConfig config, bool verbose, CancellationToken cancellationToken)
-        => await SaveAndValidateAsync(config, PlatformConfigLoader.DefaultConfigPath, verbose, cancellationToken);
-
-    private static async Task<int> SaveAndValidateAsync(PlatformConfig config, string configPath, bool verbose, CancellationToken cancellationToken)
-    {
-        await WriteConfigAsync(config, configPath, cancellationToken);
-
-        var reloaded = await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
-        var errors = PlatformConfigLoader.Validate(reloaded);
-        if (errors.Count > 0)
-        {
-            AnsiConsole.MarkupLine("[red]Config validation failed after write:[/]");
-            foreach (var error in errors)
-                AnsiConsole.MarkupLine($"  [red]\u2022[/] {Markup.Escape(error)}");
-            return 1;
-        }
-
-        if (verbose)
-            AnsiConsole.MarkupLine($"[dim]Saved config: {Markup.Escape(configPath)}[/]");
-
-        return 0;
-    }
-
-    private static async Task WriteConfigAsync(PlatformConfig config, string configPath, CancellationToken cancellationToken)
-    {
-        PlatformConfigLoader.EnsureConfigDirectory(Path.GetDirectoryName(configPath) ?? PlatformConfigLoader.DefaultHomePath);
-        var fileSystem = new System.IO.Abstractions.FileSystem();
-        var backupsDir = Path.Combine(Path.GetDirectoryName(configPath) ?? BotNexusHome.ResolveHomePath(), "backups");
-        var writer = new PlatformConfigWriter(configPath, fileSystem, new ConfigBackupService(backupsDir, fileSystem));
-        await writer.UpdatePlatformConfigAsync(config, "before-locations-update", cancellationToken);
-    }
+    /// <summary>Canonical path of the declared gateway locations section.</summary>
+    private const string LocationsPath = "gateway.locations";
 
     private static bool ContainsDictionaryKey<TKey, TValue>(Dictionary<TKey, TValue> dictionary, TKey key)
         where TKey : notnull
@@ -569,3 +573,4 @@ internal sealed class LocationsCommand
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
 }
+

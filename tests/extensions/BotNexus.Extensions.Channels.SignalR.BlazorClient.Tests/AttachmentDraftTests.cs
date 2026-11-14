@@ -23,6 +23,11 @@ public sealed class AttachmentDraftTests : IDisposable
         _ctx.Services.AddSingleton(new HttpClient());
         _ctx.JSInterop.Mode = JSRuntimeMode.Loose;
         _store.UpsertAgent(new AgentState { AgentId = "agent-1", DisplayName = "Agent", IsConnected = true });
+        // #3063: the send path now requires a conversation, so the panel must be rendered against a
+        // real one. A ChatPanel with no conversation was never a state a citizen could send from.
+        _store.SeedConversations("agent-1", [new ConversationSummaryDto(
+            "conv-1", "agent-1", "Test", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
     }
 
     public void Dispose() => _ctx.Dispose();
@@ -63,15 +68,27 @@ public sealed class AttachmentDraftTests : IDisposable
     }
 
     [Fact]
+    public async Task Paste_failure_is_announced_without_clearing_typed_draft()
+    {
+        var cut = Render();
+        cut.Find("[data-testid='chat-input']").Input("keep this text");
+
+        await cut.InvokeAsync(cut.Instance.OnAttachmentPasteFailed);
+
+        cut.Find("[role='alert']").TextContent.ShouldContain("Could not attach");
+        cut.Find("[data-testid='chat-input']").GetAttribute("value").ShouldBe("keep this text");
+    }
+
+    [Fact]
     public async Task Attachment_only_send_carries_metadata_and_clears_draft()
     {
         var cut = Render();
         var attachment = new DraftAttachment("notes.txt", "text/plain", Convert.ToBase64String("hello"u8.ToArray()), 5);
         await cut.InvokeAsync(() => cut.Instance.AddDraftAttachmentsAsync([attachment]));
         cut.Find("[data-testid='chat-send']").Click();
-        await _interaction.Received(1).SendMessageAsync("agent-1", string.Empty, Arg.Is<IReadOnlyList<DraftAttachment>>(x => x.Count == 1 && x[0].FileName == "notes.txt"));
+        await _interaction.Received(1).SendMessageAsync("agent-1", "conv-1", string.Empty, Arg.Is<IReadOnlyList<DraftAttachment>>(x => x.Count == 1 && x[0].FileName == "notes.txt"));
         cut.FindAll("[data-testid='attachment-chip']").ShouldBeEmpty();
     }
 
-    private IRenderedComponent<ChatPanel> Render() => _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+    private IRenderedComponent<ChatPanel> Render() => _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 }

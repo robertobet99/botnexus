@@ -8,7 +8,7 @@
         <div class="portal-settings-panel" role="dialog" aria-modal="true" aria-labelledby="portal-settings-title" data-testid="portal-settings-panel" @onclick:stopPropagation="true">
             <div class="portal-settings-header">
                 <h3 id="portal-settings-title">Portal Settings</h3>
-                <button class="portal-settings-close" @onclick="Close" title="Close" data-testid="portal-settings-close">&#x2715;</button>
+                <button class="portal-settings-close" @onclick="Close" title="Close" data-testid="portal-settings-close"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button>
             </div>
             <div class="portal-settings-body">
                 <div class="portal-settings-row">
@@ -19,6 +19,16 @@
                 </div>
                 <div class="portal-settings-hint">
                     Textarea grows as you type, up to @Prefs.Current.ExpandingInputMaxLines rows.
+                </div>
+                <div class="portal-settings-row">
+                    <label class="portal-settings-label">Animate active-run indicator</label>
+                    <input type="checkbox"
+                           data-testid="animate-active-run-toggle"
+                           checked="@Prefs.Current.AnimateActiveRunIndicator"
+                           @onchange="ToggleAnimateActiveRunIndicator" />
+                </div>
+                <div class="portal-settings-hint">
+                    Gently pulses the bottom edge of the message input while an agent is working.
                 </div>
                 <div class="portal-settings-row">
                     <label class="portal-settings-label">Debug Mode</label>
@@ -39,6 +49,51 @@
                 </div>
                 <div class="portal-settings-hint">
                     When enabled, shows a confirmation prompt before archiving or closing a conversation.
+                </div>
+                <div class="portal-settings-row">
+                    <label class="portal-settings-label" for="portal-theme-select">Colour theme</label>
+                    <select id="portal-theme-select"
+                            class="portal-settings-select"
+                            data-testid="theme-select"
+                            value="@Prefs.Current.Theme"
+                            @onchange="ChangeTheme">
+                        <option value="dark">Dark</option>
+                        <option value="light">Light</option>
+                    </select>
+                </div>
+                <div class="portal-settings-hint">
+                    Dark is the default. The choice is stored in this browser and applied before the
+                    page paints, so it does not flash on reload.
+                </div>
+                <div class="portal-settings-row">
+                    <label class="portal-settings-label" for="portal-shell-select">Portal shell <strong>Experimental</strong></label>
+                    <select id="portal-shell-select"
+                            class="portal-settings-select"
+                            data-testid="shell-select"
+                            value="@PortalShell.Normalize(Prefs.Current.Shell)"
+                            @onchange="ChangeShell">
+                        <option value="classic">Classic</option>
+                        <option value="simplified">Simplified</option>
+                    </select>
+                </div>
+                <div class="portal-settings-hint">
+                    Classic preserves the current portal. Simplified opts into shell and Home layout
+                    experiments as they become available. Applies immediately and is stored in this browser.
+                </div>
+                <div class="portal-settings-row">
+                    <label class="portal-settings-label" for="portal-density-select">Interface density</label>
+                    <select id="portal-density-select"
+                            class="portal-settings-select"
+                            data-testid="density-select"
+                            value="@Prefs.Current.Density"
+                            @onchange="ChangeDensity">
+                        <option value="compact">Compact</option>
+                        <option value="comfortable">Comfortable</option>
+                    </select>
+                </div>
+                <div class="portal-settings-hint">
+                    Compact tightens the top bar, tabs and sidebar rows. Comfortable restores roomier
+                    spacing. Applies immediately across the portal.
                 </div>
             </div>
         </div>
@@ -77,10 +132,31 @@
         await Prefs.SetExpandingInputAsync(enabled);
     }
 
+    private async Task ToggleAnimateActiveRunIndicator(ChangeEventArgs e)
+    {
+        var enabled = e.Value is bool b ? b : bool.Parse(e.Value?.ToString() ?? "false");
+        await Prefs.SetAnimateActiveRunIndicatorAsync(enabled);
+    }
+
     private async Task ToggleDebugMode(ChangeEventArgs e)
     {
         var enabled = e.Value is bool b ? b : bool.Parse(e.Value?.ToString() ?? "false");
         await Prefs.SetDebugModeAsync(enabled);
+    }
+
+    private async Task ChangeTheme(ChangeEventArgs e)
+    {
+        await Prefs.SetThemeAsync(e.Value?.ToString() ?? PortalTheme.Dark);
+    }
+
+    private async Task ChangeDensity(ChangeEventArgs e)
+    {
+        await Prefs.SetDensityAsync(e.Value?.ToString() ?? PortalDensity.Compact);
+    }
+
+    private async Task ChangeShell(ChangeEventArgs e)
+    {
+        await Prefs.SetShellAsync(e.Value?.ToString() ?? PortalShell.Classic);
     }
 
     private async Task ToggleArchiveConfirm(ChangeEventArgs e)

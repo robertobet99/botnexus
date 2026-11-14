@@ -1,4 +1,6 @@
+using BotNexus.Gateway.Providers;
 using BotNexus.Gateway.Api.Extensions;
+using BotNexus.Gateway.Api.Logging;
 using BotNexus.Gateway.Api;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Extensions;
@@ -7,17 +9,22 @@ using BotNexus.Gateway.Abstractions.Isolation;
 using BotNexus.Gateway.Configuration;
 using BotNexus.Gateway.Extensions;
 using BotNexus.Agent.Providers.Core.Logging;
+using BotNexus.Gateway.Abstractions.Security;
+using Microsoft.Extensions.Logging;
 using BotNexus.Agent.Providers.Core.Resilience;
 using BotNexus.Agent.Providers.Anthropic;
+using BotNexus.Agent.Providers.Copilot.Headers;
 using BotNexus.Agent.Providers.Copilot.Messages;
 using BotNexus.Agent.Providers.Copilot.Responses;
 using BotNexus.Agent.Providers.Copilot.Completions;
 using BotNexus.Agent.Providers.Core;
+using BotNexus.Agent.Providers.Core.Diagnostics;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Registry;
 using Microsoft.Extensions.Options;
 using BotNexus.Agent.Providers.OpenAI;
 using BotNexus.Agent.Providers.OpenAICompat;
+using BotNexus.Agent.Providers.Core.Embeddings;
 using BotNexus.Agent.Providers.Copilot;
 using BotNexus.Agent.Providers.Copilot.Discovery;
 using BotNexus.Agent.Providers.GitHubModels;
@@ -27,43 +34,42 @@ using BotNexus.Cron;
 using BotNexus.Cron.Extensions;
 using BotNexus.Domain.World;
 using Microsoft.AspNetCore.Routing;
+using BotNexus.Persistence.Sqlite;
 using Microsoft.OpenApi.Models;
 using OpenTelemetry.Trace;
 using BotNexus.Gateway.Telemetry;
 using Serilog;
 using System.Reflection;
+using BotNexus.Gateway.Nav;
+using BotNexus.Gateway.Tools;
 using BotNexus.Gateway.Webhooks;
 
 const string GatewayCorsPolicy = "GatewayCorsPolicy";
 
 Log.Logger = new LoggerConfiguration()
-    .WriteTo.Console()
-    .WriteTo.File(
-        Path.Combine(BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath(), "logs", "botnexus-bootstrap-.log"),
-        rollingInterval: RollingInterval.Day)
+    .ConfigureBootstrapLogging(
+        Path.Combine(BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath(), "logs", "botnexus-bootstrap-.log"))
     .CreateBootstrapLogger();
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
     Args = args
 });
+builder.Services.AddSingleton<CopilotHeaderQuotaStore>();
 
 // Enable running as an OS service (no-op when running interactively)
 builder.Host.UseSystemd();
 builder.Host.UseWindowsService();
 
+// The recent-log store must be registered before Serilog is configured: ConfigureGatewayLogging
+// resolves it to attach the sink that backs GET /api/logs/recent (issue #2390).
+builder.Services.AddGatewayRecentLogStore();
+
 builder.Host.UseSerilog((context, services, configuration) => configuration
-    .ReadFrom.Configuration(context.Configuration)
-    .ReadFrom.Services(services)
-    .Enrich.FromLogContext()
-    .Enrich.WithMachineName()
-    .Enrich.WithThreadId()
-    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}",
-        restrictedToMinimumLevel: Serilog.Events.LogEventLevel.Warning)
-    .WriteTo.File(
-        Path.Combine(BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath(), "logs", "botnexus-.log"),
-        rollingInterval: RollingInterval.Hour,
-        retainedFileCountLimit: 168),
+    .ConfigureGatewayLogging(
+        context.Configuration,
+        services,
+        Path.Combine(BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath(), "logs")),
     preserveStaticLogger: true);
 
 var platformConfigPath = builder.Configuration["BotNexus:ConfigPath"];
@@ -77,11 +83,22 @@ var resolvedConfigPath = string.IsNullOrWhiteSpace(platformConfigPath)
 // eagerly loads (and re-loads on change) each source, and a parse failure there escapes on a
 // background thread which would crash the host. If the file is invalid we skip adding it to the
 // pipeline entirely and the gateway runs on defaults until the file is fixed and the host restarts.
+//
+// #2358: the startup check above is startup-ONLY. Once the source is in the pipeline with
+// reloadOnChange: true, a LATER corruption (partial write, hand edit, disk fault) hits
+// FileConfigurationProvider.Load on the file-watcher thread, which clears the data and rethrows an
+// InvalidDataException that terminates the running host. AddResilientJsonFile registers a provider
+// that validates the candidate BEFORE applying it and, on failure, rejects it and keeps serving the
+// last-known-good configuration while logging a clear error.
 if (IsValidJsonFile(resolvedConfigPath))
 {
     try
     {
-        builder.Configuration.AddJsonFile(resolvedConfigPath, optional: true, reloadOnChange: true);
+        builder.Configuration.AddResilientJsonFile(
+            resolvedConfigPath,
+            optional: true,
+            reloadOnChange: true,
+            onLoadFailure: (message, ex) => Log.Error(ex, "{Message}", message));
     }
     catch (Exception ex)
     {
@@ -93,10 +110,44 @@ else if (File.Exists(resolvedConfigPath))
     Log.Warning("{ConfigPath} is not valid JSON — using defaults. Fix the JSON and restart to apply it.", resolvedConfigPath);
 }
 
+// #3485 D1: the SQLite store joins the SAME pipeline as the JSON file rather than sitting behind a
+// bespoke seam. Registered AFTER the JSON source, so when the store holds a key it wins - that
+// ordering is the entire precedence rule, replacing the ConfigStoreAuthoritative flag that only ever
+// affected the single read that consulted it. An absent or empty store contributes no keys, so the
+// file continues to serve every value and startup is unchanged for an installation that has never
+// enabled the store.
+try
+{
+    var configStoreDirectory = Path.GetDirectoryName(resolvedConfigPath);
+    if (!string.IsNullOrEmpty(configStoreDirectory))
+    {
+        var configStorePath = SqliteStorePathPolicy.ResolveOwnedStorePath(configStoreDirectory, "config");
+        if (File.Exists(configStorePath))
+        {
+            builder.Configuration.AddSqliteConfigStore(
+                new BotNexus.Gateway.Configuration.Store.SqliteConfigStore($"Data Source={configStorePath}"),
+                onLoadFailure: (message, ex) => Log.Error(ex, "{Message}", message));
+        }
+    }
+}
+catch (Exception ex)
+{
+    // Never let the store stop the host starting: the file has already been added above, so a store
+    // failure degrades to file-only configuration rather than to no configuration.
+    Log.Warning(ex, "Failed to add the configuration store to the pipeline - continuing with file configuration.");
+}
+
 PlatformConfig startupPlatformConfig;
 try
 {
-    startupPlatformConfig = PlatformConfigLoader.Load(resolvedConfigPath, validateOnLoad: false);
+    // #3504: bind from the configuration pipeline that was just built, rather than re-reading the
+    // file. `builder.Configuration` already carries the resilient JSON provider and, when a store
+    // exists, the SQLite provider - so this read sees exactly what every IOptions consumer will see,
+    // including store values and last-known-good on a malformed file. Re-loading here was the last
+    // place in the gateway where the startup value could differ from the served value.
+    startupPlatformConfig = new PlatformConfig();
+    builder.Configuration.Bind(startupPlatformConfig);
+    PlatformConfigPostConfigure.ApplyAuthoritativeRawShape(builder.Configuration, startupPlatformConfig);
 }
 catch (Exception ex) when (ex is Microsoft.Extensions.Options.OptionsValidationException or System.Text.Json.JsonException)
 {
@@ -114,8 +165,9 @@ builder.Services.AddBotNexusTelemetry(builder.Configuration);
 // gives extensions the same telemetry seam the platform core uses (no privileged internal-only
 // path): metrics auto-prefixed to botnexus.ext.<id>.*, durable usage isolated to the extension
 // id namespace within one shared SQLite file (so extensions never new up their own database).
-var usageTelemetryPath = System.IO.Path.Combine(
-    BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath(), "data", "usage-telemetry.db");
+var usageTelemetryPath = SqliteStorePathPolicy.ResolveOwnedStorePath(
+    System.IO.Path.Combine(BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath(), "data"),
+    "usage-telemetry");
 builder.Services.AddExtensionTelemetry(usageTelemetryPath);
 
 builder.Services.AddOpenTelemetry()
@@ -158,6 +210,10 @@ builder.Services.AddDiagnosticsHardening();
 builder.Services.AddProviderHealthCheck();
 builder.Services.AddBotNexusCron();
 builder.Services.AddPlatformConfiguration(resolvedConfigPath, builder.Configuration);
+builder.Services.AddSingleton(new ExtensionRepositoryRegistryService(resolvedConfigPath, new System.IO.Abstractions.FileSystem()));
+builder.Services.AddSingleton(sp => ExtensionLifecycleReconciler.CreateDefault(
+    Path.GetDirectoryName(resolvedConfigPath)!,
+    builder.Environment.ContentRootPath));
 builder.Services.Configure<CronOptions>(options =>
 {
     options.PromptTemplates = startupPlatformConfig.PromptTemplates?
@@ -184,8 +240,15 @@ builder.Services.Configure<CronOptions>(options =>
     if (cron is null)
         return;
 
+    options.DefaultModel = cron.DefaultModel;
     options.Enabled = cron.Enabled;
     options.TickIntervalSeconds = cron.TickIntervalSeconds;
+    // #3779: the operator-configured webhook blocked-host list must reach BOTH the API create/update
+    // seam and the scheduler's config reconciliation. Binding it here - onto the single CronOptions
+    // both already read - is what stops either seam constructing its own copy of the policy.
+    options.WebhookBlockedHosts = cron.WebhookBlockedHosts is null
+        ? []
+        : [.. cron.WebhookBlockedHosts.Where(host => !string.IsNullOrWhiteSpace(host)).Select(host => host.Trim())];
     options.Jobs = cron.Jobs?
         .ToDictionary(
             pair => pair.Key,
@@ -201,6 +264,7 @@ builder.Services.Configure<CronOptions>(options =>
                 Model = ResolveCronModel(pair.Value),
                 WebhookUrl = pair.Value.WebhookUrl,
                 ShellCommand = pair.Value.ShellCommand,
+                PreconditionCommand = pair.Value.PreconditionCommand,
                 Enabled = pair.Value.Enabled,
                 CreatedBy = pair.Value.CreatedBy,
                 Metadata = pair.Value.Metadata?.ToDictionary(entry => entry.Key, entry => (object?)entry.Value)
@@ -212,7 +276,17 @@ builder.Services.Configure<CronOptions>(options =>
 // when the config directory is mounted read-only; falls back to the config directory locally.
 var webhookDataDir = BotNexusHome.ResolveDataPath() ?? System.IO.Path.GetDirectoryName(resolvedConfigPath)!;
 var webhookDbPath = System.IO.Path.Combine(webhookDataDir, "webhooks.sqlite");
-builder.Services.AddBotNexusWebhooks(webhookDbPath);
+builder.Services.AddBotNexusWebhooks(webhookDbPath, configuration: builder.Configuration);
+
+// Portal Tools store - SQLite placed in the same writable data directory so user-defined
+// tools survive gateway restarts and roam with the user across browsers/devices (#2232).
+var toolsDbPath = System.IO.Path.Combine(webhookDataDir, "tools.sqlite");
+builder.Services.AddBotNexusTools(toolsDbPath);
+
+// Portal nav-order store - SQLite in the same writable data directory so per-user sidebar
+// ordering overrides survive gateway restarts and roam with the user (#2236, slice 5 of #2231).
+var navOrderDbPath = System.IO.Path.Combine(webhookDataDir, "nav-order.sqlite");
+builder.Services.AddBotNexusNavOrder(navOrderDbPath);
 
 static string? ResolveCronModel(CronJobConfig config)
 {
@@ -234,6 +308,11 @@ static string? ResolveCronModel(CronJobConfig config)
 builder.Services.AddExtensionLoading();
 builder.Services.AddSignalR(options =>
     SignalRHubLimits.Apply(options, startupPlatformConfig.Gateway?.SignalR));
+builder.Services.AddSingleton(_ => new BotNexus.Gateway.Diagnostics.CleanShutdownMarker(
+    new System.IO.Abstractions.FileSystem(),
+    BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath()));
+builder.Services.AddSingleton<BotNexus.Cron.IPlannedShutdownState>(services =>
+    services.GetRequiredService<BotNexus.Gateway.Diagnostics.CleanShutdownMarker>());
 builder.Services.AddBotNexusGatewayApi();
 builder.Services.AddCors(options =>
 {
@@ -254,7 +333,7 @@ builder.Services.AddCors(options =>
 
         var allowedOrigins = configuredOrigins is { Length: > 0 }
             ? configuredOrigins
-            : ["http://localhost:5005"];
+            : [GatewayDefaults.LoopbackListenUrl];
 
         // Production CORS is intentionally scoped to explicit verbs for least-privilege API exposure.
         policy.WithOrigins(allowedOrigins)
@@ -280,29 +359,59 @@ builder.Services.AddSwaggerGen(options =>
 builder.Services.AddSingleton<ApiProviderRegistry>();
 builder.Services.AddSingleton<ModelRegistry>();
 builder.Services.AddSingleton<BuiltInModels>();
+
+// Provider usage: rate-limit headroom captured off every provider response, plus the observed
+// burn derived from it. Singleton because the whole point is a live rolling view held across
+// requests; nothing here is persisted (see ProviderUsageStore for why).
+builder.Services.AddSingleton<IProviderUsageStore, ProviderUsageStore>();
+builder.Services.AddTransient<ProviderRateLimitHandler>(sp => new ProviderRateLimitHandler(
+    sp.GetRequiredService<IProviderUsageStore>(),
+    sp.GetRequiredService<ILogger<ProviderRateLimitHandler>>()));
+
 builder.Services.AddHttpClient();
-builder.Services.AddTransient<ProviderLoggingHandler>();
+builder.Services.AddTransient<ProviderExceptionalDiagnosticsHandler>();
+builder.Services.AddTransient<ProviderLoggingHandler>(sp =>
+{
+    // Always wire the gateway's shared SecretRedactor into the handler so that any API key or
+    // token that leaks into a request/response body (not just the well-known auth headers) is
+    // scrubbed before it is written to the logs. Redaction is applied unconditionally whenever
+    // the handler logs; the config flag below only controls whether the handler logs at all.
+    var redactor = sp.GetService<ISecretRedactor>();
+    // #3282: the flag is captured as a PREDICATE over the live options monitor, not as a bool.
+    // Reading it here would freeze the operator's choice at DI-construction time, which is exactly
+    // the restart requirement this indirection removes.
+    var configMonitor = sp.GetService<IOptionsMonitor<PlatformConfig>>();
+    return new ProviderLoggingHandler(
+        sp.GetRequiredService<ILogger<ProviderLoggingHandler>>(),
+        redactor is null ? null : redactor.Redact,
+        () => configMonitor?.CurrentValue?.Gateway?.EnableProviderRequestLogging == true);
+});
 builder.Services.AddHttpClient("BotNexus", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(10);
 })
+.AddHttpMessageHandler<ProviderExceptionalDiagnosticsHandler>()
 .AddHttpMessageHandler(sp =>
-    // Outermost handler: retry transient provider transport failures (notably HTTP 421
-    // Misdirected Request from Copilot endpoints) on a fresh connection before they are
-    // converted into exceptions/empty responses. Benefits every provider that flows through
+    // Retry transient provider transport failures (notably HTTP 421 Misdirected Request from
+    // Copilot endpoints) inside the terminal exceptional-diagnostics handler, so exhausted retries
+    // produce one payload-free event before they are converted into exceptions/empty responses.
+    // Benefits every provider that flows through
     // the shared provider HttpClient, including the session compaction summary call.
     new TransientHttpRetryHandler(
         sp.GetService<ILoggerFactory>()?.CreateLogger<TransientHttpRetryHandler>()))
 .AddHttpMessageHandler(sp =>
 {
-    // Conditionally attach the logging handler based on gateway config.
-    // The handler checks IsEnabled(Debug) internally — no log entries emitted when debug is off.
-    var config = sp.GetService<IOptionsMonitor<PlatformConfig>>()?.CurrentValue;
-    if (config?.Gateway?.EnableProviderRequestLogging == true)
-        return sp.GetRequiredService<ProviderLoggingHandler>();
-    // Return a no-op pass-through handler when logging is disabled.
-    return new NoOpDelegatingHandler();
-});
+    // #3282: attached UNCONDITIONALLY. IHttpClientFactory caches this pipeline for the named
+    // client's handler lifetime, so any branch taken here is permanent until restart. The handler
+    // itself re-reads the config flag and the Debug level on every request, which is what makes
+    // `botnexus config set gateway.enableProviderRequestLogging true` take effect on a live gateway.
+    return sp.GetRequiredService<ProviderLoggingHandler>();
+})
+.AddHttpMessageHandler(sp =>
+    // Innermost of the provider handlers, deliberately: the retry handler invokes this inner
+    // pipeline once per HTTP wire attempt, so usage records every response, including intermediate
+    // retriable failures. Transport exceptions have no response and are therefore not observed.
+    sp.GetRequiredService<ProviderRateLimitHandler>());
 builder.Services.AddSingleton<HttpClient>(sp =>
 {
     var factory = sp.GetRequiredService<IHttpClientFactory>();
@@ -315,140 +424,126 @@ builder.Services.AddSingleton<LlmClient>(serviceProvider =>
     var httpClient = serviceProvider.GetRequiredService<HttpClient>();
     var loggerFactory = serviceProvider.GetRequiredService<ILoggerFactory>();
 
-    apiProviders.Register(new AnthropicProvider(httpClient));
-    apiProviders.Register(new CopilotMessagesProvider(httpClient));
-    apiProviders.Register(new OpenAICompletionsProvider(httpClient, loggerFactory.CreateLogger<OpenAICompletionsProvider>()));
-    apiProviders.Register(new OpenAIResponsesProvider(httpClient, loggerFactory.CreateLogger<OpenAIResponsesProvider>()));
+    // #2485: static provider message converters have no injected logger; give them the ambient
+    // factory so dropped image content parts are warned about instead of vanishing silently.
+    ProviderDiagnostics.LoggerFactory = loggerFactory;
 
-    apiProviders.Register(new CopilotCompletionsProvider(httpClient, loggerFactory.CreateLogger<CopilotCompletionsProvider>()));
-    apiProviders.Register(new CopilotResponsesProvider(httpClient, loggerFactory.CreateLogger<CopilotResponsesProvider>()));
+    // #2881: the SAME shared SecretRedactor already wired into ProviderLoggingHandler above is
+    // handed to every provider, so a credential a provider echoes back in a 401/403 body is
+    // scrubbed on the EXCEPTION path too, not just the logging path. Without this, the raw body is
+    // interpolated into an exception message that Agent.cs persists as the session-visible
+    // ErrorMessage and renders to the user. Resolved with GetService: the redactor is optional at
+    // this seam and a null one degrades to a no-op rather than dropping diagnostics.
+    var providerSecretRedactor = serviceProvider.GetService<ISecretRedactor>();
+
+    apiProviders.Register(new AnthropicProvider(httpClient, providerSecretRedactor));
+    var copilotHeaderSink = serviceProvider.GetRequiredService<CopilotHeaderQuotaStore>();
+    apiProviders.Register(new CopilotMessagesProvider(httpClient, providerSecretRedactor, copilotHeaderSink));
+    apiProviders.Register(new OpenAICompletionsProvider(httpClient, loggerFactory.CreateLogger<OpenAICompletionsProvider>(), providerSecretRedactor));
+    apiProviders.Register(new OpenAIResponsesProvider(httpClient, loggerFactory.CreateLogger<OpenAIResponsesProvider>(), providerSecretRedactor));
+
+    apiProviders.Register(new CopilotCompletionsProvider(httpClient, loggerFactory.CreateLogger<CopilotCompletionsProvider>(), providerSecretRedactor, copilotHeaderSink));
+    apiProviders.Register(new CopilotResponsesProvider(httpClient, loggerFactory.CreateLogger<CopilotResponsesProvider>(), providerSecretRedactor, copilotHeaderSink));
     apiProviders.Register(new OpenAICompatProvider(httpClient));
     apiProviders.Register(new IntegrationMockProvider());
+
+    var platformConfig = serviceProvider.GetRequiredService<IOptionsMonitor<PlatformConfig>>().CurrentValue;
+    MicrosoftFoundryProviderComposition.Register(
+        platformConfig,
+        apiProviders,
+        models,
+        loggerFactory,
+        providerSecretRedactor);
+
+    // #2855: register the OPTIONAL embeddings capability for the configured backend. This is a
+    // separate registry from apiProviders on purpose - embeddings and chat are different
+    // endpoints, and every provider above serves only the latter. When the section is absent or
+    // disabled nothing is registered, every lookup misses, and memory retrieval stays
+    // lexical-only exactly as it is today.
+    var embeddingsConfig = serviceProvider.GetService<IOptions<MemoryEmbeddingsConfig>>()?.Value;
+    if (embeddingsConfig?.IsComplete() == true)
+    {
+        serviceProvider.GetRequiredService<EmbeddingProviderRegistry>().Register(
+            new OpenAICompatEmbeddingProvider(
+                httpClient,
+                embeddingsConfig.Provider!,
+                embeddingsConfig.BaseUrl!,
+                [new EmbeddingModelDescriptor(embeddingsConfig.Model!, embeddingsConfig.Dimensions)],
+                embeddingsConfig.ApiKey,
+                providerSecretRedactor));
+    }
 
     // #1639: resolve the per-provider API endpoint (enterprise vs individual GitHub Copilot
     // host from auth.json) up-front and hand it to RegisterAll so every Copilot model is born
     // with the CORRECT BaseUrl. No downstream consumer patches model.BaseUrl anymore.
     var authManager = serviceProvider.GetRequiredService<GatewayAuthManager>();
 
-    serviceProvider.GetRequiredService<BuiltInModels>().RegisterAll(models, authManager.GetApiEndpoint);
+    var builtInModels = serviceProvider.GetRequiredService<BuiltInModels>();
+    builtInModels.RegisterAll(models, authManager.GetApiEndpoint);
     new IntegrationMockModels().RegisterAll(models);
     GitHubModelsProvider.RegisterModels(models);
 
-    // Dynamic model discovery: overlay live API models onto built-in registry.
-    // Discovery is best-effort — failures fall back to built-in models.
-    var discoveryClient = new CopilotDiscoveryClient(httpClient);
-    var copilotDiscovery = new CopilotModelDiscoveryProvider(
-        discoveryClient,
-        async ct =>
-        {
-            var apiKey = await authManager.GetApiKeyAsync("github-copilot", ct);
-            var endpoint = authManager.GetApiEndpoint("github-copilot");
-            return (apiKey, endpoint);
-        },
-        loggerFactory.CreateLogger<CopilotModelDiscoveryProvider>());
-
-    var discoveryService = new ModelDiscoveryService(
-        models,
-        [copilotDiscovery],
-        loggerFactory.CreateLogger<ModelDiscoveryService>());
-    discoveryService.DiscoverAndRegisterAsync().GetAwaiter().GetResult();
-
-    // Register models from openai-compat providers in config (e.g. Ollama, LM Studio),
-    // or any provider with an explicit Api override (e.g. integration-mock).
-    var platformConfig = serviceProvider.GetRequiredService<IOptionsMonitor<PlatformConfig>>().CurrentValue;
+    var copilotInstances = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "github-copilot" };
     if (platformConfig.Providers is not null)
     {
         foreach (var (providerName, providerConfig) in platformConfig.Providers)
         {
-            if (!providerConfig.Enabled)
-                continue;
-
-            var apiName = string.IsNullOrWhiteSpace(providerConfig.Api)
-                ? "openai-completions"
-                : providerConfig.Api!;
-            // For openai-completions a BaseUrl is required (the HTTP endpoint). For other
-            // apis (e.g. integration-mock) BaseUrl is provider-specific (catalog file path,
-            // possibly empty) — skip the BaseUrl gate.
-            if (apiName == "openai-completions" && string.IsNullOrWhiteSpace(providerConfig.BaseUrl))
-                continue;
-
-            if (providerConfig.Models is { Count: > 0 })
+            if (providerConfig.Enabled &&
+                string.Equals(providerConfig.Type, "github-copilot", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(providerName, "github-copilot", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(providerName, "copilot", StringComparison.OrdinalIgnoreCase))
             {
-                foreach (var modelId in providerConfig.Models)
-                {
-                    // PBI6 (#1707): a dynamic (config-declared) model carries a valid capability set
-                    // so the agent + conversation pickers offer only valid thinking/context choices.
-                    // Explicit declarations win; anything omitted is inferred from the model family.
-                    var caps = DynamicModelCapabilities.Infer(
-                        modelId,
-                        declaredReasoning: providerConfig.Reasoning,
-                        declaredExtraHighThinking: providerConfig.SupportsExtraHighThinking,
-                        declaredExtendedContext: providerConfig.SupportsExtendedContextWindow);
-                    models.Register(providerName, new LlmModel(
-                        Id: modelId,
-                        Name: modelId,
-                        Api: apiName,
-                        Provider: providerName,
-                        BaseUrl: providerConfig.BaseUrl ?? string.Empty,
-                        Reasoning: caps.Reasoning,
-                        Input: ["text"],
-                        Cost: new ModelCost(0, 0, 0, 0),
-                        ContextWindow: providerConfig.ContextWindow ?? 128000,
-                        MaxTokens: 32000,
-                        SupportsExtraHighThinking: caps.SupportsExtraHighThinking,
-                        SupportsExtendedContextWindow: caps.SupportsExtendedContextWindow));
-                }
+                builtInModels.RegisterCopilotInstance(models, providerName, authManager.GetApiEndpoint);
+                copilotInstances.Add(providerName);
             }
         }
     }
 
-    // Register the model for any agent using a config-defined provider not in BuiltInModels.
-    if (platformConfig.Agents is not null && platformConfig.Providers is not null)
-    {
-        foreach (KeyValuePair<string, AgentDefinitionConfig> agentEntry in platformConfig.Agents)
-        {
-            var agentConfig = agentEntry.Value;
-            if (string.IsNullOrWhiteSpace(agentConfig.Provider) || string.IsNullOrWhiteSpace(agentConfig.Model))
-                continue;
-            if (!platformConfig.Providers.TryGetValue(agentConfig.Provider, out var agentProvider))
-                continue;
-            var apiName = string.IsNullOrWhiteSpace(agentProvider.Api)
-                ? "openai-completions"
-                : agentProvider.Api!;
-            if (apiName == "openai-completions" && string.IsNullOrWhiteSpace(agentProvider.BaseUrl))
-                continue;
-            if (models.GetModel(agentConfig.Provider, agentConfig.Model) is not null)
-                continue;
+    // Dynamic model discovery: overlay live API models independently for every configured Copilot
+    // instance. Discovery is best-effort — failures retain that instance's built-in catalogue.
+    var discoveryClient = new CopilotDiscoveryClient(httpClient);
+    var copilotDiscoveries = copilotInstances.Select(providerInstance =>
+        (IModelDiscoveryProvider)new CopilotModelDiscoveryProvider(
+            discoveryClient,
+            async ct =>
+            {
+                var apiKey = await authManager.GetApiKeyAsync(providerInstance, ct);
+                var endpoint = authManager.GetApiEndpoint(providerInstance);
+                return (apiKey, endpoint);
+            },
+            loggerFactory.CreateLogger<CopilotModelDiscoveryProvider>(),
+            providerInstance));
 
-            // PBI6 (#1707): same capability inference for an agent-referenced dynamic model, so a
-            // provider that only appears via an agent's model reference still exposes valid pickers.
-            var agentModelCaps = DynamicModelCapabilities.Infer(
-                agentConfig.Model,
-                declaredReasoning: agentProvider.Reasoning,
-                declaredExtraHighThinking: agentProvider.SupportsExtraHighThinking,
-                declaredExtendedContext: agentProvider.SupportsExtendedContextWindow);
-            models.Register(agentConfig.Provider, new LlmModel(
-                Id: agentConfig.Model,
-                Name: agentConfig.Model,
-                Api: apiName,
-                Provider: agentConfig.Provider,
-                BaseUrl: agentProvider.BaseUrl ?? string.Empty,
-                Reasoning: agentModelCaps.Reasoning,
-                Input: ["text"],
-                Cost: new ModelCost(0, 0, 0, 0),
-                ContextWindow: agentProvider.ContextWindow ?? 128000,
-                MaxTokens: 32000,
-                SupportsExtraHighThinking: agentModelCaps.SupportsExtraHighThinking,
-                SupportsExtendedContextWindow: agentModelCaps.SupportsExtendedContextWindow));
-        }
-    }
+    // The Anthropic-direct list was hardcoded in BuiltInModels, so a retired model id stayed
+    // selectable in the portal until someone traced a 404 that surfaced only as an empty run.
+    // Overlay the account's real models exactly as the Copilot path above already does.
+    var anthropicDiscovery = new AnthropicModelDiscoveryProvider(
+        httpClient,
+        ct => authManager.GetApiKeyAsync("anthropic", ct),
+        loggerFactory.CreateLogger<AnthropicModelDiscoveryProvider>());
+
+    var discoveryService = new ModelDiscoveryService(
+        models,
+        copilotDiscoveries.Append(anthropicDiscovery),
+        loggerFactory.CreateLogger<ModelDiscoveryService>());
+    discoveryService.DiscoverAndRegisterAsync().GetAwaiter().GetResult();
+
+    // Config-defined providers are projected by ConfigDefinedModelRegistryReconciler. It owns one
+    // atomic overlay and watches IOptionsMonitor, so startup and later reloads use the same path.
 
     return new LlmClient(apiProviders, models);
 });
 
+// Boot-time extension load report (#2220): capture the raw load results so a failing
+// extension is not merely a bootstrap warning that leaves /health green. The report is
+// registered as a singleton and surfaced by GET /api/extensions/health, which returns 503
+// naming the offending assembly/type instead of a generic health-check timeout.
+var extensionBootReport = new BotNexus.Gateway.Diagnostics.ExtensionBootReport();
+builder.Services.AddSingleton(extensionBootReport);
 using (var bootstrapLoggerFactory = new Serilog.Extensions.Logging.SerilogLoggerFactory(Log.Logger, dispose: false))
 {
     var extensionLoadResults = await builder.Services.LoadConfiguredExtensionsAsync(startupPlatformConfig, bootstrapLoggerFactory);
+    extensionBootReport.Record(extensionLoadResults);
     if (extensionLoadResults.Any(result => !result.Success))
     {
         var failed = string.Join(", ", extensionLoadResults.Where(result => !result.Success).Select(result => result.ExtensionId));
@@ -462,6 +557,22 @@ builder.Services.AddSingleton<BotNexus.Gateway.Diagnostics.LogDiagnosticsRingBuf
 builder.Services.AddSingleton<ILoggerProvider, BotNexus.Gateway.Diagnostics.LogDiagnosticsProvider>();
 
 var app = builder.Build();
+
+// #3282: bind gateway.logLevel to the Serilog level switch, then keep it bound. The initial call
+// applies the configured level (Serilog's own MinimumLevel was already overridden by the switch in
+// ConfigureGatewayLogging), and OnChange re-applies it whenever config.json is rewritten - the same
+// propagation seam used by CrossWorldInboundAuthService and DefaultToolPolicyProvider. Together with
+// the unconditionally-attached ProviderLoggingHandler this is what lets an operator or an agent turn
+// provider request logging on, capture traffic, and turn it off without restarting the platform.
+var logLevelMonitor = app.Services.GetRequiredService<IOptionsMonitor<PlatformConfig>>();
+GatewaySerilogConfiguration.ApplyLogLevel(logLevelMonitor.CurrentValue?.Gateway?.LogLevel);
+logLevelMonitor.OnChange(updated =>
+{
+    if (GatewaySerilogConfiguration.ApplyLogLevel(updated?.Gateway?.LogLevel))
+        Log.Information(
+            "Log level set to {LogLevel} from configuration",
+            GatewaySerilogConfiguration.LevelSwitch.MinimumLevel);
+});
 
 var platformConfig = app.Services.GetRequiredService<IOptionsMonitor<PlatformConfig>>().CurrentValue;
 var worldDescriptor = WorldDescriptorBuilder.Build(
@@ -489,6 +600,12 @@ app.UseCors(GatewayCorsPolicy);
 // emitted automatically by the middleware.
 app.UseResponseCompression();
 app.UseSerilogRequestLogging();
+
+// #2387: single central seam for cancellation. Placed inside request logging so a client abort is
+// observed by Serilog as a plain 499 response rather than an unhandled exception logged at Error
+// and reported as 500. Cancellation NOT tied to HttpContext.RequestAborted is deliberately
+// rethrown so it still surfaces as an error.
+app.UseMiddleware<RequestCancellationMiddleware>();
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseMiddleware<GatewayAuthMiddleware>();
 app.UseMiddleware<RateLimitingMiddleware>();
@@ -543,14 +660,32 @@ app.MapGet("/api/version", () =>
 {
     var assembly = typeof(Program).Assembly;
     var buildTime = File.GetLastWriteTimeUtc(assembly.Location).ToString("yyyyMMddHHmmss");
-    var gitHash = GetGitCommitHash();
-    return Results.Ok(new { version = buildTime, commit = gitHash });
+    return Results.Ok(new { version = buildTime, commit = GatewayBuildInfo.CommitSha });
 });
 var gatewayStartedAtUtc = DateTimeOffset.UtcNow;
 app.MapGet("/api/uptime", () => Results.Ok(new { startedAt = gatewayStartedAtUtc }));
 app.MapGet("/api/world", () => Results.Ok(worldDescriptor));
 
-LogGatewayStartup(app, builder.Environment, startupPlatformConfig, worldDescriptor, listenUrl);
+// #3660: the readiness banner must not be emitted until Kestrel is actually listening.
+// Calling LogGatewayStartup inline here logged "Gateway startup complete" *before* app.Run()
+// started the server and before the blocking IHostedService pass had finished, so during a slow
+// start the log asserted readiness while the port was still closed - which is precisely why a
+// 3.5-minute startup stall was diagnosed as a crash. ApplicationStarted fires after the server
+// has bound its addresses, so the banner now describes a gateway that can accept connections.
+// Pinned by GatewayStartupReadinessOrderingArchitectureTests.
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    try
+    {
+        LogGatewayStartup(app, builder.Environment, startupPlatformConfig, worldDescriptor, listenUrl);
+    }
+    catch (Exception ex)
+    {
+        // The banner is diagnostics: a failure assembling it must never take down a gateway
+        // that has already successfully bound its port.
+        app.Logger.LogWarning(ex, "Failed to emit the gateway startup banner (continuing).");
+    }
+});
 
 // Crash observability (#1901): install the last-chance fault handler, warn if the previous run
 // terminated uncleanly, and manage the clean-shutdown marker. All wiring is defensive - a
@@ -563,8 +698,6 @@ void InstallCrashObservability(WebApplication application)
 {
     try
     {
-        var dataDirectory = BotNexusHome.ResolveDataPath() ?? BotNexusHome.ResolveHomePath();
-
         // 1. Last-chance fault handler: flush a structured [FTL] breadcrumb the instant the
         //    process is about to die (unhandled exception / unobserved task / abrupt exit), so
         //    even a dump-less hard exit leaves an investigable trail.
@@ -577,24 +710,31 @@ void InstallCrashObservability(WebApplication application)
 
         // 2. Detect how the previous run ended using the clean-shutdown marker, then clear it for
         //    this run so any subsequent hard exit is detectable as unclean on the next boot.
-        var marker = new BotNexus.Gateway.Diagnostics.CleanShutdownMarker(
-            new System.IO.Abstractions.FileSystem(),
-            dataDirectory);
+        var marker = application.Services.GetRequiredService<BotNexus.Gateway.Diagnostics.CleanShutdownMarker>();
         var previousRun = marker.DetectPreviousRun();
-        if (!previousRun.WasClean)
+        if (marker.WasPreviousShutdownPlanned())
+            application.Logger.LogInformation("Previous gateway shutdown was requested through the planned lifecycle endpoint");
+        // Clause 3 of #3680: with no stamp of any kind there is nothing useful to say about when
+        // the gateway was last alive, so the builder omits the timestamp clause entirely rather
+        // than printing a placeholder that reads like a transient lookup failure.
+        var uncleanWarning = BotNexus.Gateway.Diagnostics.CleanShutdownMarker.BuildUncleanWarning(previousRun);
+        if (uncleanWarning is not null)
         {
-            var lastKnown = previousRun.LastKnownUtc?.ToString("o") ?? "unknown";
-            application.Logger.LogWarning(
-                "previous gateway run terminated uncleanly (last-known clean-shutdown timestamp: {LastKnownTimestamp})",
-                lastKnown);
+            application.Logger.LogWarning("{UncleanTerminationWarning}", uncleanWarning);
         }
+
+        // MarkRunning clears the shutdown marker AND seeds the liveness stamp for this run; the
+        // timer then refreshes it so a hard kill leaves a recent last-alive instant behind.
         marker.MarkRunning();
+        var livenessRefresh = marker.StartLivenessRefresh();
 
         // 3. On graceful shutdown, write the clean-shutdown marker so the next boot knows this run
         //    ended cleanly and does NOT emit the unclean-termination warning.
         var lifetime = application.Services.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>();
         lifetime?.ApplicationStopped.Register(() =>
         {
+            try { livenessRefresh.Dispose(); }
+            catch { /* best effort - stopping the refresh timer must never block shutdown */ }
             try { marker.MarkCleanShutdown(); }
             catch { /* best effort - a missed marker only risks a false unclean warning */ }
         });
@@ -667,13 +807,18 @@ static void LogGatewayStartup(
         .OrderBy(endpoint => endpoint.route, StringComparer.OrdinalIgnoreCase)
         .ToArray();
 
-    var gatewayUrl = app.Urls.FirstOrDefault()
-        ?? configuredListenUrl
-        ?? app.Configuration["ASPNETCORE_URLS"]?.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault()
-        ?? "http://localhost:5000";
+    var gatewayUrl = BotNexus.Gateway.Api.GatewayStartupUrlResolver.Resolve(
+        app.Urls,
+        configuredListenUrl,
+        app.Configuration["ASPNETCORE_URLS"]);
     var worldEmoji = string.IsNullOrWhiteSpace(worldIdentity.Emoji) ? "🌍" : worldIdentity.Emoji;
 
     app.Logger.LogWarning("{WorldEmoji} World: {WorldName} ({WorldId})", worldEmoji, worldIdentity.Name, worldIdentity.Id);
+
+    // #2833: the store-identity guard is installed during DI registration, before any logger exists,
+    // so it starts out silent. Hand it the real logger now that the pipeline is up, otherwise the
+    // one-time adoption warning for a pre-existing unstamped store would be written to nowhere.
+    BotNexus.Persistence.Sqlite.SqliteStoreIdentityGuard.SetLogger(app.Logger);
     app.Logger.LogWarning("📡 Gateway starting on {GatewayUrl}", gatewayUrl);
 
     app.Logger.LogInformation(
@@ -700,24 +845,6 @@ static void LogGatewayStartup(
         worldDescriptor.Locations.Count,
         worldDescriptor.AvailableStrategies.Count,
         worldDescriptor.CrossWorldPermissions.Count);
-}
-
-static string? GetGitCommitHash()
-{
-    try
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("git", "rev-parse --short HEAD")
-        {
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        using var proc = System.Diagnostics.Process.Start(psi);
-        var hash = proc?.StandardOutput.ReadToEnd().Trim();
-        proc?.WaitForExit(3000);
-        return string.IsNullOrEmpty(hash) ? null : hash;
-    }
-    catch { return null; }
 }
 
 // Returns true when the file exists and contains syntactically valid JSON.
@@ -751,10 +878,3 @@ static bool IsValidJsonFile(string path)
 /// </summary>
 public partial class Program;
 
-/// <summary>No-op delegating handler used when provider HTTP logging is disabled.</summary>
-file sealed class NoOpDelegatingHandler : DelegatingHandler
-{
-    protected override Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request, CancellationToken cancellationToken)
-        => base.SendAsync(request, cancellationToken);
-}

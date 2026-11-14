@@ -60,6 +60,51 @@ public sealed class DefaultSubAgentManagerPlanTests
         plan.SystemPromptOverride.ShouldBe("Review only.");
     }
 
+    [Fact]
+    public void ResolveSpawnPlan_Embody_AppliesArchetypeToolRestriction_WhenNoExplicitTools()
+    {
+        // #2136: archetypes are resolved from the built-in catalog, not a registered named agent.
+        // With no explicit tool override, the archetype's tool restriction is applied to the plan
+        // while model/provider still come from the parent descriptor.
+        var parent = Descriptor("nova", "gpt-4o", "openai", "You are Nova.");
+        var manager = BuildManager(parent);
+        var request = Request("nova", new Embody(SubAgentArchetype.Coder));
+
+        var plan = manager.ResolveSpawnPlan(request, parent, Uid);
+
+        plan.BaseDescriptor.ModelId.ShouldBe("gpt-4o");
+        plan.ToolIds.ShouldNotBeNull();
+        plan.ToolIds!.ShouldContain("shell");
+        plan.ToolIds.ShouldContain("edit");
+    }
+
+    [Fact]
+    public void ResolveSpawnPlan_Embody_ExplicitTools_OverrideArchetypeRestriction()
+    {
+        var parent = Descriptor("nova", "gpt-4o", "openai");
+        var manager = BuildManager(parent);
+        var request = Request("nova", new Embody(
+            SubAgentArchetype.Coder,
+            new EmbodyCustomizations { ToolIds = ["read"] }));
+
+        var plan = manager.ResolveSpawnPlan(request, parent, Uid);
+
+        plan.ToolIds.ShouldBe(["read"]);
+    }
+
+    [Fact]
+    public void ResolveSpawnPlan_Embody_GeneralArchetype_InheritsParentTools()
+    {
+        // 'general' has no built-in restriction, so ToolIds stays null (inherit parent's tools).
+        var parent = Descriptor("nova", "gpt-4o", "openai");
+        var manager = BuildManager(parent);
+        var request = Request("nova", new Embody(SubAgentArchetype.General));
+
+        var plan = manager.ResolveSpawnPlan(request, parent, Uid);
+
+        plan.ToolIds.ShouldBeNull();
+    }
+
     // ---------------- ResolveSpawnPlan: Mirror ----------------
 
     [Fact]
@@ -82,6 +127,47 @@ public sealed class DefaultSubAgentManagerPlanTests
         plan.Name.ShouldBeNull();
         plan.ModelOverride.ShouldBeNull();
         plan.ToolIds.ShouldBeNull();
+    }
+
+    /// <summary>
+    /// #3570: a Mirror run label flows into the plan's <c>Name</c> (which titles the child
+    /// conversation and is reported back on the run) WITHOUT disturbing strict descriptor
+    /// pass-through. Naming a run is not customising an agent.
+    /// </summary>
+    [Fact]
+    public void ResolveSpawnPlan_Mirror_CarriesRunName_WithoutDisturbingDescriptorPassThrough()
+    {
+        var parent = Descriptor("nova", "gpt-4o", "openai", "You are Nova.");
+        var target = Descriptor("farnsworth", "claude-sonnet-4", "anthropic", "You are Farnsworth.");
+        var manager = BuildManager(parent, target);
+        var request = Request("nova", new Mirror(AgentId.From("farnsworth"), "pr-review-run"));
+
+        var plan = manager.ResolveSpawnPlan(request, parent, Uid);
+
+        plan.Name.ShouldBe("pr-review-run");
+        // Descriptor pass-through is unchanged: the label must not leak into any override slot.
+        plan.BaseDescriptor.AgentId.ShouldBe(AgentId.From("farnsworth"));
+        plan.BaseDescriptor.ModelId.ShouldBe("claude-sonnet-4");
+        plan.BaseDescriptor.SystemPrompt.ShouldBe("You are Farnsworth.");
+        plan.ModelOverride.ShouldBeNull();
+        plan.ApiProviderOverride.ShouldBeNull();
+        plan.ToolIds.ShouldBeNull();
+        plan.SystemPromptOverride.ShouldBeNull();
+    }
+
+    /// <summary>
+    /// #3570: a whitespace-only run label is not a label - it must normalise to null so the
+    /// child conversation falls back to its default title rather than being titled with blanks.
+    /// </summary>
+    [Fact]
+    public void ResolveSpawnPlan_Mirror_WhitespaceRunName_NormalisesToNull()
+    {
+        var parent = Descriptor("nova", "gpt-4o", "openai");
+        var target = Descriptor("farnsworth", "claude-sonnet-4", "anthropic");
+        var manager = BuildManager(parent, target);
+        var request = Request("nova", new Mirror(AgentId.From("farnsworth"), "   "));
+
+        manager.ResolveSpawnPlan(request, parent, Uid).Name.ShouldBeNull();
     }
 
     [Fact]

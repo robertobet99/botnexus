@@ -1,10 +1,13 @@
 using BotNexus.Agent.Core.Configuration;
-using BotNexus.Agent.Core.Hooks;
+using BotNexus.Agent.Core.Diagnostics;
+using BotNexus.Agent.Core.ExtensionPoints.ToolExecution;
+using BotNexus.Agent.Core.ExtensionPoints.ToolResults;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Validation;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
 
 namespace BotNexus.Agent.Core.Loop;
@@ -13,7 +16,7 @@ namespace BotNexus.Agent.Core.Loop;
 /// Executes tool calls from assistant messages in sequential or parallel mode.
 /// </summary>
 /// <remarks>
-/// Coordinates argument validation, hook execution, and result collection.
+/// Coordinates argument validation, policy evaluation, result transformation, and result collection.
 /// Emits ToolExecutionStartEvent and ToolExecutionEndEvent for each tool.
 /// In parallel mode, events are emitted in deterministic order (all starts, then all ends).
 /// </remarks>
@@ -71,13 +74,15 @@ internal static class ToolExecutor
                     cancellationToken)
                 .ConfigureAwait(false);
 
+            RecordTurnTaint(preparation.Prepared?.Tool, toolCall);
+
             var (result, isError) = preparation.Prepared is null
                 ? (preparation.Result!, preparation.IsError)
-                : await ExecutePreparedToolCallAsync(preparation.Prepared, emit, cancellationToken, config.ToolTimeout).ConfigureAwait(false);
+                : await ExecutePreparedToolCallAsync(preparation.Prepared, emit, cancellationToken, config.ToolTimeout, config.SatelliteToolExecution).ConfigureAwait(false);
 
             if (preparation.Prepared is not null)
             {
-                (result, isError) = await ApplyAfterToolCallAsync(
+                (result, isError) = await TransformToolResultAsync(
                         context,
                         assistantMessage,
                         toolCall,
@@ -88,6 +93,8 @@ internal static class ToolExecutor
                         cancellationToken)
                     .ConfigureAwait(false);
             }
+
+            result = FinalizeToolResult(result, config, preparation.Prepared?.Tool);
 
             await emit(new ToolExecutionEndEvent(
                 toolCall.Id,
@@ -138,9 +145,16 @@ internal static class ToolExecutor
                     cancellationToken)
                 .ConfigureAwait(false);
 
+            // Recorded before ANY tool in this batch is dispatched. Parallel mode has no ordering
+            // guarantee between siblings, so a memory_save racing a web_fetch could otherwise
+            // observe a not-yet-tainted turn and launder the fetched content. Preparation is
+            // sequential and completes for every call before execution begins, so classifying here
+            // makes the taint independent of completion order.
+            RecordTurnTaint(preparation.Prepared?.Tool, toolCall);
+
             if (preparation.Prepared is null)
             {
-                var immediateResult = preparation.Result!;
+                var immediateResult = FinalizeToolResult(preparation.Result!, config, tool: null);
                 await emit(new ToolExecutionEndEvent(
                     toolCall.Id,
                     toolCall.Name,
@@ -164,55 +178,93 @@ internal static class ToolExecutor
 
         var executionTasks = preparedItems.Select(async item =>
         {
-            var execution = await ExecutePreparedToolCallAsync(item.Prepared, emit, cancellationToken, config.ToolTimeout).ConfigureAwait(false);
-            return new ToolExecutionOutcome(
+            var execution = await ExecutePreparedToolCallAsync(
+                    item.Prepared,
+                    emit,
+                    cancellationToken,
+                    config.ToolTimeout,
+                    config.SatelliteToolExecution)
+                .ConfigureAwait(false);
+            var outcome = new ToolExecutionOutcome(
                 item.Index,
                 item.Prepared.ToolCall,
                 execution.Result,
                 execution.IsError,
                 item.Prepared.ValidatedArgs,
-                true);
-        });
+                true,
+                item.Prepared.Tool);
 
-        completedItems.AddRange(await Task.WhenAll(executionTasks).ConfigureAwait(false));
-        var ordered = completedItems.OrderBy(result => result.Index).ToList();
-
-        foreach (var outcome in ordered)
-        {
-            var result = outcome.Result;
-            var isError = outcome.IsError;
-
-            if (outcome.ApplyAfterHook && outcome.ValidatedArgs is not null)
-            {
-                (result, isError) = await ApplyAfterToolCallAsync(
-                        context,
-                        assistantMessage,
-                        outcome.ToolCall,
-                        outcome.ValidatedArgs,
-                        outcome.Result,
-                        outcome.IsError,
-                        config,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-            }
-
-            await emit(new ToolExecutionEndEvent(
-                outcome.ToolCall.Id,
-                outcome.ToolCall.Name,
-                result,
-                isError,
-                DateTimeOffset.UtcNow)).ConfigureAwait(false);
-
-            resultSlots[outcome.Index] = await EmitToolResultMessageAsync(
-                    outcome.ToolCall,
-                    result,
-                    isError,
+            // Persist each sibling as soon as it completes. Waiting for the whole batch before
+            // emitting any terminal event made one non-cooperative tool hide every completed
+            // sibling and left the conversation looking entirely frozen (#4128).
+            resultSlots[item.Index] = await FinalizeToolOutcomeAsync(
+                    context,
+                    assistantMessage,
+                    outcome,
+                    config,
                     emit,
                     cancellationToken)
                 .ConfigureAwait(false);
+            return outcome;
+        });
+
+        completedItems.AddRange(await Task.WhenAll(executionTasks).ConfigureAwait(false));
+
+        // Slots are populated concurrently but returned in the assistant's original call order,
+        // which is the ordering required by provider tool-result threading.
+        return resultSlots.Where(result => result is not null).Select(result => result!).ToList();
+    }
+
+    /// <summary>
+    /// Walks the timeline backwards for the most recent successful <c>read</c> tool call and
+    /// returns the <c>path</c> it targeted, so a later call that omits <c>path</c> can be told
+    /// which file the caller most likely meant (issue #3711).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately read-only and best-effort: it feeds a diagnostic suggestion, never an
+    /// applied argument, so a stale or wrong answer costs a slightly less useful error message
+    /// and nothing more. Failed reads are skipped — suggesting a path whose read errored would
+    /// point the caller at a file that may not exist.
+    /// </remarks>
+    private static string? FindMostRecentlyReadPath(IReadOnlyList<AgentMessage> messages)
+    {
+        // Correlate backwards: find the newest read whose result was not an error, then recover
+        // the path from the assistant message that requested it.
+        var failedReadCallIds = new HashSet<string>(StringComparer.Ordinal);
+
+        for (var i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i] is ToolResultAgentMessage { IsError: true } failed &&
+                string.Equals(failed.ToolName, "read", StringComparison.OrdinalIgnoreCase))
+            {
+                failedReadCallIds.Add(failed.ToolCallId);
+                continue;
+            }
+
+            if (messages[i] is not AssistantAgentMessage { ToolCalls: { Count: > 0 } toolCalls })
+            {
+                continue;
+            }
+
+            for (var c = toolCalls.Count - 1; c >= 0; c--)
+            {
+                var call = toolCalls[c];
+                if (!string.Equals(call.Name, "read", StringComparison.OrdinalIgnoreCase) ||
+                    failedReadCallIds.Contains(call.Id))
+                {
+                    continue;
+                }
+
+                if (call.Arguments.TryGetValue("path", out var value) &&
+                    value?.ToString() is { } path &&
+                    !string.IsNullOrWhiteSpace(path))
+                {
+                    return path;
+                }
+            }
         }
 
-        return resultSlots.Where(result => result is not null).Select(result => result!).ToList();
+        return null;
     }
 
     private static async Task<ToolPreparation> PrepareToolCallAsync(
@@ -234,7 +286,8 @@ internal static class ToolExecutor
         }
 
         var argumentElement = JsonSerializer.SerializeToElement(rawArgs);
-        var (isValid, errors) = ToolCallValidator.Validate(argumentElement, tool.Definition.Parameters, out var coercedElement);
+        var validationContext = new ToolCallValidationContext(FindMostRecentlyReadPath(context.Messages));
+        var (isValid, errors) = ToolCallValidator.Validate(argumentElement, tool.Definition.Parameters, out var coercedElement, validationContext);
         if (!isValid)
         {
             return new ToolPreparation(
@@ -260,85 +313,240 @@ internal static class ToolExecutor
             return new ToolPreparation(null, BuildErrorResult($"Invalid arguments for '{toolCall.Name}': {ex.Message}"), true);
         }
 
-        if (config.BeforeToolCall is not null)
+        var executionContext = new ToolExecutionContext(assistantMessage, toolCall, validatedArgs, context)
+        { AgentRunId = config.AgentRunId };
+        if (config.ToolAuditGate is not null)
         {
-            var beforeContext = new BeforeToolCallContext(assistantMessage, toolCall, validatedArgs, context);
-            BeforeToolCallResult? beforeResult;
+            ToolExecutionDecision? auditResult;
             try
             {
-                beforeResult = await config.BeforeToolCall(beforeContext, cancellationToken).ConfigureAwait(false);
+                auditResult = await config.ToolAuditGate(executionContext, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 return new ToolPreparation(
                     null,
-                    BuildErrorResult($"BeforeToolCall hook failed: {ex.Message}"),
+                    BuildErrorResult($"BeforeToolAudit hook failed: {ex.Message}"),
                     true);
             }
 
-            if (beforeResult?.Block == true)
+            cancellationToken.ThrowIfCancellationRequested();
+            if (auditResult is not null && !auditResult.IsUnambiguousAllow)
             {
-                var reason = string.IsNullOrWhiteSpace(beforeResult.Reason)
-                    ? "Tool call was blocked by policy."
-                    : beforeResult.Reason!;
-                return new ToolPreparation(null, BuildErrorResult(reason), true);
+                return new ToolPreparation(null, BuildErrorResult(auditResult.EffectiveBlockReason), true);
             }
         }
 
+        if (config.ToolExecutionPolicy is not null)
+        {
+            ToolExecutionDecision? executionDecision;
+
+            // #2518: the tool-execution policy is the pre-execution gate (it enforces the
+            // tool-approval posture shipped in #2397). An approval provider that wedges -- a stalled
+            // prompt, an unreachable policy service, a deadlocked store -- would otherwise hang the
+            // whole agent turn, because a cron or channel turn may carry no ambient deadline at all.
+            // Bound it, and on breach fail CLOSED: block the call, exactly like the exception path
+            // below. Allowing execution on a timeout would turn a liveness bug into a policy bypass.
+            var budget = config.ToolExecutionPolicyTimeout ?? AgentLoopConfig.DefaultToolExecutionPolicyTimeout;
+            var budgetEnabled = budget > TimeSpan.Zero && budget != Timeout.InfiniteTimeSpan;
+            var suspendDetector = config.SuspendDetector ?? HostSuspendDetector.Instance;
+
+            // #3356: the budget is armed with CancelAfter, which is WALL clock and therefore keeps
+            // running while the host is asleep. A policy in flight across a 4h41m workstation suspend
+            // was reported as having overrun a 15s budget by 16945s and the call was denied, even
+            // though nothing had executed slowly -- the process was frozen. So a breach is only
+            // believed when the ACTIVE-time clock agrees the policy really consumed its window. When
+            // it does not, the measurement is discarded (not the budget: the policy is given one
+            // fresh window on the now-awake host) rather than converted into a policy denial.
+            // A genuinely slow policy has active time >= budget, so it still fails closed unchanged.
+            var suspendRetryUsed = false;
+
+            while (true)
+            {
+                using var policyCts = budgetEnabled
+                    ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                    : null;
+                if (policyCts is not null)
+                {
+                    policyCts.CancelAfter(budget);
+                }
+
+                var policyToken = policyCts?.Token ?? cancellationToken;
+                var startedAt = Stopwatch.GetTimestamp();
+                var activeStartedAt = suspendDetector.GetTimestamp();
+
+                try
+                {
+                    executionDecision = await config.ToolExecutionPolicy(executionContext, policyToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (
+                    policyCts is not null &&
+                    policyCts.IsCancellationRequested &&
+                    !cancellationToken.IsCancellationRequested)
+                {
+                    // Budget breach, not turn cancellation. The ambient token is untouched, so this
+                    // is either the policy overrunning its own deadline or a host suspend.
+                    if (!suspendRetryUsed &&
+                        IsAttributableToHostSuspend(suspendDetector, activeStartedAt, budget))
+                    {
+                        suspendRetryUsed = true;
+                        ReportSuspendDiscardedMeasurement(config, toolCall, budget, startedAt);
+                        cancellationToken.ThrowIfCancellationRequested();
+                        continue;
+                    }
+
+                    config.ToolExecutionDecisionObserver?.Invoke(toolCall.Id, false);
+                    return BuildToolExecutionPolicyTimeout(config, toolCall, budget, startedAt);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    config.ToolExecutionDecisionObserver?.Invoke(toolCall.Id, false);
+                    throw;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    config.ToolExecutionDecisionObserver?.Invoke(toolCall.Id, false);
+                    return new ToolPreparation(
+                        null,
+                        BuildErrorResult($"BeforeToolCall hook failed: {ex.Message}"),
+                        true);
+                }
+
+                // A policy that swallows its cancellation token and returns normally after the budget
+                // elapsed must not be treated as a policy decision either -- it produced its answer
+                // outside the window it was given.
+                if (policyCts is not null && policyCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    // ...unless the window was only exceeded on the wall clock. Here the policy DID
+                    // produce a verdict and the active-time clock says it produced it inside its
+                    // budget, so the verdict stands: there is nothing to retry and discarding a
+                    // real decision would deny the call for a reason that never happened.
+                    if (IsAttributableToHostSuspend(suspendDetector, activeStartedAt, budget))
+                    {
+                        ReportSuspendDiscardedMeasurement(config, toolCall, budget, startedAt);
+                    }
+                    else
+                    {
+                        config.ToolExecutionDecisionObserver?.Invoke(toolCall.Id, false);
+                        return BuildToolExecutionPolicyTimeout(config, toolCall, budget, startedAt);
+                    }
+                }
+
+                break;
+            }
+
+            // Genuine turn cancellation still propagates as cancellation, never as a policy timeout.
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // #2476: execution requires a positive, unambiguous allow. A null result means the
+            // policy registered no opinion at all and preserves the historical allow. Anything the
+            // policy DID return must clear IsUnambiguousAllow to proceed: an explicit block denies,
+            // and so does an indeterminate verdict, because "no decision was reached" is not an
+            // approval and treating it as one is precisely the auto-approve this gate prevents.
+            if (executionDecision is not null && !executionDecision.IsUnambiguousAllow)
+            {
+                config.ToolExecutionDecisionObserver?.Invoke(toolCall.Id, false);
+                return new ToolPreparation(null, BuildErrorResult(executionDecision.EffectiveBlockReason), true);
+            }
+        }
+
+        config.ToolExecutionDecisionObserver?.Invoke(toolCall.Id, true);
         return new ToolPreparation(
-            new PreparedToolCall(toolCall, tool, validatedArgs),
+            new PreparedToolCall(toolCall, tool, validatedArgs, executionContext),
             null,
             false);
+    }
+
+    /// <summary>
+    /// Computes the per-tool cancellation budget as the largest of the configured safety cap, the
+    /// tool's declared <see cref="IAgentTool.DefaultTimeout"/>, and any caller-requested timeout
+    /// read from the argument the tool declares via <see cref="IAgentTool.TimeoutArgument"/>. A
+    /// durable interactive wait that omits its declared expiry is exempt from the generic deadline.
+    /// </summary>
+    /// <remarks>
+    /// The unit of a requested timeout is taken from the tool's declaration, never inferred from the
+    /// argument's name. <c>timeout</c> means seconds to <c>ShellTool</c> and milliseconds to
+    /// <c>ProcessTool</c>; inferring seconds from the bare name inflated the budget 1000x for the
+    /// latter and silently defeated the safety cap (issue #2955). A tool that declares no timeout
+    /// argument has none of its arguments inspected.
+    /// </remarks>
+    internal static TimeSpan? ResolveEffectiveTimeout(
+        IAgentTool tool,
+        IReadOnlyDictionary<string, object?> args,
+        TimeSpan? toolTimeout)
+    {
+        var effectiveTimeout = toolTimeout;
+
+        // Tool-declared default — long-running tools (shell, exec, mcp) set this.
+        if (tool.DefaultTimeout.HasValue)
+        {
+            effectiveTimeout = effectiveTimeout.HasValue
+                ? TimeSpan.FromTicks(Math.Max(effectiveTimeout.Value.Ticks, tool.DefaultTimeout.Value.Ticks))
+                : tool.DefaultTimeout;
+        }
+
+        if (!effectiveTimeout.HasValue || !toolTimeout.HasValue)
+        {
+            return effectiveTimeout;
+        }
+
+        var declaration = tool.TimeoutArgument;
+        if (declaration is null)
+        {
+            return effectiveTimeout;
+        }
+
+        // A durable interactive wait owns a persisted checkpoint that remains actionable after the
+        // original turn disappears. Applying the generic safety deadline would publish a false
+        // terminal failure while leaving that checkpoint live. Omission means no caller expiry;
+        // an explicit timeout argument restores ordinary executor budgeting around the tool's own
+        // terminal expiry path.
+        if (tool is IDurableInteractiveWaitTool
+            && !args.ContainsKey(declaration.ArgumentName)
+            && (declaration.DeprecatedAliasName is not { } durableAlias || !args.ContainsKey(durableAlias)))
+        {
+            return null;
+        }
+
+        // Only the declared argument is consulted, and only in the declared unit. The deprecated
+        // alias is a fallback used solely when the canonical argument is absent.
+        TimeSpan? requested = null;
+        if (args.TryGetValue(declaration.ArgumentName, out var rawCanonical))
+        {
+            requested = declaration.ToTimeSpan(rawCanonical);
+        }
+
+        if (requested is null
+            && declaration.DeprecatedAliasName is { } alias
+            && args.TryGetValue(alias, out var rawAlias))
+        {
+            requested = declaration.ToTimeSpan(rawAlias);
+        }
+
+        if (requested.HasValue && requested.Value > toolTimeout.Value)
+        {
+            // Agent explicitly requested a longer timeout — honour it with a 10s buffer so the
+            // tool's own timeout fires before the safety cap.
+            effectiveTimeout = requested.Value + TimeSpan.FromSeconds(10);
+        }
+
+        return effectiveTimeout;
     }
 
     private static async Task<(AgentToolResult Result, bool IsError)> ExecutePreparedToolCallAsync(
         PreparedToolCall prepared,
         Func<AgentEvent, Task> emit,
         CancellationToken cancellationToken,
-        TimeSpan? toolTimeout = null)
+        TimeSpan? toolTimeout = null,
+        SatelliteToolExecutionOptions? satelliteExecution = null)
     {
         AgentToolResult result;
         var isError = false;
         var updateTasks = new ConcurrentBag<Task>();
 
-        // If the tool call includes an explicit timeout argument, respect it.
-        // Tools like ShellTool (timeout: seconds) and ExecTool (timeoutMs: ms) expose this.
-        // Also check tool.DefaultTimeout — tools declare their own expected duration.
-        // Use the largest of: configured safety cap, tool default, agent-requested arg timeout.
-        var effectiveTimeout = toolTimeout;
-
-        // Tool-declared default — long-running tools (shell, exec, mcp) set this
-        if (prepared.Tool.DefaultTimeout.HasValue)
-        {
-            effectiveTimeout = effectiveTimeout.HasValue
-                ? (TimeSpan?)TimeSpan.FromTicks(Math.Max(effectiveTimeout.Value.Ticks, prepared.Tool.DefaultTimeout.Value.Ticks))
-                : prepared.Tool.DefaultTimeout;
-        }
-
-        // Agent-specified timeout in arguments (timeout: seconds or timeoutMs: ms)
-        // Honours explicit agent intent — e.g. "run this deploy script, timeout: 600"
-        if (effectiveTimeout.HasValue)
-        {
-            TimeSpan? requested = null;
-            if (prepared.ValidatedArgs.TryGetValue("timeout", out var rawSec) && rawSec is not null
-                && int.TryParse(rawSec.ToString(), out var sec) && sec > 0)
-            {
-                requested = TimeSpan.FromSeconds(sec);
-            }
-            else if (prepared.ValidatedArgs.TryGetValue("timeoutMs", out var rawMs) && rawMs is not null
-                && int.TryParse(rawMs.ToString(), out var ms) && ms > 0)
-            {
-                requested = TimeSpan.FromMilliseconds(ms);
-            }
-
-            if (requested.HasValue && toolTimeout.HasValue && requested.Value > toolTimeout.Value)
-            {
-                // Agent explicitly requested a longer timeout — honour it with a 10s buffer
-                // so the tool's own timeout fires before the safety cap.
-                effectiveTimeout = requested.Value + TimeSpan.FromSeconds(10);
-            }
-        }
-
+        // Resolve the per-tool cancellation budget from the configured safety cap, the tool's own
+        // declared default, and any caller-requested timeout argument the tool declares.
+        var effectiveTimeout = ResolveEffectiveTimeout(prepared.Tool, prepared.ValidatedArgs, toolTimeout);
         // Create a linked CancellationTokenSource for the per-tool timeout if configured.
         using var timeoutCts = effectiveTimeout.HasValue
             ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
@@ -348,28 +556,107 @@ internal static class ToolExecutor
             timeoutCts.CancelAfter(effectiveTimeout.Value);
         }
         var effectiveToken = timeoutCts?.Token ?? cancellationToken;
+        var terminalState = 0;
+        Task<AgentToolResult>? executionTask = null;
+
+        void EmitUpdate(AgentToolResult partialResult)
+        {
+            // A tool may ignore cancellation and later call its update callback after the executor
+            // has already published an incomplete result. Such stale updates belong to an obsolete
+            // turn and must not mutate the transcript or portal (#4128).
+            if (Volatile.Read(ref terminalState) != 0)
+            {
+                return;
+            }
+
+            updateTasks.Add(emit(new ToolExecutionUpdateEvent(
+                prepared.ToolCall.Id,
+                prepared.ToolCall.Name,
+                prepared.ValidatedArgs,
+                partialResult,
+                DateTimeOffset.UtcNow)));
+        }
 
         try
         {
-            result = await prepared.Tool.ExecuteAsync(
-                prepared.ToolCall.Id,
-                prepared.ValidatedArgs,
-                effectiveToken,
-                partialResult => updateTasks.Add(emit(new ToolExecutionUpdateEvent(
-                    prepared.ToolCall.Id,
-                    prepared.ToolCall.Name,
-                    prepared.ValidatedArgs,
-                    partialResult,
-                    DateTimeOffset.UtcNow)))).ConfigureAwait(false);
+            var toolClass = satelliteExecution?.ClassifyTool(prepared.ToolCall.Name)
+                ?? SatelliteToolClass.LocalOnly;
+            if (toolClass == SatelliteToolClass.Unsupported)
+            {
+                result = BuildErrorResult(
+                    $"Tool '{prepared.ToolCall.Name}' is unsupported in the required satellite execution environment.");
+                isError = true;
+                Interlocked.Exchange(ref terminalState, 1);
+                return (result, isError);
+            }
+
+            executionTask = toolClass == SatelliteToolClass.RemoteCapable
+                ? ExecuteSatelliteToolAsync(
+                    satelliteExecution!,
+                    prepared,
+                    effectiveTimeout,
+                    effectiveToken,
+                    EmitUpdate)
+                : prepared.Tool is IContextAwareAgentTool contextAware
+                    ? contextAware.ExecuteAsync(prepared.ExecutionContext, effectiveToken, EmitUpdate)
+                    : prepared.Tool.ExecuteAsync(prepared.ToolCall.Id, prepared.ValidatedArgs, effectiveToken, EmitUpdate);
+
+            // CancelAfter only requests cooperative cancellation. WaitAsync supplies the hard
+            // executor-side bound: a tool that blocks or ignores its token can no longer hold the
+            // owning agent turn and conversation queue forever.
+            result = effectiveTimeout.HasValue
+                ? await executionTask.WaitAsync(effectiveTimeout.Value, cancellationToken).ConfigureAwait(false)
+                : await executionTask.ConfigureAwait(false);
+            Interlocked.Exchange(ref terminalState, 1);
+        }
+        catch (TimeoutException) when (effectiveTimeout.HasValue && !cancellationToken.IsCancellationRequested)
+        {
+            Interlocked.Exchange(ref terminalState, 1);
+            timeoutCts?.Cancel();
+            ObserveAbandonedToolExecution(executionTask);
+            result = BuildErrorResult(
+                $"Tool '{prepared.ToolCall.Name}' timed out after {effectiveTimeout.Value.TotalSeconds:0}s. " +
+                "The operation did not complete; an incomplete result was recorded and late output will be ignored.") with { IsIncomplete = true };
+            isError = true;
         }
         catch (OperationCanceledException) when (timeoutCts is not null && timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            // Tool timed out (not user/turn cancellation) — return structured error to LLM.
-            result = BuildErrorResult($"Tool '{prepared.ToolCall.Name}' timed out after {effectiveTimeout!.Value.TotalSeconds:0}s. The operation did not complete.");
+            Interlocked.Exchange(ref terminalState, 1);
+            // Tool cooperated with its timeout. Return the same explicit terminal shape as the hard
+            // wait deadline so callers do not need to distinguish implementation details.
+            result = BuildErrorResult(
+                $"Tool '{prepared.ToolCall.Name}' timed out after {effectiveTimeout!.Value.TotalSeconds:0}s. " +
+                "The operation did not complete.") with { IsIncomplete = true };
+            isError = true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Interlocked.Exchange(ref terminalState, 1);
+            // The outer wait can finish before ambient cancellation reaches the linked source.
+            // Forward cancellation before disposal unregisters that link and abandons the tool.
+            try
+            {
+                timeoutCts?.Cancel();
+            }
+            catch (AggregateException)
+            {
+                // Cancellation callbacks must not replace the original ambient cancellation.
+            }
+            finally
+            {
+                ObserveAbandonedToolExecution(executionTask);
+            }
+            throw;
+        }
+        catch (SatelliteToolExecutionException ex)
+        {
+            Interlocked.Exchange(ref terminalState, 1);
+            result = ex.Result;
             isError = true;
         }
         catch (Exception ex)
         {
+            Interlocked.Exchange(ref terminalState, 1);
             result = BuildErrorResult(ex.Message);
             isError = true;
         }
@@ -382,7 +669,106 @@ internal static class ToolExecutor
         return (result, isError);
     }
 
-    private static async Task<(AgentToolResult Result, bool IsError)> ApplyAfterToolCallAsync(
+    private static async Task<AgentToolResult> ExecuteSatelliteToolAsync(
+        SatelliteToolExecutionOptions satelliteExecution,
+        PreparedToolCall prepared,
+        TimeSpan? timeout,
+        CancellationToken cancellationToken,
+        AgentToolUpdateCallback? onUpdate)
+    {
+        var request = new SatelliteToolRequest(
+            ProtocolVersion: 2,
+            Scope: satelliteExecution.Scope,
+            ToolCallId: prepared.ToolCall.Id,
+            ToolName: prepared.ToolCall.Name,
+            Arguments: prepared.ValidatedArgs,
+            Environment: satelliteExecution.Environment,
+            PolicyProvenance: satelliteExecution.PolicyProvenance,
+            Timeout: timeout);
+        var remoteResult = await satelliteExecution.Executor
+            .ExecuteAsync(request, cancellationToken, onUpdate)
+            .ConfigureAwait(false);
+        var metadata = remoteResult.Metadata;
+        var normalizedResult = remoteResult.Result with
+        {
+            DeliveryDetails = new SatelliteToolResultDetails(
+                remoteResult.Outcome,
+                metadata?.IsTruncated,
+                metadata?.IsIncomplete,
+                metadata?.Artifacts ?? [],
+                remoteResult.Result.DeliveryDetails)
+        };
+        if (remoteResult.IsError)
+        {
+            throw new SatelliteToolExecutionException(normalizedResult);
+        }
+
+        return normalizedResult;
+    }
+
+    private sealed class SatelliteToolExecutionException(AgentToolResult result) : Exception
+    {
+        public AgentToolResult Result { get; } = result;
+    }
+
+    private static async Task<ToolResultAgentMessage> FinalizeToolOutcomeAsync(
+        AgentContext context,
+        AssistantAgentMessage assistantMessage,
+        ToolExecutionOutcome outcome,
+        AgentLoopConfig config,
+        Func<AgentEvent, Task> emit,
+        CancellationToken cancellationToken)
+    {
+        var result = outcome.Result;
+        var isError = outcome.IsError;
+
+        if (outcome.ApplyAfterHook && outcome.ValidatedArgs is not null)
+        {
+            (result, isError) = await TransformToolResultAsync(
+                    context,
+                    assistantMessage,
+                    outcome.ToolCall,
+                    outcome.ValidatedArgs,
+                    outcome.Result,
+                    outcome.IsError,
+                    config,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        result = FinalizeToolResult(result, config, outcome.Tool);
+
+        await emit(new ToolExecutionEndEvent(
+            outcome.ToolCall.Id,
+            outcome.ToolCall.Name,
+            result,
+            isError,
+            DateTimeOffset.UtcNow)).ConfigureAwait(false);
+
+        return await EmitToolResultMessageAsync(
+                outcome.ToolCall,
+                result,
+                isError,
+                emit,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static void ObserveAbandonedToolExecution(Task? executionTask)
+    {
+        if (executionTask is null)
+        {
+            return;
+        }
+
+        _ = executionTask.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private static async Task<(AgentToolResult Result, bool IsError)> TransformToolResultAsync(
         AgentContext context,
         AssistantAgentMessage assistantMessage,
         ToolCallContent toolCall,
@@ -392,9 +778,9 @@ internal static class ToolExecutor
         AgentLoopConfig config,
         CancellationToken cancellationToken)
     {
-        if (config.AfterToolCall is not null)
+        if (config.ToolResultTransformer is not null)
         {
-            var afterContext = new AfterToolCallContext(
+            var transformContext = new ToolResultTransformContext(
                 assistantMessage,
                 toolCall,
                 validatedArgs,
@@ -402,26 +788,149 @@ internal static class ToolExecutor
                 isError,
                 context);
 
-            AfterToolCallResult? afterResult;
+            ToolResultTransformResult? transformedResult;
             try
             {
-                afterResult = await config.AfterToolCall(afterContext, cancellationToken).ConfigureAwait(false);
+                transformedResult = await config.ToolResultTransformer(transformContext, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 return (result, isError);
             }
 
-            if (afterResult is not null)
+            if (transformedResult is not null)
             {
-                var content = afterResult.Content ?? result.Content;
-                var details = afterResult.Details ?? result.Details;
-                result = new AgentToolResult(content, details);
-                isError = afterResult.IsError ?? isError;
+                var content = transformedResult.Content ?? result.Content;
+                var details = transformedResult.Details ?? result.Details;
+                result = result with { Content = content, Details = details };
+                isError = transformedResult.IsError ?? isError;
             }
         }
 
         return (result, isError);
+    }
+
+    /// <summary>
+    /// Applies the shared central tool-output budget (#3162) to a finalised tool result.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the ONE seam where every tool result is bounded regardless of origin. It runs after
+    /// the tool-result transformer so a transformer that substitutes a larger payload is bounded too, and
+    /// before the end event and the result message so the bounded projection is what the model, the
+    /// event stream and the transcript all see -- a divergence there would make a truncation
+    /// invisible in exactly the place an operator would look for it.
+    /// </para>
+    /// <para>
+    /// It applies to error results as well: an exception message or a rejected-arguments diagnostic
+    /// can itself be arbitrarily large (a provider stack trace, a validator echoing a huge argument),
+    /// and the budget's purpose is to bound what reaches the context window, not to reward the happy
+    /// path. Per-tool caps are untouched (AC6): they are cheaper and more precise, and a tool that
+    /// already bounded its own output never reaches this budget.
+    /// </para>
+    /// </remarks>
+    private static AgentToolResult FinalizeToolResult(
+        AgentToolResult result,
+        AgentLoopConfig config,
+        IAgentTool? tool)
+    {
+        var sanitized = ToolResultSanitizer.Apply(result, config.ToolResultTextTransformer);
+        return ToolOutputBudget.Apply(sanitized, config.EffectiveMaxToolOutputBytes, tool);
+    }
+
+    /// <summary>
+    /// Records the content-source classification of a resolved tool into the ambient turn taint
+    /// scope (#2519), so a memory write later in the same run can be quarantined if any foreign
+    /// content was consumed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A <see langword="null"/> tool means the call never resolved - an unregistered name, or
+    /// arguments the validator rejected. Nothing executed and no foreign bytes entered the
+    /// context; the only text produced is the executor's own locally generated diagnostic. That is
+    /// genuinely untainted, and deliberately so: treating a typo'd tool name as a taint source
+    /// would let a model poison its own turn by calling a nonexistent tool, converting a harmless
+    /// mistake into a denial of memory writes.
+    /// </para>
+    /// <para>
+    /// Conversely a tool that resolved is recorded regardless of whether its execution later
+    /// succeeds, times out or throws. A failed <c>web_fetch</c> can still have surfaced remote
+    /// bytes - a partial body, a server-controlled error page, an exception message quoting the
+    /// response - so the outcome is not evidence of cleanliness. This is the fail-closed reading.
+    /// </para>
+    /// </remarks>
+    private static void RecordTurnTaint(IAgentTool? tool, ToolCallContent toolCall)
+    {
+        if (tool is null)
+        {
+            return;
+        }
+
+        // The declaration is read defensively: a tool whose ContentSource property throws must not
+        // take the whole turn down, and must not be credited as trusted either. Unknown taints.
+        string declared;
+        try
+        {
+            declared = tool.ContentSource;
+        }
+        catch
+        {
+            declared = ToolContentSource.Unknown;
+        }
+
+        TurnTaintScope.RecordToolResult(toolCall.Name, declared);
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when a wall-clock budget breach is attributable to the host
+    /// having been suspended rather than to the policy running slowly (#3356).
+    /// </summary>
+    /// <remarks>
+    /// The test is deliberately the direct one: how much time did the process actually spend
+    /// <i>running</i> since the policy started? This is a measurement question, not a heuristic about
+    /// sleep events, so it needs no power-notification subscription and behaves identically for a
+    /// suspend, a hibernate, or a VM pause.
+    /// <para>
+    /// The threshold is a <b>substantial</b> shortfall (half the budget), not a bare
+    /// <c>active &lt; budget</c>. Two clocks are involved and the unbiased one is coarse (~15.6ms on
+    /// Windows), so a genuinely slow policy can read a hair under its budget on the second clock; a
+    /// bare comparison would then excuse it and silently weaken the fail-closed gate. The two cases
+    /// are not close in reality -- a real suspend leaves active time near zero against a 15s budget,
+    /// while a wedged provider consumes essentially all of it -- so a wide margin costs nothing and
+    /// removes the tie. A policy that genuinely overran is rejected here, which is what keeps the
+    /// fail-closed path non-vacuous.
+    /// </para>
+    /// </remarks>
+    private static bool IsAttributableToHostSuspend(
+        IHostSuspendDetector detector,
+        long activeStartedAt,
+        TimeSpan budget)
+    {
+        var active = detector.GetElapsedActiveTime(activeStartedAt);
+        return active < TimeSpan.FromTicks(budget.Ticks / 2);
+    }
+
+    /// <summary>
+    /// Reports that a budget measurement was discarded because the host was suspended across it
+    /// (#3356). The text is deliberately distinct from <see cref="BuildToolExecutionPolicyTimeout"/> so
+    /// an operator reading the log is not sent to investigate a policy provider that never ran
+    /// slowly, which was half the cost of the original defect.
+    /// </summary>
+    private static void ReportSuspendDiscardedMeasurement(
+        AgentLoopConfig config,
+        ToolCallContent toolCall,
+        TimeSpan budget,
+        long startedAt)
+    {
+        var elapsed = Stopwatch.GetElapsedTime(startedAt);
+        var message =
+            $"BeforeToolCall budget measurement discarded for tool '{toolCall.Name}' " +
+            $"(call {toolCall.Id}): {elapsed.TotalSeconds:F1}s of wall-clock elapsed against a " +
+            $"{budget.TotalSeconds:F1}s budget, but the host was suspended for most of it and the " +
+            "hook's running time stayed within budget. This is not a hook timeout and the tool " +
+            "call was not blocked.";
+
+        DiagnosticNotification.Report(config.DiagnosticObserver, message);
     }
 
     private static AgentToolResult BuildErrorResult(string message)
@@ -430,12 +939,39 @@ internal static class ToolExecutor
     }
 
     /// <summary>
-    /// Returns the dispatch arguments for the tool. When the validator coerced one or more
-    /// values (issue #1552), the coerced JSON object is unpacked back into a
-    /// <see cref="Dictionary{TKey, TValue}"/> (each value a cloned <see cref="JsonElement"/>,
-    /// which every tool argument reader already accepts) so the tool sees the corrected
-    /// shape. When nothing was coerced the original <paramref name="rawArgs"/> is returned
-    /// unchanged to avoid needless reallocation.
+    /// Builds the fail-closed outcome for a tool-execution policy that exceeded its budget (#2518),
+    /// and reports the breach through the diagnostic sink with the elapsed time and the tool
+    /// identity so a slow policy provider is nameable rather than merely mysterious.
+    /// </summary>
+    private static ToolPreparation BuildToolExecutionPolicyTimeout(
+        AgentLoopConfig config,
+        ToolCallContent toolCall,
+        TimeSpan budget,
+        long startedAt)
+    {
+        var elapsed = Stopwatch.GetElapsedTime(startedAt);
+        var message =
+            $"BeforeToolCall hook timed out after {elapsed.TotalSeconds:F1}s " +
+            $"(budget {budget.TotalSeconds:F1}s) for tool '{toolCall.Name}' (call {toolCall.Id}). " +
+            "Tool call blocked because no policy decision was reached.";
+
+        DiagnosticNotification.Report(config.DiagnosticObserver, message);
+
+        return new ToolPreparation(null, BuildErrorResult(message), true);
+    }
+
+    /// <summary>
+    /// Projects the validated arguments into the shape dispatched to the tool. When the validator
+    /// coerced one or more losslessly-safe shape mismatches (issue #1552) the coerced JSON object is
+    /// unpacked into cloned <see cref="JsonElement"/> values (the shape every tool argument reader
+    /// already accepts). Independently — whether or not any coercion fired — boxed CLR numbers are
+    /// normalised to <see cref="JsonElement"/> numbers: streaming tool-call parsing boxes JSON numbers
+    /// as CLR <see cref="long"/>/<see cref="double"/>, and a tool argument reader that only recognised
+    /// <see cref="JsonElement"/> numbers rejected them, so a valid numeric argument (e.g. an
+    /// <c>agent_converse</c> <c>timeoutSeconds</c>) failed unless an unrelated sibling argument
+    /// happened to trigger coercion (issue #2415). On the no-coercion path, non-numeric values keep
+    /// their original CLR representation so no other dispatch behaviour changes; when coercion fires,
+    /// every value is taken from the coerced <see cref="JsonElement"/>.
     /// </summary>
     private static IReadOnlyDictionary<string, object?> ApplyCoercedArguments(
         IReadOnlyDictionary<string, object?> rawArgs,
@@ -443,13 +979,13 @@ internal static class ToolExecutor
     {
         if (coercedElement.ValueKind != JsonValueKind.Object)
         {
-            return rawArgs;
+            return NormalizeBoxedNumbers(rawArgs);
         }
 
         var original = JsonSerializer.SerializeToElement(rawArgs);
         if (string.Equals(original.GetRawText(), coercedElement.GetRawText(), StringComparison.Ordinal))
         {
-            return rawArgs;
+            return NormalizeBoxedNumbers(rawArgs);
         }
 
         var coercedArgs = new Dictionary<string, object?>(StringComparer.Ordinal);
@@ -459,6 +995,63 @@ internal static class ToolExecutor
         }
 
         return coercedArgs;
+    }
+
+    /// <summary>
+    /// Returns a copy of <paramref name="args"/> where each boxed CLR number produced by streaming
+    /// tool-call argument parsing is replaced with an equivalent <see cref="JsonElement"/> number, so
+    /// tool argument readers see a uniform <see cref="JsonElement"/> regardless of how the provider
+    /// boxed the value (issue #2415). Values that are already <see cref="JsonElement"/> or are
+    /// non-numeric are preserved verbatim. The original instance is returned when nothing needs
+    /// normalising to avoid needless reallocation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Only <see cref="long"/> and finite <see cref="double"/> are normalised: <c>StreamingJsonParser</c>
+    /// boxes JSON integers as <see cref="long"/> and non-integers as <see cref="double"/>, so those are
+    /// the only CLR numeric types a boxed JSON number can arrive as. A boxed <see cref="int"/> is left
+    /// untouched — every numeric tool argument reader already accepts <see cref="int"/> directly, and
+    /// rewriting it would needlessly perturb readers that pattern-match <c>is int</c>. A non-finite
+    /// <see cref="double"/> has no JSON number representation and is left boxed rather than serialised
+    /// here; this arm is unreachable in practice because <c>StreamingJsonParser</c> cannot produce
+    /// <c>NaN</c>/<c>Infinity</c> from JSON input.
+    /// </para>
+    /// <para>
+    /// Normalisation is intentionally top-level only. <c>StreamingJsonParser</c> maps nested JSON
+    /// objects to nested <see cref="Dictionary{TKey, TValue}"/> instances, so a boxed number nested
+    /// inside an object argument is not rewritten here; no current tool takes an object-valued numeric
+    /// argument, so this is a latent limitation rather than a live gap.
+    /// </para>
+    /// </remarks>
+    private static IReadOnlyDictionary<string, object?> NormalizeBoxedNumbers(IReadOnlyDictionary<string, object?> args)
+    {
+        var needsNormalization = false;
+        foreach (var value in args.Values)
+        {
+            if (value is long || (value is double d && double.IsFinite(d)))
+            {
+                needsNormalization = true;
+                break;
+            }
+        }
+
+        if (!needsNormalization)
+        {
+            return args;
+        }
+
+        var normalized = new Dictionary<string, object?>(args.Count, StringComparer.Ordinal);
+        foreach (var (key, value) in args)
+        {
+            normalized[key] = value switch
+            {
+                long l => JsonSerializer.SerializeToElement(l),
+                double d when double.IsFinite(d) => JsonSerializer.SerializeToElement(d),
+                _ => value
+            };
+        }
+
+        return normalized;
     }
 
     private static async Task<ToolResultAgentMessage> EmitToolResultMessageAsync(
@@ -489,7 +1082,8 @@ internal static class ToolExecutor
     private sealed record PreparedToolCall(
         ToolCallContent ToolCall,
         IAgentTool Tool,
-        IReadOnlyDictionary<string, object?> ValidatedArgs);
+        IReadOnlyDictionary<string, object?> ValidatedArgs,
+        ToolExecutionContext ExecutionContext);
 
     private sealed record ToolPreparation(
         PreparedToolCall? Prepared,
@@ -502,5 +1096,6 @@ internal static class ToolExecutor
         AgentToolResult Result,
         bool IsError,
         IReadOnlyDictionary<string, object?>? ValidatedArgs,
-        bool ApplyAfterHook);
+        bool ApplyAfterHook,
+        IAgentTool? Tool = null);
 }

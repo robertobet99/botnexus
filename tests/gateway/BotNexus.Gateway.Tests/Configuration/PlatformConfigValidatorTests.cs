@@ -13,6 +13,30 @@ namespace BotNexus.Gateway.Tests.Configuration;
 /// </summary>
 public sealed class PlatformConfigValidatorTests
 {
+    [Theory]
+    [InlineData("coder")]
+    [InlineData("reviewer")]
+    [InlineData("researcher")]
+    public void Validate_ReservedArchetypeAgentId_ReturnsError(string archetypeId)
+    {
+        // #2136: reserved worker-archetype ids cannot be defined as named agents in config.
+        var config = new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["copilot"] = new() { ApiKey = "test-key" }
+            },
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                [archetypeId] = new() { Provider = "copilot", Model = "gpt-4.1" }
+            }
+        };
+
+        var errors = PlatformConfigValidator.Validate(config);
+
+        errors.ShouldContain(e => e.Contains(archetypeId) && e.Contains("reserved"));
+    }
+
     [Fact]
     public void Validate_MinimalValidInMemoryConfig_NoErrors()
     {
@@ -49,6 +73,41 @@ public sealed class PlatformConfigValidatorTests
         errors.ShouldContain(e => e.Contains("listenUrl", StringComparison.Ordinal));
         errors.ShouldContain(e => e.Contains("logLevel", StringComparison.Ordinal));
         errors.ShouldContain(e => e.Contains("agentsDirectory", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Validate_PlaceholderGatewayCredentials_ReturnsCredentialFreeErrors()
+    {
+        var config = new PlatformConfig
+        {
+            ApiKey = " undefined ",
+            Gateway = new GatewaySettingsConfig
+            {
+                ApiKeys = new Dictionary<string, ApiKeyConfig>
+                {
+                    ["tenant-a"] = new()
+                    {
+                        ApiKey = "NULL",
+                        TenantId = "tenant-a",
+                        Permissions = ["chat:send"]
+                    }
+                },
+                Satellites = new Dictionary<string, SatelliteConfig>
+                {
+                    ["sat-1"] = new() { Enabled = true, ApiKey = "null" },
+                    ["sat-disabled"] = new() { Enabled = false, ApiKey = "undefined" }
+                }
+            }
+        };
+
+        var errors = PlatformConfigValidator.Validate(config);
+
+        errors.ShouldContain("apiKey must not be a placeholder. Supply a valid gateway API key or remove the setting for intentional development mode.");
+        errors.ShouldContain("gateway.apiKeys.tenant-a.apiKey must not be a placeholder. Supply a valid API key.");
+        errors.ShouldContain("gateway.satellites.sat-1.apiKey must not be a placeholder. Supply a valid satellite API key.");
+        errors.ShouldNotContain(e => e.Contains("sat-disabled", StringComparison.Ordinal));
+        errors.ShouldAllBe(error => !error.Contains("undefined", StringComparison.OrdinalIgnoreCase));
+        errors.ShouldAllBe(error => !error.Contains("NULL", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -95,6 +154,96 @@ public sealed class PlatformConfigValidatorTests
         warnings.Where(w => w.Contains("version '2'", StringComparison.Ordinal)).ShouldHaveSingleItem();
     }
 
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void ValidateWarnings_AgentUsesLegacyPromptFileKey_ReturnsOneActionableWarning(
+        bool includeSingular,
+        bool includePlural)
+    {
+        var agentJson = (includeSingular, includePlural) switch
+        {
+            (true, true) => "{\"systemPromptFile\":null,\"systemPromptFiles\":[]}",
+            (true, false) => "{\"systemPromptFile\":null}",
+            (false, true) => "{\"systemPromptFiles\":[]}",
+            _ => "{}"
+        };
+        var config = PlatformConfigLoader.MaterializeConfig(
+            $$"""
+            {
+              "agents": {
+                "assistant": {{agentJson}}
+              }
+            }
+            """);
+
+        var warning = PlatformConfigValidator.ValidateWarnings(config)
+            .Where(message => message == PlatformConfigValidator.LegacyPromptFilesWarning)
+            .ShouldHaveSingleItem();
+
+        warning.ShouldContain("systemPromptFile");
+        warning.ShouldContain("systemPromptFiles");
+        warning.ShouldContain("standard workspace instruction files");
+        warning.ShouldContain("WORLD.md");
+        warning.ShouldContain("inline system prompt");
+        warning.ShouldContain("conversation instructions");
+        warning.ShouldContain("model-specific variants");
+    }
+
+    [Fact]
+    public void ValidateWarnings_MultipleAgentsUseLegacyPromptFileKeys_ReturnsOneWarning()
+    {
+        var config = PlatformConfigLoader.MaterializeConfig(
+            """
+            {
+              "agents": {
+                "assistant": { "systemPromptFiles": ["AGENTS.md"] },
+                "reviewer": { "systemPromptFile": "reviewer.md" }
+              }
+            }
+            """);
+
+        PlatformConfigValidator.ValidateWarnings(config)
+            .Where(message => message == PlatformConfigValidator.LegacyPromptFilesWarning)
+            .ShouldHaveSingleItem();
+    }
+
+    [Theory]
+    [InlineData("{\"systemPromptFile\":\"legacy.md\"}")]
+    [InlineData("{\"systemPromptFiles\":[\"legacy.md\"]}")]
+    [InlineData("{\"systemPromptFile\":null,\"systemPromptFiles\":[]}")]
+    public void MaterializeConfig_LegacyPromptFileKeys_AreToleratedWithoutTypedConfigurationProjection(
+        string agentJson)
+    {
+        var config = PlatformConfigLoader.MaterializeConfig(
+            $$"""{ "agents": { "assistant": {{agentJson}} } }""");
+
+        var agent = config.Agents!["assistant"];
+        agent.LegacyPromptFileKeysPresent.ShouldBeTrue();
+        typeof(AgentDefinitionConfig).GetProperty("SystemPromptFile").ShouldBeNull();
+        typeof(AgentDefinitionConfig).GetProperty("SystemPromptFiles").ShouldBeNull();
+        PlatformConfigValidator.ValidateWarnings(config)
+            .Where(message => message == PlatformConfigValidator.LegacyPromptFilesWarning)
+            .ShouldHaveSingleItem();
+    }
+
+    [Fact]
+    public void ValidateWarnings_AgentsOmitLegacyPromptFileKeys_ReturnsNoLegacyWarning()
+    {
+        var config = PlatformConfigLoader.MaterializeConfig(
+            """
+            {
+              "agents": {
+                "assistant": {}
+              }
+            }
+            """);
+
+        PlatformConfigValidator.ValidateWarnings(config)
+            .ShouldNotContain(PlatformConfigValidator.LegacyPromptFilesWarning);
+    }
+
     [Fact]
     public void ValidateWarnings_KnownVersion_ReturnsNoWarnings()
         => PlatformConfigValidator.ValidateWarnings(new PlatformConfig { PlatformVersion = 1 }).ShouldBeEmpty();
@@ -115,6 +264,32 @@ public sealed class PlatformConfigValidatorTests
         };
 
         PlatformConfigValidator.ValidateAnnotated(config).ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void ValidateAnnotated_NonPositiveTemporalDecayHalfLife_ReturnsError()
+    {
+        var config = new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new()
+                {
+                    Provider = "copilot",
+                    Model = "gpt-4.1",
+                    Memory = new MemoryAgentConfig
+                    {
+                        Search = new MemorySearchAgentConfig
+                        {
+                            TemporalDecay = new TemporalDecayAgentConfig { HalfLifeDays = 0 }
+                        }
+                    }
+                }
+            }
+        };
+
+        PlatformConfigValidator.ValidateAnnotated(config)
+            .ShouldContain(error => error.Contains("half life days", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

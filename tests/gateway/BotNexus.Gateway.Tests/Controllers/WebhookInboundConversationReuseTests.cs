@@ -27,6 +27,7 @@ public sealed class WebhookInboundConversationReuseTests : IAsyncLifetime
     private SqliteWebhookRunStore _runs = null!;
     private InMemoryConversationStore _conversations = null!;
     private IInboundMessageOrchestrator _orchestrator = null!;
+    private IConversationDispatcher _dispatcher = null!;
     private ISessionStore _sessions = null!;
     private IHttpClientFactory _httpClientFactory = null!;
 
@@ -42,12 +43,13 @@ public sealed class WebhookInboundConversationReuseTests : IAsyncLifetime
         _orchestrator.AcceptAsync(Arg.Any<InboundMessage>(), Arg.Any<CancellationToken>())
             .Returns(InboundDispatchResult.NoRoute());
         _sessions = Substitute.For<ISessionStore>();
+        _dispatcher = Substitute.For<IConversationDispatcher>();
         _httpClientFactory = Substitute.For<IHttpClientFactory>();
     }
 
     public Task DisposeAsync()
     {
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        SqlitePoolCleanup.ClearPoolFor(_dbPath);
         foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
         {
             var path = _dbPath + suffix;
@@ -111,6 +113,7 @@ public sealed class WebhookInboundConversationReuseTests : IAsyncLifetime
             _registrations,
             _runs,
             _orchestrator,
+            _dispatcher,
             conversations,
             _sessions,
             _httpClientFactory,
@@ -163,7 +166,18 @@ public sealed class WebhookInboundConversationReuseTests : IAsyncLifetime
         public Task<Conversation?> ResolveByBindingAsync(AgentId agentId, ChannelKey channelType, ChannelAddress channelAddress, CancellationToken ct = default) => inner.ResolveByBindingAsync(agentId, channelType, channelAddress, ct);
         public Task TouchAsync(ConversationId conversationId, CancellationToken ct = default) => inner.TouchAsync(conversationId, ct);
         public Task PinAsync(ConversationId conversationId, bool pin, CancellationToken ct = default) => inner.PinAsync(conversationId, pin, ct);
+        public Task<bool> AddBindingAsync(ConversationId conversationId, ChannelBinding binding, CancellationToken ct = default)
+            => inner.AddBindingAsync(conversationId, binding, ct);
+        public Task<bool> RemoveBindingAsync(ConversationId conversationId, BindingId bindingId, CancellationToken ct = default)
+            => inner.RemoveBindingAsync(conversationId, bindingId, ct);
+        public Task<bool> MoveBindingAsync(ConversationId fromConversationId, ConversationId toConversationId, BindingId bindingId, CancellationToken ct = default)
+            => inner.MoveBindingAsync(fromConversationId, toConversationId, bindingId, ct);
+        public Task<Conversation?> PatchMetadataAsync(ConversationId conversationId, ConversationMetadataPatch patch, CancellationToken ct = default)
+            => inner.PatchMetadataAsync(conversationId, patch, ct);
+        public Task<Conversation?> PatchOverrideAsync(ConversationId conversationId, ConversationOverridePatch patch, CancellationToken ct = default)
+            => inner.PatchOverrideAsync(conversationId, patch, ct);
         public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default) => inner.GetSummariesAsync(ct);
+        public Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default) => inner.GetPendingAskUserCheckpointsAsync(ct);
         public Task<Dictionary<string, JsonElement>?> GetCanvasStateAsync(ConversationId conversationId, CancellationToken ct = default) => inner.GetCanvasStateAsync(conversationId, ct);
         public Task<bool> SetCanvasStateKeyAsync(ConversationId conversationId, string key, JsonElement value, CancellationToken ct = default) => inner.SetCanvasStateKeyAsync(conversationId, key, value, ct);
         public Task DeleteCanvasStateKeyAsync(ConversationId conversationId, string key, CancellationToken ct = default) => inner.DeleteCanvasStateKeyAsync(conversationId, key, ct);

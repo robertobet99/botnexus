@@ -112,7 +112,21 @@ public sealed class GatewayRestClient : IGatewayRestClient, IChannelErrorReporte
     {
         EnsureConfigured();
         var result = await _http.GetFromJsonAsync<List<ConversationSummaryDto>>(
-            $"{_apiBaseUrl}conversations",
+            $"{_apiBaseUrl}conversations", cancellationToken);
+        return result as IReadOnlyList<ConversationSummaryDto> ?? [];
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationSummaryDto>> GetAllConversationsAsync(
+        DateTimeOffset? activitySince,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        var query = activitySince is { } cutoff
+            ? $"?activitySince={Uri.EscapeDataString(cutoff.ToString("O", System.Globalization.CultureInfo.InvariantCulture))}"
+            : "?effectiveActivity=true";
+        var result = await _http.GetFromJsonAsync<List<ConversationSummaryDto>>(
+            $"{_apiBaseUrl}conversations{query}",
             cancellationToken);
         return result as IReadOnlyList<ConversationSummaryDto> ?? [];
     }
@@ -131,6 +145,71 @@ public sealed class GatewayRestClient : IGatewayRestClient, IChannelErrorReporte
     }
 
     /// <inheritdoc />
+    public async Task<ExportDownload?> ExportConversationAsync(
+        string conversationId,
+        ConversationExportRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        return await ExportAsync("conversations", conversationId, request, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<ExportDownload?> ExportSessionAsync(
+        string sessionId,
+        ConversationExportRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        return await ExportAsync("sessions", sessionId, request, cancellationToken);
+    }
+
+    private async Task<ExportDownload?> ExportAsync(
+        string resource,
+        string resourceId,
+        ConversationExportRequest request,
+        CancellationToken cancellationToken)
+    {
+        var query = new List<string>
+        {
+            $"includeTools={request.IncludeTools.ToString().ToLowerInvariant()}",
+            $"includeThinking={request.IncludeThinking.ToString().ToLowerInvariant()}",
+            $"includeSystemMessages={request.IncludeSystemMessages.ToString().ToLowerInvariant()}",
+            $"redactSecrets={request.RedactSecrets.ToString().ToLowerInvariant()}"
+        };
+        if (!string.IsNullOrWhiteSpace(request.FirstEntryId))
+            query.Add($"firstEntryId={Uri.EscapeDataString(request.FirstEntryId)}");
+        if (!string.IsNullOrWhiteSpace(request.LastEntryId))
+            query.Add($"lastEntryId={Uri.EscapeDataString(request.LastEntryId)}");
+
+        try
+        {
+            // The literal legacy /sessions/{id}/export/markdown route intentionally retains its
+            // historical contract and ignores the new content/range query. Use the accepted "md"
+            // alias so portal session exports reach the format-parameterised route instead.
+            var routeFormat = resource == "sessions" && request.Format == "markdown"
+                ? "md"
+                : request.Format;
+            using var response = await _http.GetAsync(
+                $"{_apiBaseUrl}{resource}/{Uri.EscapeDataString(resourceId)}/export/{Uri.EscapeDataString(routeFormat)}?{string.Join("&", query)}",
+                cancellationToken);
+            if (!response.IsSuccessStatusCode)
+                return null;
+
+            var disposition = response.Content.Headers.ContentDisposition;
+            var fallbackName = resource == "conversations" ? "conversation" : "session";
+            var fileName = disposition?.FileNameStar ?? disposition?.FileName?.Trim('"') ?? $"{fallbackName}.{request.Format}";
+            var contentType = response.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
+            var content = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+            return new ExportDownload(fileName, contentType, content);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc />
     public async Task<ConversationResponseDto?> GetConversationAsync(
         string conversationId,
         CancellationToken cancellationToken = default)
@@ -142,18 +221,89 @@ public sealed class GatewayRestClient : IGatewayRestClient, IChannelErrorReporte
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SessionSummary>> GetSessionsAsync(
-        string? agentId = null,
+    /// <inheritdoc />
+    public async Task<ConversationBindingDto?> AddConversationBindingAsync(
+        string conversationId,
+        AddConversationBindingRequestDto request,
         CancellationToken cancellationToken = default)
     {
         EnsureConfigured();
-        var query = string.IsNullOrWhiteSpace(agentId)
-            ? string.Empty
-            : $"?agentId={Uri.EscapeDataString(agentId)}";
-        var result = await _http.GetFromJsonAsync<List<SessionSummary>>(
+        var response = await _http.PostAsJsonAsync(
+            $"{_apiBaseUrl}conversations/{Uri.EscapeDataString(conversationId)}/bindings",
+            request,
+            cancellationToken);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<ConversationBindingDto>(cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RemoveConversationBindingAsync(
+        string conversationId,
+        string bindingId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        var response = await _http.DeleteAsync(
+            $"{_apiBaseUrl}conversations/{Uri.EscapeDataString(conversationId)}/bindings/{Uri.EscapeDataString(bindingId)}",
+            cancellationToken);
+        return response.IsSuccessStatusCode;
+    }
+
+    /// <inheritdoc />
+    public async Task<ConversationBindingDto?> MoveConversationBindingAsync(
+        string conversationId,
+        string bindingId,
+        MoveConversationBindingRequestDto request,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        var response = await _http.PostAsJsonAsync(
+            $"{_apiBaseUrl}conversations/{Uri.EscapeDataString(conversationId)}/bindings/{Uri.EscapeDataString(bindingId)}/move",
+            request,
+            cancellationToken);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<ConversationBindingDto>(cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationCostDto>> GetConversationCostsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        var result = await _http.GetFromJsonAsync<List<ConversationCostDto>>(
+            $"{_apiBaseUrl}conversations/costs",
+            cancellationToken);
+        return result as IReadOnlyList<ConversationCostDto> ?? [];
+    }
+
+    /// <inheritdoc />
+    public async Task<SessionPageDto> GetSessionsAsync(
+        string? agentId = null,
+        int? limit = null,
+        int offset = 0,
+        string? conversationId = null,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+
+        // #2532: the endpoint filters in the store and returns an object carrying totalCount and
+        // hasMore. Paging arguments are only emitted when supplied so the historical
+        // single-argument call produces the same URL it always did.
+        var args = new List<string>(4);
+        if (!string.IsNullOrWhiteSpace(agentId))
+            args.Add($"agentId={Uri.EscapeDataString(agentId)}");
+        if (limit is not null)
+            args.Add($"limit={limit.Value}");
+        if (offset > 0)
+            args.Add($"offset={offset}");
+        if (!string.IsNullOrWhiteSpace(conversationId))
+            args.Add($"conversationId={Uri.EscapeDataString(conversationId)}");
+
+        var query = args.Count == 0 ? string.Empty : "?" + string.Join("&", args);
+        var result = await _http.GetFromJsonAsync<SessionPageDto>(
             $"{_apiBaseUrl}sessions{query}",
             cancellationToken);
-        return result as IReadOnlyList<SessionSummary> ?? [];
+        return result ?? new SessionPageDto([], 0, false);
     }
 
     /// <inheritdoc />
@@ -167,6 +317,28 @@ public sealed class GatewayRestClient : IGatewayRestClient, IChannelErrorReporte
         return await _http.GetFromJsonAsync<SessionHistoryResponseDto>(
             $"{_apiBaseUrl}sessions/{Uri.EscapeDataString(sessionId)}/history?limit={limit}&offset={offset}",
             cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<CommandResultDto?> ExecuteCommandAsync(
+        CommandExecuteRequestDto request,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        try
+        {
+            var response = await _http.PostAsJsonAsync($"{_apiBaseUrl}commands/execute", request, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+                return null;
+
+            return await response.Content.ReadFromJsonAsync<CommandResultDto>(cancellationToken: cancellationToken);
+        }
+        catch (HttpRequestException)
+        {
+            // #2873: a transport failure must surface as a visible error at the call site, never as
+            // a silent fall-through that sends the command text to the agent instead.
+            return null;
+        }
     }
 
     /// <inheritdoc />
@@ -451,6 +623,53 @@ public sealed class GatewayRestClient : IGatewayRestClient, IChannelErrorReporte
         return await _http.GetFromJsonAsync<SessionDebugSnapshotDto>(
             $"{_apiBaseUrl}sessions/{Uri.EscapeDataString(sessionId)}/debug?offset={offset}&limit={limit}",
             cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<PromptTemplateDescriptorDto>> GetPromptTemplatesAsync(
+        string agentId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        return await _http.GetFromJsonAsync<IReadOnlyList<PromptTemplateDescriptorDto>>(
+            $"{_apiBaseUrl}prompt-templates?agentId={Uri.EscapeDataString(agentId)}",
+            cancellationToken) ?? [];
+    }
+
+    /// <inheritdoc />
+    public async Task<PromptTemplateRenderResultDto> RenderPromptTemplateAsync(
+        string agentId,
+        string templateName,
+        IReadOnlyDictionary<string, string> parameters,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConfigured();
+        var request = new PromptTemplateRenderRequestDto(
+            templateName,
+            parameters.ToDictionary(pair => pair.Key, pair => (string?)pair.Value, StringComparer.Ordinal));
+        using var response = await _http.PostAsJsonAsync(
+            $"{_apiBaseUrl}prompt-templates/render?agentId={Uri.EscapeDataString(agentId)}",
+            request,
+            cancellationToken);
+        if (response.IsSuccessStatusCode)
+        {
+            var rendered = await response.Content.ReadFromJsonAsync<PromptTemplateRenderResponseDto>(
+                cancellationToken: cancellationToken);
+            return new PromptTemplateRenderResultDto(rendered?.RenderedPrompt, new Dictionary<string, string[]>());
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
+        {
+            var problem = await response.Content.ReadFromJsonAsync<PromptTemplateValidationProblemDto>(
+                cancellationToken: cancellationToken);
+            return new PromptTemplateRenderResultDto(
+                null,
+                problem?.Errors ?? new Dictionary<string, string[]>(),
+                problem?.Error);
+        }
+
+        response.EnsureSuccessStatusCode();
+        return new PromptTemplateRenderResultDto(null, new Dictionary<string, string[]>());
     }
 
     /// <inheritdoc />

@@ -1,5 +1,6 @@
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Configuration;
+using Microsoft.Extensions.Options;
 using System.IO.Abstractions;
 
 namespace BotNexus.Gateway.Agents;
@@ -8,14 +9,18 @@ public sealed class FileAgentWorkspaceManager : IAgentWorkspaceManager
 {
     private const string MemoryDirectoryName = "memory";
     private const string SubAgentMarker = "--subagent--";
-    private const string SubAgentWorkspaceDirectoryName = "botnexus-subagent-workspaces";
     private readonly BotNexusHome _botNexusHome;
     private readonly IFileSystem _fileSystem;
+    private readonly string? _configuredWorkspaceRoot;
 
-    public FileAgentWorkspaceManager(BotNexusHome botNexusHome, IFileSystem fileSystem)
+    public FileAgentWorkspaceManager(
+        BotNexusHome botNexusHome,
+        IFileSystem fileSystem,
+        IOptions<SubAgentOptions>? subAgentOptions = null)
     {
         _botNexusHome = botNexusHome;
         _fileSystem = fileSystem;
+        _configuredWorkspaceRoot = subAgentOptions?.Value?.WorkspaceRoot;
     }
 
     public async Task<AgentWorkspace> LoadWorkspaceAsync(string agentName, CancellationToken cancellationToken = default)
@@ -58,19 +63,60 @@ public sealed class FileAgentWorkspaceManager : IAgentWorkspaceManager
             ? content
             : $"{content}{Environment.NewLine}";
 
-        await _fileSystem.File.AppendAllTextAsync(targetPath, memoryEntry, cancellationToken);
+        // #2909: two writers colliding on the same daily note used to throw a sharing violation
+        // straight out of the tool call, losing the durable write. Retry a bounded number of times,
+        // and open with FileShare.ReadWrite so a concurrent reader never blocks the append at all.
+        await FileSharingViolationRetry.ExecuteAsync(
+            async (_, ct) =>
+            {
+                await using var stream = _fileSystem.FileStream.New(
+                    targetPath,
+                    FileMode.Append,
+                    FileAccess.Write,
+                    FileShare.ReadWrite);
+                var bytes = System.Text.Encoding.UTF8.GetBytes(memoryEntry);
+                await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
+                await stream.FlushAsync(ct).ConfigureAwait(false);
+            },
+            $"Appending memory note to '{targetPath}'",
+            cancellationToken).ConfigureAwait(false);
     }
 
     public string GetWorkspacePath(string agentName)
+        => _fileSystem.Path.Combine(GetAgentRootPath(agentName), "workspace");
+
+    /// <summary>
+    /// Resolves the directory that owns an agent's workspace and data. Persistent agents use the
+    /// profile agents root; ephemeral children keep both beneath the configurable child root so
+    /// terminal cleanup reclaims their workspace and memory store as one directory tree.
+    /// </summary>
+    public string GetAgentRootPath(string agentName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(agentName);
         var normalizedAgentName = agentName.Trim();
         if (IsSubAgentAgentName(normalizedAgentName))
-            return _fileSystem.Path.Combine(GetSubAgentWorkspaceRoot(), SanitizePathSegment(normalizedAgentName), "workspace");
+            return _fileSystem.Path.Combine(GetSubAgentWorkspaceRoot(), SanitizePathSegment(normalizedAgentName));
 
-        return Path.Combine(_botNexusHome.GetAgentDirectory(normalizedAgentName), "workspace");
+        return _botNexusHome.GetAgentDirectory(normalizedAgentName);
     }
 
+    /// <summary>
+    /// Provisions an empty isolated workspace at admission, not during path lookup or tool use.
+    /// The spawn owner must register the child first so liveness probes protect the directory.
+    /// </summary>
+    internal void ProvisionSubAgentWorkspace(string agentName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(agentName);
+        if (!IsSubAgentAgentName(agentName.Trim()))
+            throw new ArgumentException("Only isolated child workspaces can be provisioned here.", nameof(agentName));
+
+        _fileSystem.Directory.CreateDirectory(GetWorkspacePath(agentName));
+    }
+
+    /// <summary>
+    /// Reports an actual isolated-directory removal, not success inferred from an absent path.
+    /// Path resolution remains side-effect free so cleanup cannot recreate a retired workspace.
+    /// </summary>
     public bool TryCleanupWorkspace(string agentName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(agentName);
@@ -89,10 +135,19 @@ public sealed class FileAgentWorkspaceManager : IAgentWorkspaceManager
         if (!IsWithinRoot(tempRoot, workspaceRootFullPath))
             return false;
 
-        if (_fileSystem.Directory.Exists(workspaceRootFullPath))
-            _fileSystem.Directory.Delete(workspaceRootFullPath, recursive: true);
+        if (!_fileSystem.Directory.Exists(workspaceRootFullPath))
+            return false;
 
-        return true;
+        try
+        {
+            _fileSystem.Directory.Delete(workspaceRootFullPath, recursive: true);
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Another cleanup won the race; this caller removed nothing and must not audit it.
+            return false;
+        }
     }
 
     private async Task<string> ReadFileOrEmptyAsync(string path, CancellationToken cancellationToken)
@@ -168,7 +223,7 @@ public sealed class FileAgentWorkspaceManager : IAgentWorkspaceManager
         => agentName.Contains(SubAgentMarker, StringComparison.OrdinalIgnoreCase);
 
     private string GetSubAgentWorkspaceRoot()
-        => _fileSystem.Path.Combine(_fileSystem.Path.GetTempPath(), SubAgentWorkspaceDirectoryName);
+        => SubAgentWorkspaceRootResolver.Resolve(_configuredWorkspaceRoot, _fileSystem);
 
     private static string SanitizePathSegment(string value)
     {

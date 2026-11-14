@@ -1,6 +1,7 @@
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Streaming;
+using BotNexus.Agent.Providers.Core.Utilities;
 
 namespace BotNexus.Agent.Core.Loop;
 
@@ -8,7 +9,8 @@ namespace BotNexus.Agent.Core.Loop;
 /// Accumulates streaming LLM events into a final AssistantAgentMessage.
 /// </summary>
 /// <remarks>
-/// Handles StartEvent, text/thinking/tool-call delta lifecycle events, DoneEvent, and ErrorEvent.
+/// Handles StartEvent, text/thinking/tool-call delta lifecycle events, WarningEvent, DoneEvent, and
+/// ErrorEvent.
 /// Emits corresponding AgentEvent for each provider event.
 /// Maintains tool call state to correlate deltas with tool IDs/names.
 /// </remarks>
@@ -20,6 +22,9 @@ internal static class StreamAccumulator
     /// <param name="stream">The provider event stream.</param>
     /// <param name="emit">The event emission callback.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
+    /// <param name="contextMessages">Optional live context updated with partial evidence.</param>
+    /// <param name="attemptFailure">When supplied by the retry owner, normalizes eligible in-band
+    /// failures before terminal emission and retains classification for unsafe-to-replay partials.</param>
     /// <returns>The final accumulated assistant message.</returns>
     /// <remarks>
     /// Emits MessageStartEvent → MessageUpdateEvent (0+) → MessageEndEvent.
@@ -29,17 +34,26 @@ internal static class StreamAccumulator
         LlmStream stream,
         Func<AgentEvent, Task> emit,
         CancellationToken cancellationToken,
-        IList<AgentMessage>? contextMessages = null)
+        IList<AgentMessage>? contextMessages = null,
+        ProviderAttemptFailure? attemptFailure = null)
     {
         var _startEmitted = false;
         var partialAddedToContext = false;
         AssistantAgentMessage? current = null;
         AssistantAgentMessage? final = null;
         var toolCallState = new Dictionary<int, (string? Id, string? Name)>();
+        var exposedSemanticOutput = false;
 
         await foreach (var evt in stream.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // Starts for text/thinking alone carry no semantic output; tool identity already does.
+            exposedSemanticOutput |= evt is TextDeltaEvent { Delta.Length: > 0 }
+                or ThinkingDeltaEvent { Delta.Length: > 0 }
+                or TextEndEvent { Content.Length: > 0 }
+                or ThinkingEndEvent { Content.Length: > 0 }
+                or ToolCallStartEvent or ToolCallDeltaEvent or ToolCallEndEvent;
 
             switch (evt)
             {
@@ -154,8 +168,12 @@ internal static class StreamAccumulator
                 case ToolCallStartEvent toolStart:
                     current = MessageConverter.ToAgentMessage(toolStart.Partial);
                     UpdateContextPartial(contextMessages, current, partialAddedToContext);
-                    toolCallState[toolStart.ContentIndex] = ResolveToolCallIdentity(current, toolStart.ContentIndex);
-                    var startedTool = toolCallState[toolStart.ContentIndex];
+                    // Identity comes off the event, not from indexing the partial message (#3290).
+                    // ContentIndex counts every content block, including text and thinking, so it is
+                    // not a position in ToolCalls; resolving by index attributed fragments to the
+                    // wrong call whenever more than one call streamed concurrently.
+                    var startedTool = (Id: toolStart.ToolCallId, Name: toolStart.ToolName);
+                    toolCallState[toolStart.ContentIndex] = startedTool;
 
                     await emit(new MessageUpdateEvent(
                         Message: current,
@@ -173,9 +191,10 @@ internal static class StreamAccumulator
                 case ToolCallDeltaEvent toolDelta:
                     current = MessageConverter.ToAgentMessage(toolDelta.Partial);
                     UpdateContextPartial(contextMessages, current, partialAddedToContext);
-                    if (!toolCallState.TryGetValue(toolDelta.ContentIndex, out var deltaTool))
+                    if (!toolCallState.TryGetValue(toolDelta.ContentIndex, out var deltaTool) ||
+                        deltaTool.Id is null)
                     {
-                        deltaTool = ResolveToolCallIdentity(current, toolDelta.ContentIndex);
+                        deltaTool = (Id: toolDelta.ToolCallId, Name: toolDelta.ToolName);
                         toolCallState[toolDelta.ContentIndex] = deltaTool;
                     }
 
@@ -222,8 +241,38 @@ internal static class StreamAccumulator
                     await emit(new MessageEndEvent(final, DateTimeOffset.UtcNow)).ConfigureAwait(false);
                     break;
 
+                case WarningEvent:
+                    // Non-terminal by contract (#3291): accumulation continues, no MessageEndEvent
+                    // is emitted, `final` is left alone, and the loop keeps reading. The channel now
+                    // exists end to end; gateway/channel presentation of a warning is a separate
+                    // contract (#2078) and is deliberately not decided here, so the event is
+                    // consumed without emitting a gateway event.
+                    break;
+
                 case ErrorEvent error:
                     final = MessageConverter.ToAgentMessage(error.Error) with { FinishReason = error.Reason };
+                    if (attemptFailure is not null && error.Reason == StopReason.Error)
+                    {
+                        var failureClass = TransientErrorClassifier.Classify(final.ErrorMessage);
+                        attemptFailure.Classification = failureClass;
+                        attemptFailure.DiagnosticDetail = final.ErrorMessage is { Length: > 512 } detail
+                            ? detail[..512] : final.ErrorMessage;
+                        // Overflow remains on its independent one-compaction budget in the loop.
+                        if (!exposedSemanticOutput && !ContextOverflowDetector.IsContextOverflow(final.ErrorMessage)
+                            && failureClass is ProviderFailureClass.Transient or ProviderFailureClass.Exhausted)
+                        {
+                            throw new ProviderInBandFailureException(error.Error.Provider, failureClass, final.ErrorMessage);
+                        }
+
+                        if (exposedSemanticOutput
+                            && failureClass is ProviderFailureClass.Transient or ProviderFailureClass.Exhausted)
+                        {
+                            final = final with
+                            {
+                                ErrorMessage = $"Provider '{error.Error.Provider}' failed ({failureClass}) after partial output; automatic replay stopped. Resume only after you verify partial text and tool effects."
+                            };
+                        }
+                    }
                     ReplacePartialWithFinal(contextMessages, final, partialAddedToContext);
                     if (!_startEmitted)
                     {
@@ -241,7 +290,11 @@ internal static class StreamAccumulator
             return final;
         }
 
-        var result = await stream.GetResultAsync().ConfigureAwait(false);
+        // No terminal event was observed, so the final message must come from the stream's result
+        // task. That await is outside the cancellation-observing enumeration above, so it is bound
+        // to the caller's token explicitly (#3293) - otherwise a producer that never completes the
+        // result strands this turn with no error, no cancellation and no timeout.
+        var result = await stream.GetResultAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
         final = StripNonExecutableToolCalls(MessageConverter.ToAgentMessage(result));
         ReplacePartialWithFinal(contextMessages, final, partialAddedToContext);
 
@@ -320,24 +373,5 @@ internal static class StreamAccumulator
         }
 
         contextMessages.Add(final);
-    }
-
-    private static (string? Id, string? Name) ResolveToolCallIdentity(
-        AssistantAgentMessage message,
-        int contentIndex)
-    {
-        if (message.ToolCalls is null || message.ToolCalls.Count == 0)
-        {
-            return (null, null);
-        }
-
-        if (contentIndex >= 0 && contentIndex < message.ToolCalls.Count)
-        {
-            var directMatch = message.ToolCalls[contentIndex];
-            return (directMatch.Id, directMatch.Name);
-        }
-
-        var latest = message.ToolCalls[^1];
-        return (latest.Id, latest.Name);
     }
 }

@@ -1,3 +1,4 @@
+using BotNexus.Agent.Core.Tools;
 using BotNexus.Extensions.Skills;
 using BotNexus.Gateway.Abstractions.Models;
 using System.Reflection;
@@ -6,14 +7,19 @@ namespace BotNexus.Extensions.Skills.Tests;
 
 public sealed class SkillToolTests
 {
-    private static SkillDefinition MakeSkill(string name, string? description = null, string? content = null)
+    private static SkillDefinition MakeSkill(
+        string name,
+        string? description = null,
+        string? content = null,
+        SkillSource source = SkillSource.Global,
+        string? sourcePath = null)
         => new()
         {
             Name = name,
             Description = description ?? $"{name} skill description",
             Content = content ?? $"Content for {name}",
-            Source = SkillSource.Global,
-            SourcePath = $"/skills/{name}"
+            Source = source,
+            SourcePath = sourcePath ?? $"/skills/{name}"
         };
 
     private static IReadOnlyDictionary<string, object?> Args(string action, string? skillName = null)
@@ -147,6 +153,53 @@ public sealed class SkillToolTests
     }
 
     [Fact]
+    public async Task Load_CountLimit_ReturnsDistinctReasonAndMeasurements()
+    {
+        // Put the new request first to prove discovery order cannot displace session-loaded usage.
+        var skills = new[] { MakeSkill("requested"), MakeSkill("already-loaded") };
+        var config = new SkillsConfig { MaxLoadedSkills = 1 };
+        var tool = new SkillTool(skills, config);
+        await tool.ExecuteAsync("call-1", Args("load", "already-loaded"));
+
+        var text = ResultText(await tool.ExecuteAsync("call-2", Args("load", "requested")));
+
+        text.ShouldContain("reason=count_limit");
+        text.ShouldContain("configured=1");
+        text.ShouldContain("current=1");
+        text.ShouldContain("requested=1");
+        text.ShouldNotContain("Content for requested");
+    }
+
+    [Fact]
+    public async Task Load_ContentLimit_ReturnsDistinctReasonAndAuthorizedRecovery()
+    {
+        var skill = MakeSkill("large", content: new string('x', 20), sourcePath: "/skills/large") with
+        {
+            LinkedFiles =
+            [
+                new SkillLinkedFile
+                {
+                    RelativePath = "references/focused.md",
+                    Directory = "references",
+                    SizeBytes = 12
+                }
+            ]
+        };
+        var tool = new SkillTool([skill], new SkillsConfig { MaxSkillContentChars = 10 });
+
+        var text = ResultText(await tool.ExecuteAsync("call-1", Args("load", "large")));
+
+        text.ShouldContain("reason=content_limit");
+        text.ShouldContain("configured=10");
+        text.ShouldContain("current=0");
+        text.ShouldContain("requested=20");
+        text.ShouldContain("**Resolved from:** Global skill root");
+        text.ShouldContain("references/focused.md");
+        text.ShouldContain("view_file");
+        text.ShouldNotContain(new string('x', 20));
+    }
+
+    [Fact]
     public async Task Load_MissingSkillName_ReturnsError()
     {
         var tool = new SkillTool([], config: null);
@@ -155,6 +208,43 @@ public sealed class SkillToolTests
         var text = ResultText(result);
 
         text.ShouldContain("skillName is required");
+    }
+
+    [Fact]
+    public async Task Load_AfterContextReplacement_ReturnsFullSkillContentAgain()
+    {
+        var tool = new SkillTool([MakeSkill("calendar", content: "Calendar body")], config: null);
+
+        var first = ResultText(await tool.ExecuteAsync("c1", Args("load", "calendar")));
+        var suppressed = ResultText(await tool.ExecuteAsync("c2", Args("load", "calendar")));
+        ((IContextReplacementAwareTool)tool).OnContextReplaced();
+        var reloaded = ResultText(await tool.ExecuteAsync("c3", Args("load", "calendar")));
+
+        first.ShouldContain("Calendar body");
+        suppressed.ShouldBe("Skill 'calendar' is already loaded in the current context.");
+        suppressed.ShouldNotContain("Calendar body");
+        reloaded.ShouldContain("Calendar body");
+    }
+
+    [Fact]
+    public async Task Load_WhenSkillContentChanges_ReturnsUpdatedFullContent()
+    {
+        var root = "/skills";
+        var fs = new System.IO.Abstractions.TestingHelpers.MockFileSystem(new Dictionary<string, System.IO.Abstractions.TestingHelpers.MockFileData>
+        {
+            [$"{root}/calendar/SKILL.md"] = "---\nname: calendar\ndescription: Calendar\n---\nold body"
+        });
+        var tool = new SkillTool(root, null, null, config: null);
+        typeof(SkillTool).GetField("_fileSystem", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(tool, fs);
+
+        var first = ResultText(await tool.ExecuteAsync("c1", Args("load", "calendar")));
+        fs.File.WriteAllText($"{root}/calendar/SKILL.md", "---\nname: calendar\ndescription: Calendar\n---\nnew body");
+        var updated = ResultText(await tool.ExecuteAsync("c2", Args("load", "calendar")));
+
+        first.ShouldContain("old body");
+        updated.ShouldContain("new body");
+        updated.ShouldNotContain("already loaded");
     }
 
     [Fact]
@@ -279,6 +369,51 @@ public sealed class SkillToolTests
 
         text.ShouldContain("**Path:**");
         text.ShouldContain("/skills/git-workflow");
+    }
+
+    // #3712: there is more than one skill root, so the resolved root must be named at point of
+    // use. An agent that only sees a bare path has no way to know which of the four tiers it
+    // came from, and hard-codes the shared root for an agent-local skill.
+    [Fact]
+    public async Task Load_NamesResolvedRootTier()
+    {
+        var skill = MakeSkill(
+            "botnexus-maintenance",
+            source: SkillSource.Workspace,
+            sourcePath: "/agents/farnsworth/workspace/skills/botnexus-maintenance");
+        var tool = new SkillTool([skill], config: null);
+
+        var result = await tool.ExecuteAsync("call-1", Args("load", "botnexus-maintenance"));
+        var text = ResultText(result);
+
+        text.ShouldContain("**Resolved from:** Workspace skill root");
+        text.ShouldContain("/agents/farnsworth/workspace/skills/botnexus-maintenance");
+    }
+
+    [Theory]
+    [InlineData(SkillSource.Plugin, "Plugin")]
+    [InlineData(SkillSource.Global, "Global")]
+    [InlineData(SkillSource.Agent, "Agent")]
+    [InlineData(SkillSource.Workspace, "Workspace")]
+    public async Task Load_NamesEveryRootTier(SkillSource source, string expectedTier)
+    {
+        var tool = new SkillTool([MakeSkill("tiered", source: source)], config: null);
+
+        var result = await tool.ExecuteAsync("call-1", Args("load", "tiered"));
+
+        ResultText(result).ShouldContain($"**Resolved from:** {expectedTier} skill root");
+    }
+
+    // The whole point of #3712: the load output must steer the agent to build support-file
+    // paths from the resolved directory instead of a hard-coded absolute root.
+    [Fact]
+    public async Task Load_TellsAgentToBuildPathsFromResolvedDirectory()
+    {
+        var tool = new SkillTool([MakeSkill("git-workflow")], config: null);
+
+        var result = await tool.ExecuteAsync("call-1", Args("load", "git-workflow"));
+
+        ResultText(result).ShouldContain("Resolve scripts and support files against this directory");
     }
 
     [Fact]

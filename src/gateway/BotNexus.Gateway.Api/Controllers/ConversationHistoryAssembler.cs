@@ -17,6 +17,15 @@ namespace BotNexus.Gateway.Api.Controllers;
 /// </remarks>
 public sealed class ConversationHistoryAssembler : IConversationHistoryAssembler
 {
+    /// <summary>
+    /// Hard ceiling on the number of entries a single page may return once a folded run has been
+    /// expanded (#2936). Folded rows render collapsed, so returning a whole run at once is cheap for
+    /// the client and removes the ~137-round-trip walk a 20-row page implies over a 2,700-row
+    /// compacted transcript - but an unbounded expansion would let one request materialise an
+    /// arbitrarily large transcript, so the run is chunked at this size instead.
+    /// </summary>
+    public const int MaxFoldedPageEntries = 500;
+
     private readonly IConversationStore _conversations;
     private readonly ISessionStore _sessions;
 
@@ -60,7 +69,7 @@ public sealed class ConversationHistoryAssembler : IConversationHistoryAssembler
                 linkedSessions = [fallbackSession];
         }
 
-        var allEntries = AssembleEntries(linkedSessions);
+        var allEntries = ConversationHistoryProjection.Project(linkedSessions);
 
         var totalCount = allEntries.Count;
         var page = PageFromNewest(allEntries, limit, offset);
@@ -71,84 +80,6 @@ public sealed class ConversationHistoryAssembler : IConversationHistoryAssembler
             Offset: offset,
             Limit: limit,
             Entries: page);
-    }
-
-    /// <summary>
-    /// Flattens the ordered session list into a single chronological entry list, inserting a
-    /// <c>boundary</c> marker between sessions, dropping <c>NO_REPLY</c> assistant turns (#773) and
-    /// folded entries, and projecting compaction summaries as distinct <c>compaction</c> markers.
-    /// </summary>
-    private static List<ConversationHistoryEntry> AssembleEntries(IReadOnlyList<GatewaySession> linkedSessions)
-    {
-        var allEntries = new List<ConversationHistoryEntry>();
-
-        for (var i = 0; i < linkedSessions.Count; i++)
-        {
-            var session = linkedSessions[i];
-
-            // Insert boundary marker before each session except the first.
-            if (i > 0)
-            {
-                var previousSession = linkedSessions[i - 1];
-                allEntries.Add(new ConversationHistoryEntry
-                {
-                    Kind = "boundary",
-                    SessionId = previousSession.SessionId.Value,
-                    AgentId = previousSession.AgentId.Value,
-                    Timestamp = previousSession.UpdatedAt,
-                    Reason = "session_end"
-                });
-            }
-
-            // Append all history entries from this session.
-            // Skip assistant entries whose content is exactly "NO_REPLY" (optionally padded with whitespace).
-            // These are deliberate cron no-ops that produced no user-facing output; including them in
-            // history would show blank turns in the portal for every cron wakeup that had nothing to say (#773).
-            var snapshot = session.GetHistorySnapshot();
-            foreach (var entry in snapshot)
-            {
-                // Skip folded entries that have been superseded by compaction summaries.
-                if (entry.IsHistory)
-                    continue;
-
-                if (entry.Role == MessageRole.Assistant &&
-                    string.Equals(entry.Content?.Trim(), "NO_REPLY", StringComparison.Ordinal))
-                    continue;
-
-                // Emit compaction summaries as distinct boundary markers so the portal
-                // can render them as separators rather than normal system messages.
-                if (entry.IsCompactionSummary)
-                {
-                    allEntries.Add(new ConversationHistoryEntry
-                    {
-                        Kind = "compaction",
-                        SessionId = session.SessionId.Value,
-                        AgentId = session.AgentId.Value,
-                        Timestamp = entry.Timestamp,
-                        Reason = "compaction",
-                        Content = entry.Content
-                    });
-                    continue;
-                }
-
-                allEntries.Add(new ConversationHistoryEntry
-                {
-                    Kind = "message",
-                    SessionId = session.SessionId.Value,
-                    AgentId = session.AgentId.Value,
-                    Role = entry.Role.ToString().ToLowerInvariant(),
-                    Content = entry.Content,
-                    Timestamp = entry.Timestamp,
-                    ToolName = entry.ToolName,
-                    ToolCallId = entry.ToolCallId,
-                    ToolArgs = entry.ToolArgs,
-                    ToolIsError = entry.ToolIsError,
-                    ThinkingContent = entry.ThinkingContent
-                });
-            }
-        }
-
-        return allEntries;
     }
 
     /// <summary>
@@ -165,10 +96,27 @@ public sealed class ConversationHistoryAssembler : IConversationHistoryAssembler
             return [];
 
         var take = Math.Min(limit, totalCount - offset);
-        var startIndex = Math.Max(0, totalCount - offset - take);
+        var endExclusive = totalCount - offset;
+        var startIndex = Math.Max(0, endExclusive - take);
+
+        // #2936 paging-cost mitigation. Unfolding pre-compaction history without this turns a
+        // "cannot reach history" bug into a "reachable but unusable" one: at a 20-row page a 2,736-row
+        // transcript is ~137 sequential round trips. Folded rows render collapsed, so when a page
+        // lands inside a contiguous folded run we extend it backwards over the rest of that run (up
+        // to MaxFoldedPageEntries) and hand the client the whole collapsed block in one response.
+        // The extension only ever grows the page BACKWARDS from startIndex, so the newest-first
+        // window the client already anchored on is unchanged and offset arithmetic stays monotonic:
+        // the client advances its offset by the actual returned count.
+        if (startIndex > 0 && allEntries[startIndex].IsFolded)
+        {
+            var maxStart = Math.Max(0, endExclusive - MaxFoldedPageEntries);
+            while (startIndex > maxStart && allEntries[startIndex - 1].IsFolded)
+                startIndex--;
+        }
+
         return allEntries
             .Skip(startIndex)
-            .Take(take)
+            .Take(endExclusive - startIndex)
             .ToList();
     }
 }

@@ -19,6 +19,16 @@ namespace BotNexus.Gateway.Abstractions.Conversations;
 /// </remarks>
 public interface IConversationStore
 {
+    /// <summary>Reads current canonical ownership without hydrating aggregate state or using a cache.
+    /// Missing conversations return null. Unsupported implementations fail closed.</summary>
+    Task<ConversationOwnership?> GetOwnershipAsync(ConversationId conversationId, CancellationToken ct = default)
+        => throw new NotSupportedException("This store does not support ownership-only reads.");
+
+    /// <summary>Projects only canonical IDs and owners, optionally filtered by owner, in any status.
+    /// This enumeration is not a bounded page; it must never hydrate conversation aggregates.</summary>
+    Task<IReadOnlyList<ConversationOwnership>> ListOwnershipAsync(AgentId? agentId = null, CancellationToken ct = default)
+        => throw new NotSupportedException("This store does not support ownership-only reads.");
+
     /// <summary>
     /// Gets a specific conversation by ID. Returns <c>null</c> if not found.
     /// </summary>
@@ -106,6 +116,36 @@ public interface IConversationStore
     Task ArchiveAsync(ConversationId conversationId, CancellationToken ct = default);
 
     /// <summary>
+    /// Archives a conversation while recording the lifecycle source and correlation identifier.
+    /// Production callers use this overload so every archive transition has central provenance.
+    /// </summary>
+    /// <param name="conversationId">The conversation identifier.</param>
+    /// <param name="source">Stable source name such as <c>rest-api</c> or <c>retention</c>.</param>
+    /// <param name="correlationId">Request, job, session, or trace identifier for the transition.</param>
+    /// <param name="actor">The actor initiating the transition.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task ArchiveAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+        => ArchiveAsync(conversationId, ct);
+
+    /// <summary>
+    /// Atomically archives an active conversation and records lifecycle provenance.
+    /// Returns <see langword="true"/> only when this caller performed the Active-to-Archived
+    /// transition; missing or already archived conversations return <see langword="false"/>.
+    /// </summary>
+    Task<bool> TryArchiveAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This conversation store does not implement atomic archive transitions.");
+
+    /// <summary>
     /// Resolves an active conversation for the given agent and channel binding details.
     /// Returns <c>null</c> if no matching conversation exists.
     /// </summary>
@@ -145,6 +185,71 @@ public interface IConversationStore
     /// </summary>
     Task PinAsync(ConversationId conversationId, bool pin, CancellationToken ct = default);
 
+    // ── Transactional binding + narrow patch operations (issue #2139) ──────────
+    // These exist so partial REST updates never round-trip the whole aggregate through
+    // SaveAsync, which rewrites every column and deletes/recreates every binding from a
+    // detached snapshot. Each operation mutates only the state it owns, atomically with
+    // respect to the implementation's concurrency model, so concurrent binding adds,
+    // add/remove interleavings, and override/metadata/pin interleavings cannot clobber
+    // each other or unrelated fields.
+
+    /// <summary>
+    /// Atomically appends a single channel binding to the conversation without rewriting any
+    /// other conversation field or existing binding. Concurrent adds both survive because the
+    /// insert targets only the new binding row. No-ops (returns <c>false</c>) when the
+    /// conversation does not exist.
+    /// </summary>
+    /// <param name="conversationId">The conversation to bind.</param>
+    /// <param name="binding">The binding to append.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> when the conversation existed and the binding was added.</returns>
+    Task<bool> AddBindingAsync(ConversationId conversationId, ChannelBinding binding, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically removes a single channel binding by id without touching any other binding or
+    /// conversation field. Returns <c>false</c> when the conversation or the binding does not
+    /// exist, so an add of an unrelated binding interleaved with this remove leaves the added
+    /// binding intact.
+    /// </summary>
+    /// <param name="conversationId">The conversation owning the binding.</param>
+    /// <param name="bindingId">The binding to remove.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> when a matching binding was removed.</returns>
+    Task<bool> RemoveBindingAsync(ConversationId conversationId, BindingId bindingId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically re-parents a single binding from one conversation to another without rewriting
+    /// either aggregate's other fields or bindings. Returns <c>false</c> when the binding is not
+    /// found on the source conversation or the target conversation does not exist.
+    /// </summary>
+    /// <param name="fromConversationId">The conversation currently owning the binding.</param>
+    /// <param name="toConversationId">The conversation to move the binding to.</param>
+    /// <param name="bindingId">The binding to move.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns><c>true</c> when the binding was moved.</returns>
+    Task<bool> MoveBindingAsync(ConversationId fromConversationId, ConversationId toConversationId, BindingId bindingId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically applies a narrow metadata patch (title / purpose / instructions). Only fields
+    /// marked set on the patch are written; bindings, pin, overrides and participants are left as
+    /// committed, so a metadata edit cannot revert an independently committed field. Returns the
+    /// updated conversation, or <c>null</c> when it does not exist.
+    /// </summary>
+    /// <param name="conversationId">The conversation to patch.</param>
+    /// <param name="patch">The set of fields to write.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<Conversation?> PatchMetadataAsync(ConversationId conversationId, ConversationMetadataPatch patch, CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically applies a narrow override patch (model / thinking / context). Only fields marked
+    /// set on the patch are written; bindings, pin, metadata and participants are left as
+    /// committed. Returns the updated conversation, or <c>null</c> when it does not exist.
+    /// </summary>
+    /// <param name="conversationId">The conversation to patch.</param>
+    /// <param name="patch">The set of override fields to write.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<Conversation?> PatchOverrideAsync(ConversationId conversationId, ConversationOverridePatch patch, CancellationToken ct = default);
+
     /// <summary>
     /// Returns lightweight summaries for all <em>active</em> conversations across the world,
     /// ordered most-recently-updated first.
@@ -165,6 +270,95 @@ public interface IConversationStore
     /// </remarks>
     /// <param name="ct">Cancellation token.</param>
     Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default);
+
+    /// <summary>Returns active, top-level Activity summaries using the inclusive maximum of
+    /// creation, update, and binding inbound/outbound timestamps. Null explicitly requests all
+    /// history; the token-only overload retains its legacy semantics.</summary>
+    /// <remarks>The compatibility fallback reads aggregates via ListAsync and filters before
+    /// summary and participant projection. Stores may override it with an optimized query.</remarks>
+    async Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(
+        DateTimeOffset? activitySince, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var conversations = await ListAsync(ct: ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+        return [.. conversations
+            .Where(c => c.Status == ConversationStatus.Active && c.ParentConversationId is null)
+            .Select(c => (Conversation: c, Activity: c.ChannelBindings
+                .SelectMany(b => new[] { b.LastInboundAt, b.LastOutboundAt })
+                .Append(c.CreatedAt).Append(c.UpdatedAt)
+                .Where(at => at.HasValue).Max(at => at.GetValueOrDefault())))
+            .Where(x => activitySince is null || x.Activity >= activitySince.Value)
+            .OrderByDescending(x => x.Conversation.IsPinned)
+            .ThenByDescending(x => x.Conversation.PinnedAt)
+            .ThenByDescending(x => x.Activity)
+            .ThenBy(x => x.Conversation.ConversationId.Value, StringComparer.Ordinal)
+            .Select(x => new ConversationSummary(
+                x.Conversation.ConversationId.Value,
+                x.Conversation.AgentId.Value,
+                x.Conversation.Title,
+                x.Conversation.IsDefault,
+                x.Conversation.Status.ToString(),
+                x.Conversation.ActiveSessionId?.Value,
+                x.Conversation.ChannelBindings.Count,
+                x.Conversation.CreatedAt,
+                x.Activity,
+                x.Conversation.Purpose,
+                x.Conversation.Kind.ToString(),
+                x.Conversation.Source.ToString(),
+                x.Conversation.Visibility.ToString(),
+                x.Conversation.IsPinned,
+                x.Conversation.PinnedAt,
+                x.Conversation.Participants.Select(p => new ParticipantSummary(
+                    p.CitizenId.Kind.ToString(), p.CitizenId.Value, p.Role)).ToList(),
+                x.Conversation.SourceId))];
+    }
+    /// <summary>
+    /// Returns active retention candidates using only lifecycle, ownership, timestamp, pin, and
+    /// source provenance fields. Implementations must not hydrate bindings, participants, or blobs.
+    /// </summary>
+    async Task<IReadOnlyList<ConversationRetentionCandidate>> GetRetentionCandidatesAsync(
+        ConversationSource? source = null,
+        CancellationToken ct = default)
+    {
+        var conversations = await ListAsync(ct: ct).ConfigureAwait(false);
+        return [.. conversations
+            .Where(c => c.Status == ConversationStatus.Active && (!source.HasValue || c.Source == source.Value))
+            .Select(c => new ConversationRetentionCandidate(
+                c.ConversationId,
+                c.AgentId,
+                c.UpdatedAt,
+                c.IsPinned,
+                c.Source,
+                c.SourceId))];
+    }
+
+    /// <summary>
+    /// Returns every conversation that currently holds a non-empty durable pending <c>ask_user</c>
+    /// checkpoint, projected to the conversation id and the checkpoint JSON only.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the startup-reconciliation query (issue #3660). Its cost must scale with the number
+    /// of <em>pending checkpoints</em>, not with the total conversation population — implementations
+    /// must filter in the store, never materialise all conversations and filter in memory. The
+    /// SQLite implementation therefore issues a
+    /// <c>WHERE pending_ask_user_json IS NOT NULL AND pending_ask_user_json &lt;&gt; ''</c> query and
+    /// does not go through full-conversation materialisation.
+    /// </para>
+    /// <para>
+    /// Rows whose checkpoint column is <c>NULL</c> or empty are omitted, so a caller never has to
+    /// re-check emptiness. Malformed checkpoint <em>content</em> is not the store's concern — the
+    /// payload is returned verbatim and the caller decides how to handle a parse failure.
+    /// </para>
+    /// <para>
+    /// Conversations in any status are returned. A checkpoint on an archived conversation is still
+    /// a waiter that must be rehydrated, because #2047's mis-dispatch hazard does not care about
+    /// the conversation's lifecycle state.
+    /// </para>
+    /// </remarks>
+    /// <param name="ct">Cancellation token.</param>
+    Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default);
 
     // ── Canvas State ───────────────────────────────────────────────────────
 

@@ -13,12 +13,16 @@
 3. [Configuration](#configuration)
 4. [Cron Schedule Syntax](#cron-schedule-syntax)
 5. [Agent Session Modes](#agent-session-modes)
-6. [Channel Output Routing](#channel-output-routing)
-7. [Built-in System Actions](#built-in-system-actions)
-8. [Built-in Maintenance Actions](#built-in-maintenance-actions)
+6. [Output Routing](#output-routing)
+7. [Built-in Actions](#built-in-actions)
+8. [Action Reference](#action-reference)
 9. [CronTool — Runtime Job Management](#crontool--runtime-job-management)
 10. [REST API Endpoints](#rest-api-endpoints)
 11. [Migration from HeartbeatService](#migration-from-heartbeatservice)
+11a. [Failure Alerts](#11a-failure-alerts-2557)
+11b. [Zero-Tool-Call Runs](#11b-zero-tool-call-runs-2985)
+11c. [Delivery Failure](#11c-delivery-failure-delivery_failed)
+11d. [Operator Abort](#11d-operator-abort-aborted)
 12. [Observability](#observability)
 13. [Examples](#examples)
 
@@ -26,13 +30,36 @@
 
 ## 1. Overview
 
-BotNexus provides a **centralized cron service** (`ICronService`) that schedules and executes jobs on a fixed tick interval. Unlike per-agent scheduling (legacy `AgentConfig.CronJobs`), all jobs are registered in a single, global configuration section: `BotNexus.Cron.Jobs`.
+BotNexus provides a **centralized cron service** (`CronScheduler`) that schedules and executes jobs on a fixed tick interval. Unlike per-agent scheduling (legacy `AgentConfig.CronJobs`), all jobs are registered in a single, global configuration section: the `cron` section of `config.json`.
+
+### Optional global model routing
+
+Configure `cron.defaultModel` through the installed CLI's canonical configuration writer, not by editing JSON files. It is absent/null by default; no model is chosen by price, speed, or name.
+
+**CLI:** In a terminal with the installed `botnexus` command, run:
+
+```shell
+botnexus config set cron.defaultModel openai/gpt-4.1-mini
+botnexus config get cron.defaultModel
+```
+
+Choose a model registered in your installation and permitted for the jobs' agents. Use your normal `--target` option when managing a non-default installation. The existing `config set` path type-checks the value and uses `CliConfigMutation` and the canonical writer factory; it preserves unrelated configuration. The change is durable configuration, not a live-runtime override.
+
+**UI:** The schema-driven Cron settings expose **Default cron model**. Save through the normal settings writer, then restart the gateway.
+
+To roll back, run `botnexus config set cron.defaultModel null` and restart. Existing job model pins remain intact; clear a job's `model` through its API/tool update only when you want it to inherit the global setting.
+
+For model-running actions (`agent-prompt`, `heartbeat`, `skill-review`, `memory-dreaming`, and `agent-converse`), each occurrence selects **explicit job model > global default > standing conversation model > agent fallback**. `command` and `webhook` ignore this setting. System-provisioned, declarative, API-authored, and tool-authored jobs use the same dispatch path.
+
+A selection is resolved against the registered models and agent model permissions before dispatch. An invalid or forbidden explicit/global model fails the run; it does not silently fall back. The selected model applies only to that occurrence and never changes the conversation's durable model override. Job JSON exposes `modelRoutingIndicator`; run history exposes `effectiveModel` with the requested token, resolved provider/model, and winning layer. Historical runs and deterministic actions retain null model audit values. Session metadata carries the same selection. Listings also expose `configuredDefaultModel` and distinguish `global-default` from `job-override`. Pinned heartbeats use a separate heartbeat execution session, including for soul-enabled agents, so an occurrence cannot leave its model or cached handle on the shared interactive soul session. With no explicit/global pin, heartbeats retain their actual execution conversation's inheritance and exchanges retain their participant-specific model defaults and remote target routing; their single-model audit remains unknown. A pinned exchange requires a local target so both participants' model permissions can be verified. Minimal hosts without a model registry retain legacy unset behavior; a configured global default requires registry validation.
+
+Cron options are captured from startup configuration. **Restart the gateway after changing `cron.defaultModel`**; the configuration file watcher alone does not refresh this startup snapshot. A change does not retarget an occurrence already dispatched. Unset or clear the setting to restore normal conversation/agent inheritance. Thinking and context-window parity are separate work (#4636).
 
 ### Key Characteristics
 
-- **Centralized**: All scheduled jobs in one place (`Cron.Jobs` config dict)
-- **Three job types**: Agent (LLM prompts), System (non-LLM actions), Maintenance (internal tasks)
-- **Tickless evaluation**: Service wakes every N seconds (default 10) and checks which jobs are due
+- **Centralized**: All config-defined jobs in one place (`cron.jobs`), merged at runtime with jobs created through the `cron` tool and the REST API
+- **One field selects the behaviour**: a job's `actionType` decides what happens when it fires (see [Job Types](#job-types))
+- **Tickless evaluation**: Service wakes every N seconds (default 60) and checks which jobs are due
 - **Non-blocking execution**: Jobs run concurrently; the scheduler does not wait for completion
 - **Async-first**: All job execution is fully asynchronous
 - **Correlated logging**: Every job execution gets a unique correlation ID for tracing
@@ -42,139 +69,117 @@ BotNexus provides a **centralized cron service** (`ICronService`) that schedules
 
 ```text
 ┌──────────────────────┐
-│   CronService        │
+│   CronScheduler      │
 │  (Background Svc)    │
 └──────┬───────────────┘
-       │ (every 10s tick)
+       │ (every tickIntervalSeconds)
        ▼
    Check due jobs
    │
-   ├─→ Agent job → AgentRunner → LLM prompt → Route output to channels
-   ├─→ System job → ISystemAction → Execute action → Route output
-   └─→ Maintenance job → Cleanup/consolidation tasks
+   └─→ Dispatch to the ICronAction whose ActionType matches the job's actionType
 ```
+
+Each action is a registered `ICronAction` implementation (see
+`CronServiceCollectionExtensions.AddBotNexusCron`). Adding a new action type means registering a
+new `ICronAction`; there is no separate system/maintenance registry.
 
 ---
 
 ## 2. Job Types
 
-### 2.1 Agent Jobs (`type: "agent"`)
+A job's behaviour is selected by a single `actionType` field. There is no `type` field and no
+separate agent/system/maintenance job taxonomy - every job is dispatched to the registered
+`ICronAction` whose `ActionType` matches.
 
-Execute a prompt through the agent runner pipeline. Output is routed to channels.
+| `actionType` | What it does when it fires | Required fields | Cost |
+|---|---|---|---|
+| `agent-prompt` (default) | Sends a prompt to the target agent through the agent runner | `agentId` + (`message` **or** `templateName`) | One full model turn per fire |
+| `command` | Runs `shellCommand` as a script | `shellCommand` | No tokens unless the script escalates |
+| `webhook` | POSTs to `webhookUrl` | `webhookUrl` | None |
+| `memory-dreaming` | LLM memory consolidation pass (see [8.4](#_8-4-memory-dreaming)) | `agentId` | One model turn per fire |
+| `skill-review` | LLM skill-review pass (see [8.7](#_8-7-skill-review)) | `agentId` | One model turn per fire |
+| `agent-converse` | Scheduled agent-to-agent conversation (see [8.6](#_8-6-agent-converse)) | `agentId` + metadata | One or more model turns |
+| `heartbeat` | System-provisioned agent heartbeat | `agentId` | One model turn per fire |
+| `plugin-update` | Updates every installed plugin whose update preference is enabled (see [8.9](#_8-9-plugin-update)) | none - platform-wide, `agentId` is `null` | None |
 
-**Configuration Properties:**
-- `Type`: `"agent"` (required)
-- `Agent`: Agent name to run (required)
-- `Prompt`: Prompt text to send to the agent (required)
-- `Schedule`: Cron expression (required)
-- `Session`: Session mode (`new`, `persistent`, or `named:<key>`; default: `new`)
-- `Timezone`: Timezone ID for schedule evaluation (optional; default: UTC)
-- `OutputChannels`: List of channel names to route agent response to (optional)
-- `Enabled`: Whether job is active (optional; default: `true`)
+For heartbeat provisioning and its opt-in agent configuration, see [Heartbeat ownership and configuration](#heartbeat-ownership-and-configuration). `skill-review` jobs are auto-provisioned per user-defined agent. These jobs are marked `system` and hidden from `cron` tool `list` output unless `includeSystem` is set. The single `plugin-update` job is auto-provisioned the first time a plugin is installed and is
+marked `system` for the same reason.
+
+### 2.1 Agent prompt jobs (`actionType: "agent-prompt"`)
+
+Execute a prompt through the agent runner pipeline. This is the default when `actionType` is
+omitted.
 
 **Example:**
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Jobs": {
-        "morning-briefing": {
-          "Type": "agent",
-          "Schedule": "0 9 * * *",
-          "Agent": "analyst",
-          "Prompt": "Generate a morning briefing on recent alerts.",
-          "Session": "persistent",
-          "Timezone": "America/New_York",
-          "OutputChannels": ["slack", "email"],
-          "Enabled": true
-        }
+  "cron": {
+    "jobs": {
+      "morning-briefing": {
+        "name": "Morning briefing",
+        "schedule": "0 9 * * *",
+        "actionType": "agent-prompt",
+        "agentId": "analyst",
+        "message": "Generate a morning briefing on recent alerts.",
+        "timeZone": "America/New_York",
+        "enabled": true
       }
     }
   }
 }
 ```
 
-### 2.2 System Jobs (`type: "system"`)
+Instead of a literal `message`, a job may name a prompt template declared under
+`cron.promptTemplates` and supply `templateParameters`.
 
-Execute a built-in or custom system action. Output is routed to channels.
+### 2.2 Command jobs (`actionType: "command"`)
 
-**Configuration Properties:**
-- `Type`: `"system"` (required)
-- `Action`: System action name (required; see [Built-in System Actions](#built-in-system-actions))
-- `Schedule`: Cron expression (required)
-- `Timezone`: Timezone ID for schedule evaluation (optional; default: UTC)
-- `OutputChannels`: List of channel names to route action output to (optional)
-- `Enabled`: Whether job is active (optional; default: `true`)
+Run a shell script with no model turn.
 
-**Example:**
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Jobs": {
-        "weekly-health-check": {
-          "Type": "system",
-          "Schedule": "0 0 * * 0",
-          "Action": "health-audit",
-          "Timezone": "UTC",
-          "OutputChannels": ["slack"],
-          "Enabled": true
-        }
+  "cron": {
+    "jobs": {
+      "disk-space-check": {
+        "name": "Disk space check",
+        "schedule": "0 * * * *",
+        "actionType": "command",
+        "shellCommand": "pwsh -NoProfile -File ./scripts/check-disk.ps1"
       }
     }
   }
 }
 ```
 
-### 2.3 Maintenance Jobs (`type: "maintenance"`)
+`shellCommand` is an arbitrary-execution surface. Firing is gated through the `exec` tool policy,
+and authoring a command job through the `cron` tool is authorized at create/update time as well as
+at fire time - see [Shell Execution](./features/shell-execution.md).
 
-Execute maintenance tasks: memory consolidation, session cleanup, log rotation.
+### 2.3 Webhook jobs (`actionType: "webhook"`)
 
-**Configuration Properties:**
-- `Type`: `"maintenance"` (required)
-- `Action`: Maintenance action name (required; see [Built-in Maintenance Actions](#built-in-maintenance-actions))
-- `Schedule`: Cron expression (required)
-- `Timezone`: Timezone ID for schedule evaluation (optional; default: UTC)
-- `Agents`: List of agent names for consolidation (required for `consolidate-memory`)
-- `SessionCleanupDays`: Sessions older than N days are deleted (default: 30)
-- `LogRetentionDays`: Logs older than N days are archived (default: 30)
-- `LogsPath`: Path to logs directory (optional; default: `~/.botnexus/logs`)
-- `Enabled`: Whether job is active (optional; default: `true`)
+POST to an external URL on a schedule.
 
-**Example:**
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Jobs": {
-        "nightly-consolidation": {
-          "Type": "maintenance",
-          "Schedule": "0 2 * * *",
-          "Action": "consolidate-memory",
-          "Agents": ["analyst", "planner", "writer"],
-          "Timezone": "America/Los_Angeles",
-          "Enabled": true
-        },
-        "cleanup-old-sessions": {
-          "Type": "maintenance",
-          "Schedule": "0 3 * * 0",
-          "Action": "cleanup-sessions",
-          "SessionCleanupDays": 30,
-          "Enabled": true
-        },
-        "rotate-logs": {
-          "Type": "maintenance",
-          "Schedule": "0 4 * * *",
-          "Action": "rotate-logs",
-          "LogRetentionDays": 30,
-          "LogsPath": "~/.botnexus/logs",
-          "Enabled": true
-        }
+  "cron": {
+    "jobs": {
+      "ping-monitor": {
+        "name": "Ping monitor",
+        "schedule": "*/15 * * * *",
+        "actionType": "webhook",
+        "webhookUrl": "https://example.com/hooks/botnexus"
       }
     }
   }
 }
 ```
+
+`webhookUrl` is validated at a single shared boundary (`CronWebhookUrl`) on both the config-declared
+and API paths. It must be an **absolute `http` or `https` URL carrying no embedded credentials** -
+`file:`, `ftp:` and every other scheme are rejected, as is `https://user:pass@host/hook`. A rejected
+URL fails the request with
+`WebhookUrl must be an absolute http or https URL and must not contain embedded credentials.`
+and leaves no row in the store.
 
 ---
 
@@ -182,71 +187,135 @@ Execute maintenance tasks: memory consolidation, session cleanup, log rotation.
 
 ### 3.1 Top-Level Cron Config
 
-**Section:** `BotNexus.Cron`
+**Section:** `cron` (in `config.json`)
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `Enabled` | bool | `true` | Enable/disable the cron service globally |
-| `TickIntervalSeconds` | int | `10` | How often the scheduler checks for due jobs (seconds) |
-| `ExecutionHistorySize` | int | `100` | Max execution history entries per job (in-memory queue) |
-| `Jobs` | dict | `{}` | Centralized job registry (key → `CronJobConfig`) |
+| `enabled` | bool | `true` | Enable/disable the cron service globally |
+| `tickIntervalSeconds` | int | `60` | How often the scheduler wakes to evaluate due jobs (seconds). This is the single normative default; it is set in `src/gateway/BotNexus.Cron/CronOptions.cs` and mirrored by `CronConfig` in `src/gateway/BotNexus.Gateway.Configuration/PlatformConfig.cs`. Values `<= 0` are rejected by config validation, and the scheduler additionally floors the effective delay at 1 second. |
+| `defaultJobTimeoutSeconds` | int | `3600` | Timeout applied to a run when the job declares none. A job can override it - or opt out of it entirely - via `metadata.timeoutSeconds`, see [Per-job timeout](#_3-2-1-per-job-timeout-timeoutseconds). |
+| `orphanedRunThresholdSeconds` | int | `86400` | How far a run's `started_at` may deviate from now (in **either** direction) before the scheduler treats a still-`running` row as orphaned and stamps it as an error (#2410). The bound is symmetric, so a clock skew forward widens the reap window rather than nulling live runs. |
+| `maxConcurrentJobs` | int | `5` | Aggregate cap on how many due jobs the scheduler executes concurrently on a single tick (#2670). Jobs beyond the cap **queue and run as slots free** - none are dropped. A value of `0` or less degrades to the default of `5` rather than to unbounded fan-out. Independent of the per-job lock, which separately prevents two runs of the *same* job from overlapping. |
+| `activeRunCancellationGraceSeconds` | int | `30` | How long a delete or disable waits for a cancelled in-flight run to actually observe its cancellation before archiving the conversation and sweeping the run's sessions (#3160). A grace period, not a guarantee: it **fails open**, so an action that swallows its cancellation token can never make its job permanently undeletable. `0` or less skips the wait entirely. |
+| `selfPacingFloorSeconds` | int | `60` | Floor for the self-pacing `next_check` action (#3338). A job may never ask to be woken sooner than this. A non-positive value degrades to the built-in default of 1 minute rather than to "no floor" — a bad config value must not be able to disable the bound the clamp exists to enforce. See [Self-pacing](./features/cron-session-targets.md#self-pacing-the-next-check-bound). |
+| `selfPacingCeilingSeconds` | int | `3600` | Ceiling for the self-pacing `next_check` action. A job asking to sleep longer than this is pinned here and told so, because a loop parked far out looks scheduled while doing nothing. A value at or below the floor degrades to the built-in default of 1 hour. |
+| `jobs` | dict | `{}` | Config-defined job registry (key → job descriptor, see §3.2) |
+
+> **Reachability.** Only `enabled`, `tickIntervalSeconds` and `jobs` are copied out of
+> `config.json`'s `cron` section into the scheduler options — `CronConfig` declares no other
+> property, and `Program.cs` builds `CronOptions` with a hand-written projection of exactly those
+> three. `defaultJobTimeoutSeconds`, `orphanedRunThresholdSeconds`, `maxConcurrentJobs`,
+> `activeRunCancellationGraceSeconds`, `selfPacingFloorSeconds` and `selfPacingCeilingSeconds` are
+> scheduler options **bound in code, not from `config.json`**; setting them in the file has no
+> effect. They are documented here because they govern observable scheduler behaviour.
 
 ### 3.2 Per-Job Configuration
 
-**Type:** `CronJobConfig`
+**Type:** `CronJobConfig` (each entry under `cron.jobs`)
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `Name` | string | (inferred) | Optional explicit job name override |
-| `Type` | string | `"agent"` | Job type: `agent`, `system`, or `maintenance` |
-| `Schedule` | string | (required) | Cron expression (5- or 6-field) |
-| `Enabled` | bool | `true` | Whether the job is active |
-| `Timezone` | string | `null` | Timezone ID for schedule evaluation (IANA format) |
-| `Agent` | string | (agent jobs only) | Name of agent to run |
-| `Prompt` | string | (agent jobs only) | Prompt to execute |
-| `Session` | string | (agent jobs only) | Session mode: `new`, `persistent`, or `named:<key>` |
-| `DeleteAfterRun` | bool | `false` | Opt-in cleanup for ephemeral jobs: when `true`, the scheduler deletes the run's agent session and its transcript after the run completes (across success / timeout / error / abort), provided the run produced a cron-scoped (`cron:`) session. Prevents run-scoped sessions from accumulating transcript entries indefinitely. Leave off for long-lived reporting jobs that intentionally persist context across runs — use compaction for those. Only ever deletes `cron:`-prefixed sessions, so a misconfigured flag cannot remove an unrelated long-lived session. |
-| `Action` | string | (system/maintenance jobs) | Action name to execute |
-| `Agents` | list | `[]` | Agent names for `consolidate-memory` |
-| `OutputChannels` | list | `[]` | Channels to route output to |
-| `SessionCleanupDays` | int | `30` | Session retention days for cleanup |
-| `LogRetentionDays` | int | `30` | Log retention days for rotation |
-| `LogsPath` | string | `null` | Override logs directory path |
+| `name` | string | (inferred) | Display name for the job |
+| `schedule` | string | (required) | Cron expression (5- or 6-field) |
+| `actionType` | string | `agent-prompt` | What the job does when it fires — e.g. `agent-prompt`, `webhook`, `command` |
+| `agentId` | string | (agent jobs only) | Agent to run the prompt against |
+| `message` | string | (agent jobs only) | Prompt message sent to the agent |
+| `templateName` | string | `null` | Named prompt template to use instead of a literal `message` |
+| `templateParameters` | dict | `{}` | Parameter values for `templateName` |
+| `model` | string | `null` | Model override for agent-prompt jobs |
+| `webhookUrl` | string | (webhook jobs only) | URL invoked by a webhook job. Must be an absolute `http`/`https` URL with no embedded credentials - see [2.3](#_2-3-webhook-jobs-actiontype-webhook). |
+| `shellCommand` | string | (command jobs only) | Script run by a `command` job. Firing is gated through the `exec` tool policy — see [Shell Execution](./features/shell-execution.md). |
+| `enabled` | bool | `true` | Whether the job is active |
+| `createdBy` | string | `null` | Provenance marker for who created the job |
+| `metadata` | dict | `{}` | Free-form metadata carried with the job. The key `timeoutSeconds` overrides `defaultJobTimeoutSeconds` for this job - see [Per-job timeout](#_3-2-1-per-job-timeout-timeoutseconds). |
+
+Those thirteen properties are the **complete** set `CronJobConfig` declares, and therefore the
+complete set a `cron.jobs` entry in `config.json` can carry.
+
+### 3.2.0 Runtime-only job properties
+
+The following properties exist on a cron job **row** (`CronJob` in the store, and the
+`ConfiguredCronJob` the scheduler works with) but are **not** declared on `CronJobConfig`. They are
+set through the `cron` tool or the REST API and persist in `cron.sqlite` — putting them in a
+`config.json` `cron.jobs` entry has **no effect**, because the config loader never reads them.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `system` | bool | `false` | Marks a job as system-provisioned (e.g. `heartbeat`, `skill-review`). System jobs are hidden from `cron` tool `list` output unless `includeSystem` is set. |
+| `timeZone` | string | `null` | IANA timezone the schedule is evaluated in (UTC when omitted) |
+| `deleteAfterRun` | bool | `false` | Opt-in cleanup for ephemeral jobs: when `true`, the scheduler deletes the run's agent session and its transcript after the run completes (across success / timeout / error / abort), provided the run produced a cron-scoped (`cron:`) session. Prevents run-scoped sessions from accumulating transcript entries indefinitely. Leave off for long-lived reporting jobs that intentionally persist context across runs — use compaction for those. Only ever deletes `cron:`-prefixed sessions, so a misconfigured flag cannot remove an unrelated long-lived session. |
+| `deleteJobAfterRun` | bool | `false` | Opt-in **job-level** one-shot disposition: when `true`, the scheduler deletes the **job itself** after its first terminal run - success, timeout, error, or host abort alike - from the same post-run teardown that already owns the run. Deliberately **not** `deleteAfterRun`, which removes the run's ephemeral *session* and leaves the job scheduled forever; the two compose. Use this instead of writing "delete this cron job after running" into the prompt: a prompt instruction has no enforcement and no retry if the turn ends early, this flag does. Off by default, and rows written before the column existed read `false`, so nothing is ever removed without an explicit opt-in. |
+| `executionClass` | bool | `false` | Marks the job as **execution-class**: its contract is to *perform work*, so a run that completes having made **zero tool calls** records `no_tool_calls` instead of `ok` (see [Zero-tool-call runs](#11b-zero-tool-call-runs-2985)). Off by default, and rows written before the column existed read `false`, so an unmarked job is completely unaffected and may legitimately finish with no tool call. Only meaningful for `agent-prompt` jobs -- `command` and `webhook` actions report no tool count at all and can never reach the outcome. |
+| `expiresAt` | string (ISO-8601) | `null` | Optional hard expiry instant. Once `now >= expiresAt` the job **stops executing**: the scheduler suppresses the fire and never invokes the action. Expiry **suppresses only** - it does not delete or disable the row, so the job stays visible with its history intact for a human to inspect and extend. Checked at both schedule time (cheap early-out) and fire time (the authoritative gate, so a past-due job or a manual run cannot leak through). `null` means no expiry - exactly today's behaviour. Pair with `deleteJobAfterRun` if removal is actually wanted. |
+
+### 3.2.1 Per-Job Timeout (`metadata.timeoutSeconds`)
+
+A job overrides the scheduler's `defaultJobTimeoutSeconds` by carrying a `timeoutSeconds` value in
+its `metadata`. `command` jobs use the same key, with their own lower default of **120 seconds**.
+
+| Value | Meaning |
+|-------|---------|
+| absent / `null` | Use the default (`defaultJobTimeoutSeconds`, or `120` for `command` jobs). |
+| positive integer | Cancel the run after that many seconds. |
+| **`0`** | **Unlimited** - no timeout is armed at all (#2904). |
+| negative / unparseable | Invalid. A **warning** is logged naming the job id and the offending value, and the default is used. |
+
+`0` is an **explicit sentinel**, deliberately distinguished from "unset": it is how an operator says
+"this job legitimately runs long". Before this existed the only way to express it was an arbitrary
+large magic number, and a `0` was silently discarded.
+
+**Unlimited removes the per-job cap, not all cancellation.** An unlimited run is still bounded by
+the ambient cancellation token, so gateway shutdown, scheduler stop, and an explicit cancel all
+still end it promptly. It will not, however, be stopped by anything else - use it only for jobs
+whose runtime is genuinely unbounded, and prefer a generous positive value where you can name one.
+
+The value is accepted in every shape job metadata can carry it in - JSON number, JSON string, `int`,
+`long`, `double`, `string` - so the sentinel behaves identically whether the job came from
+`config.json`, the `cron` tool, or the API.
+
+```json
+"long-running-watch": {
+  "name": "Long running watch",
+  "schedule": "0 7 * * *",
+  "actionType": "command",
+  "shellCommand": "pwsh -NoProfile -File ./scripts/watch.ps1",
+  "metadata": { "timeoutSeconds": 0 }
+}
+```
 
 ### 3.3 Complete Configuration Example
 
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Enabled": true,
-      "TickIntervalSeconds": 10,
-      "ExecutionHistorySize": 100,
-      "Jobs": {
-        "morning-briefing": {
-          "Type": "agent",
-          "Schedule": "0 9 * * *",
-          "Agent": "analyst",
-          "Prompt": "Generate a morning briefing.",
-          "Session": "persistent",
-          "Timezone": "America/New_York",
-          "OutputChannels": ["slack"],
-          "Enabled": true
+  "cron": {
+    "enabled": true,
+    "tickIntervalSeconds": 60,
+    "jobs": {
+      "morning-briefing": {
+        "name": "Morning briefing",
+        "schedule": "0 9 * * *",
+        "actionType": "agent-prompt",
+        "agentId": "analyst",
+        "message": "Generate a morning briefing.",
+        "timeZone": "America/New_York",
+        "enabled": true
+      },
+      "disk-space-check": {
+        "name": "Disk space check",
+        "schedule": "0 * * * *",
+        "actionType": "command",
+        "shellCommand": "pwsh -NoProfile -File ./scripts/check-disk.ps1",
+        "enabled": true
+      },
+      "nightly-dreaming": {
+        "name": "Nightly memory consolidation",
+        "schedule": "0 2 * * *",
+        "actionType": "memory-dreaming",
+        "agentId": "analyst",
+        "metadata": {
+          "lookbackDays": "14"
         },
-        "weekly-health-check": {
-          "Type": "system",
-          "Schedule": "0 0 * * 0",
-          "Action": "health-audit",
-          "OutputChannels": ["slack"],
-          "Enabled": true
-        },
-        "nightly-consolidation": {
-          "Type": "maintenance",
-          "Schedule": "0 2 * * *",
-          "Action": "consolidate-memory",
-          "Agents": ["analyst", "planner"],
-          "Enabled": true
-        }
+        "enabled": true
       }
     }
   }
@@ -302,353 +371,174 @@ BotNexus uses the **Cronos** library, which supports:
 
 ### Timezone Support
 
-When `Timezone` is specified in the job config, the cron expression is evaluated in that timezone. For example:
+When `timeZone` is set on a job, the cron expression is evaluated in that timezone. For example:
 
 ```json
 {
-  "Schedule": "0 9 * * *",
-  "Timezone": "America/New_York"
+  "schedule": "0 9 * * *",
+  "timeZone": "America/New_York"
 }
 ```
 
-This job runs at 9:00 AM **Eastern Time**, not UTC.
+This job runs at 9:00 AM **Eastern Time**, not UTC. Omitting `timeZone` (or setting it to `UTC`) evaluates
+the expression in UTC.
+
+**Id resolution accepts either family.** A timezone id is resolved through a single canonical resolver
+(`CronTimeZoneResolver`, issue #2748), which tries the id as given and then converts between the Windows
+and IANA spellings and retries. `America/New_York` and `Eastern Standard Time` therefore both resolve on
+either a Linux or a Windows host, and the scheduler's next-run computation, the `cron` tool's validation
+and the missed-run detector all agree on the result - before #2748 three independent implementations
+disagreed, so a job could fire at the wrong hour while the action that ran it reported the right one.
+
+**An unresolvable id degrades to UTC rather than throwing**, because resolution runs inside the scheduler
+loop and a throw would stop all scheduling. This is fail-safe, not silent-correct: check the job's reported
+next-run time after setting an unusual id, since a typo lands you in UTC instead of erroring.
 
 ---
 
 ## 5. Agent Session Modes
 
-Agent jobs can operate in different session modes, controlling whether output is accumulated or isolated.
+Agent-prompt jobs run in a session derived from the job, not from a configurable `session` field
+(there is no such field on a cron job). The scheduler resolves the job's session and conversation
+deterministically:
 
-### Mode: `new` (Default)
+- Sessions created for a job are **`cron:`-prefixed** and carry the job id slug
+  (`cron:{jobIdSlug}:...`), which is what lets the scheduler re-bind a job's prior sessions onto its
+  canonical conversation and what scopes cleanup.
+- A job's canonical conversation is titled `cron:{jobId}`; every `cron:*` session for that agent is
+  rebound onto it, so a job's history accumulates in one place across runs.
+- Setting `deleteAfterRun` to `true` deletes the run's session and transcript after the run
+  completes (success, timeout, error or abort), but **only** when the session id begins with
+  `cron:` - so a misconfigured flag cannot remove an unrelated long-lived session.
 
-Create a new session for each job execution. Output is **isolated**.
-
-```json
-{
-  "Session": "new"
-}
-```
-
-Resulting session key: `cron:{jobname}:{yyyyMMddHHmmss}`
-
-**Use case:** One-off reports, independent prompts, no conversation history.
-
-### Mode: `persistent`
-
-Reuse the same session across all job executions. Output is **accumulated**.
-
-```json
-{
-  "Session": "persistent"
-}
-```
-
-Resulting session key: `cron:{jobname}`
-
-**Use case:** Multi-turn conversations, iterative refinement, conversation history matters.
-
-### Mode: `named:<key>`
-
-Use a custom session key.
-
-```json
-{
-  "Session": "named:my-custom-key"
-}
-```
-
-Resulting session key: `my-custom-key`
-
-**Use case:** Shared sessions, referencing a session created elsewhere.
+Leave `deleteAfterRun` off for long-lived reporting jobs that intentionally accumulate context
+across runs; use compaction for those instead.
 
 ---
 
-## 6. Channel Output Routing
+## 6. Output Routing
 
-Agent and system jobs can route their output to one or more channels.
+There is no `outputChannels` field on a cron job. A job's output goes wherever its action sends it:
 
-**Configuration:**
-```json
-{
-  "OutputChannels": ["slack", "discord", "email"]
-}
-```
+- **`agent-prompt`** - the agent's response is delivered through the agent's own channel bindings
+  and appears in the job's canonical `cron:{jobId}` conversation.
+- **`webhook`** - the payload is POSTed to `webhookUrl`.
+- **`command`** - stdout/stderr are captured into the run record; nothing is sent to a channel.
 
-The cron service will attempt to send the output to each named channel if it is registered and running.
-
-### Supported Channels (Built-in)
-
-- `slack` — Slack messaging
-- `discord` — Discord messaging
-- `telegram` — Telegram messaging
-- `email` — Email (if configured)
-- Custom channels from extensions
-
-### No Output Routing
-
-If `OutputChannels` is empty or null, output is **logged only** and not routed to channels.
-
-```json
-{
-  "OutputChannels": []
-}
-```
+Run output and errors are always recorded on the run record regardless of action type, and are
+readable via `GET /api/cron/{jobId}/runs` and the `cron` tool's `history` action.
 
 ---
 
-## 7. Built-in System Actions
+## 7. Built-in Actions
 
-System jobs execute pluggable system actions via the `ISystemActionRegistry`.
+Every action is a registered `ICronAction`. The complete set registered by
+`AddBotNexusCron` is:
 
-### 7.1 `check-updates`
+| `actionType` | Implementation | Notes |
+|---|---|---|
+| `agent-prompt` | `AgentPromptAction` | Default action; sends a prompt to the target agent |
+| `command` | `CommandCronAction` | Shell script; authorized through the `exec` tool policy |
+| `webhook` | `WebhookAction` | POSTs to the validated `webhookUrl` |
+| `heartbeat` | `HeartbeatAction` | Auto-provisioned per agent (system job) |
+| `memory-dreaming` | `MemoryDreamingCronAction` | See [8.4](#_8-4-memory-dreaming) |
+| `skill-review` | `SkillReviewCronAction` | Auto-provisioned per agent (system job); see [8.7](#_8-7-skill-review) |
+| `agent-converse` | `AgentConverseCronAction` | See [8.6](#_8-6-agent-converse) |
 
-**Name:** `check-updates`  
-**Description:** Reports the currently running assembly version.
+Two background services run alongside the scheduler and are **not** cron jobs - they need no job
+definition and cannot be scheduled:
 
-Checks the entry assembly version and returns the version number. External update feed integration is pending.
-
-**Configuration:**
-```json
-{
-  "Type": "system",
-  "Action": "check-updates",
-  "Schedule": "0 0 * * 0"
-}
-```
-
-**Output:**
-```text
-[check-updates] BotNexus is running version 1.0.0.0. External update feed integration is pending.
-```
-
-### 7.2 `health-audit`
-
-**Name:** `health-audit`  
-**Description:** Runs internal health checks and reports status.
-
-Executes all registered `HealthCheck` services and summarizes their status.
-
-**Configuration:**
-```json
-{
-  "Type": "system",
-  "Action": "health-audit",
-  "Schedule": "0 0 * * 0",
-  "OutputChannels": ["slack"]
-}
-```
-
-**Output:**
-```text
-[health-audit] Overall status: Healthy. Checks: database: Healthy, services: Healthy, memory: Healthy
-```
-
-### 7.3 `extension-scan`
-
-**Name:** `extension-scan`  
-**Description:** Lists dynamically loaded extensions and their registration status.
-
-Reports all loaded extensions, organized by service type.
-
-**Configuration:**
-```json
-{
-  "Type": "system",
-  "Action": "extension-scan",
-  "Schedule": "0 0 * * 0",
-  "OutputChannels": ["slack"]
-}
-```
-
-**Output:**
-```text
-[extension-scan] Registered extension services: 5
-- IChannel: discord, slack, telegram
-- ISystemAction: health-audit, check-updates
-Load contexts: 3
-```
+- **`CronRunRetentionHostedService`** - purges completed/failed/timed-out run records older than
+  `RetentionDays` (default 30), checking every `CheckInterval` (default 1 hour). Bound from
+  `CronRunRetentionOptions`. Prevents unbounded growth of `cron.sqlite`.
+- **`MissedRunDetectionService`** - see [8.8](#_8-8-missed-run-detection).
 
 ---
 
-## 8. Built-in Maintenance Actions
+## 8. Action Reference
 
-Maintenance jobs perform internal housekeeping tasks.
+### 8.1 `agent-prompt`
 
-### 8.1 `consolidate-memory`
+**Name:** `agent-prompt`
+**Description:** The default action. Sends a prompt to the target agent through the agent runner.
 
-**Name:** `consolidate-memory`  
-**Description:** Consolidates daily memory files into a single consolidated entry per agent.
+**Job fields:**
+- `agentId`: Target agent (required)
+- `message`: Prompt text, **or** `templateName` + `templateParameters`
+- `model`: Optional model override, validated against the model registry at create/update time
 
-Processes each agent's memory directory and combines daily entries into a consolidated memory file for more efficient storage and retrieval.
+### 8.2 `command`
 
-**Configuration Properties:**
-- `Action`: `"consolidate-memory"`
-- `Agents`: List of agent names to consolidate (required)
+**Name:** `command`
+**Description:** Runs `shellCommand` as a script, costing no model turn.
 
-**Configuration:**
-```json
-{
-  "Type": "maintenance",
-  "Action": "consolidate-memory",
-  "Schedule": "0 2 * * *",
-  "Agents": ["analyst", "planner", "writer"]
-}
-```
+**Job fields:**
+- `shellCommand`: Script to run (required)
 
-**Output:**
-```text
-analyst: success=true, files=5, entries=120
-planner: success=true, files=3, entries=87
-writer: success=false, files=0, entries=0
-```
+Authorization runs at **both** authoring time (create/update through the `cron` tool) and firing
+time, both routed through the same `exec` tool policy via `ICommandCronAuthorizer`, so a job that
+would be refused at fire time cannot be stored silently.
 
-**Metadata:**
-```json
-{
-  "agentsProcessed": 3,
-  "agentsSucceeded": 2,
-  "dailyFilesProcessed": 8,
-  "entriesConsolidated": 207
-}
-```
+### 8.3 `webhook`
 
-### 8.2 `cleanup-sessions`
+**Name:** `webhook`
+**Description:** POSTs to `webhookUrl` on the schedule.
 
-**Name:** `cleanup-sessions`  
-**Description:** Deletes sessions older than the specified retention period.
-
-Iterates all stored sessions and deletes those whose last activity is older than `SessionCleanupDays`.
-
-**Configuration Properties:**
-- `Action`: `"cleanup-sessions"`
-- `SessionCleanupDays`: Retention period in days (default: 30)
-
-**Configuration:**
-```json
-{
-  "Type": "maintenance",
-  "Action": "cleanup-sessions",
-  "Schedule": "0 3 * * 0",
-  "SessionCleanupDays": 30
-}
-```
-
-**Output:**
-```text
-Deleted 42 sessions older than 30 days.
-```
-
-**Metadata:**
-```json
-{
-  "sessionsChecked": 157,
-  "sessionsDeleted": 42,
-  "retentionDays": 30
-}
-```
-
-### 8.3 `rotate-logs`
-
-**Name:** `rotate-logs`  
-**Description:** Archives log files older than the specified retention period.
-
-Moves old log files to an `archive/` subdirectory within the logs path.
-
-**Configuration Properties:**
-- `Action`: `"rotate-logs"`
-- `LogRetentionDays`: Retention period in days (default: 30)
-- `LogsPath`: Override logs directory (default: `~/.botnexus/logs`)
-
-**Configuration:**
-```json
-{
-  "Type": "maintenance",
-  "Action": "rotate-logs",
-  "Schedule": "0 4 * * *",
-  "LogRetentionDays": 30,
-  "LogsPath": "~/.botnexus/logs"
-}
-```
-
-**Output:**
-```text
-Archived 8 log files older than 30 days.
-```
-
-**Metadata:**
-```json
-{
-  "archivedFiles": 8,
-  "retentionDays": 30,
-  "logsPath": "/home/user/.botnexus/logs"
-}
-```
+**Job fields:**
+- `webhookUrl`: Absolute `http`/`https` URL with no embedded credentials (required) - see
+  [2.3](#_2-3-webhook-jobs-actiontype-webhook)
 
 ### 8.4 `memory-dreaming`
 
 **Name:** `memory-dreaming`  
-**Description:** Periodic memory consolidation via LLM — reads recent daily notes, builds a consolidation prompt, and dispatches a session to update `MEMORY.md` with distilled insights.
+**Description:** Implemented LLM review action that reads recent daily notes and dispatches a consolidation prompt. Dispatch does not prove that workspace `MEMORY.md` was updated.
 
-Unlike `consolidate-memory` (which merges files mechanically), memory dreaming uses an LLM to extract patterns, decisions, and knowledge from daily notes and weave them into the agent's long-term memory.
+**Main branch:** source-verified at `08ae4a8c353ce8a6ecfa6d866c53b70be86a8310` in `MemoryDreamingCronAction` and `CronServiceCollectionExtensions`. The action is registered, but no memory-dreaming startup provisioner is registered. A job must be configured explicitly; the example schedule below is not a platform default.
 
-**Configuration Properties:**
-- `Action`: `"memory-dreaming"`
+**Persistence limitation:** The prompt asks for an append to workspace `MEMORY.md` through `memory_save`. Under the default memory root, `file_path="MEMORY.md"` resolves to `memory/MEMORY.md`, not the workspace-root file loaded into prompt context. Omitting the path saves a daily note; parent traversal is rejected. [#4818](https://github.com/sytone/botnexus/issues/4818) tracks this mismatch. Do not broaden write access or change the memory root to work around it. See [Memory consolidation](development/workspace-and-memory.md#memory-consolidation) for normal-turn boundaries and future authority work.
+
+**Job fields:**
+- `actionType`: `"memory-dreaming"`
+- `agentId`: Agent whose memory is consolidated (required)
 - `lookbackDays` (in job metadata): Number of days of daily notes to read (default: 14)
 - `maxContentChars` (in job metadata): Maximum characters of source material (default: 50000)
 
 **Configuration:**
 ```json
 {
-  "Type": "maintenance",
-  "Action": "memory-dreaming",
-  "Schedule": "0 3 * * 0",
-  "Agent": "my-agent",
-  "Metadata": {
-    "lookbackDays": 14,
-    "maxContentChars": 50000
+  "actionType": "memory-dreaming",
+  "schedule": "0 3 * * 0",
+  "agentId": "my-agent",
+  "metadata": {
+    "lookbackDays": "14",
+    "maxContentChars": "50000"
   },
-  "Enabled": true
+  "enabled": true
 }
 ```
 
 **Behavior:**
 - Reads `memory/YYYY-MM-DD.md` files from the last N days in the agent's workspace
 - Builds a consolidation prompt with the collected daily notes as context
-- Dispatches a cron-triggered session that writes distilled insights back to `MEMORY.md`
+- Dispatches a cron-triggered session with instructions to append distilled insights; the persistence limitation above still applies
 - Skips execution if no daily notes exist in the lookback window
 
-**Use case:** Keep an agent's long-term memory fresh and relevant without manual curation. Schedule weekly during off-hours.
+**Use case:** Review recent notes for possible durable insights. The configured action is not a verified automatic update of long-term prompt memory.
 
-### 8.5 `cron-run-retention`
+### 8.5 Cron run retention (background service, not a job)
 
-**Name:** `cron-run-retention`  
+**Type:** `CronRunRetentionHostedService` / `CronRunRetentionOptions`
 **Description:** Purges old completed cron run history records to prevent unbounded database growth.
 
 Periodically sweeps the cron run store and deletes records with status `Completed`, `Failed`, or `Timeout` that are older than the configured retention period.
 
-**Configuration Properties:**
-- `Action`: `"cron-run-retention"`
-- `RetentionDays`: Number of days to keep run records (default: 30)
-- `CheckIntervalMinutes`: How often the service checks for expired records (default: 60)
+This is a **hosted background service**, not a cron action - it runs automatically and has no job
+definition, no `actionType` and no schedule. It is configured from `CronRunRetentionOptions`:
 
-**Configuration:**
-```json
-{
-  "Type": "maintenance",
-  "Action": "cron-run-retention",
-  "Schedule": "0 4 * * *",
-  "Metadata": {
-    "RetentionDays": 30,
-    "CheckIntervalMinutes": 60
-  },
-  "Enabled": true
-}
-```
-
-**Output:**
-```text
-Purged 156 cron run records older than 30 days.
-```
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `RetentionDays` | int | `30` | Number of days to retain completed/failed run records |
+| `CheckInterval` | TimeSpan | `01:00:00` | How often the service checks for expired runs |
 
 **Use case:** Prevent the cron SQLite database from growing indefinitely on long-running instances.
 
@@ -668,22 +558,21 @@ Delegates to `IAgentExchangeService.ConverseAsync` — the same pathway used by 
 **Configuration:**
 ```json
 {
-  "Type": "system",
-  "Action": "agent-converse",
-  "Schedule": "0 9 * * 1-5",
-  "Agent": "coordinator",
-  "Metadata": {
+  "actionType": "agent-converse",
+  "schedule": "0 9 * * 1-5",
+  "agentId": "coordinator",
+  "metadata": {
     "targetAgentId": "reporter",
     "message": "Generate the morning status report.",
     "objective": "Get daily status",
-    "maxTurns": 5
+    "maxTurns": "5"
   }
 }
 ```
 
 **Behavior:**
 - Subject to exchange budget enforcement — skipped if pair is in cooldown or at daily cap
-- The initiating agent is the one specified in the job's `Agent` field
+- The initiating agent is the one specified in the job's `agentId` field
 - Results are logged; output channels can route the response
 
 **Use case:** Schedule recurring agent check-ins, status syncs, or delegation workflows on a fixed schedule.
@@ -708,23 +597,22 @@ A default-enabled `skill-review` job is **auto-provisioned at startup for every 
 **Configuration:**
 ```json
 {
-  "Type": "maintenance",
-  "Action": "skill-review",
-  "Schedule": "0 4 * * *",
-  "Agent": "my-agent",
-  "System": true,
-  "Enabled": true,
-  "Metadata": {
-    "enabled": true,
-    "minToolCalls": 5,
-    "lookbackHours": 24,
-    "maxSessions": 50
+  "actionType": "skill-review",
+  "schedule": "0 4 * * *",
+  "agentId": "my-agent",
+  "system": true,
+  "enabled": true,
+  "metadata": {
+    "enabled": "true",
+    "minToolCalls": "5",
+    "lookbackHours": "24",
+    "maxSessions": "50"
   }
 }
 ```
 
 **Behavior:**
-- Auto-provisioned per user-defined agent at startup (job id `skill-review:<agentId>`), default schedule `0 4 * * *` (daily at 04:00, staggered after `memory-dreaming`)
+- Auto-provisioned per user-defined agent at startup (job id `skill-review:<agentId>`), default schedule `0 4 * * *` (daily at 04:00; this does not imply a memory-dreaming job is automatically scheduled)
 - Reads the last `lookbackHours` of the agent's session transcripts, scanning at most `maxSessions` sessions newest-first
 - Derives signals: total tool-call count, whether a skill was loaded (`skills`/`skills_list`/`skill_view`), and whether a `skill_manage` call errored
 - Runs the review pass only when `enabled` is true and the aggregated tool-call count meets `minToolCalls`
@@ -754,50 +642,305 @@ For jobs with `catchUp: true` in their metadata, BotNexus will execute the misse
 
 Missed runs appear in `cron history` output and via `GET /api/cron/{jobId}/runs`.
 
+### 8.9 `plugin-update`
+
+Updates every installed plugin whose per-plugin update preference is enabled. Introduced by #2683
+as slice 4 of the plugin epic #2623.
+
+**Agentless.** Like `command`, it carries no `agentId`, bonds no session, and resolves no model, so
+it costs nothing and records no token usage. Cost fields stay `null` ("not measured") rather than
+zero - a zero would rank a job with no model concept as the cheapest agent job on the platform.
+
+**One job for the whole gateway.** Plugins are installed into the gateway, not into an agent, so a
+per-agent job would run the same update N times over one plugin root and race itself. The job id is
+the fixed constant `plugin-update`.
+
+**Provisioned on first install, never overwritten.** The job is created the first time a plugin is
+installed successfully - not at startup, because an always-up gateway that never restarts would
+never provision, and every test restarts the process so the defect would pass CI. Once the job
+exists it is never modified: a schedule you edit, or a job you disable, survives every subsequent
+install. To turn the loop off, **disable** the job rather than delete it - a deleted job is
+recreated by the next install, matching `heartbeat` and `skill-review` semantics.
+
+**Default schedule:** `0 3 * * *` (daily at 03:00).
+
+**Partial failure is not a failed run.** Each plugin is updated independently; one plugin whose
+source is unreachable does not stop the others. The run is recorded as an error only when *every*
+enabled plugin failed, because at that point there is no partial success left to protect. A pinned
+plugin (update preference disabled) is never even fetched.
+
 ---
 
 ## 9. CronTool — Runtime Job Management
 
-Agents can schedule, remove, or list cron jobs at runtime using the **`cron` tool**.
+Agents can create, update, delete, run, list, and inspect cron jobs at runtime using the
+**`cron` tool**.
 
 ### 9.1 Tool Definition
 
 **Name:** `cron`  
-**Description:** Schedule or manage cron jobs. Actions: list, create, update, delete, run, history.
+**Description:** Schedule or manage cron jobs. Actions: list, create, update, delete, run, history, costs.
+
+A job created through the tool is one of two action types:
+
+| `actionType` | What it does on each fire | Required fields | Cost |
+|---|---|---|---|
+| `agent-prompt` (default) | Sends a prompt to the target agent | `message` **or** `templateName` | One full model turn per fire |
+| `command` | Runs `shellCommand` as a script | `shellCommand` | No tokens unless the script escalates |
+
+`actionType` is optional and defaults to `agent-prompt`, so callers that omit it behave
+exactly as before. Validation is per action type: an `agent-prompt` job still requires a
+prompt source, and a `command` job still requires a non-empty `shellCommand` - neither is
+allowed to be created with nothing to do.
+
+`shellCommand` is an arbitrary-execution surface, so it carries the same authorization
+posture as the `exec` path. See [Command job authorization](#command-job-authorization).
+
+#### Command Job Authorization
+
+Command jobs are gated by `ICommandCronAuthorizer` (issue #2462). The default implementation,
+`ToolPolicyCommandCronAuthorizer`, does **not** define its own policy language: it delegates to
+the existing tool-boundary policy surface - `IToolPolicyProvider`, `ToolRiskLevel` and
+`ToolApprovalFallback` - classifying the command under the **`exec`** tool name. There is one
+policy vocabulary, not two, so setting `askFallback: deny` for an agent closes the interactive
+`exec` path and the unattended cron command path with a single switch. **No new configuration
+keys are introduced by command-job authorization.**
+
+Both lifecycle phases are gated, deliberately and distinctly:
+
+| Phase | Where | What happens on denial |
+|---|---|---|
+| **Authoring** - `create`/`update` carrying a `shellCommand` via the `cron` tool | `CronTool` | `UnauthorizedAccessException` with the reason. **Nothing is written to the store**, so a denied command never becomes a job. |
+| **Firing** - every scheduled or manual execution | `CommandCronAction`, immediately before `Process.Start()` | The reason is logged at `Error`, the run is recorded with status `error` carrying the reason, and **no subprocess is started**. |
+
+Firing is re-evaluated independently of authoring rather than trusting the stored job, because
+policy can be tightened after a job is created, and jobs can arrive through paths other than the
+`cron` tool (for example `POST /api/cron` or an imported store).
+
+The decision order, identical in both phases:
+
+1. Extract the leading executable token from the command. If none can be extracted - the command
+   opens with a shell operator, substitution, or is empty - it is **unclassifiable** and is
+   **denied**. This is fail-closed by design, matching the posture of `ChannelFailureClassifier`
+   (#2447): the gate never guesses.
+2. Resolve `IToolPolicyProvider`. If it is unavailable the policy cannot be evaluated, so the
+   command is **denied**. An unregistered dependency therefore fails closed rather than silently
+   disabling the gate.
+3. If the `exec` tool does not require approval, **allow**.
+4. If it does require approval, consult the agent's approval fallback. A cron firing is
+   unattended, so no approval workflow can ever service the request: `deny` refuses,
+   `allow` (the platform default, per #2391) permits with an audit log entry.
+
+Because `ToolApprovalFallback.Allow` remains the default, out of the box a command job still runs
+and simply records an audit line; blocking is opt-in via `askFallback: deny`. The unclassifiable
+and missing-provider paths deny unconditionally regardless of that setting.
+
+`agent-prompt` jobs are entirely unaffected: the gate is only consulted for `command` jobs.
+
+The action set is defined by the tool's input schema in
+`src/gateway/BotNexus.Cron/Tools/CronTool.cs` and is exactly:
+`list`, `create`, `update`, `delete`, `run`, `history`, `costs`. There is no `schedule` action and no
+`remove` action — use `create` and `delete`. Jobs are addressed by `jobId` (the server-generated
+identifier returned by `create` and listed by `list`), not by name.
 
 ### 9.2 Actions
 
-#### `history`
+#### `create`
 
-Retrieves execution history for a specific job.
+Creates a new job.
 
 **Arguments:**
-- `action` = `"history"`
+- `action` = `"create"`
+- `name`: Job name (required)
+- `schedule`: Standard 5-field cron expression (required)
+- `actionType`: `"agent-prompt"` (default) or `"command"` (optional)
+- `message`: Prompt text - `agent-prompt` jobs only
+- `templateName` / `templateParameters`: Named prompt template - `agent-prompt` jobs only
+- `shellCommand`: Script to run - required for `command` jobs
+- `timeZone`: IANA timezone the schedule is evaluated in (optional; defaults to UTC)
+- `agentId`: Target agent (optional; defaults to the calling agent)
+- `model`: Model override - `agent-prompt` jobs only (optional)
+- `enabled`: Whether the job is enabled (optional; default `true`)
+- `deleteAfterRun`: Delete the run's ephemeral cron-scoped **session** and transcript after each run (optional; default `false`)
+- `deleteJobAfterRun`: One-shot lifecycle - the scheduler deletes the **job itself** after its first terminal run (optional; default `false`)
+- `expiresAt`: ISO-8601 instant (e.g. `"2026-12-31T00:00:00Z"`) after which the job stops firing (optional; omit for no expiry)
+- `failureAlertsEnabled`: Master opt-in for this job's failure alerts (optional; default `false`)
+- `failureAlertConversationId`: Conversation the alert is delivered to (optional). Must resolve to an existing conversation - an unresolvable target is refused at the tool seam by the same shared validator the REST API uses, because an alert that could never deliver is worse than none.
+
+::: warning Alerting needs BOTH fields
+`failureAlertsEnabled: true` with no `failureAlertConversationId` delivers nothing - there is
+deliberately no implicit fallback conversation. Set both, or the job stays silently unalertable.
+:::
+
+::: tip Prefer `deleteJobAfterRun` over a self-delete prompt
+Writing "delete this cron job after running" into a job's prompt is a request with no
+enforcement: if the turn ends early the job survives and keeps firing forever. Set
+`deleteJobAfterRun: true` instead - the scheduler performs the deletion itself from the
+post-run teardown, so it happens on every terminal outcome including timeout and abort.
+:::
+
+**Example - a zero-token command job:**
+```json
+{
+  "action": "create",
+  "name": "disk-space-check",
+  "schedule": "0 * * * *",
+  "actionType": "command",
+  "shellCommand": "pwsh -NoProfile -File ./scripts/check-disk.ps1"
+}
+```
+
+Returns the created job serialized as JSON, including its generated `id`.
+
+#### `update`
+
+Updates an existing job. Every field except `jobId` is optional; an omitted field keeps its
+current value.
+
+**Arguments:**
+- `action` = `"update"`
 - `jobId`: Job identifier (required)
-- `limit`: Maximum entries to return (1–100, default: 20)
+- Any of the `create` fields above
+
+Passing an **empty string** for `expiresAt` clears an existing expiry; omitting the field
+leaves the current expiry untouched. The same rule applies to `failureAlertConversationId`:
+an empty string clears the alert target, an omitted field leaves it (and `failureAlertsEnabled`)
+exactly as stored, so an unrelated edit can never silently un-alert a job.
+
+Updating prompt-irrelevant fields (`schedule`, `timeZone`, `name`, `enabled`) on a
+`command` job does **not** require a `message` or `templateName`, and preserves the
+existing `shellCommand`.
+
+Supplying a different `actionType` switches the job and clears the fields belonging to the
+other action type, so a job is never left as a `command` job holding a stale prompt (or an
+`agent-prompt` job holding an orphaned `shellCommand`). A switch must satisfy the new type's
+validation in the same call - e.g. switching to `agent-prompt` requires a `message` or
+`templateName`.
 
 **Example:**
 ```json
 {
-  "action": "history",
-  "jobId": "morning-briefing",
-  "limit": 10
+  "action": "update",
+  "jobId": "3f1c8b0a9d2e4f5a8b7c6d5e4f3a2b1c",
+  "schedule": "0 9 * * MON-FRI",
+  "enabled": false
+}
+```
+
+Returns the saved job serialized as JSON.
+
+#### `delete`
+
+Deletes a cron job.
+
+**Arguments:**
+- `action` = `"delete"`
+- `jobId`: Job identifier (required)
+
+**Example:**
+```json
+{
+  "action": "delete",
+  "jobId": "3f1c8b0a9d2e4f5a8b7c6d5e4f3a2b1c"
 }
 ```
 
 **Response:**
 ```text
-Run History for 'morning-briefing' (last 10 runs):
-
-| # | Started | Duration | Status | Result |
-|---|---------|----------|--------|--------|
-| 1 | 2026-06-10 09:00:05Z | 12.3s | Completed | Success |
-| 2 | 2026-06-09 09:00:03Z | 8.1s | Completed | Success |
+Deleted cron job '3f1c8b0a9d2e4f5a8b7c6d5e4f3a2b1c'.
 ```
+
+#### `run`
+
+Triggers an immediate, out-of-schedule execution of a job.
+
+**Arguments:**
+- `action` = `"run"`
+- `jobId`: Job identifier (required)
+
+The scheduler stamps the run identity before launching scheduler-owned execution, then returns
+promptly with an acceptance response:
+
+```json
+{
+  "runId": "7d985ca245cd4afeafaf6d933d7e8916",
+  "jobId": "3f1c8b0a9d2e4f5a8b7c6d5e4f3a2b1c",
+  "status": "accepted",
+  "startedAt": "2026-08-13T20:15:30.1234567+00:00",
+  "pollWith": "cron history"
+}
+```
+
+`accepted` means the scheduler owns the run; it is not a terminal run status. The run continues
+after the requesting tool call ends or is cancelled, while remaining subject to the scheduler's
+normal per-job timeout (including the unlimited sentinel), gateway shutdown, operator cancellation,
+and same-job serialization. Use the `history` action with the returned `jobId` to poll for the
+terminal run record.
+
+#### `history`
+
+Retrieves execution history for one job, or recent runs across every job the caller may manage.
+
+**Arguments:**
+- `action` = `"history"`
+- `jobId`: Job identifier (**optional**). Omit it to query across jobs.
+- `limit`: Maximum entries to return (1–100, default: 20)
+- `failedOnly`: Return only runs that did not succeed - `error`, `timed_out`, `no_tool_calls`, `delivery_failed`, and `missed` (optional; default `false`)
+
+**Example - one job:**
+```json
+{
+  "action": "history",
+  "jobId": "3f1c8b0a9d2e4f5a8b7c6d5e4f3a2b1c",
+  "limit": 10
+}
+```
+
+**Example - "which of my jobs have failed recently?":**
+```json
+{
+  "action": "history",
+  "failedOnly": true,
+  "limit": 50
+}
+```
+
+Without a `jobId` the query is scoped to the jobs the caller may manage, using the same
+authorisation rule as the per-job path; an agent with no manageable jobs gets an empty result
+rather than every job's history.
+
+Returns the matching run records serialized as JSON, newest first. Each record carries a `cost`
+object (see [12.6](#126-per-run-cost-metrics-2641)); a `null` field there means "not measured",
+not zero.
+
+#### `costs`
+
+Per-job cost rollup over a bounded window, ordered by **total** spend descending (#2641).
+
+**Arguments:**
+- `action` = `"costs"`
+- `windowDays`: Days of run history to roll up (optional; default `7`). Clamped to the configured
+  run retention.
+
+**Example - "which of my jobs cost the most?":**
+```json
+{
+  "action": "costs",
+  "windowDays": 7
+}
+```
+
+Scope is the jobs the caller may manage, using the same authorisation rule as the `history` path;
+an agent with no manageable jobs gets an empty result rather than every job's costs.
+
+Each entry reports `runCount`, `measuredRunCount`, `totalTokens`, `averageTokensPerRun`,
+`totalToolCalls`, `totalTurns`, `totalDurationMs`, the effective `windowDays`, and
+`windowTruncatedByRetention`. Jobs whose runs measured nothing report `null` totals and sort last
+— they are never treated as zero-cost.
 
 #### `list`
 
-Lists all registered cron job names.
+Lists the cron jobs visible to the calling agent, serialized as JSON.
 
 **Arguments:**
 - `action` = `"list"`
@@ -809,68 +952,7 @@ Lists all registered cron job names.
 }
 ```
 
-**Response:**
-```text
-morning-briefing
-weekly-health-check
-nightly-consolidation
-```
-
-#### `remove`
-
-Removes a cron job by name.
-
-**Arguments:**
-- `action` = `"remove"`
-- `name`: Job name to remove (required)
-
-**Example:**
-```json
-{
-  "action": "remove",
-  "name": "morning-briefing"
-}
-```
-
-**Response:**
-```text
-Cron job 'morning-briefing' removed
-```
-
-#### `schedule`
-
-Schedules a new agent job.
-
-**Arguments:**
-- `action` = `"schedule"`
-- `name`: Job name (optional; auto-generated if omitted)
-- `agent`: Agent name to run (required)
-- `prompt`: Prompt text (required)
-- `schedule` or `expression`: Cron expression (required)
-- `session`: Session mode: `new`, `persistent`, or `named:<key>` (optional)
-- `timezone`: Timezone ID (optional)
-- `enabled`: Whether job is enabled (optional; default: `true`)
-- `output_channels`: List of channel names (optional)
-
-**Example:**
-```json
-{
-  "action": "schedule",
-  "name": "dynamic-report",
-  "agent": "analyst",
-  "prompt": "Generate a real-time report on active incidents.",
-  "schedule": "*/30 * * * *",
-  "session": "persistent",
-  "timezone": "America/Los_Angeles",
-  "output_channels": ["slack"],
-  "enabled": true
-}
-```
-
-**Response:**
-```text
-Agent cron job 'dynamic-report' scheduled with expression '*/30 * * * *'
-```
+Returns the visible job definitions serialized as JSON.
 
 ---
 
@@ -913,7 +995,7 @@ Manually trigger a job outside its schedule. Returns `404` if not found.
 ```json
 {
   "id": "run-id",
-  "jobId": "morning-briefing",
+  "jobId": "3f1c8b0a9d2e4f5a8b7c6d5e4f3a2b1c",
   "status": "accepted"
 }
 ```
@@ -967,6 +1049,18 @@ System jobs are excluded from the list by default, matching the API behaviour.
 
 The legacy `HeartbeatService` and `AgentConfig.CronJobs` have been replaced by the centralized `CronService`.
 
+### Heartbeat ownership and configuration
+
+**Main branch:** source-verified at `08ae4a8c353ce8a6ecfa6d866c53b70be86a8310`. This section owns the heartbeat feature and configuration relationship; other references link here.
+
+`HeartbeatCronProvisioner`, registered by `AddBotNexusCron`, creates and synchronizes system jobs named `heartbeat:<agentId>` from each registered descriptor's `heartbeat` object. The action type is `heartbeat`, executed by `HeartbeatAction` through `CronScheduler`. There is no separate `HeartbeatService` timer or health-check adapter.
+
+Configure `agents.<id>.heartbeat`, not `gateway.heartbeat.*`. The old gateway `Heartbeat.Enabled` and `Heartbeat.IntervalSeconds` settings have no current declaration, binder, or consumer and do not control these jobs. A present `HeartbeatAgentConfig` defaults to `enabled: true` and `intervalMinutes: 30`; an absent object does not enable a job. The provisioner converts minutes and optional active hours to a cron expression. Disabling the object removes the corresponding system-owned job; runtime agent creation and updates also invoke provisioning.
+
+`agents.defaults.heartbeat` is declared and bound, but current `PlatformConfigAgentSource` does not merge agent defaults into descriptors (#3515). Set the heartbeat object on the individual agent. Do not infer effective inheritance from the defaults schema.
+
+`HeartbeatAction` skips quiet hours and an absent or effectively empty `HEARTBEAT.md`. Scheduled runs defer while the agent is busy. This is periodic agent work, not an HTTP keepalive or proof of gateway health. Inspect system jobs and their run history using the scheduling interfaces described in this guide.
+
 ### Legacy Configuration (Deprecated)
 
 ```json
@@ -997,18 +1091,15 @@ The legacy `HeartbeatService` and `AgentConfig.CronJobs` have been replaced by t
 
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Jobs": {
-        "analyst-morning-briefing": {
-          "Type": "agent",
-          "Schedule": "0 9 * * *",
-          "Agent": "analyst",
-          "Prompt": "Generate a morning briefing.",
-          "Session": "persistent",
-          "OutputChannels": ["slack"],
-          "Enabled": true
-        }
+  "cron": {
+    "jobs": {
+      "analyst-morning-briefing": {
+        "name": "Morning briefing",
+        "schedule": "0 9 * * *",
+        "actionType": "agent-prompt",
+        "agentId": "analyst",
+        "message": "Generate a morning briefing.",
+        "enabled": true
       }
     }
   }
@@ -1017,12 +1108,16 @@ The legacy `HeartbeatService` and `AgentConfig.CronJobs` have been replaced by t
 
 ### Migration Path
 
-1. **Move all `AgentConfig.CronJobs` to `Cron.Jobs`**:
+1. **Move all `AgentConfig.CronJobs` to `cron.jobs`**:
    - Flatten the per-agent structure into a centralized dictionary
    - Each key should be a unique job identifier (e.g., `{agent}-{job-type}`)
 
-2. **Keep the same properties**:
-   - `Type`, `Schedule`, `Agent`, `Prompt`, `Session`, `Timezone`, `OutputChannels` map directly
+2. **Map the legacy properties onto the current ones**:
+   - `Type: "agent"` -> `actionType: "agent-prompt"`
+   - `Agent` -> `agentId`, `Prompt` -> `message`, `Timezone` -> `timeZone`
+   - `Session` and `OutputChannels` have **no equivalent** - sessions are derived from the job
+     (see [Agent Session Modes](#agent-session-modes)) and output routing follows the action
+     (see [Output Routing](#output-routing))
 
 3. **Disable old jobs**:
    - Set `CronJobs` to empty array in agent configs or remove entirely
@@ -1042,6 +1137,305 @@ AgentConfig.CronJobs is deprecated. Migrate to Cron.Jobs in config.json.
 This maintains backwards compatibility while encouraging migration.
 
 ---
+
+## 11a. Failure Alerts (#2557)
+
+A cron job that starts failing every night at 02:00 is otherwise invisible until somebody reads
+the run history or the log. **Failure alerts** deliver a message to a configured conversation when
+a run terminates as `error`.
+
+### Opt-in setting
+
+Failure alerts are **opt-in per job and off by default**. Existing jobs -- including rows written
+before this feature existed -- read as disabled and behave exactly as they did before.
+
+Two job fields control it:
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `failureAlertsEnabled` | bool | `false` | Master opt-in for this job. |
+| `failureAlertConversationId` | string \| null | `null` | Conversation the alert is delivered to. |
+
+Both must be set: enabling alerts without a conversation id delivers nothing and logs a warning.
+There is deliberately **no** implicit fallback to the job's own `conversationId`, so turning alerts
+on can never accidentally retarget a job's long-lived run conversation.
+
+Both fields are writable from **every** authoring surface: the config file, `POST /api/cron` (create)
+and `PUT /api/cron/{jobId}` (update), and the agent-facing `cron` tool's `create` and `update`
+actions (#2838). Before #2838 the tool
+declared neither parameter, so no agent-created job could ever be made alertable - silent cron
+death was the default failure mode for the only surface agents have.
+
+Configuration example:
+
+```json
+{
+  "cron": {
+    "jobs": {
+      "nightly-report": {
+        "name": "Nightly Report",
+        "schedule": "0 2 * * *",
+        "actionType": "agent-prompt",
+        "agentId": "reporter",
+        "message": "Produce the nightly report.",
+        "failureAlertsEnabled": true,
+        "failureAlertConversationId": "c_ops_alerts"
+      }
+    }
+  }
+}
+```
+
+### Backoff
+
+Alerting on *every* failed run would turn a job failing each minute into the noise the alert was
+meant to detect. Instead, alerts fire on the **first** failure of an error streak and thereafter
+only at streak positions that are exact powers of two:
+
+```
+streak position: 1  2  3  4  5  6  7  8  9 ...
+alert delivered: Y  Y  .  Y  .  .  .  Y  . ...
+```
+
+The streak is derived from the job's run history (consecutive `error` rows, newest first); a
+non-error terminal outcome resets it. Concurrent in-flight (`running`) rows are skipped rather
+than treated as a reset, so a parallel run cannot silently restart the backoff.
+
+### Alert payload
+
+| Field | Notes |
+| --- | --- |
+| `JobId` | Identifier of the failing job. |
+| `JobName` | Human-readable job name. |
+| `ScheduledRunTime` | **The occurrence the run was triggered for.** Without it the recipient cannot tell *which* occurrence broke -- this is the point of the alert. |
+| `AttemptedAt` | Wall-clock instant the failure was observed. |
+| `ConsecutiveErrorCount` | Length of the current error streak (1 on the first failure). |
+| `Error` | Error text, passed through `CronExternalDeliveryRedactor.RedactSummary` before it leaves the box. |
+
+Rendered message shape:
+
+```
+Cron job failed: Nightly Report (nightly-report)
+Scheduled run time: 2026-07-31T02:00:00.0000000+00:00
+Attempted at: 2026-07-31T02:00:04.1173920+00:00
+Consecutive errors: 1
+Error: <redacted error text>
+```
+
+### Delivery and failure semantics
+
+Delivery reuses the existing conversation-message seam (`IConversationRouter` ->
+`IInboundMessageOrchestrator`), the same path the `conversation` tool's `message` action takes.
+Webhook delivery and per-channel / per-account routing are **out of scope**; so are recovery
+("healthy again") notifications.
+
+An alert-delivery failure **never fails the cron run**. The run's terminal state is persisted
+before the alert is attempted, and every exception out of the delivery sink is caught and logged
+at `Error` level.
+
+---
+
+## 11b. Zero-Tool-Call Runs (#2985)
+
+A cron run that throws is visible and retried. A cron run that **completes having done nothing** was
+not: before #2985 a job of action type `agent-prompt` whose turn produced one text reply and made no
+tool calls recorded `status: ok`, `error: null` -- byte-identical to a healthy run.
+
+That is not hypothetical. On 2026-08-11 the autonomous-maintenance job had **four consecutive runs**
+of 9-11 seconds (healthy runs of the same job take 200-550s) that made zero tool calls, each recorded
+as a success, each emitting a detailed report of PR rebases and dispatches that never happened. The
+discrepancy was found days later only by hand-counting `session_history` rows. Because run status is
+the input to the [failure-alert path](#11a-failure-alerts-2557), alerting could not fire on it either.
+
+### The `executionClass` marker
+
+The rule cannot be applied to every `agent-prompt` job: a genuine **reporting or classification** job
+may legitimately answer from context without calling a tool, and demoting those would make the signal
+worthless. So the operator declares the job's class and the scheduler enforces it:
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `executionClass` | bool | `false` | When `true`, a run that completes with zero tool invocations is recorded as `no_tool_calls` rather than `ok`. |
+
+**Off by default.** A job without the marker behaves exactly as it did before, and rows written
+before the column existed read `false` -- an upgrade never retroactively reclassifies an existing
+job's runs as failing.
+
+```json
+{
+  "cron": {
+    "jobs": {
+      "autonomous-maintenance": {
+        "name": "Autonomous Issue & PR Maintenance",
+        "schedule": "0 * * * *",
+        "actionType": "agent-prompt",
+        "agentId": "farnsworth",
+        "message": "Perform the hourly maintenance pass.",
+        "executionClass": true,
+        "failureAlertsEnabled": true,
+        "failureAlertConversationId": "c_ops_alerts"
+      }
+    }
+  }
+}
+```
+
+The same flag is available on `POST /api/cron` and on the `cron` tool's `create` / `update` actions.
+On update, omitting `executionClass` leaves the stored classification alone, so an unrelated edit
+(rename, reschedule, enable/disable) can never silently un-mark an execution-class job.
+
+### The `no_tool_calls` outcome
+
+`no_tool_calls` is a **terminal, non-success** run status alongside `ok`, `error`, and `timed_out`:
+
+| Property | Behaviour |
+| --- | --- |
+| Run history | Written as a normal terminal row, with an `error` reason naming the zero-tool-call condition. Not `null`. |
+| `lastRunStatus` | Set on the job, so the portal's run-status badge distinguishes it without anyone reading `session_history`. |
+| Failure alerts | Participates in the existing `failureAlertConversationId` path with the same power-of-two backoff. There is deliberately **no** second notification channel. |
+| Streak counting | Counts toward the alert streak alongside `error`, so a job stuck in the do-nothing state does not alert on every single run. |
+| Retention | Purged by `PurgeRunsOlderThanAsync` like any other terminal status -- it is not immune to cleanup. |
+
+### When the rule does *not* fire
+
+Two conditions must both hold, and each guards a distinct way of getting this wrong:
+
+1. **The job is marked `executionClass`.** An unmarked job is untouched (a reporting job may
+   legitimately make no tool call).
+2. **The action actually reported a tool count.** `command` and `webhook` actions have no tool
+   concept and report nothing. That silence means *not applicable*, and is never read as "zero
+   tools" -- otherwise every shell job on the platform would be classified as a do-nothing run.
+   Interrupted agent turns can report partial counts, but retain their interruption outcome rather
+   than being classified by the zero-tool rule.
+
+A genuinely completed run that invokes one or more tools can record `ok`; a tool invocation
+alone does not prove that the run completed successfully.
+
+### Interrupted runs and partial evidence
+
+Cancellation is not a completed zero-tool run. Operator cancellation records `aborted`; host
+cancellation records `error` and still propagates cancellation to the caller. A timeout records
+`timed_out`. If a returned agent response explicitly reports cancellation, failure, incomplete work,
+or a parked run, that disposition takes precedence over the zero-tool rule.
+
+Cron and soul-triggered runs retain the current run's partial tool timeline and measured usage.
+An unfinished tool is marked incomplete, not successful. Missing token measurements remain unknown
+(`null`), not zero; a missing final answer does not mean that no tools ran or that the run was free.
+Cancellation does **not** roll back tool side effects. Inspect the retained transcript and the target
+system before retrying work that could have changed external state.
+
+Disposable no-op cleanup applies only to an empty or `NO_REPLY` response with no tool calls and no
+explicit non-completed disposition. Interrupted cron sessions are retained rather than deleted as
+silent wakes. A genuinely completed silent no-tool run can still be cleaned up. This is separate
+from an explicitly configured `deleteAfterRun` retention policy.
+
+## 11c. Delivery failure (`delivery_failed`)
+
+A cron run has two halves: the action does the work, and that work is **delivered** to the job's
+destination conversation. Before #3161 only the first half decided the run status, so a run whose
+output reached nobody was recorded as `ok` with a `null` error -- byte-identical to a run that
+delivered perfectly. A destination that had been archived or deleted therefore produced an unbroken
+streak of successful-looking runs indefinitely, and the consecutive-error backoff could not help
+because no error was ever recorded.
+
+### The `delivery_failed` outcome
+
+`delivery_failed` is a **terminal, non-success** run status alongside `ok`, `error`, `timed_out`,
+and `no_tool_calls`:
+
+| Property | Behaviour |
+| --- | --- |
+| Run history | Written as a normal terminal row, with an `error` reason naming the delivery failure and quoting the underlying cause. Not `null`. |
+| `lastRunStatus` | Set on the job, so the portal's run-status badge shows the run did not succeed. |
+| Failure alerts | Participates in the existing `failureAlertConversationId` path with the same power-of-two backoff. There is deliberately **no** second notification channel. |
+| Streak counting | Counts toward the alert streak alongside `error` and `no_tool_calls`, so a job whose destination is permanently gone does not alert on every single run. |
+| Retention | Purged by `PurgeRunsOlderThanAsync` like any other terminal status. |
+| `failedOnly` history | Included in the `cron` tool's failed-only view. |
+
+It is a **separate status rather than a reuse of `error`** because the two demand different operator
+responses: `error` means the job is broken, `delivery_failed` means the job works and its
+*destination* is broken. Collapsing them would send an operator debugging a healthy job.
+
+### When `delivery_failed` is recorded
+
+Only when an action reported a delivery failure. Today that is the `agent-prompt` path, when the
+job's pinned destination conversation no longer resolves: the run still executes and its output
+still lands somewhere (a freshly created conversation, which the scheduler's CAS then reconciles),
+but because that is not where the operator is reading, the run is recorded as undelivered rather
+than as a success.
+
+An action that never performs a conversation delivery at all -- `command` and `webhook` have no
+delivery concept -- reports nothing, and that silence is *not applicable*, never "delivery failed".
+A silent action can never reach this status.
+
+When both conditions apply to one run, **`delivery_failed` outranks `no_tool_calls`**: if the output
+reached nobody, that is the actionable problem to fix first.
+
+### Fail-closed when the alert itself cannot be delivered
+
+Alert delivery still **never** fails or alters a cron run -- a broken alert channel must not convert
+one failure into a second, different one. But it is no longer silently discarded either. When the
+failure alert cannot be delivered and no alternate destination is configured, the reason is appended
+to the run's recorded error (and to the job's `lastRunError`) behind the marker:
+
+```text
+Failure alert could not be delivered: <reason>
+```
+
+The run's *status* is left exactly as it was decided. Only the error text grows. This makes the
+double failure -- the run failed **and** nobody could be told -- discoverable from run history
+instead of existing only as one log line that nothing queries and no operator reads.
+
+## 11d. Operator abort (`aborted`)
+
+Deleting or disabling a cron job used to do nothing at all to a run that was **already executing**
+(#3160). `DeleteJobAsync` removed the row and returned; the in-flight action kept burning a model
+turn and tool budget, kept writing into the conversation that had just been archived, raced the
+session sweep that was concurrently deleting the rows it was writing, and could still fire a failure
+alert for a job the operator had deliberately removed. The scheduler simply kept no handle to signal
+-- `_jobLocks` is a serialisation mutex, and the per-run timeout source was a method local.
+
+The scheduler now keeps a registry of in-flight runs keyed by run id, each holding the cancellation
+source the run executes under. Both operator paths -- delete, and the `enabled: true -> false`
+transition of an update -- cancel that source before anything is torn down.
+
+### The `aborted` outcome
+
+`aborted` is a **terminal** run status, and deliberately **not a failure**:
+
+| Property | Behaviour |
+| --- | --- |
+| Run history | Written as a normal terminal row, with a reason naming the operator delete/disable. |
+| `lastRunStatus` | Set on the job (when the job still exists -- a delete removes the row shortly after). |
+| Failure alerts | **None.** An operator who killed the job does not need to be alarmed about it. |
+| Streak counting | Excluded from the alert streak, so a deliberate stop cannot distort the backoff position of the next genuine failure. |
+| Retention | Purged by `PurgeRunsOlderThanAsync` like any other terminal status. |
+| `failedOnly` history | **Excluded** -- it is not a failure, and the operator already knows. |
+
+It is a separate status rather than a reuse of `error` or `timed_out` because those two mean
+"something went wrong" and this means "someone meant to stop it". An operator scanning history must
+be able to tell the three apart.
+
+### Host cancellation is *not* an operator abort
+
+A gateway shutdown or scheduler stop keeps its pre-#3160 shape verbatim: recorded as `error`, and
+the `OperationCanceledException` still propagates to the caller. Only a delete or disable produces
+`aborted`, and that call does **not** throw -- the caller asked for the run to stop, so reporting
+their successful request as a fault would be wrong.
+
+### Ordering and the grace period
+
+Cancellation is issued **before** the conversation archive and the run-session sweep, and the delete
+then waits for each cancelled run to actually *observe* the cancellation and leave its action body.
+That ordering is the substance of the fix: archiving or sweeping while the action is still writing
+is what resurrected archived conversations and destroyed session rows mid-write.
+
+The wait is bounded by `activeRunCancellationGraceSeconds` (default 30) and **fails open**. An
+action that swallows its cancellation token must never be able to make its job permanently
+undeletable, so when the grace elapses the scheduler logs a warning and the delete proceeds anyway.
+The operator's removal always wins.
+
+A job with no run in flight skips the wait entirely.
 
 ## 12. Observability
 
@@ -1118,10 +1512,64 @@ foreach (var job in jobs)
 
 ### 12.5 Health Check Integration
 
-The `HeartbeatService` (now a thin adapter) delegates to the cron service:
+Heartbeat feature ownership is described in [Heartbeat ownership and configuration](#heartbeat-ownership-and-configuration). There is no `HeartbeatService.IsHealthy` / `LastBeat` adapter in current source. Job execution history is not a substitute for gateway health diagnostics.
 
-- `IsHealthy` returns `true` if the cron service is running
-- `LastBeat` returns the timestamp of the most recent job execution
+### 12.6 Per-run cost metrics (#2641)
+
+Every cron run records what it cost, written by the same run-finalization path that records the
+terminal status. Because it rides that path, the measurements are recorded for **every** terminal
+outcome — `ok`, `error`, `timed_out`, `no_tool_calls`, `delivery_failed` and `aborted` alike. A run
+that failed after twelve turns is not a free run, and recording it as one would make the most
+broken jobs on the platform look like the cheapest.
+
+`cron_runs` carries five nullable columns:
+
+| Column | Meaning |
+|--------|---------|
+| `turn_count` | Model turns (LLM invocations) the run consumed. |
+| `tool_call_count` | Tool invocations the run performed. |
+| `duration_ms` | Wall-clock duration, stamped by the scheduler around the whole action invocation. |
+| `prompt_tokens` | Provider-reported prompt tokens, summed across every turn (cache reads/writes folded in). |
+| `completion_tokens` | Provider-reported completion tokens, summed across every turn. |
+
+> **`NULL` means "not measured", never zero.** This is the #2554 `ScheduleActivatedAt` rule applied
+> to cost. A `command` or `webhook` job has no turn or token concept, and a run recorded before
+> these columns existed measured nothing. Coercing either to `0` presents "we did not look" as
+> "this job is free" — the single most misleading value this feature could produce, because it
+> inverts the exact ranking the feature exists to establish. No layer (store, API, tool, UI) may
+> render or aggregate a `NULL` as `0`.
+
+`turn_count`, `tool_call_count` and `duration_ms` are computed from data the platform already has
+and do not depend on provider token reporting. The token columns are populated when the provider
+reports usage and stay `NULL` when it does not.
+
+### 12.7 Per-job cost rollup
+
+The rollup is **derived from run history at read time**, not stored as a counter on `cron_jobs` —
+the same pattern #2557 established for failure streaks. A stored aggregate is state every write
+path must remember to keep current, and the one that forgets is invisible until the number is
+already wrong.
+
+Available as `GET /api/cron/costs?windowDays=7` and as the `costs` action of the `cron` tool.
+
+**Ranking is by total spend, not by per-run average.** The two disagree, and the disagreement is
+the point:
+
+| Job | Runs / 7d | ~tokens per run | Total |
+|-----|----------:|----------------:|------:|
+| Daily People Profile Enrichment | 8 | ~65,300 | ~522k |
+| Autonomous Issue & PR Maintenance | 193 | ~17,200 | ~3.3M |
+
+The first job is nearly 4x more expensive *per run*; the second is by a wide margin the platform's
+largest consumer. A per-run figure alone reports the larger consumer as the cheaper job.
+
+Each rollup entry also reports `measuredRunCount` alongside `runCount`, so averages divide by the
+measured population rather than being diluted by runs that never reported a figure.
+
+**Retention bounds the window.** `CronRunRetentionOptions.RetentionDays` (default 30) purges older
+runs, so a window longer than retention cannot be answered completely. The store clamps the window
+to retention and sets `windowTruncatedByRetention: true` on every entry, because a truncated total
+that looks exactly like a complete one is worse than an explicitly bounded one.
 
 ---
 
@@ -1133,19 +1581,16 @@ Run an analyst agent every weekday at 9:00 AM to generate a morning briefing.
 
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Jobs": {
-        "morning-briefing": {
-          "Type": "agent",
-          "Schedule": "0 9 * * MON-FRI",
-          "Agent": "analyst",
-          "Prompt": "Generate a concise morning briefing on recent alerts and incidents.",
-          "Session": "persistent",
-          "Timezone": "America/New_York",
-          "OutputChannels": ["slack"],
-          "Enabled": true
-        }
+  "cron": {
+    "jobs": {
+      "morning-briefing": {
+        "name": "Morning briefing",
+        "schedule": "0 9 * * MON-FRI",
+        "actionType": "agent-prompt",
+        "agentId": "analyst",
+        "message": "Generate a concise morning briefing on recent alerts and incidents.",
+        "timeZone": "America/New_York",
+        "enabled": true
       }
     }
   }
@@ -1153,30 +1598,27 @@ Run an analyst agent every weekday at 9:00 AM to generate a morning briefing.
 ```
 
 **Behavior:**
-- Runs at 9:00 AM Monday–Friday (Eastern Time)
-- Reuses the same session (`persistent`), so briefings build on history
-- Agent output is sent to Slack
-- Session key: `cron:morning-briefing`
+- Runs at 9:00 AM Monday-Friday (Eastern Time)
+- Runs in the job's canonical `cron:morning-briefing` conversation, so briefings build on history
+- Agent output is delivered through the agent's own channel bindings
 
 ---
 
-### Example 2: Weekly Health Check System Job
+### Example 2: Zero-Token Command Job
 
-Run a system action every Sunday at midnight to audit system health.
+Run a shell script every hour with no model turn.
 
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Jobs": {
-        "weekly-health-check": {
-          "Type": "system",
-          "Schedule": "0 0 * * 0",
-          "Action": "health-audit",
-          "Timezone": "UTC",
-          "OutputChannels": ["slack", "email"],
-          "Enabled": true
-        }
+  "cron": {
+    "jobs": {
+      "disk-space-check": {
+        "name": "Disk space check",
+        "schedule": "0 * * * *",
+        "actionType": "command",
+        "shellCommand": "pwsh -NoProfile -File ./scripts/check-disk.ps1",
+        "timeZone": "UTC",
+        "enabled": true
       }
     }
   }
@@ -1184,45 +1626,31 @@ Run a system action every Sunday at midnight to audit system health.
 ```
 
 **Behavior:**
-- Runs every Sunday at midnight UTC
-- Executes the `health-audit` system action
-- Output is sent to Slack and email
-- No agent involvement; just a built-in action
+- Runs hourly on the hour, UTC
+- Costs no tokens; stdout/stderr are captured on the run record
+- Authorized through the `exec` tool policy at both authoring and firing time
 
 ---
 
-### Example 3: Nightly Memory Consolidation & Cleanup
+### Example 3: Nightly Memory Consolidation
 
-Consolidate memory and clean up old sessions every night.
+Configure an LLM review of recent notes every night. The [memory-dreaming persistence limitation](#_8-4-memory-dreaming) applies; this example does not establish a successful `MEMORY.md` update.
 
 ```json
 {
-  "BotNexus": {
-    "Cron": {
-      "Jobs": {
-        "nightly-consolidation": {
-          "Type": "maintenance",
-          "Schedule": "0 2 * * *",
-          "Action": "consolidate-memory",
-          "Agents": ["analyst", "planner", "writer"],
-          "Timezone": "America/Los_Angeles",
-          "Enabled": true
+  "cron": {
+    "jobs": {
+      "nightly-dreaming": {
+        "name": "Nightly memory consolidation",
+        "schedule": "0 2 * * *",
+        "actionType": "memory-dreaming",
+        "agentId": "analyst",
+        "timeZone": "America/Los_Angeles",
+        "metadata": {
+          "lookbackDays": "14",
+          "maxContentChars": "50000"
         },
-        "cleanup-old-sessions": {
-          "Type": "maintenance",
-          "Schedule": "0 3 * * 0",
-          "Action": "cleanup-sessions",
-          "SessionCleanupDays": 30,
-          "Enabled": true
-        },
-        "rotate-logs": {
-          "Type": "maintenance",
-          "Schedule": "0 4 * * *",
-          "Action": "rotate-logs",
-          "LogRetentionDays": 30,
-          "LogsPath": "~/.botnexus/logs",
-          "Enabled": true
-        }
+        "enabled": true
       }
     }
   }
@@ -1230,9 +1658,9 @@ Consolidate memory and clean up old sessions every night.
 ```
 
 **Behavior:**
-- **2:00 AM** (Pacific): Consolidate memory for three agents
-- **3:00 AM** (Pacific, Sunday only): Delete sessions older than 30 days
-- **4:00 AM** (Pacific, daily): Archive log files older than 30 days
+- **2:00 AM** (Pacific, daily): reads recent daily notes and dispatches a consolidation prompt. The persistence limitation above applies; dispatch does not verify an update to workspace `MEMORY.md`.
+- Skips execution if no daily notes exist in the lookback window
+- Old run records are purged automatically by the cron run retention service - no cleanup job needed
 
 ---
 
@@ -1251,31 +1679,27 @@ for the next 4 hours. Use the cron tool to schedule it.
 {
   "tool": "cron",
   "arguments": {
-    "action": "schedule",
+    "action": "create",
     "name": "incident-status-check",
-    "agent": "responder",
-    "prompt": "Check current incident status and alert if anything changed.",
+    "agentId": "responder",
+    "message": "Check current incident status and alert if anything changed.",
     "schedule": "*/15 * * * *",
-    "session": "new",
-    "timezone": "America/Los_Angeles",
-    "output_channels": ["slack"],
+    "timeZone": "America/Los_Angeles",
     "enabled": true
   }
 }
 ```
 
-**Response:**
-```text
-Agent cron job 'incident-status-check' scheduled with expression '*/15 * * * *'
-```
+**Response:** the created job as JSON, including the generated `id` used for later
+`update`, `run`, `history`, and `delete` calls.
 
-**Later, clean up:**
+**Later, clean up** (jobs are deleted by `jobId`, not by name):
 ```json
 {
   "tool": "cron",
   "arguments": {
-    "action": "remove",
-    "name": "incident-status-check"
+    "action": "delete",
+    "jobId": "3f1c8b0a9d2e4f5a8b7c6d5e4f3a2b1c"
   }
 }
 ```
@@ -1321,7 +1745,7 @@ response modes and signing details, and the
 ┌────────────────────────────────────────────────────────────────┐
 │                        CronService (IHostedService)            │
 │  - Registers jobs at startup (CronJobFactory)                  │
-│  - Ticks every TickIntervalSeconds (default: 10s)              │
+│  - Ticks every TickIntervalSeconds (see §3.1 for the default)  │
 │  - Checks which jobs are due                                   │
 │  - Queues due jobs for concurrent execution                    │
 │  - Publishes activity events                                   │
@@ -1332,25 +1756,26 @@ response modes and signing details, and the
          │            │            │
          ▼            ▼            ▼
     ┌─────────┐  ┌─────────┐  ┌──────────┐
-    │  Agent  │  │ System  │  │ Maintenance
-    │  Job    │  │  Job    │  │  Job
-    │         │  │         │  │
+    │ agent-  │  │ command │  │ webhook  │
+    │ prompt  │  │         │  │          │
+    │         │  │         │  │          │
     └────┬────┘  └────┬────┘  └────┬─────┘
          │            │            │
          ▼            ▼            ▼
-    AgentRunner   ISystemAction   Consolidate-Memory
-    (LLM prompt)   health-audit   Cleanup-Sessions
-                   check-updates  Rotate-Logs
-                   extension-scan
+    AgentRunner    Shell script   HTTP POST
+    (LLM prompt)   (exec policy)  (webhookUrl)
+
+    plus memory-dreaming / skill-review /
+    agent-converse / heartbeat actions
          │            │            │
          └────────────┼────────────┘
                       │
          ┌────────────┴────────────┐
          │                         │
          ▼                         ▼
-    IChannel                   Activity Stream
-    (Slack, Discord,           (Correlation ID,
-     Telegram, Email)           Event Type,
+    Run record                 Activity Stream
+    (output, error,            (Correlation ID,
+     status)                    Event Type,
                                 Metadata)
 ```
 
@@ -1360,27 +1785,31 @@ response modes and signing details, and the
 
 ### Job Not Running
 
-1. **Check if cron service is enabled**: `"Cron.Enabled": true` in config
-2. **Check if job is enabled**: `"Enabled": true` in job config
+1. **Check if cron service is enabled**: `cron.enabled` is `true` in `config.json`
+2. **Check if job is enabled**: `enabled` is `true` in the job definition
 3. **Check cron expression**: Use [crontab.guru](https://crontab.guru) to validate
-4. **Check timezone**: If job is timezone-aware, ensure the timezone ID is valid (e.g., `"America/New_York"`)
+4. **Check timezone**: If the job sets `timeZone`, ensure the IANA id is valid (e.g., `"America/New_York"`)
 5. **Check logs**: Look for `"Registered cron job"` on startup; verify schedule format
 
-### Output Not Reaching Channel
+### Output Not Where Expected
 
-1. **Check channel name**: Ensure channel name matches registered channel (case-insensitive)
-2. **Check channel status**: Verify channel is running (`channel.IsRunning == true`)
-3. **Check output routing**: Job config has non-empty `OutputChannels` list
-4. **Check job output**: Verify the job produced output (not empty/null)
-5. **Check logs**: Look for warnings like `"channel '{ChannelName}' was not found"`
+1. **Check the action type**: output routing follows the action - see [Output Routing](#output-routing)
+2. **For `agent-prompt`**: the response lands in the job's `cron:{jobId}` conversation and the agent's own channel bindings
+3. **For `command`**: stdout/stderr are on the run record, not on a channel
+4. **For `webhook`**: confirm `webhookUrl` passed validation (absolute `http`/`https`, no credentials)
+5. **Check the run record**: `GET /api/cron/{jobId}/runs` or the `cron` tool's `history` action
 
 ### Job Failing
 
 1. **Check error logs**: Look for `"Cron job '{JobName}' failed"` with exception details
-2. **Check execution history**: `ICronService.GetHistory(jobName)` shows recent failures
+2. **Check execution history**: `GET /api/cron/{jobId}/runs` shows recent failures
 3. **Check correlation ID**: Use correlation ID to trace through activity stream
-4. **For agent jobs**: Check if agent is configured and available
-5. **For system jobs**: Verify system action is registered (e.g., `health-audit`)
+4. **For `agent-prompt` jobs**: Check if the agent is configured and available. If the run's error
+   reads `Cron job's agent '<id>' is not registered.`, the job's `agentId` points at an agent that
+   was deleted, renamed, or never registered. Cron classifies this **before** dispatch and fails the
+   run once with that reason rather than dispatching and failing opaquely on every fire. Recover by
+   re-registering the agent, or by deleting the job or reassigning it to a registered agent.
+5. **For `command` jobs**: Verify the command is permitted by the `exec` tool policy
 
 ---
 
