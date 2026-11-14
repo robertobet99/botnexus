@@ -1,3 +1,7 @@
+using BotNexus.Domain.Text;
+using System.Collections.Immutable;
+using BotNexus.Gateway.Abstractions.Events;
+using System.Text.Json;
 using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Domain.Primitives;
@@ -10,8 +14,15 @@ using Microsoft.Extensions.Logging;
 namespace BotNexus.Gateway.Services;
 
 /// <summary>
-/// Generates a short descriptive title for a conversation after the first user+assistant
-/// exchange, if the title is still at the default value "New conversation".
+/// Generates a short descriptive title for a conversation. Two entry points exist:
+/// <list type="bullet">
+/// <item><see cref="TriggerProvisionalBestEffort"/> fires when the first live user message is
+/// persisted, BEFORE the assistant turn completes, so a human-agent conversation stops showing
+/// "New conversation" almost immediately (#2126). The title is marked provisional.</item>
+/// <item><see cref="TriggerBestEffort"/> fires after the first user+assistant exchange. It either
+/// titles a still-default conversation or refines a provisional title exactly once
+/// (refine-once policy) using the completed assistant response.</item>
+/// </list>
 /// </summary>
 /// <remarks>
 /// This is a best-effort background service. Title generation failures are logged at
@@ -22,8 +33,19 @@ public sealed class ConversationAutoTitleService
     /// <summary>The default title assigned to new conversations before a user-generated title exists.</summary>
     public const string DefaultTitle = "New conversation";
 
+    /// <summary>
+    /// Conversation metadata flag marking a title as provisional - generated from the first user
+    /// message alone before the assistant turn completed (#2126). A provisional title is eligible
+    /// for exactly one refinement by the post-response auto-title path (refine-once policy): the
+    /// refine save clears this flag, after which the title is treated as final and the standard
+    /// custom-title guard protects it. A manually assigned title never carries this flag, so it is
+    /// never overwritten.
+    /// </summary>
+    public const string ProvisionalTitleMetadataKey = "provisionalTitle";
+
     private readonly IConversationStore _store;
     private readonly IConversationChangeNotifier? _notifier;
+    private readonly IConversationEventPublisher? _conversationEventPublisher;
     private readonly LlmClient _llmClient;
     private readonly ILogger _logger;
     private readonly GatewayAuthManager? _authManager;
@@ -38,12 +60,14 @@ public sealed class ConversationAutoTitleService
         LlmClient llmClient,
         ILogger logger,
         IConversationChangeNotifier? notifier = null,
-        GatewayAuthManager? authManager = null)
+        GatewayAuthManager? authManager = null,
+        IConversationEventPublisher? conversationEventPublisher = null)
     {
         _store = store;
         _llmClient = llmClient;
         _logger = logger;
         _notifier = notifier;
+        _conversationEventPublisher = conversationEventPublisher;
         // #1639: the titling model is resolved from the registry, which already carries the correct
         // per-provider endpoint (enterprise vs individual GitHub Copilot resolved at registration),
         // so no endpoint override is threaded through here anymore.
@@ -52,6 +76,50 @@ public sealed class ConversationAutoTitleService
         // rather than calling the provider with no options and relying on environment keys that do
         // not exist for OAuth providers (the "No API key for github-copilot" failure).
         _authManager = authManager;
+    }
+
+    /// <summary>
+    /// Attempts to auto-generate and persist a PROVISIONAL conversation title from the first user
+    /// message alone, best-effort, before the assistant turn completes (#2126). Returns immediately
+    /// without waiting for the background work. Callers must gate this on the conversation being a
+    /// human-agent, interactive, default-titled conversation with a real human first message; the
+    /// service applies the default-title re-guard itself so a custom title is never overwritten.
+    /// </summary>
+    /// <param name="conversationId">Conversation to title.</param>
+    /// <param name="agentId">Agent that owns the conversation.</param>
+    /// <param name="userText">The first user message text.</param>
+    /// <param name="preferredModelId">Optional model ID from auxiliary.titling config.</param>
+    /// <param name="timeoutSeconds">Per-call timeout in seconds; non-positive falls back to 30.</param>
+    /// <param name="sessionId">
+    /// #3417: the id of the session that originated this conversation turn, threaded onto the
+    /// outgoing <c>GenerationOptions.SessionId</c> so the titling request carries the same session
+    /// identity every interactive request does. Optional: a caller with no resolved session still
+    /// titles, it simply emits no cache key. Typed (#3099) so a blank id is not representable.
+    /// </param>
+    public void TriggerProvisionalBestEffort(
+        ConversationId conversationId,
+        AgentId agentId,
+        string userText,
+        string? preferredModelId,
+        int timeoutSeconds = 30,
+        SessionId? sessionId = null)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await GenerateProvisionalAndSaveAsync(
+                    conversationId, agentId, userText, preferredModelId,
+                    timeoutSeconds, CancellationToken.None, sessionId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Provisional auto-title generation failed for conversation '{ConversationId}' (best-effort, ignoring)",
+                    conversationId);
+            }
+        });
     }
 
     /// <summary>
@@ -65,13 +133,15 @@ public sealed class ConversationAutoTitleService
     /// <param name="assistantText">The first assistant response text.</param>
     /// <param name="preferredModelId">Optional model ID from auxiliary.titling config.</param>
     /// <param name="timeoutSeconds">Per-call timeout in seconds from auxiliary.titling config; non-positive falls back to 30.</param>
+    /// <param name="sessionId">#3417: originating session id, threaded onto the outgoing options.</param>
     public void TriggerBestEffort(
         ConversationId conversationId,
         AgentId agentId,
         string? userText,
         string assistantText,
         string? preferredModelId,
-        int timeoutSeconds = 30)
+        int timeoutSeconds = 30,
+        SessionId? sessionId = null)
     {
         _ = Task.Run(async () =>
         {
@@ -79,7 +149,7 @@ public sealed class ConversationAutoTitleService
             {
                 await GenerateAndSaveAsync(
                     conversationId, agentId, userText, assistantText, preferredModelId,
-                    timeoutSeconds, CancellationToken.None);
+                    timeoutSeconds, CancellationToken.None, sessionId);
             }
             catch (Exception ex)
             {
@@ -92,8 +162,86 @@ public sealed class ConversationAutoTitleService
     }
 
     /// <summary>
+    /// Generates and saves a provisional conversation title from the first user message alone
+    /// (#2126). Returns the generated title, or null when the conversation already has a
+    /// non-default title, the LLM returned an empty result, or the guard tripped. The persisted
+    /// title carries the provisional metadata flag so the post-response path can refine it once.
+    /// </summary>
+    internal async Task<string?> GenerateProvisionalAndSaveAsync(
+        ConversationId conversationId,
+        AgentId agentId,
+        string userText,
+        string? preferredModelId,
+        int timeoutSeconds,
+        CancellationToken ct,
+        SessionId? sessionId = null)
+    {
+        // Provisional titling only ever applies to a brand-new, still-default-titled conversation.
+        var conversation = await _store.GetAsync(conversationId, ct).ConfigureAwait(false);
+        if (conversation is null || !IsDefaultTitle(conversation.Title))
+        {
+            _logger.LogInformation(
+                "Provisional auto-title: not persisting for conversation '{ConversationId}' at initial guard " +
+                "(conversationLoaded={ConversationLoaded}, title='{Title}'); already non-default or not found",
+                conversationId,
+                conversation is not null,
+                conversation?.Title);
+            return null;
+        }
+
+        LlmModel? model;
+        try
+        {
+            model = ResolveModel(preferredModelId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Provisional auto-title: no model available for conversation '{ConversationId}'",
+                conversationId);
+            return null;
+        }
+
+        var prompt = BuildProvisionalPrompt(userText);
+        var title = await CompleteTitleAsync(model, prompt, conversationId, timeoutSeconds, sessionId, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(title))
+            return null;
+
+        // Re-read and guard again in case another path already set a custom title between reads.
+        conversation = await _store.GetAsync(conversationId, ct).ConfigureAwait(false);
+        if (conversation is null || !IsDefaultTitle(conversation.Title))
+        {
+            _logger.LogInformation(
+                "Provisional auto-title: not persisting for conversation '{ConversationId}' at re-read guard " +
+                "(conversationLoaded={ConversationLoaded}, title='{Title}'); title changed concurrently or row removed",
+                conversationId,
+                conversation is not null,
+                conversation?.Title);
+            return null;
+        }
+
+        var changedFields = GetChangedFields(conversation, title, provisional: true);
+        conversation.Title = title;
+        // Mark provisional so the post-response path may refine exactly once (refine-once policy).
+        conversation.Metadata[ProvisionalTitleMetadataKey] = true;
+        await _store.SaveAsync(conversation, ct).ConfigureAwait(false);
+
+        await PublishUpdatedBestEffortAsync(conversationId, changedFields, ct).ConfigureAwait(false);
+        await NotifyChangedAsync(agentId, conversationId, ct).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "Provisional auto-title set to '{Title}' for conversation '{ConversationId}' (model {ModelId})",
+            title, conversationId, model.Id);
+
+        return title;
+    }
+
+    /// <summary>
     /// Generates and saves the conversation title. Returns the generated title, or null when
-    /// the conversation already has a custom title or the LLM returned an empty result.
+    /// the conversation already has a final custom title or the LLM returned an empty result.
+    /// A provisional title (see <see cref="ProvisionalTitleMetadataKey"/>) is refined exactly
+    /// once here and the provisional flag is cleared on save (refine-once policy, #2126).
     /// </summary>
     internal async Task<string?> GenerateAndSaveAsync(
         ConversationId conversationId,
@@ -102,11 +250,13 @@ public sealed class ConversationAutoTitleService
         string assistantText,
         string? preferredModelId,
         int timeoutSeconds,
-        CancellationToken ct)
+        CancellationToken ct,
+        SessionId? sessionId = null)
     {
-        // Load conversation and check that it still has the default title.
+        // Load conversation and check that it is still eligible for titling: either the default
+        // title, or a provisional title that has not yet been refined (refine-once, #2126).
         var conversation = await _store.GetAsync(conversationId, ct).ConfigureAwait(false);
-        if (conversation is null || !IsDefaultTitle(conversation.Title))
+        if (conversation is null || !IsTitleEligible(conversation))
         {
             // #1979: previously a silent return. When auto-title fires (the hook logs
             // "titling from assistant content") but no title is ever persisted, this guard
@@ -138,6 +288,54 @@ public sealed class ConversationAutoTitleService
 
         // Call LLM.
         var prompt = BuildPrompt(userText, assistantText);
+        var title = await CompleteTitleAsync(model, prompt, conversationId, timeoutSeconds, sessionId, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(title))
+            return null;
+
+        // Re-read and guard again in case another path already set a custom title.
+        conversation = await _store.GetAsync(conversationId, ct).ConfigureAwait(false);
+        if (conversation is null || !IsTitleEligible(conversation))
+        {
+            // #1979: a concurrent path set a custom title (or the row vanished) between the first
+            // guard and here. Log it so the re-read race is observable rather than a silent no-op.
+            _logger.LogInformation(
+                "Auto-title: not persisting for conversation '{ConversationId}' at re-read guard " +
+                "(conversationLoaded={ConversationLoaded}, title='{Title}'); title changed concurrently or row removed",
+                conversationId,
+                conversation is not null,
+                conversation?.Title);
+            return null;
+        }
+
+        var changedFields = GetChangedFields(conversation, title, provisional: false);
+        conversation.Title = title;
+        // Refine-once (#2126): once the post-response path titles/refines, the title is final, so
+        // clear the provisional flag. A subsequent turn then hits the standard custom-title guard.
+        conversation.Metadata.Remove(ProvisionalTitleMetadataKey);
+        await _store.SaveAsync(conversation, ct).ConfigureAwait(false);
+
+        await PublishUpdatedBestEffortAsync(conversationId, changedFields, ct).ConfigureAwait(false);
+        await NotifyChangedAsync(agentId, conversationId, ct).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "Auto-title set to '{Title}' for conversation '{ConversationId}' (model {ModelId})",
+            title, conversationId, model.Id);
+
+        return title;
+    }
+
+    /// <summary>
+    /// Runs the titling LLM call and returns the sanitised title, or null when the call failed or
+    /// produced an empty title after sanitisation. Shared by the provisional and post-response paths.
+    /// </summary>
+    private async Task<string?> CompleteTitleAsync(
+        LlmModel model,
+        string prompt,
+        ConversationId conversationId,
+        int timeoutSeconds,
+        SessionId? sessionId,
+        CancellationToken ct)
+    {
         var context = new Context(
             SystemPrompt: null,
             Messages: [new UserMessage(new UserMessageContent(prompt), DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())]);
@@ -151,20 +349,44 @@ public sealed class ConversationAutoTitleService
 
             // #2025: resolve credentials through the shared GatewayAuthManager seam and thread the
             // key into the provider options, exactly as the foreground agent loop and the compactor
-            // do. Without this the provider fell back to environment keys (absent for OAuth
-            // providers like github-copilot) and threw "No API key", surfacing as an empty title.
-            // A null auth manager yields null-key options -> provider env fallback (behaviour-
-            // preserving for callers/tests that construct the service without an auth manager).
-            var streamOptions = _authManager is not null
-                ? await _authManager
-                    .CreateAuthenticatedOptionsAsync(model.Provider, baseOptions: null, ct)
-                    .ConfigureAwait(false)
+            // do. A null auth manager yields null-key options -> provider env fallback.
+            // #3417: the same seam now also carries the originating session id, so the titling
+            // request is correlatable and eligible for the Copilot prompt cache. When there is no
+            // auth manager AND no session id there is still nothing to say, so null options are
+            // preserved verbatim - behaviour-preserving for the pre-#2025 shape.
+            var generationOptions = new GenerationOptions
+            {
+                SessionId = sessionId?.Value,
+                CancellationToken = ct
+            };
+            var executionOptions = _authManager is not null
+                ? await _authManager.CreateExecutionOptionsAsync(model.Provider, cancellationToken: ct).ConfigureAwait(false)
                 : null;
-
-            completion = await _llmClient
-                .CompleteSimpleAsync(model, context, streamOptions)
-                .WaitAsync(TimeSpan.FromSeconds(effectiveTimeout), ct)
-                .ConfigureAwait(false);
+            // #3833: the auto-title call goes through the auth manager's bounded invalidate-and-
+            // retry so a credential rotating mid-flight costs one wasted round trip rather than a
+            // silently skipped title (the catch below swallows the failure into a warning, which is
+            // exactly the shape that made a rotation look like "auto-title just never works").
+            completion = _authManager is not null
+                ? await _authManager
+                    .InvokeWithAuthRetryAsync(
+                        model.Provider,
+                        async (apiKey, _) =>
+                        {
+                            var attemptOptions = (executionOptions ?? new ProviderExecutionOptions()) with
+                            {
+                                ApiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey
+                            };
+                            return await _llmClient
+                                .CompleteSimpleAsync(model, context, generationOptions, attemptOptions)
+                                .WaitAsync(TimeSpan.FromSeconds(effectiveTimeout), ct)
+                                .ConfigureAwait(false);
+                        },
+                        ct)
+                    .ConfigureAwait(false)
+                : await _llmClient
+                    .CompleteSimpleAsync(model, context, generationOptions, executionOptions)
+                    .WaitAsync(TimeSpan.FromSeconds(effectiveTimeout), ct)
+                    .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -176,7 +398,6 @@ public sealed class ConversationAutoTitleService
         }
 
         var rawTitle = ExtractTitleText(completion);
-
         var title = SanitizeTitle(rawTitle);
         if (string.IsNullOrWhiteSpace(title))
         {
@@ -190,52 +411,107 @@ public sealed class ConversationAutoTitleService
             return null;
         }
 
-        // Re-read and guard again in case another path already set a custom title.
-        conversation = await _store.GetAsync(conversationId, ct).ConfigureAwait(false);
-        if (conversation is null || !IsDefaultTitle(conversation.Title))
-        {
-            // #1979: a concurrent path set a custom title (or the row vanished) between the first
-            // guard and here. Log it so the re-read race is observable rather than a silent no-op.
-            _logger.LogInformation(
-                "Auto-title: not persisting for conversation '{ConversationId}' at re-read guard " +
-                "(conversationLoaded={ConversationLoaded}, title='{Title}'); title changed concurrently or row removed",
-                conversationId,
-                conversation is not null,
-                conversation?.Title);
-            return null;
-        }
-
-        conversation.Title = title;
-        await _store.SaveAsync(conversation, ct).ConfigureAwait(false);
-
-        if (_notifier is not null)
-        {
-            try
-            {
-                await _notifier.NotifyConversationChangedAsync(
-                    "updated", agentId.Value, conversationId.Value, ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                // Notification failure must not fail the title save.
-                _logger.LogWarning(
-                    ex,
-                    "Auto-title: SignalR notification failed for conversation '{ConversationId}'",
-                    conversationId);
-            }
-        }
-
-        _logger.LogInformation(
-            "Auto-title set to '{Title}' for conversation '{ConversationId}' (model {ModelId})",
-            title, conversationId, model.Id);
-
         return title;
+    }
+
+    private static ImmutableArray<string> GetChangedFields(Conversation conversation, string title, bool provisional)
+    {
+        var fields = ImmutableArray.CreateBuilder<string>();
+        if (!string.Equals(conversation.Title, title, StringComparison.Ordinal))
+            fields.Add(nameof(Conversation.Title));
+        var hasFlag = conversation.Metadata.TryGetValue(ProvisionalTitleMetadataKey, out var flag);
+        // Compare persisted JSON values, not just eligibility: removing false/null or replacing
+        // the string "true" with a boolean also changes the metadata that this write owns.
+        var alreadyTrue = flag is true || flag is JsonElement { ValueKind: JsonValueKind.True };
+        if (provisional ? !hasFlag || !alreadyTrue : hasFlag)
+            fields.Add(nameof(Conversation.Metadata));
+        return fields.ToImmutable();
+    }
+
+    private async Task PublishUpdatedBestEffortAsync(
+        ConversationId conversationId, ImmutableArray<string> changedFields, CancellationToken ct)
+    {
+        if (_conversationEventPublisher is null || changedFields.IsEmpty)
+            return;
+
+        try
+        {
+            // SaveAsync returns no aggregate and stores replace UpdatedAt on a copy. Reload to
+            // publish durable timestamps and bindings, without changing the existing save contract.
+            var updated = await _store.GetAsync(conversationId, ct).ConfigureAwait(false);
+            if (updated is null)
+                return;
+            var accepted = await _conversationEventPublisher.PublishAsync(new ConversationUpdatedEvent
+            {
+                AgentId = updated.AgentId,
+                ConversationId = updated.ConversationId,
+                ChangedFields = changedFields,
+                Bindings = ConversationBindingSnapshot.FromMany(updated.ChannelBindings),
+                OccurredAt = updated.UpdatedAt
+            }, ct).ConfigureAwait(false);
+            if (!accepted)
+                _logger.LogWarning("Auto-title: event publisher rejected update for conversation '{ConversationId}'; clients must reconcile from durable state", conversationId);
+        }
+        catch (Exception ex)
+        {
+            // A missed typed fact must neither undo the save nor suppress legacy invalidation.
+            _logger.LogWarning(ex, "Auto-title: failed to publish update for conversation '{ConversationId}'; clients must reconcile from durable state", conversationId);
+        }
+    }
+
+    private async Task NotifyChangedAsync(AgentId agentId, ConversationId conversationId, CancellationToken ct)
+    {
+        if (_notifier is null)
+            return;
+
+        try
+        {
+            await _notifier.NotifyConversationChangedAsync(
+                "updated", agentId.Value, conversationId.Value, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Notification failure must not fail the title save.
+            _logger.LogWarning(
+                ex,
+                "Auto-title: SignalR notification failed for conversation '{ConversationId}'",
+                conversationId);
+        }
     }
 
     /// <summary>Returns true when the title is still at the default "New conversation" value.</summary>
     public static bool IsDefaultTitle(string? title)
         => string.IsNullOrWhiteSpace(title) ||
            string.Equals(title, DefaultTitle, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Returns true when the conversation carries the provisional-title flag (#2126) - i.e. it was
+    /// titled from the first user message alone and has not yet been refined by the post-response
+    /// path. The metadata value round-trips through JSON, so a raw bool, a <see cref="JsonElement"/>,
+    /// and the string "true" are all accepted.
+    /// </summary>
+    public static bool IsProvisionalTitle(Conversation conversation)
+    {
+        if (!conversation.Metadata.TryGetValue(ProvisionalTitleMetadataKey, out var raw) || raw is null)
+            return false;
+
+        return raw switch
+        {
+            bool b => b,
+            JsonElement { ValueKind: JsonValueKind.True } => true,
+            JsonElement { ValueKind: JsonValueKind.False } => false,
+            JsonElement je when je.ValueKind == JsonValueKind.String => bool.TryParse(je.GetString(), out var jb) && jb,
+            string s => bool.TryParse(s, out var sb) && sb,
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// Returns true when the post-response auto-title path may write a title: either the title is
+    /// still the default, or it is a provisional title eligible for its one refinement (#2126).
+    /// </summary>
+    private static bool IsTitleEligible(Conversation conversation)
+        => IsDefaultTitle(conversation.Title) || IsProvisionalTitle(conversation);
 
     /// <summary>
     /// Returns true when the entry is a live conversation entry that should be counted
@@ -249,6 +525,27 @@ public sealed class ConversationAutoTitleService
            && !entry.IsCompactionSummary
            && entry.Role != MessageRole.Tool
            && entry.Role != MessageRole.System;
+
+    /// <summary>
+    /// Evaluates the session history to decide whether a provisional title should be generated
+    /// from the first user message alone (#2126). Returns the first user text when exactly one
+    /// live user entry exists and no assistant entry has been produced yet (the first user message
+    /// has just been persisted, before the assistant turn completes); otherwise returns null.
+    /// </summary>
+    public static string? ShouldTriggerProvisionalTitle(IReadOnlyList<SessionEntry> history)
+    {
+        var liveEntries = history.Where(IsLiveConversationEntry).ToList();
+        var userEntries = liveEntries.Where(e => e.Role == MessageRole.User).ToList();
+        var assistantEntries = liveEntries.Where(e => e.Role == MessageRole.Assistant).ToList();
+
+        // Only the pristine "first user message, no assistant yet" state qualifies. A second user
+        // turn or any assistant entry means the post-response path owns titling from here.
+        if (userEntries.Count != 1 || assistantEntries.Count != 0)
+            return null;
+
+        var userText = userEntries[0].Content;
+        return string.IsNullOrWhiteSpace(userText) ? null : userText;
+    }
 
     /// <summary>
     /// Evaluates the session history to find a user+assistant exchange to title. Returns the
@@ -310,6 +607,15 @@ public sealed class ConversationAutoTitleService
         return (userText, assistantText);
     }
 
+    /// <summary>
+    /// Builds the provisional titling prompt from the first user message alone (#2126). No
+    /// assistant response exists yet, so the model titles purely on the user's opening intent.
+    /// </summary>
+    internal static string BuildProvisionalPrompt(string userText)
+        => "In 5 words or fewer, give a descriptive title for a conversation that begins with the " +
+           "following user message. Return only the title, no punctuation, no quotes.\n\n" +
+           $"User: {userText}";
+
     internal static string BuildPrompt(string? userText, string assistantText)
     {
         // Agent-initiated conversations (cron/sub-agent/agent-first) have no user turn: the first
@@ -347,7 +653,7 @@ public sealed class ConversationAutoTitleService
         if (!string.IsNullOrWhiteSpace(text))
             return text;
 
-        // No usable text block — fall back to thinking content so a reasoning model still titles.
+        // No usable text block - fall back to thinking content so a reasoning model still titles.
         return string.Concat(
             completion.Content
                 .OfType<ThinkingContent>()
@@ -362,8 +668,9 @@ public sealed class ConversationAutoTitleService
         var sanitised = string.Join(
             " ",
             withoutQuotes.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-        // Limit to 80 chars defensively.
-        return sanitised.Length > 80 ? sanitised[..80].TrimEnd() : sanitised;
+        // Limit to 80 chars defensively, on a grapheme boundary so an emoji title is not cut in
+        // half before being persisted (#2883).
+        return TextTruncation.SafeTruncate(sanitised, 80)!.TrimEnd();
     }
 
     private LlmModel ResolveModel(string? preferredModelId)

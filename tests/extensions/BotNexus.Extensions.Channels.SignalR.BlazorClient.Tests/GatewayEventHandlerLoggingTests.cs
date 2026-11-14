@@ -19,14 +19,13 @@ public sealed class GatewayEventHandlerLoggingTests
         // A fresh, unconnected GatewayHubConnection makes SubscribeAllAsync fail inside
         // HandleReconnectedAsync -- the exact recovery-failure path that previously wrote to
         // Console.Error.
-        _handler = new GatewayEventHandler(_store, new GatewayHubConnection(), _logger);
+        _handler = new GatewayEventHandler(_store, new GatewayHubConnection(), _logger, _store);
 
         _store.UpsertAgent(new AgentState
         {
             AgentId = "agent-1",
             DisplayName = "Agent 1",
             IsConnected = true,
-            ActiveConversationId = "conv-1"
         });
         var agent = _store.GetAgent("agent-1")!;
         agent.Conversations["conv-1"] = new ConversationState
@@ -35,6 +34,9 @@ public sealed class GatewayEventHandlerLoggingTests
             Title = "Conversation 1",
             HistoryLoaded = true
         };
+        // #3212: the reconnect recovery path repairs the DISPLAYED pane, resolved from the route.
+        // Establish that route selection explicitly instead of relying on the ambient marker.
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
     }
 
     [Fact]
@@ -65,10 +67,10 @@ public sealed class GatewayEventHandlerLoggingTests
     public void Handler_has_no_console_error_writes_remaining()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "BotNexus.slnx")))
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "Directory.Packages.props")))
             dir = dir.Parent;
         if (dir is null)
-            throw new InvalidOperationException("Could not locate BotNexus.slnx from test base directory.");
+            throw new InvalidOperationException("Could not locate Directory.Packages.props from test base directory.");
 
         var path = Path.Combine(
             dir.FullName,

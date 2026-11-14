@@ -7,6 +7,40 @@ namespace BotNexus.Cron.Tests;
 public sealed class SqliteCronStoreTests
 {
     [Fact]
+    public async Task GetRunAsync_UnknownIdentity_ReturnsNull()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        (await context.Store.GetRunAsync(RunId.From("missing-run"))).ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task GetRunAsync_RunningAndTerminalRows_ReturnsFullPersistedRecordBeyondRecentHistory()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        await context.Store.CreateAsync(CronStoreTestContext.CreateJob("job-1"));
+        var run = await context.Store.RecordRunStartAsync(JobId.From("job-1"));
+        (await context.Store.GetRunAsync(run.Id)).ShouldBe(run);
+        var session = SessionId.From("cron:job-1:lookup");
+        var cost = new CronRunCost
+        {
+            TurnCount = 2, ToolCallCount = 3, DurationMs = 400,
+            PromptTokens = 50, CompletionTokens = 60
+        };
+        await context.Store.RecordRunCompleteAsync(run.Id, CronRunStatus.Error, "persisted error", session, cost);
+        var expected = (await context.Store.GetRunHistoryAsync(run.JobId)).ShouldHaveSingleItem();
+        for (var i = 0; i < 25; i++)
+            await context.Store.TryRecordMissedRunAsync(run.JobId, run.StartedAt.AddSeconds(i + 1));
+        (await context.Store.GetRunHistoryAsync(run.JobId)).ShouldNotContain(r => r.Id == run.Id);
+
+        var loaded = await context.Store.GetRunAsync(run.Id);
+        loaded.ShouldNotBeNull();
+        loaded.ShouldBe(expected);
+        loaded.CompletedAt.ShouldNotBeNull();
+        loaded.SessionId.ShouldBe(session);
+        loaded.Cost.ShouldBe(cost);
+    }
+
+    [Fact]
     public async Task InitializeAsync_CreatesSchema()
     {
         await using var context = await CronStoreTestContext.CreateAsync();
@@ -73,7 +107,7 @@ public sealed class SqliteCronStoreTests
     }
 
     [Fact]
-    public async Task UpdateAsync_ModifiesJob()
+    public async Task UpdateDefinitionAsync_ModifiesDefinitionColumns()
     {
         await using var context = await CronStoreTestContext.CreateAsync();
         await context.Store.CreateAsync(CronStoreTestContext.CreateJob("job-1"));
@@ -81,15 +115,83 @@ public sealed class SqliteCronStoreTests
         var updated = CronStoreTestContext.CreateJob("job-1") with
         {
             Name = "Updated Name",
-            Enabled = false,
-            LastRunStatus = "ok"
+            Enabled = false
         };
-        await context.Store.UpdateAsync(updated);
+        var saved = await context.Store.UpdateDefinitionAsync(updated);
 
+        saved.ShouldNotBeNull();
         var loaded = await context.Store.GetAsync(JobId.From("job-1"));
         loaded.ShouldNotBeNull();
         loaded!.Name.ShouldBe("Updated Name");
         loaded.Enabled.ShouldBeFalse();
+    }
+
+    // #2133: a definition update must NOT touch scheduler-owned runtime bookkeeping
+    // (LastRun*/NextRunAt) or the CAS-established ConversationId, even if the passed record
+    // carries stale values in those fields. This is the store-level guarantee behind the
+    // controller/tool acceptance criteria.
+    [Fact]
+    public async Task UpdateDefinitionAsync_DoesNotRegress_RuntimeOrConversationState()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        await context.Store.CreateAsync(CronStoreTestContext.CreateJob("job-1"));
+
+        // Establish scheduler-owned runtime state and a pinned conversation.
+        var runAt = DateTimeOffset.UtcNow;
+        await context.Store.RecordRunFinalizationAsync(JobId.From("job-1"), runAt, "ok", null);
+        await context.Store.SetNextRunAtAsync(JobId.From("job-1"), runAt.AddMinutes(5));
+        var pinned = await context.Store.TrySetConversationIdAsync(
+            JobId.From("job-1"), ConversationId.From("conv-winner"));
+        pinned!.Value.Value.ShouldBe("conv-winner");
+
+        // A racing definition update carrying stale/empty runtime + conversation fields.
+        var stale = CronStoreTestContext.CreateJob("job-1") with
+        {
+            Name = "Renamed",
+            Enabled = false,
+            LastRunStatus = "regressed",
+            LastRunError = "regressed",
+            LastRunAt = null,
+            NextRunAt = null,
+            ConversationId = null
+        };
+        await context.Store.UpdateDefinitionAsync(stale);
+
+        var loaded = await context.Store.GetAsync(JobId.From("job-1"));
+        loaded.ShouldNotBeNull();
+        // Definition columns applied...
+        loaded!.Name.ShouldBe("Renamed");
+        loaded.Enabled.ShouldBeFalse();
+        // ...but runtime bookkeeping and the conversation pin are untouched.
+        loaded.LastRunStatus.ShouldBe("ok");
+        loaded.LastRunAt.ShouldNotBeNull();
+        loaded.NextRunAt.ShouldNotBeNull();
+        loaded.ConversationId!.Value.Value.ShouldBe("conv-winner");
+    }
+
+    // #2133: scheduler run finalization must not overwrite a concurrent definition edit.
+    // The narrow last_run_* write only touches bookkeeping columns.
+    [Fact]
+    public async Task RecordRunFinalizationAsync_DoesNotClobber_DefinitionColumns()
+    {
+        await using var context = await CronStoreTestContext.CreateAsync();
+        await context.Store.CreateAsync(CronStoreTestContext.CreateJob("job-1") with { Schedule = "*/5 * * * *" });
+
+        // Concurrent controller/tool definition edit.
+        await context.Store.UpdateDefinitionAsync(
+            CronStoreTestContext.CreateJob("job-1") with { Name = "Edited", Schedule = "0 0 * * *", Enabled = false });
+
+        // Scheduler finalizes a run that started before the edit.
+        var runAt = DateTimeOffset.UtcNow;
+        await context.Store.RecordRunFinalizationAsync(JobId.From("job-1"), runAt, "ok", null);
+
+        var loaded = await context.Store.GetAsync(JobId.From("job-1"));
+        loaded.ShouldNotBeNull();
+        // Definition edit survives finalization...
+        loaded!.Name.ShouldBe("Edited");
+        loaded.Schedule.ShouldBe("0 0 * * *");
+        loaded.Enabled.ShouldBeFalse();
+        // ...and the run bookkeeping is recorded.
         loaded.LastRunStatus.ShouldBe("ok");
     }
 
@@ -154,7 +256,8 @@ public sealed class SqliteCronStoreTests
             corrupt.Parameters.AddWithValue("$bad", "{ this is not valid json ");
             (await corrupt.ExecuteNonQueryAsync()).ShouldBe(1);
         }
-        SqliteConnection.ClearAllPools();
+        // NOT ClearAllPools(): process-global, disposes sibling tests' live handles (#3324).
+        SqlitePoolCleanup.ClearPoolFor(context.DbPath);
 
         // Must NOT throw: the corrupt row is skipped-to-safe (null metadata), not fatal.
         var jobs = await context.Store.ListAsync();
@@ -184,7 +287,8 @@ public sealed class SqliteCronStoreTests
             corrupt.Parameters.AddWithValue("$bad", "[not, valid");
             (await corrupt.ExecuteNonQueryAsync()).ShouldBe(1);
         }
-        SqliteConnection.ClearAllPools();
+        // NOT ClearAllPools(): process-global, disposes sibling tests' live handles (#3324).
+        SqlitePoolCleanup.ClearPoolFor(context.DbPath);
 
         var loaded = await context.Store.GetAsync(JobId.From("job-tpl"));
 

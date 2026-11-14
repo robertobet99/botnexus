@@ -120,6 +120,12 @@ public sealed class DefaultToolPolicyProvider : IToolPolicyProvider
     {
         if (_dynamicDenyLists.TryRemove(agentId.Value, out _))
             _logger.LogDebug("Removed dynamic deny-list for sub-agent '{AgentId}'", agentId);
+
+        // Fired unconditionally, unlike the log line: the caller's question is "is this id gone",
+        // and an id that was never present is equally gone. Gating the notification on TryRemove
+        // would make an observer unable to distinguish "removed" from "never registered", which is
+        // the same conflation #2847 removed from the set path.
+        OnDynamicDenyListRemoved?.Invoke(agentId);
     }
 
     /// <summary>
@@ -127,6 +133,13 @@ public sealed class DefaultToolPolicyProvider : IToolPolicyProvider
     /// Allows tests to verify the child deny-list without requiring a full DI setup.
     /// </summary>
     internal Action<AgentId, IReadOnlyList<string>>? OnDynamicDenyListSet { get; set; }
+
+    /// <summary>
+    /// Test hook: invoked on each <see cref="RemoveDynamicDenyList"/> call. Mirrors
+    /// <see cref="OnDynamicDenyListSet"/> so a test can assert the set/remove pair is symmetric
+    /// (#2847 clause 5).
+    /// </summary>
+    internal Action<AgentId>? OnDynamicDenyListRemoved { get; set; }
 
     /// <summary>
     /// Returns the union of the static config deny-list and any dynamic deny-list for the given agent.
@@ -193,8 +206,69 @@ public sealed class DefaultToolPolicyProvider : IToolPolicyProvider
         return DangerousTools.Contains(toolName);
     }
 
+    /// <summary>
+    /// The default posture when a tool requires approval but no approval workflow can service the
+    /// request. <see cref="ToolApprovalFallback.Allow"/> reproduces the historical behaviour and is
+    /// what unattended agents, cron jobs, and sub-agents depend on (issue #2391).
+    /// </summary>
+    internal const ToolApprovalFallback DefaultApprovalFallback = ToolApprovalFallback.Allow;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Resolution order: the per-agent <c>askFallbackAllow</c> exemption list wins, then the
+    /// per-agent <c>askFallback</c> value, then <see cref="DefaultApprovalFallback"/>. An
+    /// unrecognised configured value is treated as <see cref="ToolApprovalFallback.Allow"/> and
+    /// logged: a typo must not silently brick an agent's dangerous tools.
+    /// </remarks>
+    public ToolApprovalFallback GetApprovalFallback(string toolName, string? agentId = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(toolName);
+
+        if (agentId is null)
+            return DefaultApprovalFallback;
+
+        var agentPolicy = GetAgentToolPolicy(agentId);
+        if (agentPolicy?.AskFallback is not { Length: > 0 } configured)
+            return DefaultApprovalFallback;
+
+        // A per-tool exemption keeps a narrow set of tools working under a fail-closed agent.
+        if (agentPolicy.AskFallbackAllow?.Contains(toolName, StringComparer.OrdinalIgnoreCase) == true)
+            return ToolApprovalFallback.Allow;
+
+        if (string.Equals(configured, "deny", StringComparison.OrdinalIgnoreCase))
+            return ToolApprovalFallback.Deny;
+
+        if (!string.Equals(configured, "allow", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning(
+                "Unrecognised askFallback value '{Value}' for agent {AgentId}; expected 'allow' or 'deny'. Treating as 'allow'.",
+                configured, agentId);
+        }
+
+        return ToolApprovalFallback.Allow;
+    }
+
     /// <inheritdoc />
     public IReadOnlyList<string> GetDeniedForHttp() => HttpDeniedTools;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Overrides the interface default so the answer accounts for every axis that governs
+    /// availability in production, in the same order the runtime applies them: the descriptor's
+    /// allowlist narrows the tool set (archetype / <c>toolIds</c>), then the effective deny-list
+    /// (static config unioned with any inherited sub-agent deny-list) removes more, with pinned
+    /// tools exempt. Answering from the allowlist alone would report an archetype-granted tool as
+    /// available while a deny-list was quietly removing it.
+    /// </remarks>
+    public bool IsToolAvailable(string toolName, AgentId? agentId = null, IReadOnlyList<string>? allowedToolIds = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(toolName);
+
+        var allowedByList = IToolPolicyProvider.IsUnrestrictedAllowList(allowedToolIds)
+                            || allowedToolIds!.Contains(toolName, StringComparer.OrdinalIgnoreCase);
+
+        return allowedByList && !IsDenied(toolName, agentId?.Value);
+    }
 
     /// <summary>
     /// Checks whether a tool is completely blocked for a specific agent.

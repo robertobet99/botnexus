@@ -35,6 +35,13 @@ public interface IGatewayRestClient
     Task<IReadOnlyList<ConversationSummaryDto>> GetAllConversationsAsync(
         CancellationToken cancellationToken = default);
 
+    /// <summary>Activity overview query with an inclusive absolute last-activity cutoff.
+    /// Null explicitly requests all history with effective creation/update/binding timestamps;
+    /// the token-only overload preserves the legacy unbounded update timestamps.</summary>
+    Task<IReadOnlyList<ConversationSummaryDto>> GetAllConversationsAsync(
+        DateTimeOffset? activitySince,
+        CancellationToken cancellationToken = default);
+
     /// <summary>GET /api/conversations/{conversationId}/history?limit={limit}&amp;offset={offset}</summary>
     Task<ConversationHistoryResponseDto?> GetHistoryAsync(
         string conversationId,
@@ -42,14 +49,67 @@ public interface IGatewayRestClient
         int offset = 0,
         CancellationToken cancellationToken = default);
 
+    /// <summary>Downloads a whole-conversation transcript with explicit content/privacy options.</summary>
+    Task<ExportDownload?> ExportConversationAsync(
+        string conversationId,
+        ConversationExportRequest request,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Downloads a single-session transcript.</summary>
+    Task<ExportDownload?> ExportSessionAsync(
+        string sessionId,
+        ConversationExportRequest request,
+        CancellationToken cancellationToken = default);
+
     /// <summary>GET /api/conversations/{conversationId}</summary>
     Task<ConversationResponseDto?> GetConversationAsync(
         string conversationId,
         CancellationToken cancellationToken = default);
 
-    /// <summary>GET /api/sessions?agentId={agentId}</summary>
-    Task<IReadOnlyList<SessionSummary>> GetSessionsAsync(
+    /// <summary>Adds an address binding to a conversation and returns the persisted binding.</summary>
+    Task<ConversationBindingDto?> AddConversationBindingAsync(
+        string conversationId,
+        AddConversationBindingRequestDto request,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Removes one binding from a conversation.</summary>
+    Task<bool> RemoveConversationBindingAsync(
+        string conversationId,
+        string bindingId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Moves one binding to another conversation owned by the same agent.</summary>
+    Task<ConversationBindingDto?> MoveConversationBindingAsync(
+        string conversationId,
+        string bindingId,
+        MoveConversationBindingRequestDto request,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// GET /api/conversations/costs - the read-time conversation cost rollup (#2898).
+    /// </summary>
+    /// <remarks>
+    /// Returns an empty list rather than throwing when the server predates the endpoint, so a
+    /// portal talking to an older gateway renders "no cost data" rather than an error.
+    /// </remarks>
+    Task<IReadOnlyList<ConversationCostDto>> GetConversationCostsAsync(
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// GET /api/sessions?agentId={agentId}&amp;limit={limit}&amp;offset={offset}&amp;conversationId={conversationId}
+    /// </summary>
+    /// <remarks>
+    /// #2532: agent/conversation/status filtering happens in the store, so <paramref name="offset"/>
+    /// addresses the FILTERED set and the response carries an explicit
+    /// <see cref="SessionPageDto.HasMore"/>. Callers must terminate on that flag - never on a short
+    /// page, since the server clamps <paramref name="limit"/> to its own maximum (#2499).
+    /// Prefer <see cref="SessionRosterLoader"/> over hand-rolling the walk.
+    /// </remarks>
+    Task<SessionPageDto> GetSessionsAsync(
         string? agentId = null,
+        int? limit = null,
+        int offset = 0,
+        string? conversationId = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>GET /api/sessions/{sessionId}/history?limit={limit}&amp;offset={offset}</summary>
@@ -57,6 +117,22 @@ public interface IGatewayRestClient
         string sessionId,
         int limit = 50,
         int offset = 0,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// POST /api/commands/execute - runs a slash command through the gateway command pipeline
+    /// and returns its <see cref="CommandResultDto"/> (#2873).
+    /// </summary>
+    /// <remarks>
+    /// This is the seam whose absence caused #2873: the portal had no way to reach
+    /// <c>CommandsController</c>, so the slash-command dispatcher sent command text to the agent
+    /// as a user message and the command pipeline was never invoked from chat. Returns
+    /// <see langword="null"/> when the gateway rejects the request (4xx/5xx) or the response body
+    /// cannot be read, so callers can surface a visible error instead of falling through to the
+    /// agent.
+    /// </remarks>
+    Task<CommandResultDto?> ExecuteCommandAsync(
+        CommandExecuteRequestDto request,
         CancellationToken cancellationToken = default);
 
     /// <summary>POST /api/conversations</summary>
@@ -171,6 +247,18 @@ public interface IGatewayRestClient
     /// <summary>GET /api/sessions/{sessionId}/subagents — returns the live sub-agents for a session.</summary>
     Task<IReadOnlyList<SubAgentInfo>> ListSessionSubAgentsAsync(
         string sessionId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Lists the effective prompt-template catalogue for one agent.</summary>
+    Task<IReadOnlyList<PromptTemplateDescriptorDto>> GetPromptTemplatesAsync(
+        string agentId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Renders a named prompt template without dispatching it.</summary>
+    Task<PromptTemplateRenderResultDto> RenderPromptTemplateAsync(
+        string agentId,
+        string templateName,
+        IReadOnlyDictionary<string, string> parameters,
         CancellationToken cancellationToken = default);
 
     /// <summary>Current API base URL (set via Configure). Null if not yet configured.</summary>

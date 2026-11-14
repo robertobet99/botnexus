@@ -1,11 +1,28 @@
 using BotNexus.Cli.Commands.Doctor;
+using BotNexus.Gateway.Configuration;
 using Shouldly;
-using System.Text.Json.Nodes;
 
 namespace BotNexus.Cli.Tests.Commands;
 
+/// <summary>
+/// Behaviour of the two compaction doctor checks.
+/// <para>
+/// <b>#2764 history \u2014 read before changing a fixture.</b> Every fixture in this class originally
+/// seeded a ROOT-level <c>compaction</c> block, because both checks read <c>root["compaction"]</c>.
+/// The setting actually binds at <c>gateway.compaction</c>, so those reads were permanently null
+/// and the tests passed only because production and test agreed on the same wrong shape. The model
+/// inputs below are the original regression corpus and are preserved verbatim; only the nesting
+/// they are seeded at moved to the path the gateway really binds. Two tests were added pinning that
+/// a root-level block is inert, so the old shape can never quietly come back.
+/// </para>
+/// </summary>
 public sealed class CompactionModelCheckTests
 {
+    private const string ModelPath = "gateway.compaction.summarizationModel";
+
+    private static ConfigDocument AtBoundPath(string model)
+        => ConfigDocument.Parse($"{{\"gateway\":{{\"compaction\":{{\"summarizationModel\":\"{model}\"}}}}}}");
+
     [Theory]
     [InlineData("claude-opus-4.6", true)]
     [InlineData("claude-opus-4-6", true)]
@@ -16,7 +33,7 @@ public sealed class CompactionModelCheckTests
     [InlineData("claude-sonnet-4.6", false)]
     public void CompactionModelCheck_DetectsExpensiveModels(string model, bool shouldFlag)
     {
-        var root = JsonNode.Parse($"{{\"compaction\":{{\"summarizationModel\":\"{model}\"}}}}")!.AsObject();
+        var root = AtBoundPath(model);
         var check = new CompactionModelCheck();
         check.IsApplicable(root).ShouldBe(shouldFlag);
     }
@@ -24,7 +41,7 @@ public sealed class CompactionModelCheckTests
     [Fact]
     public void CompactionModelCheck_NotApplicable_WhenNoModelSet()
     {
-        var root = JsonNode.Parse("""{"compaction":{}}""")!.AsObject();
+        var root = ConfigDocument.Parse("""{"gateway":{"compaction":{}}}""");
         var check = new CompactionModelCheck();
         check.IsApplicable(root).ShouldBeFalse();
     }
@@ -32,7 +49,7 @@ public sealed class CompactionModelCheckTests
     [Fact]
     public void CompactionModelMissingCheck_Applicable_WhenNoCompactionBlock()
     {
-        var root = JsonNode.Parse("""{"gateway":{}}""")!.AsObject();
+        var root = ConfigDocument.Parse("""{"gateway":{}}""");
         var check = new CompactionModelMissingCheck();
         check.IsApplicable(root).ShouldBeTrue();
     }
@@ -40,7 +57,7 @@ public sealed class CompactionModelCheckTests
     [Fact]
     public void CompactionModelMissingCheck_NotApplicable_WhenModelSet()
     {
-        var root = JsonNode.Parse("""{"compaction":{"summarizationModel":"claude-haiku-4.5"}}""")!.AsObject();
+        var root = AtBoundPath("claude-haiku-4.5");
         var check = new CompactionModelMissingCheck();
         check.IsApplicable(root).ShouldBeFalse();
     }
@@ -48,9 +65,31 @@ public sealed class CompactionModelCheckTests
     [Fact]
     public void CompactionModelCheck_Apply_SetsHaiku()
     {
-        var root = JsonNode.Parse("""{"compaction":{"summarizationModel":"claude-opus-4.6"}}""")!.AsObject();
+        var root = AtBoundPath("claude-opus-4.6");
         var check = new CompactionModelCheck();
         check.Apply(root);
-        root["compaction"]!["summarizationModel"]!.GetValue<string>().ShouldBe("claude-haiku-4.5");
+        root.TryGetString(ModelPath, out var updated).ShouldBeTrue();
+        updated.ShouldBe("claude-haiku-4.5");
+    }
+
+    // The two pins below are the #2764 regression itself, stated as behaviour: a root-level
+    // compaction block binds to nothing, so neither check may treat it as configuration.
+
+    [Fact]
+    public void CompactionModelCheck_IgnoresInertRootLevelBlock()
+    {
+        var root = ConfigDocument.Parse("""{"compaction":{"summarizationModel":"claude-opus-4.6"}}""");
+
+        new CompactionModelCheck().IsApplicable(root)
+            .ShouldBeFalse($"a root-level compaction block binds to nothing; only {ModelPath} is real configuration");
+    }
+
+    [Fact]
+    public void CompactionModelMissingCheck_TreatsInertRootLevelBlockAsUnset()
+    {
+        var root = ConfigDocument.Parse("""{"compaction":{"summarizationModel":"claude-haiku-4.5"}}""");
+
+        new CompactionModelMissingCheck().IsApplicable(root)
+            .ShouldBeTrue($"the model is not configured at {ModelPath}, so the check must still fire");
     }
 }

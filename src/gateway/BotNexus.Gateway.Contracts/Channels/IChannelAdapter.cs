@@ -63,6 +63,26 @@ public interface IChannelAdapter
     /// </summary>
     bool SupportsInboundImages { get; }
 
+    /// <summary>
+    /// Whether this channel can render a structured interactive prompt - discrete choice
+    /// affordances (buttons, a picker), multi-select, and an explicit cancel control - for an
+    /// <c>ask_user</c> checkpoint (#2322).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the signal the gateway needs to decide <em>how</em> to present a pending prompt.
+    /// An adapter returning <c>false</c> is not excluded from ask_user: the gateway degrades the
+    /// prompt to a numbered text list via
+    /// <see cref="BotNexus.Gateway.Abstractions.Models.AskUserPromptTextRenderer"/> so the user can
+    /// still answer, because the agent is genuinely blocked either way.
+    /// </para>
+    /// <para>
+    /// Defaults to <c>false</c> so existing adapters keep their current (text) behaviour without
+    /// change; an adapter opts in only once it can actually render the affordances.
+    /// </para>
+    /// </remarks>
+    bool SupportsInteractivePrompts => false;
+
     /// <summary>Whether the adapter is currently running and accepting messages.</summary>
     bool IsRunning { get; }
 
@@ -121,6 +141,21 @@ public interface IChannelDispatcher
 /// </summary>
 public interface IStreamEventChannelAdapter
 {
+    /// <summary>
+    /// Whether this adapter can deliver a stream event for the supplied target.
+    /// </summary>
+    /// <remarks>
+    /// Some adapters carry hard preconditions on the target (for example, Service Bus
+    /// correlates a stream by <see cref="ChannelStreamTarget.ChannelRequestId"/> and cannot
+    /// deliver without one). Fan-out hops such as the internal adapter consult this before
+    /// delegating so an unsatisfiable destination is a logged skip rather than an exception
+    /// that aborts the originating agent turn. The default returns <c>true</c>; adapters with
+    /// preconditions override it. Returning <c>false</c> does not relax the adapter's own
+    /// guard - <see cref="SendStreamEventAsync"/> still throws when called directly.
+    /// </remarks>
+    /// <param name="target">The routing target the caller intends to stream to.</param>
+    bool CanSendStreamEvent(ChannelStreamTarget target) => true;
+
     /// <summary>
     /// Sends a structured stream event to a target conversation.
     /// </summary>

@@ -4,11 +4,18 @@ namespace BotNexus.Architecture.Tests;
 
 /// <summary>
 /// Architecture fitness functions enforcing the F-6 contract: a sub-agent's
-/// child session is pinned to the parent <see cref="BotNexus.Domain.Primitives.ConversationId"/>
-/// strictly on the synchronous <c>SpawnAsync</c> path — never inside a
+/// child session is bound to its <see cref="BotNexus.Domain.Primitives.ConversationId"/>
+/// strictly on the synchronous <c>SpawnAsync</c> path - never inside a
 /// <c>Task.Run(...)</c> or any other fire-and-forget continuation.
 /// </summary>
 /// <remarks>
+/// Since #2338 the id being assigned is the child run's <em>own</em> minted conversation
+/// rather than the parent's, and <c>SubAgentSpawnRequest.InheritedConversationId</c> is the
+/// parent edge recorded on <c>Conversation.ParentConversationId</c>. Both fences below are
+/// unchanged in intent: the assignment must still be eager, and the parent edge must still be
+/// required and non-nullable (a parentless sub-agent conversation would be unreachable, since
+/// nested runs are excluded from top-level listings by design).
+///
 /// The original bug: <c>DefaultSubAgentManager.SpawnAsync</c> created the
 /// child session, then queued <c>Task.Run(RunSubAgentAsync(...))</c> and
 /// returned. The conversation pinning happened inside that background task,
@@ -25,7 +32,7 @@ namespace BotNexus.Architecture.Tests;
 ///    non-nullable so callers cannot construct a "pinless" request that
 ///    would degrade silently at runtime.
 /// </remarks>
-public sealed class SubAgentEagerPinArchitectureTests
+public sealed class SubAgentEagerPinArchitectureTests : ArchitectureTest
 {
     /// <summary>
     /// In <c>DefaultSubAgentManager.cs</c>, every <c>.ConversationId =</c>
@@ -81,8 +88,8 @@ public sealed class SubAgentEagerPinArchitectureTests
     /// <summary>
     /// <c>SubAgentSpawnRequest.InheritedConversationId</c> must be a
     /// non-nullable, required <see cref="BotNexus.Domain.Primitives.ConversationId"/>.
-    /// A nullable or optional shape lets callers construct a request that
-    /// would pin to nothing, defeating the eager-pin contract.
+    /// Since #2338 it is the parent edge rather than the child's identity, but a nullable or
+    /// optional shape would still let callers construct a run with nothing to attach to.
     /// </summary>
     [Fact]
     public void SpawnRequest_InheritedConversationId_IsRequiredAndNonNullable()
@@ -113,17 +120,17 @@ public sealed class SubAgentEagerPinArchitectureTests
             "File: " + requestPath);
     }
 
-    private static string LocateManagerFile()
+    private string LocateManagerFile()
     {
-        var srcRoot = FindSourceRoot();
+        var srcRoot = Repository.SourceRoot;
         var path = Path.Combine(srcRoot, "gateway", "BotNexus.Gateway", "Agents", "DefaultSubAgentManager.cs");
         File.Exists(path).ShouldBeTrue("Expected DefaultSubAgentManager.cs at " + path);
         return path;
     }
 
-    private static string LocateSpawnRequestFile()
+    private string LocateSpawnRequestFile()
     {
-        var srcRoot = FindSourceRoot();
+        var srcRoot = Repository.SourceRoot;
         var path = Path.Combine(srcRoot, "domain", "BotNexus.Domain", "Gateway", "Models", "SubAgentSpawnRequest.cs");
         File.Exists(path).ShouldBeTrue("Expected SubAgentSpawnRequest.cs at " + path);
         return path;
@@ -140,17 +147,4 @@ public sealed class SubAgentEagerPinArchitectureTests
         return line;
     }
 
-    private static string FindSourceRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !File.Exists(Path.Combine(current.FullName, "BotNexus.slnx")))
-        {
-            current = current.Parent;
-        }
-
-        current.ShouldNotBeNull("Could not locate repo root from " + AppContext.BaseDirectory);
-        var srcRoot = Path.Combine(current.FullName, "src");
-        Directory.Exists(srcRoot).ShouldBeTrue("Expected src/ under " + current.FullName);
-        return srcRoot;
-    }
 }

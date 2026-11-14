@@ -1,0 +1,86 @@
+name: 'Spike'
+description: 'Research or investigation. Produces a plan or a decision, NOT shipped code.'
+labels: [type:spike]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Spike** — Research or investigation. Produces a plan or a decision, NOT shipped code.
+        Use a title such as [Portal] describe the problem or outcome. Required fields are enforced by this form; API clients must validate them too.
+        Search existing issues before filing. Never include secrets or private infrastructure details. Report exploitable vulnerabilities through the private security link instead.
+        Agents with the issue-creation skill: use `New-BotNexusIssue.ps1 -Action template -Type type:spike` instead of this form.
+  - type: textarea
+    id: summary
+    attributes:
+      label: 'Summary'
+      description: 'Explain the problem and wanted outcome in two or three short sentences. Use plain language; define technical terms. Do not repeat the title.'
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: 'Question'
+      description: 'The single question to answer. If you cannot phrase it as a question, this is not a spike.'
+    validations:
+      required: true
+  - type: textarea
+    id: why_it_matters
+    attributes:
+      label: 'Why it matters'
+      description: 'What decision is blocked until this is answered.'
+    validations:
+      required: true
+  - type: textarea
+    id: deliverable
+    attributes:
+      label: 'Deliverable'
+      description: 'Name the output: a written recommendation with alternatives and trade-offs, a bounded prototype, or a benchmark. State where the result will be recorded and which decision it supports. Production implementation belongs in a follow-up issue.'
+    validations:
+      required: true
+  - type: textarea
+    id: timebox
+    attributes:
+      label: 'Timebox'
+      description: 'Set a maximum effort or a concrete stop condition. Report findings, unknowns, and a recommendation when the limit is reached, even if the answer is incomplete.'
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: 'Acceptance criteria'
+      description: 'Numbered, independently checkable outcomes. Say what evidence proves each one: a named test, command result, reviewed document, or recorded decision. Separate required outcomes from suggestions. Close only when all required outcomes are verified.'
+      placeholder: |
+        1. First independently checkable clause
+        2. Second clause
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: 'Files'
+      description: 'Known public repository paths and symbols, one per line. State what you checked against current source and what remains unverified. Do not include private machine paths.'
+    validations:
+      required: false
+  - type: textarea
+    id: related
+    attributes:
+      label: 'Related'
+      description: 'Link related issues and PRs. Identify parent, children, duplicates, blocked-by issues, and required decisions or external prerequisites explicitly. A related link alone does not mean blocked.'
+    validations:
+      required: false
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: 'Optional. Leave blank if unsure. Explain high or critical priority using the impact evidence; do not infer urgency from the issue type.'
+      options: [priority:critical, priority:high, priority:medium, priority:low]
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options: [area:platform, area:channels, area:portal, area:mobile, area:security, area:tooling, area:testing, area:trailguide]
+    validations:
+      required: false

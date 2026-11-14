@@ -24,14 +24,13 @@ public sealed class GatewayEventHandlerConcurrencyTests
     {
         // A fresh, unconnected GatewayHubConnection makes SubscribeAllAsync fail inside
         // HandleReconnectedAsync (the reconnect-recovery failure path).
-        _handler = new GatewayEventHandler(_store, new GatewayHubConnection(), _logger);
+        _handler = new GatewayEventHandler(_store, new GatewayHubConnection(), _logger, _store);
 
         _store.UpsertAgent(new AgentState
         {
             AgentId = "agent-1",
             DisplayName = "Agent 1",
             IsConnected = true,
-            ActiveConversationId = "conv-1"
         });
         var agent = _store.GetAgent("agent-1")!;
         agent.Conversations["conv-1"] = new ConversationState
@@ -40,6 +39,9 @@ public sealed class GatewayEventHandlerConcurrencyTests
             Title = "Conversation 1",
             HistoryLoaded = true
         };
+        // #3212: reconnect recovery repairs the DISPLAYED pane, which is now route-derived.
+        // The fixture must state the route rather than lean on the ambient per-agent marker.
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
     }
 
     // ── (b) fire-and-forget observation ──────────────────────────────────────
@@ -61,7 +63,9 @@ public sealed class GatewayEventHandlerConcurrencyTests
         act.ShouldNotThrow();
 
         // (2) the failure is observed and logged at Error within a bounded wait
-        await WaitForAsync(() => _logger.Entries.Any(e => e.Level == LogLevel.Error));
+        await TestAwait.EventuallyAsync(
+            () => _logger.Entries.Any(e => e.Level == LogLevel.Error),
+            "the fire-and-forget refresh failure to be logged");
         var error = _logger.Entries.FirstOrDefault(e => e.Level == LogLevel.Error);
         error.ShouldNotBeNull("A failed fire-and-forget refresh must be logged at Error, not vanish.");
         error!.Exception.ShouldBeOfType<InvalidOperationException>();
@@ -77,7 +81,9 @@ public sealed class GatewayEventHandlerConcurrencyTests
         _handler.HandleConversationChanged(
             new ConversationChangedPayload("updated", "agent-1", "conv-1"));
 
-        await WaitForAsync(() => _logger.Entries.Any(e => e.Level == LogLevel.Error));
+        await TestAwait.EventuallyAsync(
+            () => _logger.Entries.Any(e => e.Level == LogLevel.Error),
+            "the faulted refresh task to be logged");
         var error = _logger.Entries.FirstOrDefault(e => e.Level == LogLevel.Error);
         error.ShouldNotBeNull("A faulted fire-and-forget refresh task must be observed and logged.");
         error!.Exception.ShouldBeOfType<TimeoutException>();
@@ -119,6 +125,8 @@ public sealed class GatewayEventHandlerConcurrencyTests
 
         // Register the session so the drain (which routes by session) can resolve the agent.
         _store.RegisterSession("agent-1", "sess-1", conversationId: "conv-1");
+        // #3212: visibility is route-derived; state the displayed pane explicitly.
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         agent.Conversations["conv-1"].ActiveSessionId = "sess-1";
 
         // A no-op refresh delegate keeps the drain side effect-free and fast.
@@ -177,8 +185,7 @@ public sealed class GatewayEventHandlerConcurrencyTests
                 AgentId = id,
                 DisplayName = id,
                 IsConnected = true,
-                IsStreaming = true,
-                ActiveConversationId = $"conv-{a}"
+                IsStreaming = true
             });
             _store.GetAgent(id)!.Conversations[$"conv-{a}"] = new ConversationState
             {
@@ -273,10 +280,10 @@ public sealed class GatewayEventHandlerConcurrencyTests
     private static string ReadHandlerSource()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "BotNexus.slnx")))
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "Directory.Packages.props")))
             dir = dir.Parent;
         if (dir is null)
-            throw new InvalidOperationException("Could not locate BotNexus.slnx from test base directory.");
+            throw new InvalidOperationException("Could not locate Directory.Packages.props from test base directory.");
 
         var path = Path.Combine(
             dir.FullName,
@@ -287,14 +294,4 @@ public sealed class GatewayEventHandlerConcurrencyTests
         return File.ReadAllText(path);
     }
 
-    private static async Task WaitForAsync(Func<bool> condition, int timeoutMs = 5_000)
-    {
-        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-        while (DateTime.UtcNow < deadline)
-        {
-            if (condition())
-                return;
-            await Task.Delay(15);
-        }
-    }
 }

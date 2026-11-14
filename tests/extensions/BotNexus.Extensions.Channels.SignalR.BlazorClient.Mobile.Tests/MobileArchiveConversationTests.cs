@@ -1,6 +1,8 @@
 using Bunit;
 using BotNexus.Extensions.Channels.SignalR.BlazorClient.Mobile.Pages;
 using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
+using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services.Abstractions;
+using Microsoft.AspNetCore.Components;
 using Microsoft.Extensions.DependencyInjection;
 using NSubstitute;
 
@@ -18,6 +20,7 @@ public sealed class MobileArchiveConversationTests : IDisposable
     private readonly IClientStateStore _store;
     private readonly IPortalLoadService _portalLoad;
     private readonly IAgentInteractionService _interaction;
+    private readonly IPortalPreferencesService _preferences;
     private readonly AgentState _agentState;
 
     public MobileArchiveConversationTests()
@@ -25,6 +28,8 @@ public sealed class MobileArchiveConversationTests : IDisposable
         _store = Substitute.For<IClientStateStore>();
         _portalLoad = Substitute.For<IPortalLoadService>();
         _interaction = Substitute.For<IAgentInteractionService>();
+        _preferences = Substitute.For<IPortalPreferencesService>();
+        _preferences.Current.Returns(new PortalPreferences());
 
         _portalLoad.IsReady.Returns(true);
         _portalLoad.IsSignalRConnected.Returns(true);
@@ -45,7 +50,6 @@ public sealed class MobileArchiveConversationTests : IDisposable
             DisplayName = "Agent 1",
             Emoji = null,
             SessionId = "session-1",
-            ActiveConversationId = "conv-1"
         };
         _agentState.Conversations["conv-1"] = convState;
 
@@ -58,9 +62,15 @@ public sealed class MobileArchiveConversationTests : IDisposable
         _interaction.ArchiveConversationAsync(Arg.Any<string>(), Arg.Any<string>()).Returns(Task.CompletedTask);
 
         _ctx.Services.AddSingleton(_store);
+        var displayedConversation = Substitute.For<IDisplayedConversation>();
+        displayedConversation.DisplayedConversationIdFor(Arg.Any<string?>())
+            .Returns(call => call.Arg<string?>() is { } agentId ? (_store as IDisplayedConversation)?.DisplayedConversationIdFor(agentId) : null);
+        _ctx.Services.AddSingleton(displayedConversation);
         _ctx.Services.AddSingleton(_portalLoad);
         _ctx.Services.AddSingleton(new BotNexus.Extensions.Channels.SignalR.BlazorClient.Mobile.Services.MobileHubTuningOptions());
         _ctx.Services.AddSingleton(_interaction);
+        _ctx.Services.AddSingleton(_preferences);
+        _ctx.Services.AddSingleton(Substitute.For<IChannelErrorReporter>());
         _ctx.JSInterop.Mode = JSRuntimeMode.Loose;
     }
 
@@ -69,7 +79,7 @@ public sealed class MobileArchiveConversationTests : IDisposable
     [Fact]
     public void Archive_action_visible_in_menu_when_conversation_selected()
     {
-        var cut = _ctx.Render<Chat>();
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".overflow-btn").Click();
 
@@ -80,10 +90,10 @@ public sealed class MobileArchiveConversationTests : IDisposable
     [Fact]
     public void Archive_action_hidden_when_no_conversation_selected()
     {
-        _agentState.ActiveConversationId = null;
+        _store.SelectView(_agentState.AgentId, null ?? string.Empty, SelectionSource.RouteNavigation);
         _store.GetMessages(Arg.Any<string>()).Returns(new List<ChatMessage>().AsReadOnly());
 
-        var cut = _ctx.Render<Chat>();
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
 
         cut.Find(".overflow-btn").Click();
 
@@ -93,7 +103,7 @@ public sealed class MobileArchiveConversationTests : IDisposable
     [Fact]
     public void Archive_action_shows_confirm_overlay()
     {
-        var cut = _ctx.Render<Chat>();
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".overflow-btn").Click();
         cut.Find("[data-testid='archive-conversation-btn']").Click();
@@ -104,9 +114,44 @@ public sealed class MobileArchiveConversationTests : IDisposable
     }
 
     [Fact]
+    public async Task Archive_action_skips_overlay_when_confirmation_is_disabled()
+    {
+        _preferences.Current.Returns(new PortalPreferences { ArchiveConfirmEnabled = false });
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        cut.Find(".overflow-btn").Click();
+        cut.Find("[data-testid='archive-conversation-btn']").Click();
+
+        cut.WaitForAssertion(() =>
+        {
+            cut.FindAll("[data-testid='archive-confirm-btn']").ShouldBeEmpty();
+            _interaction.Received(1).ArchiveConversationAsync("agent-1", "conv-1");
+        });
+    }
+
+    [Fact]
+    public async Task Mobile_layout_loads_preferences_and_emits_normalized_density()
+    {
+        _preferences.LoadAsync().Returns(_ =>
+        {
+            _preferences.Current.Returns(new PortalPreferences { Density = "COMFORTABLE" });
+            return Task.CompletedTask;
+        });
+
+        var cut = _ctx.Render<BotNexus.Extensions.Channels.SignalR.BlazorClient.Mobile.Layout.MobileLayout>(parameters =>
+            parameters.Add(layout => layout.Body, (RenderFragment)(builder => builder.AddContent(0, "content"))));
+
+        cut.WaitForAssertion(() =>
+        {
+            _preferences.Received(1).LoadAsync();
+            cut.Find("[data-density='comfortable']");
+        });
+    }
+
+    [Fact]
     public async Task Archive_confirm_calls_ArchiveConversationAsync()
     {
-        var cut = _ctx.Render<Chat>();
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".overflow-btn").Click();
         cut.Find("[data-testid='archive-conversation-btn']").Click();
@@ -118,7 +163,7 @@ public sealed class MobileArchiveConversationTests : IDisposable
     [Fact]
     public async Task Archive_cancel_does_not_call_ArchiveConversationAsync()
     {
-        var cut = _ctx.Render<Chat>();
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".overflow-btn").Click();
         cut.Find("[data-testid='archive-conversation-btn']").Click();
@@ -131,7 +176,7 @@ public sealed class MobileArchiveConversationTests : IDisposable
     [Fact]
     public void Archive_overlay_backdrop_click_cancels()
     {
-        var cut = _ctx.Render<Chat>();
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".overflow-btn").Click();
         cut.Find("[data-testid='archive-conversation-btn']").Click();
@@ -142,12 +187,25 @@ public sealed class MobileArchiveConversationTests : IDisposable
         Assert.Empty(cut.FindAll(".reset-confirm-overlay"));
     }
 
+    /// <summary>
+    /// #2305 (epic #2300): the close-vs-archive wording is driven by the IMMUTABLE, server-stamped
+    /// <c>Source == ConversationSource.Cron</c>, not by the deleted mutable virtual-session flag. Because <c>Source</c> is <c>init</c>-only, the cron row must be CONSTRUCTED as cron -
+    /// which is exactly the point: no inbound event can retro-fit it.
+    /// </summary>
     [Fact]
-    public void Virtual_session_uses_close_wording()
+    public void Cron_source_conversation_uses_close_wording()
     {
-        _agentState.Conversations["conv-1"].IsVirtualSession = true;
+        _agentState.Conversations["conv-1"] = new ConversationState
+        {
+            ConversationId = "conv-1",
+            Title = "Quarterly plan",
+            Status = "Active",
+            ActiveSessionId = "session-1",
+            Source = ConversationSource.Cron,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
 
-        var cut = _ctx.Render<Chat>();
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".overflow-btn").Click();
 

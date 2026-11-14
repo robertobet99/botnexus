@@ -1,4 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BotNexus.Gateway.Webhooks.Tests" />
+  </ItemGroup>
   <PropertyGroup>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <RootNamespace>BotNexus.Gateway.Webhooks</RootNamespace>
@@ -9,23 +13,38 @@
     <Compile Include="WebhookResponseMode.cs" />
     <Compile Include="WebhookRun.cs" />
     <Compile Include="WebhookRunStatus.cs" />
+    <Compile Include="WebhookInboundQueue.cs" />
+    <Compile Include="WebhookInboundQueueOptions.cs" />
     <Compile Include="IWebhookRegistrationStore.cs" />
     <Compile Include="IWebhookRunStore.cs" />
     <Compile Include="WebhookSecretHelper.cs" />
     <Compile Include="SqliteWebhookRegistrationStore.cs" />
     <Compile Include="SqliteWebhookRunStore.cs" />
+    <Compile Include="WebhookSqliteSchema.cs" />
     <Compile Include="WebhookServiceCollectionExtensions.cs" />
     <Compile Include="WebhookCallbackValidator.cs" />
+    <Compile Include="WebhookCallbackHttpTransport.cs" />
+    <Compile Include="WebhookInboundBodyGuard.cs" />
     <Compile Include="WebhookRunRetentionHostedService.cs" />
     <Compile Include="WebhookRunRetentionOptions.cs" />
+    <Compile Include="WebhookConversationProvenance.cs" />
+    <Compile Include="WebhookConversationRetentionOptions.cs" />
+    <Compile Include="WebhookConversationRetentionHostedService.cs" />
+    <Compile Include="IAgentWebhookProvisioner.cs" />
+    <Compile Include="AgentWebhookProvisioner.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\persistence\BotNexus.Persistence.Sqlite\BotNexus.Persistence.Sqlite.csproj" />
     <ProjectReference Include="..\..\domain\BotNexus.Domain\BotNexus.Domain.csproj" />
+    <ProjectReference Include="..\BotNexus.Gateway.Contracts\BotNexus.Gateway.Contracts.csproj" />
+    <ProjectReference Include="..\BotNexus.Gateway.Abstractions\BotNexus.Gateway.Abstractions.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Http" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />

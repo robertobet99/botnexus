@@ -7,16 +7,62 @@ namespace BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
 /// </summary>
 public interface IAgentInteractionService
 {
-    Task SendMessageAsync(string agentId, string content);
+    /// <summary>
+    /// Sends a user turn into <paramref name="conversationId"/> (#3063). The conversation is a
+    /// REQUIRED parameter rather than something this layer re-derives from ambient state: every
+    /// caller already holds the id, from the route or from the create-conversation response, and an
+    /// ambient re-read is the defect family that produced duplicate thread bindings, double fan-out
+    /// and misrouted steers. Sending never creates a conversation as a side effect - a caller that
+    /// needs one calls <see cref="CreateConversationAsync"/> first and passes the id it gets back.
+    /// </summary>
+    Task DeliverMessageAsync(
+        string agentId,
+        string conversationId,
+        string content,
+        InboundDeliveryMode deliveryMode = InboundDeliveryMode.Auto,
+        IReadOnlyList<DraftAttachment>? attachments = null);
+    /// <summary>
+    /// Injects a canvas-authored prompt into the conversation that owns the canvas as a genuine
+    /// USER turn (#2449). This is the server-side half of the <c>canvasState.submitToAgent</c>
+    /// bridge verb: the iframe supplies only text, never a target.
+    /// </summary>
+    /// <param name="agentId">Agent hosting the canvas panel.</param>
+    /// <param name="conversationId">
+    /// The conversation the canvas is BOUND to, taken from the host component's own parameter.
+    /// Callers must never pass a value read out of the iframe message payload - the whole point of
+    /// this parameter is that the target is derived from the host binding.
+    /// </param>
+    /// <param name="prompt">Agent-authored prompt text supplied by the canvas.</param>
+    /// <param name="instructions">Optional retrieval hint appended after the prompt.</param>
+    Task<CanvasSubmitResult> SubmitCanvasPromptAsync(string agentId, string conversationId, string? prompt, string? instructions);
+    /// <summary>Queues a follow-up turn on <paramref name="conversationId"/> (#3211).</summary>
+    Task FollowUpAsync(string agentId, string conversationId, string content);
 
-    /// <summary>Sends optional text plus validated generic attachments through the existing content-parts seam.</summary>
-    Task SendMessageAsync(string agentId, string content, IReadOnlyList<DraftAttachment> attachments);
-    Task SteerAsync(string agentId, string content);
-    Task FollowUpAsync(string agentId, string content);
-    Task AbortAsync(string agentId);
-    Task InterruptAndSteerAsync(string agentId, string message);
-    Task ResetSessionAsync(string agentId);
-    Task<CompactSessionResult?> CompactSessionAsync(string agentId);
+    /// <summary>Follows up with optional draft attachments, matching the send media overload (#2484).</summary>
+    Task FollowUpAsync(string agentId, string conversationId, string content, IReadOnlyList<DraftAttachment> attachments);
+
+    /// <summary>Aborts the run owned by <paramref name="conversationId"/> (#3211).</summary>
+    Task AbortAsync(string agentId, string conversationId);
+
+    /// <summary>Starts a fresh session for <paramref name="conversationId"/> (#3211).</summary>
+    Task ResetSessionAsync(string agentId, string conversationId);
+
+    /// <summary>
+    /// Executes <paramref name="commandText"/> through the gateway command pipeline
+    /// (<c>POST /api/commands/execute</c>) and appends the returned <c>CommandResult</c> to the
+    /// conversation named by <paramref name="conversationId"/> as a locally-rendered row (#2873).
+    /// </summary>
+    /// <remarks>
+    /// No model turn is consumed: the command text is never delivered to the agent. When the
+    /// pipeline rejects the command, is unreachable, or the named conversation is unknown, an
+    /// <c>Error</c> row is appended so the failure is visible rather than silent. #3211 made the
+    /// conversation explicit so a command never renders into a conversation the user is not viewing.
+    /// </remarks>
+    /// <returns><see langword="true"/> when the pipeline returned a non-error result.</returns>
+    Task<bool> ExecuteGatewayCommandAsync(string agentId, string conversationId, string commandText);
+
+    /// <summary>Compacts the session bound to <paramref name="conversationId"/> (#3211).</summary>
+    Task<CompactSessionResult?> CompactSessionAsync(string agentId, string conversationId);
     Task<string?> CreateConversationAsync(string agentId, string? title = null, bool select = true);
     Task SelectConversationAsync(string agentId, string conversationId);
 
@@ -39,7 +85,16 @@ public interface IAgentInteractionService
     Task SetConversationPinnedAsync(string agentId, string conversationId, bool pinned);
     Task RefreshAgentsAsync();
     Task RefreshConversationsAsync(string agentId);
+    /// <summary>
+    /// Opens a read-only sub-agent session as an explicit, NON-navigational overlay (#2247). This
+    /// intentionally does not change the browser URL: the active view is otherwise route-owned, so
+    /// leaving the URL on the user's own agent+conversation means a refresh or back/forward restores
+    /// the user's route rather than the transient sub-agent transcript. Promotes the read-only
+    /// session via <see cref="SelectionSource.SubAgentView"/>, the only source the store's anti-hijack
+    /// guard permits onto a read-only agent.
+    /// </summary>
     Task ViewSubAgentAsync(SubAgentInfo subAgent);
     Task RespondToAskUserAsync(string conversationId, string requestId, string? freeFormText, string[]? selectedValues, bool cancelled);
-    void ClearLocalMessages(string agentId);
+    /// <summary>Clears the locally-held transcript of <paramref name="conversationId"/> (#3211).</summary>
+    void ClearLocalMessages(string agentId, string conversationId);
 }

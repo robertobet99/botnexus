@@ -63,13 +63,28 @@ public static class ResponsesStreamHelpers
     /// Projects a Responses-API <c>usage</c> object into the core <see cref="Usage"/> model, folding
     /// cache read/write tokens out of the billed input count and attaching computed cost for the model.
     /// </summary>
-    public static Usage ParseUsage(JsonElement usageElement, LlmModel model)
+    /// <remarks>
+    /// Reported reasoning tokens (<c>output_tokens_details.reasoning_tokens</c>) are carried on
+    /// <see cref="Usage.Reasoning"/> for attribution only (#3297). <see cref="Usage.Output"/> keeps its
+    /// inclusive meaning — the Responses API already counts reasoning inside <c>output_tokens</c> — so
+    /// the cost arithmetic and every existing consumer are unaffected. The field stays
+    /// <see langword="null"/> when the provider reported no breakdown: absent is never coerced to a
+    /// measured zero, because that would rank a thinking-heavy model as free.
+    /// </remarks>
+    public static Usage ParseUsage(this JsonElement usageElement, LlmModel model)
     {
         var inputTokens = usageElement.TryGetProperty("input_tokens", out var input) ? input.GetInt32() : 0;
         var outputTokens = usageElement.TryGetProperty("output_tokens", out var output) ? output.GetInt32() : 0;
         var total = usageElement.TryGetProperty("total_tokens", out var totalEl) ? totalEl.GetInt32() : inputTokens + outputTokens;
         var cacheRead = 0;
         var cacheWrite = 0;
+        int? reasoning = null;
+        if (usageElement.TryGetProperty("output_tokens_details", out var outputDetails) &&
+            outputDetails.TryGetProperty("reasoning_tokens", out var reasoningEl))
+        {
+            reasoning = reasoningEl.GetInt32();
+        }
+
         if (usageElement.TryGetProperty("input_tokens_details", out var details))
         {
             if (details.TryGetProperty("cached_tokens", out var cached))
@@ -83,6 +98,7 @@ public static class ResponsesStreamHelpers
             Output = outputTokens,
             CacheRead = cacheRead,
             CacheWrite = cacheWrite,
+            Reasoning = reasoning,
             TotalTokens = total
         };
         return usage with { Cost = ModelRegistry.CalculateCost(model, usage) };
@@ -92,6 +108,13 @@ public static class ResponsesStreamHelpers
     /// Maps a Responses-API completion <c>status</c> string to the core <see cref="StopReason"/>.
     /// Unknown, in-progress, or absent statuses fall back to <see cref="StopReason.Stop"/>.
     /// </summary>
+    /// <remarks>
+    /// <c>cancelled</c> is deliberately NOT grouped with <c>failed</c> (#3294): a cancellation is a
+    /// caller decision, not a provider failure, so it normalises to <see cref="StopReason.Aborted"/>
+    /// — the same value the out-of-band <c>ResponsesStreamEngine.EmitAborted</c> path already emits
+    /// for the identical event. Grouping them made one user cancellation surface two different ways
+    /// depending on whether the abort arrived in-band on the SSE stream or out-of-band.
+    /// </remarks>
     public static StopReason MapStopReason(string? status) => status switch
     {
         "completed" => StopReason.Stop,
@@ -99,7 +122,7 @@ public static class ResponsesStreamHelpers
         "refusal" => StopReason.Refusal,
         "content_filter" => StopReason.Sensitive,
         "failed" => StopReason.Error,
-        "cancelled" => StopReason.Error,
+        "cancelled" => StopReason.Aborted,
         "in_progress" => StopReason.Stop,
         "queued" => StopReason.Stop,
         _ => StopReason.Stop

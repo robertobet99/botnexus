@@ -1,7 +1,9 @@
 using System.Text;
+using Microsoft.Extensions.Logging;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Audit;
 using BotNexus.Gateway.Sessions;
 
 namespace BotNexus.Gateway.Streaming;
@@ -39,15 +41,50 @@ public static class StreamingSessionHelper
         CancellationToken cancellationToken = default)
     {
         options ??= new StreamingSessionOptions();
+        // #2614: every tool history row this delivery-layer helper persists is rendered by the ONE
+        // execution-layer audit sink the blocking PromptAsync callers also write through. The helper
+        // no longer owns a tool-entry format of its own.
+        var auditSink = options.ToolAuditSink ?? DefaultToolAuditSink.Instance;
+        // #2149: the orthogonal typed kind to stamp on assistant entries this run produces. The
+        // default (MessageKind.Message) stores as null so ordinary streamed responses are
+        // unchanged; a subagent-response run carries the distinct kind through every flush path so
+        // live delivery and history replay agree.
+        var assistantKind = options.AssistantMessageKind is { } k && !k.Equals(MessageKind.Message)
+            ? k
+            : null;
         var streamedContent = new StringBuilder();
+        var runAssistantContent = new StringBuilder();
         var streamedHistory = new List<SessionEntry>();
         var allHistoryEntries = new List<SessionEntry>();
         var hadThinkingContent = false;
         var thinkingBuffer = new StringBuilder();
         var hadMessageEnd = false;
+        // #2921: latch whether this run has ALREADY persisted a non-empty assistant entry.
+        // hadThinkingContent is sticky for the whole run while thinkingBuffer is cleared at every
+        // TurnEnd, so a normal thinking+text turn used to satisfy the #1198 thinking-only branch
+        // below at the final write and append a second, contentless assistant row. That ghost row
+        // carried no ThinkingContent - which is exactly why all observed rows have thinking_content
+        // NULL. The #1198 branch itself is unchanged; it is simply no longer reachable once real
+        // assistant content has been emitted.
+        var emittedAssistantContent = false;
+        // #3336: index into streamedContent at which the CURRENT assistant message's text begins.
+        // MessageEnd carries the provider's reconciled final text for that message only, so the
+        // replacement is scoped to this message's tail - a whole-buffer overwrite would discard an
+        // earlier message's text when a single turn produces more than one.
+        var currentMessageStart = 0;
         var toolStartIds = new HashSet<string>(StringComparer.Ordinal);
         var toolEndIds = new HashSet<string>(StringComparer.Ordinal);
         var toolStartEntries = new Dictionary<string, SessionEntry>(StringComparer.Ordinal);
+        // #2613: the streaming half of the shared tool-invocation timeline. Records are appended in
+        // ToolStart order (so OrderIndex is execution order) and completed in place on ToolEnd, then
+        // surfaced on StreamingSessionResult so this boundary and the blocking PromptAsync boundary
+        // hand back the SAME record shape produced by the SAME policy.
+        var toolInvocationBuilders = new List<ToolInvocationBuilder>();
+        var toolInvocationIndex = new Dictionary<string, ToolInvocationBuilder>(StringComparer.Ordinal);
+        RunCompletionSignal? runCompletion = null;
+        AgentResponseUsage? runUsage = null;
+        var turnCount = 0;
+        AgentRunId? agentRunId = null;
 
         // Apply stall watchdog if configured — wraps the stream with inactivity timeout.
         var effectiveStream = options.StallWatchdog is not null
@@ -56,6 +93,7 @@ public static class StreamingSessionHelper
 
         await foreach (var evt in effectiveStream.WithCancellation(cancellationToken))
         {
+            agentRunId = evt.AgentRunId ?? agentRunId;
             switch (evt.Type)
             {
                 case AgentStreamEventType.ContentDelta when evt.ContentDelta is not null:
@@ -65,27 +103,63 @@ public static class StreamingSessionHelper
                     hadThinkingContent = true;
                     thinkingBuffer.Append(evt.ThinkingContent);
                     break;
+                case AgentStreamEventType.MessageStart:
+                    // #3336: anchor the current message's slice of the shared content buffer.
+                    currentMessageStart = streamedContent.Length;
+                    break;
                 case AgentStreamEventType.MessageEnd:
                     hadMessageEnd = true;
+                    turnCount++;
+                    runUsage = AddUsage(runUsage, evt.Usage);
+                    // #3336: the provider's own final text for this message wins over the text we
+                    // assembled from deltas, mirroring StreamAssemblyConformance.Reconcile at the
+                    // parser seam. The deltas were already emitted (and already rendered live), so
+                    // this is the only point at which a transport artifact can be kept out of
+                    // session_history. NULL means the provider supplied nothing to check against -
+                    // never "the message was empty" - so absence leaves the assembled text alone.
+                    if (evt.FinalContent is { } reconciled)
+                    {
+                        // The buffer is cleared at every TurnEnd, so the anchor can outlive the text
+                        // it pointed at. Clamp rather than index blindly.
+                        var anchor = Math.Min(currentMessageStart, streamedContent.Length);
+                        var assembled = streamedContent.ToString(anchor, streamedContent.Length - anchor);
+                        // An EMPTY final never overwrites non-empty assembled text. Reconciliation
+                        // exists to remove transport artifacts, not to delete a model's answer, and
+                        // several terminal paths report a contentless completion (#2921). Deleting
+                        // real content would be a strictly worse defect than the one being fixed.
+                        if (reconciled.Length > 0
+                            && !string.Equals(assembled, reconciled, StringComparison.Ordinal))
+                        {
+                            streamedContent.Length = anchor;
+                            streamedContent.Append(reconciled);
+                        }
+                    }
+                    // #2522 producer seam: a MessageEnd carries the provider's reported usage for
+                    // the request that produced this assistant message, and the session is writable
+                    // and about to be persisted by the flush below. Stamp the prompt-token count
+                    // here so the compactor's measure-first diagnostic (which already reads this
+                    // key) stops rendering "unavailable". Diagnostic only - no compaction
+                    // behaviour is gated on it.
+                    ProviderTokenUsageRecorder.Record(session, evt.Usage);
+                    break;
+                case AgentStreamEventType.RunEnded:
+                    runCompletion = evt.Completion;
                     break;
                 case AgentStreamEventType.ToolStart when evt.ToolCallId is not null || evt.ToolName is not null:
-                    var startEntry = new SessionEntry
-                    {
-                        Role = MessageRole.Tool,
-                        Content = $"Tool '{evt.ToolName ?? "unknown"}' started.",
-                        ToolName = evt.ToolName,
-                        ToolCallId = evt.ToolCallId,
-                        ToolArgs = evt.ToolArgs is { Count: > 0 }
+                    var startEntry = auditSink.ProjectStart(
+                        evt.ToolCallId,
+                        evt.ToolName,
+                        evt.ToolArgs is { Count: > 0 }
                             ? System.Text.Json.JsonSerializer.Serialize(evt.ToolArgs)
-                            : null
-                    };
+                            : null) with { AgentRunId = evt.AgentRunId, PersistenceKey = DefaultToolAuditSink.GetToolStartPersistenceKey(evt.ToolCallId, evt.AgentRunId) };
+                    // The write-ahead can append directly through ISessionStore, so this aggregate
+                    // may be stale. The stable persistence key on ProjectStart is the authoritative
+                    // idempotency contract; this snapshot check is only a cheap in-memory guard.
                     var alreadyPersisted = evt.ToolCallId is not null
                         && session.GetHistorySnapshot().Any(entry =>
-                            entry.ToolCallId == evt.ToolCallId && entry.ToolArgs is not null);
+                            entry.ToolCallId == evt.ToolCallId && entry.AgentRunId == evt.AgentRunId && entry.IsToolStartRow());
                     if (!alreadyPersisted)
-                    {
                         streamedHistory.Add(startEntry);
-                    }
                     allHistoryEntries.Add(startEntry);
                     if (evt.ToolCallId is not null)
                     {
@@ -93,11 +167,31 @@ public static class StreamingSessionHelper
                         toolStartEntries[evt.ToolCallId] = startEntry;
                     }
 
+                    // #2613: open a record for this call at its start, capturing the arguments and
+                    // the observed start time. A duplicate ToolStart for the same id does not open
+                    // a second record - ordering is defined by first observation.
+                    var startKey = evt.ToolCallId ?? evt.ToolName ?? "unknown";
+                    if (!toolInvocationIndex.ContainsKey(startKey))
+                    {
+                        var builder = new ToolInvocationBuilder
+                        {
+                            ToolCallId = startKey,
+                            ToolName = evt.ToolName ?? "unknown",
+                            Arguments = startEntry.ToolArgs,
+                            StartedAt = evt.Timestamp
+                        };
+                        toolInvocationBuilders.Add(builder);
+                        toolInvocationIndex[startKey] = builder;
+                    }
+
                     // Write-ahead: persist tool start immediately so the entry
                     // survives browser refresh or session stall (#1052).
                     session.AddEntries(streamedHistory.ToList());
                     streamedHistory.Clear();
-                    session.RemoveCrashSentinels();
+                    // Do NOT remove the crash sentinel on this mid-run tool-start write-ahead
+                    // (#2135). The sentinel is a durable lease for the entire agent run; a tool
+                    // turn is a continuation, not a terminal boundary. It is removed only at the
+                    // final authoritative completion save below.
                     try
                     {
                         await sessionStore.SaveAsync(session, cancellationToken);
@@ -109,28 +203,59 @@ public static class StreamingSessionHelper
                     }
                     break;
                 case AgentStreamEventType.ToolEnd when evt.ToolCallId is not null || evt.ToolName is not null:
-                    var toolEndContent = evt.ToolResult ?? (evt.ToolIsError == true ? "Tool execution failed." : "Tool execution completed.");
-                    // Cap oversized tool results at write time (#1598) so the full blob never
-                    // lands in session_history nor gets re-sent to the model on the next turn.
-                    toolEndContent = TruncateToolResult(toolEndContent, options.MaxPersistedToolResultBytes);
-                    streamedHistory.Add(new SessionEntry
-                    {
-                        Role = MessageRole.Tool,
-                        Content = toolEndContent,
-                        ToolName = evt.ToolName,
-                        ToolCallId = evt.ToolCallId,
-                        ToolIsError = evt.ToolIsError == true
-                    });
+                    // #2614: the sink renders the result row and applies the write-time #1598 cap,
+                    // so the streamed and blocking boundaries cannot drift in format.
+                    // #2906: re-supply the arguments the paired ToolStart carried so the RESULT row
+                    // is self-describing. They are already in hand here - the start entry for this
+                    // tool_call_id is held in toolStartEntries - so the value never has to be
+                    // recovered later by a self-join over the transcript.
+                    var resultArgs = evt.ToolCallId is not null
+                        && toolStartEntries.TryGetValue(evt.ToolCallId, out var pairedStart)
+                        ? pairedStart.ToolArgs
+                        : null;
+                    streamedHistory.Add(auditSink.ProjectResult(
+                        evt.ToolCallId,
+                        evt.ToolName,
+                        evt.ToolResult,
+                        evt.ToolIsError == true,
+                        options.MaxPersistedToolResultBytes,
+                        resultArgs) with { AgentRunId = evt.AgentRunId, ToolIsIncomplete = evt.ToolIsIncomplete });
                     allHistoryEntries.Add(streamedHistory[^1]);
                     if (evt.ToolCallId is not null)
                         toolEndIds.Add(evt.ToolCallId);
+
+                    // #2613: close the matching record with the raw result and error state. The
+                    // record's own byte budget and secret sweep are applied by the policy at
+                    // construction time, independently of the history write-time cap above.
+                    var endKey = evt.ToolCallId ?? evt.ToolName ?? "unknown";
+                    if (toolInvocationIndex.TryGetValue(endKey, out var endBuilder))
+                    {
+                        endBuilder.ResultContent = evt.ToolResult;
+                        endBuilder.IsError = evt.ToolIsError == true;
+                        endBuilder.CompletedAt = evt.Timestamp;
+                        endBuilder.Completed = !evt.ToolIsIncomplete;
+                    }
+                    else
+                    {
+                        // Defensive: a ToolEnd with no observed ToolStart still belongs on the
+                        // timeline rather than being silently dropped.
+                        var orphan = new ToolInvocationBuilder
+                        {
+                            ToolCallId = endKey,
+                            ToolName = evt.ToolName ?? "unknown",
+                            ResultContent = evt.ToolResult,
+                            IsError = evt.ToolIsError == true,
+                            StartedAt = evt.Timestamp,
+                            CompletedAt = evt.ToolIsIncomplete ? null : evt.Timestamp,
+                            Completed = !evt.ToolIsIncomplete
+                        };
+                        toolInvocationBuilders.Add(orphan);
+                        toolInvocationIndex[endKey] = orphan;
+                    }
+
                     break;
                 case AgentStreamEventType.Error when options.IncludeErrorsInHistory && !string.IsNullOrWhiteSpace(evt.ErrorMessage):
-                    streamedHistory.Add(new SessionEntry
-                    {
-                        Role = MessageRole.System,
-                        Content = $"Agent stream error: {evt.ErrorMessage}"
-                    });
+                    streamedHistory.Add(CreateErrorEntry(agentRunId, evt.ErrorMessage));
                     allHistoryEntries.Add(streamedHistory[^1]);
                     break;
                 case AgentStreamEventType.TurnEnd when streamedHistory.Count > 0 || streamedContent.Length > 0:
@@ -143,13 +268,24 @@ public static class StreamingSessionHelper
                     streamedHistory.Clear();
                     if (streamedContent.Length > 0)
                     {
-                        turnSnapshot.Add(new SessionEntry { Role = MessageRole.Assistant, Content = streamedContent.ToString(), ThinkingContent = thinkingBuffer.Length > 0 ? thinkingBuffer.ToString() : null });
+                        if (runAssistantContent.Length > 0)
+                            runAssistantContent.AppendLine();
+                        runAssistantContent.Append(streamedContent);
+                        turnSnapshot.Add(new SessionEntry { AgentRunId = agentRunId, Role = MessageRole.Assistant, Content = streamedContent.ToString(), ThinkingContent = thinkingBuffer.Length > 0 ? thinkingBuffer.ToString() : null, Kind = assistantKind });
+                        emittedAssistantContent = true;
                         thinkingBuffer.Clear();
                         streamedContent.Clear();
+                        // #3336: the buffer this anchor indexed into is gone.
+                        currentMessageStart = 0;
                     }
                     session.AddEntries(turnSnapshot);
-                    // Remove crash sentinel before flushing partial turn state.
-                    session.RemoveCrashSentinels();
+                    // Do NOT remove the crash sentinel here (#2135). A streamed agent run can
+                    // emit another MessageStart/tool turn after this intermediate TurnEnd; the
+                    // sentinel is a durable lease for the ENTIRE run, not one streamed model turn.
+                    // Clearing it at each intermediate TurnEnd left in-flight work with no
+                    // replayable marker if the process died before the run reached its final,
+                    // authoritative completion save (which is the only place the sentinel is
+                    // removed - see below).
                     try
                     {
                         await sessionStore.SaveAsync(session, cancellationToken);
@@ -175,17 +311,11 @@ public static class StreamingSessionHelper
         // consumers (e.g. provider message builders) do not encounter an orphan call.
         foreach (var orphanId in toolStartIds.Except(toolEndIds))
         {
-            var toolName = toolStartEntries.TryGetValue(orphanId, out var entry)
-                ? entry.ToolName ?? "unknown"
-                : "unknown";
-            var orphanEntry = new SessionEntry
-            {
-                Role = MessageRole.Tool,
-                Content = $"Tool '{toolName}' did not complete — result synthesized for transcript consistency.",
-                ToolName = toolName,
-                ToolCallId = orphanId,
-                ToolIsError = true
-            };
+            var hasStart = toolStartEntries.TryGetValue(orphanId, out var entry);
+            var toolName = hasStart ? entry!.ToolName ?? "unknown" : "unknown";
+            // #2906: an interrupted call is exactly the case forensics needs the arguments for, so
+            // the synthesized row carries them too.
+            var orphanEntry = auditSink.ProjectIncomplete(orphanId, toolName, hasStart ? entry!.ToolArgs : null) with { AgentRunId = hasStart ? entry?.AgentRunId : agentRunId };
             streamedHistory.Add(orphanEntry);
             allHistoryEntries.Add(orphanEntry);
         }
@@ -196,9 +326,10 @@ public static class StreamingSessionHelper
         var finalContent = streamedContent.ToString();
         if (!string.IsNullOrWhiteSpace(finalContent))
         {
-            session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = finalContent, ThinkingContent = thinkingBuffer.Length > 0 ? thinkingBuffer.ToString() : null });
+            session.AddEntry(new SessionEntry { AgentRunId = agentRunId, Role = MessageRole.Assistant, Content = finalContent, ThinkingContent = thinkingBuffer.Length > 0 ? thinkingBuffer.ToString() : null, Kind = assistantKind });
+            emittedAssistantContent = true;
         }
-        else if (streamedHistory.Count == 0 && hadThinkingContent && hadMessageEnd)
+        else if (streamedHistory.Count == 0 && hadThinkingContent && hadMessageEnd && !emittedAssistantContent)
         {
             // The model produced only reasoning/thinking blocks and no visible text or tool calls.
             // Add an empty assistant entry so the transcript is in a valid state (prevents the
@@ -206,13 +337,122 @@ public static class StreamingSessionHelper
             // thinking-only responses are a normal model behaviour, not an error (#1198).
             session.AddEntry(new SessionEntry
             {
+                AgentRunId = agentRunId,
                 Role = MessageRole.Assistant,
-                Content = string.Empty
+                Content = string.Empty,
+                Kind = assistantKind
+            });
+        }
+        else if (hadMessageEnd && streamedHistory.Count == 0 && !emittedAssistantContent)
+        {
+            // #2921: the run reached a clean MessageEnd but produced no visible text, no tool calls
+            // and no thinking for this final completion. Nothing is persisted (a contentless row is
+            // not a valid transcript entry), but the run has ended without answering - make that
+            // observable instead of failing silently.
+            //
+            // #3129: streamedContent/streamedHistory are per-TURN buffers - the TurnEnd case above
+            // persists the assistant message and then CLEARS both, so by the time this final write
+            // runs a perfectly normal ContentDelta -> MessageEnd -> TurnEnd run looks identical to a
+            // contentless one. emittedAssistantContent is the run-scoped latch that distinguishes
+            // them: it is set only where an assistant row is actually appended to the session (the
+            // TurnEnd flush and the final-content write above), so gating on it suppresses the
+            // false positive without muting the genuine "ended without answering" signal that #2921
+            // added and the #3125 spike depends on.
+            //
+            // #3535: ONE of the shapes reaching here is a genuine user-facing failure rather than a
+            // curiosity - the prompt already filled the provider's context window, so there was no
+            // room left to answer. The notifier discriminates that case arithmetically (recorded
+            // provider prompt tokens vs the SCOPE-RESOLVED window) and appends a
+            // MessageRole.Notification only then. The thinking-only branch above and the #3129
+            // normal-run case never reach this line, and a run with no recorded provider count
+            // returns null here, so both stay silent exactly as before.
+            //
+            // The notice is delivered as a ContentDelta through options.OnEventAsync - the SAME
+            // callback every other byte of this run's user-visible output already travels on - so it
+            // reaches whatever channel is attached by a path that channel already renders, and this
+            // helper does not acquire any knowledge of channels. Best-effort throughout: this run
+            // has already failed to answer and a throwing notifier would turn a silent turn into a
+            // crashed one.
+            string? exhaustionNotice = null;
+            if (options.ContextExhaustionNotifier is { } exhaustionNotifier)
+            {
+                try
+                {
+                    exhaustionNotice = await exhaustionNotifier
+                        .TryBuildNoticeAsync(session, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    options.Logger?.LogWarning(ex,
+                        "Context-exhaustion check failed for session '{SessionId}'.",
+                        session.SessionId.Value);
+                }
+            }
+
+            if (exhaustionNotice is not null)
+            {
+                if (options.OnEventAsync is not null)
+                {
+                    try
+                    {
+                        await options.OnEventAsync(
+                            new AgentStreamEvent
+                            {
+                                Type = AgentStreamEventType.ContentDelta,
+                                ContentDelta = exhaustionNotice,
+                                SessionId = session.SessionId
+                            },
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        options.Logger?.LogWarning(ex,
+                            "Could not deliver the context-exhaustion notice for session '{SessionId}'. " +
+                            "The transcript row was still written.",
+                            session.SessionId.Value);
+                    }
+                }
+            }
+            else
+            {
+                options.Logger?.LogWarning(
+                    "Run for session '{SessionId}' terminated on an empty assistant completion " +
+                    "(no content, no tool calls, no thinking). No transcript row was written.",
+                    session.SessionId.Value);
+            }
+        }
+
+        // A host-authored row survives both history endpoints, even when the optional model
+        // summary is empty. Do not mix it into AssistantContent or the provider's final text.
+        var budgetNotice = ToolResultBudgetNotice.Create(runCompletion?.StopReason,
+            runCompletion?.GuardObservations?.Any(guard => guard.AbsoluteLimitReached) == true,
+            runCompletion?.ToolResultBudget);
+        if (budgetNotice is not null && !session.GetHistorySnapshot().Any(entry =>
+            entry.ResolveKind().Value == ToolResultBudgetNotice.Kind && entry.AgentRunId == agentRunId))
+        {
+            session.AddEntry(new SessionEntry
+            {
+                AgentRunId = agentRunId,
+                Role = MessageRole.System,
+                Content = budgetNotice,
+                Kind = MessageKind.FromString(ToolResultBudgetNotice.Kind),
+                PersistenceKey = agentRunId is { } noticeRun ? $"tool-result-budget:{noticeRun.Value}" : null
             });
         }
 
-        // Remove crash sentinel on clean completion (#363).
-        session.RemoveCrashSentinels();
+        // Persist the authoritative finalization signal alongside the session before the same
+        // final save that commits the transcript. This keeps history/debug callers truthful after a
+        // restart instead of forcing them to infer completion from inactivity (#4165). Assign even
+        // when null so a later legacy/no-signal run cannot leave an earlier parked outcome behind.
+        session.RunCompletion = runCompletion;
+
+        // A failed terminal completion is recoverable work, not a clean lease release. Keep the
+        // sentinel through the authoritative save so the live recovery subscriber (or startup scan
+        // after a crash) has the same durable marker to accept-before-consume (#4406).
+        var terminalFailure = IsTerminalFailure(runCompletion);
+        if (!terminalFailure)
+            session.RemoveCrashSentinels();
 
         // #1518: the final write is the authoritative post-run finalizer save. When a fence was
         // supplied, honour it so a delete/reset that landed mid-stream cannot be undone here. On
@@ -228,12 +468,88 @@ public static class StreamingSessionHelper
                 new SessionLifecycleEvent(
                     session.SessionId.Value,
                     session.AgentId.Value,
-                    SessionLifecycleEventType.Closed,
+                    terminalFailure
+                        ? SessionLifecycleEventType.TerminalFailure
+                        : SessionLifecycleEventType.Closed,
                     session),
                 cancellationToken);
         }
 
-        return new StreamingSessionResult(streamedContent.ToString(), allHistoryEntries);
+        // #2613: materialise the tool timeline through the single shared policy, so the streaming
+        // boundary hands back exactly the record shape the blocking boundary produces.
+        var toolInvocations = toolInvocationBuilders
+            .Select((builder, index) => ToolInvocationRecordPolicy.Default.Create(
+                orderIndex: index,
+                toolCallId: builder.ToolCallId,
+                toolName: builder.ToolName,
+                rawArguments: builder.Arguments,
+                rawResultContent: builder.ResultContent,
+                isError: builder.Completed ? builder.IsError : true,
+                isIncomplete: !builder.Completed,
+                startedAt: builder.StartedAt,
+                completedAt: builder.Completed ? builder.CompletedAt : null) with { AgentRunId = agentRunId })
+            .ToList();
+
+        if (streamedContent.Length > 0)
+        {
+            if (runAssistantContent.Length > 0)
+                runAssistantContent.AppendLine();
+            runAssistantContent.Append(streamedContent);
+        }
+
+        return new StreamingSessionResult(
+            runAssistantContent.ToString(),
+            allHistoryEntries,
+            toolInvocations,
+            runCompletion,
+            runUsage,
+            turnCount,
+            finalOutcome);
+    }
+
+    private static AgentResponseUsage? AddUsage(AgentResponseUsage? aggregate, AgentResponseUsage? next)
+    {
+        if (next is null)
+            return aggregate;
+
+        static int? Add(int? left, int? right)
+        {
+            if (left is null && right is null)
+                return null;
+            return (int)Math.Min(int.MaxValue, (long)(left ?? 0) + (right ?? 0));
+        }
+
+        return new AgentResponseUsage(
+            Add(aggregate?.InputTokens, next.InputTokens),
+            Add(aggregate?.OutputTokens, next.OutputTokens),
+            Add(aggregate?.CacheRead, next.CacheRead),
+            Add(aggregate?.CacheWrite, next.CacheWrite));
+    }
+
+    /// <summary>Error text for a failed run that carries no detail, on either execution branch.</summary>
+    internal const string RunFailedWithoutDetail = "The agent run failed but supplied no detail.";
+
+    /// <summary>
+    /// True when a settled run's completion says it failed. Shared with the blocking branch of
+    /// <see cref="GatewayHost"/> so both classify the same completion alike. A missing completion is not a failure.
+    /// </summary>
+    internal static bool IsTerminalFailure(RunCompletionSignal? completion)
+        => string.Equals(completion?.Status, "Failed", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The history row that records a run error, shared with the blocking branch so both record it in the same words.</summary>
+    internal static SessionEntry CreateErrorEntry(AgentRunId? agentRunId, string errorMessage)
+        => new() { AgentRunId = agentRunId, Role = MessageRole.System, Content = $"Agent stream error: {errorMessage}" };
+
+    /// <summary>
+    /// The error row for a failed blocking run, with the detail the stream boundary would emit for it:
+    /// the terminal turn's error, else the completion's detail, else <see cref="RunFailedWithoutDetail"/>.
+    /// </summary>
+    internal static SessionEntry CreateFailedRunEntry(AgentRunId? agentRunId, string? terminalError, RunCompletionSignal? completion)
+    {
+        if (!string.IsNullOrWhiteSpace(terminalError))
+            return CreateErrorEntry(agentRunId, terminalError);
+        return CreateErrorEntry(agentRunId,
+            completion?.Detail is { } detail && !string.IsNullOrWhiteSpace(detail) ? detail : RunFailedWithoutDetail);
     }
 
     /// <summary>
@@ -314,13 +630,57 @@ public sealed record StreamingSessionOptions(
     bool IncludeErrorsInHistory = false,
     Func<AgentStreamEvent, CancellationToken, ValueTask>? OnEventAsync = null,
     ProviderStallWatchdog? StallWatchdog = null,
-    int MaxPersistedToolResultBytes = 0);
+    int MaxPersistedToolResultBytes = 0,
+    MessageKind? AssistantMessageKind = null,
+    IToolAuditSink? ToolAuditSink = null,
+    ILogger? Logger = null,
+    Sessions.IContextExhaustionNotifier? ContextExhaustionNotifier = null);
 
 /// <summary>
 /// Represents the accumulated results of stream processing.
 /// </summary>
 /// <param name="AssistantContent">The full assistant response assembled from deltas.</param>
 /// <param name="HistoryEntries">The history entries generated from stream events.</param>
+/// <param name="ToolInvocations">
+/// The run's tool timeline in execution order (issue #2613). Same record type, produced by the
+/// same <see cref="ToolInvocationRecordPolicy"/>, as the blocking <c>PromptAsync</c> boundary
+/// projects - so a streamed run and a blocking run of the same tool sequence are observably
+/// equivalent rather than two parallel shapes.
+/// </param>
+/// <param name="Completion">Authoritative completion signal carried by the run-ended event.</param>
+/// <param name="Usage">Usage aggregated across every streamed assistant message.</param>
+/// <param name="TurnCount">Number of completed streamed assistant messages.</param>
+/// <param name="FinalSaveOutcome">Outcome of the authoritative final transcript save.</param>
 public sealed record StreamingSessionResult(
     string AssistantContent,
-    IReadOnlyList<SessionEntry> HistoryEntries);
+    IReadOnlyList<SessionEntry> HistoryEntries,
+    IReadOnlyList<ToolInvocationRecord>? ToolInvocations = null,
+    RunCompletionSignal? Completion = null,
+    AgentResponseUsage? Usage = null,
+    int TurnCount = 0,
+    SessionSaveOutcome FinalSaveOutcome = SessionSaveOutcome.Persisted)
+{
+    /// <summary>
+    /// The run's tool timeline in execution order; never null, empty when the run used no tools.
+    /// </summary>
+    public IReadOnlyList<ToolInvocationRecord> ToolInvocations { get; init; } = ToolInvocations ?? [];
+}
+
+/// <summary>
+/// Mutable in-flight accumulator for one streamed tool call. A stream reveals a call's arguments
+/// at <c>ToolStart</c> and its result at <c>ToolEnd</c>, so the record cannot be built in one shot;
+/// this holds the halves until the run settles, at which point every entry is materialised through
+/// <see cref="ToolInvocationRecordPolicy"/>. Internal by design - it is scaffolding, not a second
+/// public tool-timeline shape (#2613 AC3).
+/// </summary>
+internal sealed class ToolInvocationBuilder
+{
+    public required string ToolCallId { get; init; }
+    public required string ToolName { get; init; }
+    public string? Arguments { get; init; }
+    public string? ResultContent { get; set; }
+    public bool IsError { get; set; }
+    public DateTimeOffset? StartedAt { get; init; }
+    public DateTimeOffset? CompletedAt { get; set; }
+    public bool Completed { get; set; }
+}

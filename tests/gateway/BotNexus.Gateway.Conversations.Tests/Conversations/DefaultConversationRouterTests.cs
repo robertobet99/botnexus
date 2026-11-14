@@ -41,7 +41,13 @@ public sealed class DefaultConversationRouterTests
         result.ShouldNotBeNull();
         result.Conversation.ShouldNotBeNull();
         result.Conversation.AgentId.ShouldBe(agentId);
-        result.Conversation.IsDefault.ShouldBeFalse(); // per-address conversation, not the default
+        // #2488: this agent had NO conversations, so the first one the router mints becomes its
+        // default. The original intent of this test - "every channel address gets its own
+        // conversation, bound to that address" - is unchanged and still asserted below; only the
+        // IsDefault expectation flips, because before #2488 nothing in production could ever set
+        // it. DefaultConversationRouterDefaultConversationTests pins that the SECOND address does
+        // not become a second default.
+        result.Conversation.IsDefault.ShouldBeTrue();
         result.Conversation.ChannelBindings.ShouldHaveSingleItem();
         result.Conversation.ChannelBindings[0].ChannelAddress.ShouldBe(ChannelAddress.From("chat-123"));
     }
@@ -782,6 +788,81 @@ public sealed class DefaultConversationRouterTests
         second.Conversation.ChannelBindings
             .Count(b => b.ChannelType == channel && b.ChannelAddress == address)
             .ShouldBe(1);
+    }
+
+    // -- #2530: agent-id-as-address must not persist on EXTERNAL transports ------
+
+    [Theory]
+    [InlineData("servicebus")]
+    [InlineData("telegram")]
+    [InlineData("agent365")]
+    [InlineData("internal")]
+    public async Task ResolveInbound_AddressEqualsAgentId_OnExternalChannel_PersistsNoSuchBinding(string channelType)
+    {
+        // #2530: an agent id minted as a ChannelAddress on an external transport is a junk
+        // binding -- fan-out sends a real envelope to it and the relay drops the reply with
+        // "No conversation reference found for <agentId>". Assert the OBSERVABLE: the
+        // conversation as PERSISTED carries no binding addressed by the agent id.
+        var conversationStore = new InMemoryConversationStore();
+        var router = CreateRouter(conversationStore);
+        var agentId = Agent("tinker");
+
+        var result = await router.ResolveInboundAsync(
+            agentId, Channel(channelType), ChannelAddress.From(agentId.Value), null);
+
+        var persisted = await conversationStore.GetAsync(result.Conversation.ConversationId, CancellationToken.None);
+        persisted.ShouldNotBeNull();
+        persisted!.ChannelBindings
+            .ShouldNotContain(
+                b => b.ChannelAddress.Value == agentId.Value,
+                $"channel type '{channelType}' must not persist a binding addressed by the agent id");
+    }
+
+    [Fact]
+    public async Task ResolveInbound_AddressEqualsAgentId_OnSignalR_StillPersistsBinding()
+    {
+        // The portal deliberately uses the agent id as its conversation-first signalr routing
+        // key (GatewayHub). Delivery is by SignalR group, not by the address, so this binding
+        // is deliverable and MUST keep persisting -- dropping it would break reconnect
+        // resolution via ResolveByBindingAsync.
+        var conversationStore = new InMemoryConversationStore();
+        var router = CreateRouter(conversationStore);
+        var agentId = Agent("tinker");
+
+        var result = await router.ResolveInboundAsync(
+            agentId, Channel("signalr"), ChannelAddress.From(agentId.Value), null);
+
+        var persisted = await conversationStore.GetAsync(result.Conversation.ConversationId, CancellationToken.None);
+        persisted.ShouldNotBeNull();
+        persisted!.ChannelBindings
+            .ShouldContain(
+                b => b.ChannelType.Value == "signalr" && b.ChannelAddress.Value == agentId.Value,
+                "the portal's agent-id signalr binding is a legitimate routing key");
+    }
+
+    [Fact]
+    public async Task ResolveInbound_ExplicitConversationId_AgentIdAddressOnExternalChannel_AddsNoBinding()
+    {
+        // The explicit-conversationId path has its own bind-on-first-use branch. It must
+        // apply the same guard, otherwise a proactive send with a known conversation still
+        // grafts the junk binding on.
+        var conversationStore = new InMemoryConversationStore();
+        var router = CreateRouter(conversationStore);
+        var agentId = Agent("tinker");
+
+        var seeded = await router.ResolveInboundAsync(
+            agentId, Channel("telegram"), ChannelAddress.From("chat-999"), null);
+        var conversationId = seeded.Conversation.ConversationId;
+
+        await router.ResolveInboundAsync(
+            agentId, Channel("servicebus"), ChannelAddress.From(agentId.Value), conversationId);
+
+        var persisted = await conversationStore.GetAsync(conversationId, CancellationToken.None);
+        persisted.ShouldNotBeNull();
+        persisted!.ChannelBindings
+            .ShouldNotContain(
+                b => b.ChannelAddress.Value == agentId.Value,
+                "the explicit-conversationId path must not graft an agent-id servicebus binding");
     }
 }
 

@@ -22,12 +22,108 @@ public static class CronRunStatus
     /// <summary>The run completed successfully.</summary>
     public const string Ok = "ok";
 
+    /// <summary>A successful negative precondition: durable, non-failure history without an agent turn.</summary>
+    public const string NoWork = "no_work";
+
     /// <summary>The run failed with an exception (or was aborted before completion).</summary>
     public const string Error = "error";
 
     /// <summary>The run exceeded its configured timeout and was cancelled.</summary>
     public const string TimedOut = "timed_out";
+    /// <summary>
+    /// #2985: an <b>execution-class</b> run that completed without throwing but performed zero tool
+    /// invocations. For a job whose contract is to do work, that is by definition a run that did
+    /// nothing - yet the turn completed, so the pre-#2985 outcome was <see cref="Ok"/> with a null
+    /// error, byte-identical to a healthy run.
+    ///
+    /// <para>
+    /// This is a <b>terminal non-success</b> outcome: it is written to run history, it is what
+    /// <c>LastRunStatus</c> shows, it participates in the failure-alert streak alongside
+    /// <see cref="Error"/>, and it is purgeable by retention like any other terminal row. It is a
+    /// separate value rather than a reuse of <see cref="Error"/> so run history distinguishes
+    /// "the action threw" from "the action returned having done nothing" - two different
+    /// operator responses.
+    /// </para>
+    /// <para>
+    /// Only ever written for a job with <c>ExecutionClass = true</c> whose action reported a tool
+    /// count. A job that is not execution-class, or an action that reports no count at all
+    /// (command/webhook), can never reach this status.
+    /// </para>
+    /// </summary>
+    public const string NoToolCalls = "no_tool_calls";
 
+    /// <summary>
+    /// The agent run exhausted its bounded automatic continuation budget while actionable
+    /// execution-checklist items remained and no valid structured stop disposition existed.
+    /// This is a terminal non-success outcome, distinct from an exception and from zero tool use.
+    /// </summary>
+    public const string Incomplete = "incomplete";
+
+    /// <summary>
+    /// The agent run legitimately stopped with actionable checklist work remaining and a validated
+    /// structured stop disposition. This is terminal but not a failure: the durable wake owner and
+    /// condition live on the authoritative run-completion signal rather than being inferred from
+    /// inactivity.
+    /// </summary>
+    public const string Parked = "parked";
+
+    /// <summary>
+    /// #3161: the action's turn completed without throwing, but the run's <b>primary delivery</b> -
+    /// getting that output to the job's destination conversation - failed. The work happened; nobody
+    /// received it.
+    ///
+    /// <para>
+    /// This is a <b>terminal non-success</b> outcome with the same standing as <see cref="Error"/>
+    /// and <see cref="NoToolCalls"/>: it is written to run history, it is what <c>LastRunStatus</c>
+    /// shows, it participates in the failure-alert streak, and retention may purge it. It is a
+    /// separate value rather than a reuse of <see cref="Error"/> because the two demand different
+    /// operator responses - "the job is broken" versus "the job works but its destination is gone"
+    /// (an archived, deleted, or unresolvable conversation). Collapsing them would send an operator
+    /// debugging a healthy job.
+    /// </para>
+    /// <para>
+    /// Only ever written when an action routed its delivery through
+    /// <c>CronExecutionContext.DeliverAsync</c> and that delivery failed. An action that never uses
+    /// the seam at all (command / webhook - they have no conversation delivery concept) reports no
+    /// delivery outcome and can never reach this status. Silence is not failure.
+    /// </para>
+    /// </summary>
+    public const string DeliveryFailed = "delivery_failed";
+
+    /// <summary>
+    /// #3160: the run was deliberately terminated by an operator - the job was deleted or disabled
+    /// while the run was in flight, and the scheduler cancelled it.
+    ///
+    /// <para>
+    /// This is a <b>terminal</b> outcome and is written to run history like any other, but it is
+    /// emphatically <b>not a failure</b>. It is a separate value rather than a reuse of
+    /// <see cref="Error"/> or <see cref="TimedOut"/> because those two say "something went wrong"
+    /// and this says "someone meant to stop it". Collapsing them would send an operator to debug a
+    /// job they themselves removed thirty seconds earlier - and, worse, would enrol their own
+    /// deliberate action in the failure-alert streak, distorting the backoff position of the next
+    /// genuine failure.
+    /// </para>
+    /// <para>
+    /// Consequently this status is excluded from the alertable-failure set: an operator abort emits
+    /// no cron failure alert. A host cancellation (gateway shutdown / scheduler stop) is a different
+    /// thing entirely and keeps recording <see cref="Error"/>.
+    /// </para>
+    /// </summary>
+    public const string Aborted = "aborted";
     /// <summary>The run has been started and stamped but has not yet reached a terminal state.</summary>
     public const string Running = "running";
+
+    /// <summary>
+    /// A fire that was suppressed before the action was invoked because the job is past its
+    /// <c>ExpiresAt</c> instant (#2634). Returned to the caller for visibility; deliberately NOT
+    /// written to run history, because a suppressed fire is the absence of a run, not a run.
+    /// </summary>
+    public const string Skipped = "skipped";
+
+    /// <summary>
+    /// A scheduled occurrence that elapsed while the gateway was down and was never executed.
+    /// Written only by startup missed-run detection, which stamps the row with the scheduled
+    /// occurrence instant so the (job, occurrence) pair is a stable identity across restarts.
+    /// </summary>
+    public const string Missed = "missed";
 }

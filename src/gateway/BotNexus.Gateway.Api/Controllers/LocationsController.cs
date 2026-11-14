@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -66,31 +67,42 @@ public sealed class LocationsController(
         if (string.IsNullOrWhiteSpace(request.Name))
             return BadRequest(new { error = "Location name is required." });
 
-        var config = await configWriter.ReadPlatformConfigAsync(cancellationToken);
-        config.Gateway ??= new GatewaySettingsConfig();
-        config.Gateway.Locations ??= new Dictionary<string, LocationConfig>(StringComparer.OrdinalIgnoreCase);
-
-        if (TryFindDictionaryKey(config.Gateway.Locations, request.Name, out _))
-            return Conflict(new { error = $"Location '{request.Name}' already exists." });
-
         var configEntry = BuildLocationConfig(request, existingConfig: null, out var validationError);
         if (configEntry is null)
             return BadRequest(new { error = validationError });
 
-        config.Gateway.Locations[request.Name.Trim()] = configEntry;
-        var saveError = await SaveConfigAsync(config, cancellationToken);
+        var name = request.Name.Trim();
+        var duplicate = false;
+
+        // #2134: the existence check, the insert and the write all happen inside the writer lock.
+        // Reading the locations map out here first and handing back a finished snapshot is exactly
+        // what let two concurrent creates each persist their own stale-plus-one view.
+        var saveError = await MutateLocationsAsync(locations =>
+        {
+            if (TryFindLocationKey(locations, name, out _))
+            {
+                duplicate = true;
+                return $"Location '{name}' already exists.";
+            }
+
+            locations[name] = SerializeLocation(configEntry);
+            return null;
+        }, "before-location-create", cancellationToken);
+
+        if (duplicate)
+            return Conflict(new { error = $"Location '{name}' already exists." });
         if (saveError is not null)
             return BadRequest(new { error = saveError });
         await WaitForConfigConditionAsync(
-            current => TryGetLocation(current, request.Name.Trim(), out var reloaded)
+            current => TryGetLocation(current, name, out var reloaded)
                 && IsSameLocation(reloaded, configEntry),
             cancellationToken);
 
         return CreatedAtAction(
             nameof(Get),
-            new { name = request.Name.Trim() },
+            new { name },
             BuildLocationResponse(
-                name: request.Name.Trim(),
+                name: name,
                 type: configEntry.Type,
                 rawValue: ResolveStoredValue(configEntry),
                 description: configEntry.Description,
@@ -133,24 +145,42 @@ public sealed class LocationsController(
             return BadRequest(new { error = "Location name in payload must match route name." });
         }
 
-        var config = await configWriter.ReadPlatformConfigAsync(cancellationToken);
-        var locations = config.Gateway?.Locations;
-        if (locations is null || !TryFindDictionaryKey(locations, name, out var existingKey))
-            return NotFound(new { error = $"Location '{name}' was not found." });
+        var existingKey = string.Empty;
+        LocationConfig? configEntry = null;
+        string? validationError = null;
+        var missing = false;
 
-        var existingConfig = locations[existingKey];
-        var configEntry = BuildLocationConfig(new UpsertLocationRequest
+        // #2134: read the current entry, rebuild it and write it back all inside the writer lock,
+        // so a concurrent create/update/delete of a different location cannot be erased by this
+        // save (and cannot make this save operate on a stale value of its own entry).
+        var saveError = await MutateLocationsAsync(locations =>
         {
-            Name = existingKey,
-            Type = request.Type,
-            Value = request.Value,
-            Description = request.Description
-        }, existingConfig, out var validationError);
+            if (!TryFindLocationKey(locations, name, out existingKey))
+            {
+                missing = true;
+                return $"Location '{name}' was not found.";
+            }
+
+            var existingConfig = DeserializeLocation(locations[existingKey]);
+            configEntry = BuildLocationConfig(new UpsertLocationRequest
+            {
+                Name = existingKey,
+                Type = request.Type,
+                Value = request.Value,
+                Description = request.Description
+            }, existingConfig, out validationError);
+
+            if (configEntry is null)
+                return validationError ?? "Invalid location definition.";
+
+            locations[existingKey] = SerializeLocation(configEntry);
+            return null;
+        }, "before-location-update", cancellationToken);
+
+        if (missing)
+            return NotFound(new { error = $"Location '{name}' was not found." });
         if (configEntry is null)
             return BadRequest(new { error = validationError });
-
-        locations[existingKey] = configEntry;
-        var saveError = await SaveConfigAsync(config, cancellationToken);
         if (saveError is not null)
             return BadRequest(new { error = saveError });
         await WaitForConfigConditionAsync(
@@ -173,13 +203,24 @@ public sealed class LocationsController(
     [HttpDelete("{name}")]
     public async Task<IActionResult> Delete(string name, CancellationToken cancellationToken)
     {
-        var config = await configWriter.ReadPlatformConfigAsync(cancellationToken);
-        var locations = config.Gateway?.Locations;
-        if (locations is null || !TryFindDictionaryKey(locations, name, out var existingKey))
-            return NotFound(new { error = $"Location '{name}' was not found." });
+        var existingKey = string.Empty;
+        var missing = false;
 
-        locations.Remove(existingKey);
-        var saveError = await SaveConfigAsync(config, cancellationToken);
+        // #2134: locate-and-remove under the writer lock (see Create/Update).
+        var saveError = await MutateLocationsAsync(locations =>
+        {
+            if (!TryFindLocationKey(locations, name, out existingKey))
+            {
+                missing = true;
+                return $"Location '{name}' was not found.";
+            }
+
+            locations.Remove(existingKey);
+            return null;
+        }, "before-location-remove", cancellationToken);
+
+        if (missing)
+            return NotFound(new { error = $"Location '{name}' was not found." });
         if (saveError is not null)
             return BadRequest(new { error = saveError });
         await WaitForConfigConditionAsync(
@@ -322,6 +363,30 @@ public sealed class LocationsController(
            && string.Equals(left.ConnectionString, right.ConnectionString, StringComparison.Ordinal)
            && string.Equals(left.Description, right.Description, StringComparison.Ordinal);
 
+    /// <summary>
+    /// Builds the entry to persist, preserving every stored field the request does not model.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #3616. This deliberately mutates a COPY of <paramref name="existingConfig"/> rather than
+    /// constructing a fresh <see cref="LocationConfig"/>. <see cref="UpsertLocationRequest"/> models
+    /// four fields - name, type, value, description - while <see cref="LocationConfig"/> declares
+    /// six. Rebuilding from the DTO silently dropped <c>Properties</c>, so editing a location's
+    /// description destroyed the extensible settings a consumer of that location depends on.
+    /// </para>
+    /// <para>
+    /// The loss was invisible: the write succeeded, the response was 200, and the change set
+    /// genuinely contained only the edited keys - because the entry had already been narrowed
+    /// before the differ ever saw it. Same defect class as #3547 on <c>PUT /api/agents/{id}</c>,
+    /// where a typed DTO projected over stored configuration deleted everything it did not model.
+    /// </para>
+    /// <para>
+    /// Absent from the payload means "not being changed", never "delete it". The one place that
+    /// rule does NOT apply is the type-discriminated value: changing a location's type must clear
+    /// the previous type's field, or a filesystem-turned-api location would keep a stale
+    /// <c>Path</c> alongside its new <c>Endpoint</c>. That clearing is explicit below.
+    /// </para>
+    /// </remarks>
     private static LocationConfig? BuildLocationConfig(
         UpsertLocationRequest request,
         LocationConfig? existingConfig,
@@ -344,11 +409,18 @@ public sealed class LocationsController(
             value = existingConfig?.ConnectionString;
         }
 
-        var config = new LocationConfig
-        {
-            Type = type,
-            Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim()
-        };
+        // Start from what is stored so unmodelled fields survive; on create there is nothing to
+        // preserve and this is an empty instance, exactly as before.
+        var config = CloneForUpdate(existingConfig);
+
+        config.Type = type;
+        config.Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim();
+
+        // Type-discriminated value: set the field this type uses and clear the other two, so a
+        // type change cannot strand the previous type's value.
+        config.Path = null;
+        config.Endpoint = null;
+        config.ConnectionString = null;
 
         if (type == LocationType.FileSystem.Value)
             config.Path = value;
@@ -366,6 +438,36 @@ public sealed class LocationsController(
         error = null;
         return config;
     }
+
+    /// <summary>
+    /// Copies the stored entry so an update starts from persisted state rather than from defaults.
+    /// </summary>
+    /// <remarks>
+    /// Copied field-by-field rather than by serialization round trip: a round trip would silently
+    /// acquire any future property, which sounds convenient but would also silently acquire one
+    /// that must NOT be carried forward. An explicit list means adding a property to
+    /// <see cref="LocationConfig"/> forces a decision here, and the companion fence test fails
+    /// until that decision is made.
+    /// </remarks>
+    private static LocationConfig CloneForUpdate(LocationConfig? existing)
+        => existing is null
+            ? new LocationConfig()
+            : new LocationConfig
+            {
+                Type = existing.Type,
+                Path = existing.Path,
+                Endpoint = existing.Endpoint,
+                ConnectionString = existing.ConnectionString,
+                Description = existing.Description,
+                Properties = existing.Properties,
+                // Credential and transport identity (#3556). None of these is modelled by
+                // UpsertLocationRequest, so preservation is the only correct disposition: an
+                // edit to the description must not silently unauthenticate the location.
+                Username = existing.Username,
+                CredentialRef = existing.CredentialRef,
+                VerifyTls = existing.VerifyTls,
+                Tags = existing.Tags,
+            };
 
     private static string? ResolveStoredValue(LocationConfig config)
         => config.Path ?? config.Endpoint ?? config.ConnectionString;
@@ -393,63 +495,92 @@ public sealed class LocationsController(
         };
     }
 
-    private async Task<string?> SaveConfigAsync(PlatformConfig config, CancellationToken cancellationToken)
+    /// <summary>
+    /// Applies a mutation to the <c>gateway.locations</c> map entirely inside the
+    /// <see cref="PlatformConfigWriter"/> lock (issue #2134).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Previously this controller read a whole <see cref="PlatformConfig"/>, mutated the locations
+    /// dictionary in memory, and then replaced the entire <c>gateway</c> section with that
+    /// precomputed snapshot. The writer lock covered only the final file I/O, so two concurrent
+    /// requests both read the same locations map and the second replace silently discarded the
+    /// first request's location.
+    /// </para>
+    /// <para>
+    /// The mutation now runs against the live on-disk <c>locations</c> node under the lock, so the
+    /// read-modify-write window is inside mutual exclusion and no broad precomputed snapshot is
+    /// ever handed to a replacement operation. The writer validates the complete candidate document
+    /// before touching the file, so a rejected candidate leaves config.json byte-for-byte unchanged.
+    /// </para>
+    /// </remarks>
+    /// <returns><see langword="null"/> on success, otherwise a caller-presentable error message.</returns>
+    private async Task<string?> MutateLocationsAsync(
+        Func<JsonObject, string?> mutation,
+        string reason,
+        CancellationToken cancellationToken)
     {
-        var errors = PlatformConfigLoader.Validate(config);
-        if (errors.Count > 0)
-            return string.Join(Environment.NewLine, errors);
+        var errors = await configWriter.MutateSectionAsync(
+            "gateway",
+            gateway =>
+            {
+                if (gateway["locations"] is not JsonObject locations)
+                {
+                    locations = new JsonObject();
+                    gateway["locations"] = locations;
+                }
 
-        var root = await configWriter.ReadAsync(cancellationToken);
-        if (root["gateway"] is not JsonObject gatewaySection)
-        {
-            gatewaySection = new JsonObject();
-            root["gateway"] = gatewaySection;
-        }
+                return mutation(locations);
+            },
+            reason,
+            cancellationToken);
 
-        if (config.Gateway is null)
-        {
-            gatewaySection.Remove("locations");
-        }
-        else
-        {
-            var gatewayNode = JsonSerializer.SerializeToNode(config.Gateway, WriteJsonOptions) as JsonObject ?? new JsonObject();
-            if (gatewayNode["locations"] is null)
-                gatewaySection.Remove("locations");
-            else
-                gatewaySection["locations"] = gatewayNode["locations"]!.DeepClone();
-        }
-
-        var candidateJson = root.ToJsonString(WriteJsonOptions);
-        PlatformConfig candidateConfig;
-        try
-        {
-            candidateConfig = JsonSerializer.Deserialize<PlatformConfig>(
-                candidateJson,
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new PlatformConfig();
-        }
-        catch (JsonException ex)
-        {
-            return $"Invalid JSON while preparing config update: {ex.Message}";
-        }
-
-        var candidateErrors = PlatformConfigLoader.Validate(candidateConfig);
-        if (candidateErrors.Count > 0)
-            return string.Join(Environment.NewLine, candidateErrors);
-
-        // LocationsController assembles the full authoritative gateway section from
-        // disk (real secrets intact) and must be able to delete locations by
-        // omission, so it opts out of the config-UI merge/secret-restore path.
-        await configWriter.UpdateSectionAsync("gateway", gatewaySection.DeepClone(), cancellationToken, merge: false);
-        return null;
+        return errors.Count == 0 ? null : string.Join(Environment.NewLine, errors);
     }
 
+    private static JsonObject SerializeLocation(LocationConfig config)
+        => JsonSerializer.SerializeToNode(config, WriteJsonOptions) as JsonObject ?? new JsonObject();
+
+    private static LocationConfig? DeserializeLocation(JsonNode? node)
+        => node is null
+            ? null
+            : node.Deserialize<LocationConfig>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+    /// <summary>
+    /// Case-insensitive key lookup over the raw locations JSON object, matching the semantics
+    /// <see cref="TryFindDictionaryKey{TValue}"/> provides for the typed dictionary.
+    /// </summary>
+    private static bool TryFindLocationKey(JsonObject locations, string key, out string existingKey)
+    {
+        foreach (var candidate in locations.Select(entry => entry.Key))
+        {
+            if (string.Equals(candidate, key, StringComparison.OrdinalIgnoreCase))
+            {
+                existingKey = candidate;
+                return true;
+            }
+        }
+
+        existingKey = string.Empty;
+        return false;
+    }
+
+    /// <summary>
+    /// Polls <paramref name="predicate"/> against the current config for up to two seconds, so a caller
+    /// observes its own write after the options monitor has reloaded.
+    /// </summary>
+    /// <remarks>
+    /// #3738: the two-second bound is measured with <see cref="Stopwatch"/>, not a
+    /// <c>DateTimeOffset.UtcNow</c>-derived absolute instant, so a host wall-clock step (NTP correction,
+    /// VM resume, container host time sync) can neither extend this wait nor expire it early.
+    /// </remarks>
     private async Task WaitForConfigConditionAsync(Func<PlatformConfig, bool> predicate, CancellationToken cancellationToken)
     {
         if (predicate(configOptions.CurrentValue))
             return;
 
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(2);
-        while (DateTimeOffset.UtcNow < deadline)
+        var elapsed = Stopwatch.StartNew();
+        while (elapsed.Elapsed < TimeSpan.FromSeconds(2))
         {
             cancellationToken.ThrowIfCancellationRequested();
             await Task.Delay(50, cancellationToken);

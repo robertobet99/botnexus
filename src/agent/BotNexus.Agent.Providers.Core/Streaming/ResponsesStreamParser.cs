@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using BotNexus.Agent.Providers.Core.Models;
+using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Agent.Providers.Core.Utilities;
 using Microsoft.Extensions.Logging;
 
@@ -48,11 +49,6 @@ public static class ResponsesStreamParser
     /// provider supplies the cast to its own options type). Used to price usage on completion when
     /// the response body omits <c>service_tier</c>. May be null.
     /// </param>
-    /// <param name="normalizeTextDelta">
-    /// Optional transport-compatibility hook applied only to text/refusal delta payloads before
-    /// they are accumulated or emitted. Providers should leave this null unless their upstream
-    /// transport has a confirmed wire-level quirk; tool arguments and reasoning are never changed.
-    /// </param>
     /// <param name="ct">Cancellation token.</param>
     public static Task ParseAsync(
         LlmStream stream,
@@ -64,8 +60,8 @@ public static class ResponsesStreamParser
         Action<LlmStream, LlmModel, string, IReadOnlyList<ContentBlock>?> emitError,
         Action<JsonElement>? onParsedEvent,
         Func<StreamOptions?, string?>? resolveConfiguredServiceTier,
-        Func<LlmModel, string, string>? normalizeTextDelta,
-        CancellationToken ct)
+        CancellationToken ct,
+        ISecretRedactor? secretRedactor = null)
         => ParseEventsAsync(
             stream,
             async cancellationToken =>
@@ -80,8 +76,8 @@ public static class ResponsesStreamParser
             emitError,
             onParsedEvent,
             resolveConfiguredServiceTier,
-            normalizeTextDelta,
-            ct);
+            ct,
+            secretRedactor);
 
     /// <summary>
     /// Normalizes Responses JSON events from any provider-private wire transport into the shared
@@ -98,8 +94,8 @@ public static class ResponsesStreamParser
         Action<LlmStream, LlmModel, string, IReadOnlyList<ContentBlock>?> emitError,
         Action<JsonElement>? onParsedEvent,
         Func<StreamOptions?, string?>? resolveConfiguredServiceTier,
-        Func<LlmModel, string, string>? normalizeTextDelta,
-        CancellationToken ct)
+        CancellationToken ct,
+        ISecretRedactor? secretRedactor = null)
     {
         var contentBlocks = new List<ContentBlock>();
         var usage = Usage.Empty();
@@ -107,10 +103,19 @@ public static class ResponsesStreamParser
         var started = false;
         var stopReason = StopReason.Stop;
         var sawRefusal = false;
+        // Text items whose content arrived on the refusal channel. Membership decides which
+        // content-block kind the item is rebuilt into on every later delta and on item.done, so a
+        // refusal can never be silently re-labelled as ordinary prose (#3295).
+        var refusalItems = new HashSet<string>(StringComparer.Ordinal);
 
         var textStates = new Dictionary<string, (int ContentIndex, StringBuilder Text)>(StringComparer.Ordinal);
         var thinkingStates = new Dictionary<string, (int ContentIndex, StringBuilder Text)>(StringComparer.Ordinal);
+        var sawOpaqueReasoning = false;
+        var sawDisplayableReasoning = false;
         var toolStates = new Dictionary<string, ToolState>(StringComparer.Ordinal);
+        // Per-text-item delta counts, carried solely so the assembly-conformance diagnostic can
+        // report how many fragments produced a mismatched buffer (#2443).
+        var textDeltaCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
         AssistantMessage BuildPartial() => new(
             Content: contentBlocks.ToList(),
@@ -138,7 +143,20 @@ public static class ResponsesStreamParser
 
             if (string.Equals(evt.Event, "error", StringComparison.Ordinal))
             {
-                emitError(stream, model, evt.Data, null);
+                string detail;
+                try
+                {
+                    using var errorDocument = JsonDocument.Parse(evt.Data);
+                    detail = errorDocument.RootElement.GetErrorMessage();
+                }
+                catch (JsonException)
+                {
+                    // Some endpoints send plain-text error data. Preserve the existing redacted,
+                    // bounded diagnostic rather than discarding the only failure signal.
+                    detail = evt.Data;
+                }
+                detail = ProviderHttpErrorHelper.RedactDiagnosticText(detail, secretRedactor);
+                emitError(stream, model, detail.Length > 512 ? detail[..512] : detail, contentBlocks);
                 return;
             }
 
@@ -150,6 +168,15 @@ public static class ResponsesStreamParser
             catch (JsonException)
             {
                 logger.LogDebug("Skipping malformed responses SSE event {Event}", evt.Event);
+                // Same non-terminal report as the completions path (#3291): a skipped frame is a
+                // silent content loss that only debug logging witnessed. The event name is a
+                // protocol discriminator, not content, so it is safe to include.
+                stream.Push(new WarningEvent(
+                    WarningCodes.MalformedChunkSkipped,
+                    $"Skipping malformed responses SSE event '{evt.Event}': the frame could not be " +
+                    $"parsed as JSON and was discarded. api={api} model={model.Id} " +
+                    $"provider={model.Provider}. Content for this frame is lost; the turn continues.",
+                    BuildPartial()));
                 continue;
             }
 
@@ -200,8 +227,12 @@ public static class ResponsesStreamParser
                             var arguments = GetString(item, "arguments") ?? "";
                             var index = contentBlocks.Count;
                             var parsed = StreamingJsonParser.Parse(arguments);
-                            contentBlocks.Add(new ToolCallContent(ResponsesStreamHelpers.ComposeToolCallId(callId, itemId), name, parsed));
-                            stream.Push(new ToolCallStartEvent(index, BuildPartial()));
+                            // The id carried on the event is the same composed id the end event and the
+                            // content block use, so a consumer can correlate start -> delta -> end with a
+                            // single key rather than re-deriving it (#3290).
+                            var composedId = ResponsesStreamHelpers.ComposeToolCallId(callId, itemId);
+                            contentBlocks.Add(new ToolCallContent(composedId, name, parsed));
+                            stream.Push(new ToolCallStartEvent(index, BuildPartial(), composedId, name));
 
                             var state = new ToolState(callId, itemId, name, index);
                             state.Arguments.Append(arguments);
@@ -210,7 +241,7 @@ public static class ResponsesStreamParser
                                 toolStates[itemId] = state;
 
                             if (arguments.Length > 0)
-                                stream.Push(new ToolCallDeltaEvent(index, arguments, BuildPartial()));
+                                stream.Push(new ToolCallDeltaEvent(index, arguments, BuildPartial(), composedId, name));
                             break;
                         }
                     }
@@ -225,6 +256,7 @@ public static class ResponsesStreamParser
                     if (itemId is null || !thinkingStates.TryGetValue(itemId, out var state)) continue;
                     var delta = GetString(root, "delta") ?? "";
                     if (delta.Length == 0) continue;
+                    sawDisplayableReasoning = true;
                     state.Text.Append(delta);
                     contentBlocks[state.ContentIndex] = new ThinkingContent(state.Text.ToString());
                     stream.Push(new ThinkingDeltaEvent(state.ContentIndex, delta, BuildPartial()));
@@ -246,31 +278,45 @@ public static class ResponsesStreamParser
                 if (evt.Event is "response.output_text.delta" or "response.refusal.delta")
                 {
                     EnsureStart();
-                    if (evt.Event is "response.refusal.delta")
+                    // Refusal is tracked per text item, not just per response: the block this
+                    // item's content is rebuilt into must stay a RefusalContent for every
+                    // subsequent delta, otherwise the second fragment would silently demote the
+                    // block back to ordinary prose (#3295).
+                    var isRefusal = evt.Event is "response.refusal.delta";
+                    if (isRefusal)
                     {
                         sawRefusal = true;
                         stopReason = StopReason.Refusal;
                     }
                     var itemId = GetString(root, "item_id");
                     var delta = GetString(root, "delta") ?? "";
-                    if (normalizeTextDelta is not null)
-                        delta = normalizeTextDelta(model, delta);
+                    // Byte-identical accumulation (#3442): no transport normalization hook. The
+                    // CRLF blamed on the Copilot wire was our own separator injection (#3425/#3428).
                     if (delta.Length == 0) continue;
 
+                    var stateKeyForRefusal = itemId ?? Guid.NewGuid().ToString("N");
                     if (itemId is null || !textStates.TryGetValue(itemId, out var state))
                     {
                         var index = contentBlocks.Count;
-                        contentBlocks.Add(new TextContent(""));
+                        contentBlocks.Add(isRefusal ? new RefusalContent("") : new TextContent(""));
                         state = (index, new StringBuilder());
-                        textStates[itemId ?? Guid.NewGuid().ToString("N")] = state;
+                        textStates[stateKeyForRefusal] = state;
                         stream.Push(new TextStartEvent(index, BuildPartial()));
                     }
 
+                    if (isRefusal)
+                        refusalItems.Add(stateKeyForRefusal);
+
                     state.Text.Append(delta);
-                    contentBlocks[state.ContentIndex] = new TextContent(state.Text.ToString());
+                    contentBlocks[state.ContentIndex] = refusalItems.Contains(stateKeyForRefusal)
+                        ? new RefusalContent(state.Text.ToString())
+                        : new TextContent(state.Text.ToString());
                     stream.Push(new TextDeltaEvent(state.ContentIndex, delta, BuildPartial()));
                     if (itemId is not null)
+                    {
                         textStates[itemId] = state;
+                        textDeltaCounts[itemId] = textDeltaCounts.GetValueOrDefault(itemId) + 1;
+                    }
                     continue;
                 }
 
@@ -282,11 +328,13 @@ public static class ResponsesStreamParser
                     if (stateKey is null || delta.Length == 0 || !toolStates.TryGetValue(stateKey, out var state)) continue;
 
                     state.Arguments.Append(delta);
+                    var deltaToolId = ResponsesStreamHelpers.ComposeToolCallId(state.CallId, state.ItemId);
                     contentBlocks[state.ContentIndex] = new ToolCallContent(
-                        ResponsesStreamHelpers.ComposeToolCallId(state.CallId, state.ItemId),
+                        deltaToolId,
                         state.Name,
                         StreamingJsonParser.Parse(state.Arguments.ToString()));
-                    stream.Push(new ToolCallDeltaEvent(state.ContentIndex, delta, BuildPartial()));
+                    stream.Push(new ToolCallDeltaEvent(
+                        state.ContentIndex, delta, BuildPartial(), deltaToolId, state.Name));
                     continue;
                 }
 
@@ -298,19 +346,57 @@ public static class ResponsesStreamParser
                     var before = state.Arguments.ToString();
                     state.Arguments.Clear();
                     state.Arguments.Append(finalArgs);
+                    var doneToolId = ResponsesStreamHelpers.ComposeToolCallId(state.CallId, state.ItemId);
                     contentBlocks[state.ContentIndex] = new ToolCallContent(
-                        ResponsesStreamHelpers.ComposeToolCallId(state.CallId, state.ItemId),
+                        doneToolId,
                         state.Name,
                         StreamingJsonParser.Parse(finalArgs));
                     if (finalArgs.StartsWith(before, StringComparison.Ordinal))
                     {
                         var delta = finalArgs[before.Length..];
                         if (delta.Length > 0)
-                            stream.Push(new ToolCallDeltaEvent(state.ContentIndex, delta, BuildPartial()));
+                            stream.Push(new ToolCallDeltaEvent(
+                                state.ContentIndex, delta, BuildPartial(), doneToolId, state.Name));
                     }
                     continue;
                 }
 
+                // The provider's own authoritative text for the block. Comparing it against what we
+                // accumulated is a free per-response checksum that we previously discarded (#2443):
+                // it is what turns a silent assembly defect into a named, self-reporting event
+                // instead of a multi-issue archaeology dig across transports.
+                if (evt.Event is "response.output_text.done")
+                {
+                    var itemId = GetString(root, "item_id");
+                    var finalText = GetString(root, "text");
+                    if (itemId is null || finalText is null || !textStates.TryGetValue(itemId, out var doneState))
+                        continue;
+
+                    var assembled = doneState.Text.ToString();
+                    var canonical = StreamAssemblyConformance.Reconcile(
+                        assembled,
+                        finalText,
+                        model.Provider,
+                        model.Id,
+                        api,
+                        "responses",
+                        textDeltaCounts.GetValueOrDefault(itemId),
+                        logger,
+                        stream,
+                        BuildPartial);
+
+                    if (!ReferenceEquals(canonical, assembled))
+                    {
+                        doneState.Text.Clear();
+                        doneState.Text.Append(canonical);
+                        contentBlocks[doneState.ContentIndex] = refusalItems.Contains(itemId)
+                            ? new RefusalContent(canonical)
+                            : new TextContent(canonical);
+                        textStates[itemId] = doneState;
+                    }
+
+                    continue;
+                }
                 if (evt.Event is "response.output_item.done")
                 {
                     if (!root.TryGetProperty("item", out var item)) continue;
@@ -320,18 +406,40 @@ public static class ResponsesStreamParser
                     switch (itemType)
                     {
                         case "reasoning" when itemId is not null && thinkingStates.TryGetValue(itemId, out var thinkingState):
+                        {
+                            sawOpaqueReasoning |= HasNonEmptyString(item, "encrypted_content");
+                            var terminalSummary = GetReasoningSummaryText(item);
+                            var accumulated = thinkingState.Text.ToString();
+                            if (accumulated.Length == 0 && terminalSummary.Length > 0)
+                            {
+                                sawDisplayableReasoning = true;
+                                thinkingState.Text.Append(terminalSummary);
+                                contentBlocks[thinkingState.ContentIndex] = new ThinkingContent(terminalSummary);
+                                stream.Push(new ThinkingDeltaEvent(
+                                    thinkingState.ContentIndex,
+                                    terminalSummary,
+                                    BuildPartial()));
+                                accumulated = terminalSummary;
+                            }
+
                             contentBlocks[thinkingState.ContentIndex] = new ThinkingContent(
-                                thinkingState.Text.ToString(),
+                                accumulated,
                                 JsonSerializer.Serialize(item));
-                            stream.Push(new ThinkingEndEvent(thinkingState.ContentIndex, thinkingState.Text.ToString(), BuildPartial()));
+                            stream.Push(new ThinkingEndEvent(thinkingState.ContentIndex, accumulated, BuildPartial()));
                             thinkingStates.Remove(itemId);
                             break;
+                        }
 
                         case "message" when itemId is not null && textStates.TryGetValue(itemId, out var textState):
                             var phase = GetString(item, "phase");
-                            contentBlocks[textState.ContentIndex] = new TextContent(
-                                textState.Text.ToString(),
-                                EncodeTextSignatureV1(itemId, phase));
+                            // A refusal item must close as a RefusalContent. Rebuilding it as a
+                            // plain TextContent here would undo the classification at the very
+                            // last event, which is precisely the silent demotion #3295 is about.
+                            contentBlocks[textState.ContentIndex] = refusalItems.Contains(itemId)
+                                ? new RefusalContent(textState.Text.ToString())
+                                : new TextContent(
+                                    textState.Text.ToString(),
+                                    EncodeTextSignatureV1(itemId, phase));
                             stream.Push(new TextEndEvent(textState.ContentIndex, textState.Text.ToString(), BuildPartial()));
                             textStates.Remove(itemId);
                             break;
@@ -384,10 +492,25 @@ public static class ResponsesStreamParser
                     if (responseEl.TryGetProperty("usage", out var usageEl) &&
                         usageEl.ValueKind == JsonValueKind.Object)
                     {
-                        usage = ResponsesStreamHelpers.ParseUsage(usageEl, model);
+                        usage = usageEl.ParseUsage(model);
                         var configuredTier = resolveConfiguredServiceTier?.Invoke(options);
                         var responseTier = GetString(responseEl, "service_tier");
                         usage = ApplyServiceTierPricing(usage, responseTier ?? configuredTier);
+                    }
+
+                    if (!sawDisplayableReasoning && (sawOpaqueReasoning || usage.Reasoning > 0))
+                    {
+                        const string warningMessage =
+                            "Reasoning used; summary not provided. Opaque reasoning content was not exposed.";
+                        logger.LogInformation(
+                            "Provider reasoning summary unavailable for {Provider}/{Model}; "
+                            + "opaque content remains undisclosed",
+                            model.Provider,
+                            model.Id);
+                        stream.Push(new WarningEvent(
+                            WarningCodes.ReasoningSummaryUnavailable,
+                            warningMessage,
+                            BuildPartial()));
                     }
 
                     if (contentBlocks.OfType<ToolCallContent>().Any() && stopReason == StopReason.Stop)
@@ -398,8 +521,9 @@ public static class ResponsesStreamParser
 
                 if (evt.Event is "response.failed")
                 {
-                    var message = GetErrorMessage(root);
-                    emitError(stream, model, message, contentBlocks);
+                    var message = ProviderHttpErrorHelper.RedactDiagnosticText(
+                        root.GetErrorMessage(), secretRedactor);
+                    emitError(stream, model, message.Length > 512 ? message[..512] : message, contentBlocks);
                     return;
                 }
             }
@@ -448,10 +572,40 @@ public static class ResponsesStreamParser
         return new SseEvent(eventType ?? "message", data.ToString());
     }
 
-    private static string GetErrorMessage(JsonElement root)
+    /// <summary>
+    /// Reads a named property only when <paramref name="element"/> is actually a JSON object.
+    /// <c>JsonElement.TryGetProperty</c> is <em>partial</em>, not total: on any non-object kind it
+    /// throws <see cref="InvalidOperationException"/> rather than returning <c>false</c>. Routing
+    /// every provider-payload property access through this helper means a property access added
+    /// later inherits the kind check instead of re-introducing #3130, where a
+    /// <c>{"response": null}</c> failure event crashed the error-reporting path itself and replaced
+    /// the upstream API error with a parser stack trace.
+    /// </summary>
+    private static bool TryGetObjectProperty(JsonElement element, string propertyName, out JsonElement value)
     {
-        if (root.TryGetProperty("response", out var response) &&
-            response.TryGetProperty("error", out var error) &&
+        value = default;
+        return element.ValueKind == JsonValueKind.Object
+            && element.TryGetProperty(propertyName, out value);
+    }
+
+    /// <summary>
+    /// Best-effort description of a failure event. Provider payloads are untrusted input: a shape
+    /// the parser did not anticipate must degrade to a worse message, never to an exception (#3130).
+    /// </summary>
+    internal static string GetErrorMessage(this JsonElement root)
+    {
+        if (TryGetObjectProperty(root, "error", out var directError) && directError.ValueKind == JsonValueKind.Object)
+        {
+            return $"{GetString(directError, "code") ?? "unknown"}: {GetString(directError, "message") ?? "no message"}";
+        }
+
+        if (TryGetObjectProperty(root, "code", out var directCode) && directCode.ValueKind == JsonValueKind.String)
+        {
+            return $"{directCode.GetString()}: {GetString(root, "message") ?? "no message"}";
+        }
+
+        if (TryGetObjectProperty(root, "response", out var response) &&
+            TryGetObjectProperty(response, "error", out var error) &&
             error.ValueKind == JsonValueKind.Object)
         {
             var code = GetString(error, "code");
@@ -459,15 +613,15 @@ public static class ResponsesStreamParser
             return $"{code ?? "unknown"}: {message ?? "no message"}";
         }
 
-        if (root.TryGetProperty("response", out response) &&
-            response.TryGetProperty("incomplete_details", out var details) &&
-            details.TryGetProperty("reason", out var reason))
+        if (TryGetObjectProperty(root, "response", out response) &&
+            TryGetObjectProperty(response, "incomplete_details", out var details) &&
+            GetString(details, "reason") is { } reason)
         {
-            return $"incomplete: {reason.GetString()}";
+            return $"incomplete: {reason}";
         }
 
-        if (root.TryGetProperty("message", out var messageEl))
-            return messageEl.GetString() ?? "Unknown error";
+        if (TryGetObjectProperty(root, "message", out var messageEl))
+            return (messageEl.ValueKind == JsonValueKind.String ? messageEl.GetString() : null) ?? "Unknown error";
 
         return "Unknown error";
     }
@@ -512,8 +666,29 @@ public static class ResponsesStreamParser
 
     private static string? GetString(JsonElement element, string propertyName)
     {
-        if (element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String)
+        if (TryGetObjectProperty(element, propertyName, out var value) && value.ValueKind == JsonValueKind.String)
             return value.GetString();
         return null;
+    }
+
+    private static bool HasNonEmptyString(JsonElement element, string propertyName)
+        => !string.IsNullOrEmpty(GetString(element, propertyName));
+
+    private static string GetReasoningSummaryText(JsonElement item)
+    {
+        if (!TryGetObjectProperty(item, "summary", out var summary) || summary.ValueKind != JsonValueKind.Array)
+            return string.Empty;
+
+        var text = new StringBuilder();
+        foreach (var part in summary.EnumerateArray())
+        {
+            if (GetString(part, "type") is not "summary_text")
+                continue;
+            var value = GetString(part, "text");
+            if (!string.IsNullOrEmpty(value))
+                text.Append(value);
+        }
+
+        return text.ToString();
     }
 }

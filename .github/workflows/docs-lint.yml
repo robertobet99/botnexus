@@ -1,0 +1,51 @@
+name: "CI: Docs lint"
+
+# Mechanical grooming for docs/** (issue #2865).
+#
+# Grooming was 100% human, and a human read reliably catches tone and structure and reliably
+# glides past a wrong port number. On 2026-08-07 one writer reading the docset cold found
+# twelve defects; the worst sent every new user to http://localhost:18790 on the highest-
+# traffic page in the docset while the gateway binds 5005. This workflow runs the checks that
+# would have caught them for free.
+#
+# NOTE ON TRIGGER SCOPE: this deliberately runs on the docs/** paths that ci-build-test.yml
+# lists under paths-ignore, so a docs-only PR - which triggers no test workflow at all - is
+# still gated. It also runs on the lint's own inputs, because a change to the fact registry
+# or the allow-list can silently disarm the gate.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'scripts/repo/docs-lint.ps1'
+      - 'scripts/repo/docs-lint-facts.json'
+      - 'scripts/repo/docs-lint-allow.json'
+      - '.github/workflows/docs-lint.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'scripts/repo/docs-lint.ps1'
+      - 'scripts/repo/docs-lint-facts.json'
+      - 'scripts/repo/docs-lint-allow.json'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  docs-lint:
+    name: docs-lint (literal drift, contradiction, legacy markers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run docs-lint
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/repo/docs-lint.ps1

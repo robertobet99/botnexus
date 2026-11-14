@@ -1,3 +1,5 @@
+using BotNexus.Domain.Primitives;
+
 namespace BotNexus.Gateway.Abstractions.Models;
 
 /// <summary>
@@ -19,6 +21,15 @@ public sealed class GatewaySessionRuntime
     // match) or rebase (count grew). If destructive changed they must abort.
     private long _additionVersion;
     private long _destructiveVersion;
+
+    // Persistence cursor for aggregate stores. The cursor is guarded by the same lock as
+    // history mutation, so a save can capture an immutable delta and acknowledge exactly the
+    // prefix it wrote without hiding additions that arrive while I/O is in flight (#3907).
+    private int _persistedHistoryCount;
+    private long _persistedDestructiveVersion;
+    private long _nextTransientPersistenceId = -1;
+    private readonly HashSet<long> _observedPersistedHistoryIds = [];
+    private readonly HashSet<string> _ownedPersistenceKeys = new(StringComparer.Ordinal);
 
     public GatewaySessionRuntime(Session session)
     {
@@ -48,6 +59,7 @@ public sealed class GatewaySessionRuntime
     {
         lock (_lock)
         {
+            if (IsRetainedToolResultDuplicate(entry)) return;
             Session.History.Add(entry);
             _additionVersion++;
             Session.UpdatedAt = DateTimeOffset.UtcNow;
@@ -62,11 +74,18 @@ public sealed class GatewaySessionRuntime
     {
         lock (_lock)
         {
-            Session.History.AddRange(entries);
+            foreach (var entry in entries)
+                if (!IsRetainedToolResultDuplicate(entry)) Session.History.Add(entry);
             _additionVersion++;
             Session.UpdatedAt = DateTimeOffset.UtcNow;
         }
     }
+
+    private bool IsRetainedToolResultDuplicate(SessionEntry entry)
+        => entry.Kind == MessageKind.ToolResult && entry.PersistenceKey is { } key
+            && key.StartsWith("tool-result:", StringComparison.Ordinal)
+            && Session.History.Any(existing => existing.PersistenceKey == key
+                && existing.AgentRunId == entry.AgentRunId);
 
     /// <summary>
     /// Executes replace history.
@@ -146,6 +165,34 @@ public sealed class GatewaySessionRuntime
             return new SessionAppendResult(
                 new HistorySnapshot(snapshot, _destructiveVersion, snapshot.Length),
                 priorUpdatedAt);
+        }
+    }
+
+    /// <summary>
+    /// Copies aggregate and persistence state under the history lock. The candidate owns its
+    /// history entries and cursor, so a speculative rewrite or persistence acknowledgement
+    /// cannot leak into a cached session retained by reset or transcript readers.
+    /// </summary>
+    internal GatewaySessionRuntime CreateDetachedCopy()
+    {
+        lock (_lock)
+        {
+            var copy = new GatewaySessionRuntime(Session with
+            {
+                History = Session.History.Select(static entry => entry with { }).ToList(),
+                Metadata = new Dictionary<string, object?>(Session.Metadata)
+            })
+            {
+                _additionVersion = _additionVersion,
+                _destructiveVersion = _destructiveVersion,
+                _persistedHistoryCount = _persistedHistoryCount,
+                _persistedDestructiveVersion = _persistedDestructiveVersion,
+                _nextTransientPersistenceId = _nextTransientPersistenceId
+            };
+            copy._observedPersistedHistoryIds.UnionWith(_observedPersistedHistoryIds);
+            copy._ownedPersistenceKeys.UnionWith(_ownedPersistenceKeys);
+            copy.StreamReplay.SetState(this.StreamReplay.NextSequenceId, this.StreamReplay.GetEventSnapshot());
+            return copy;
         }
     }
 
@@ -257,6 +304,144 @@ public sealed class GatewaySessionRuntime
     }
 
     /// <summary>
+    /// Captures the history work required by an aggregate save. Ordinary append-only mutation
+    /// returns only the unpersisted tail. A destructive mutation returns the complete current
+    /// history and requests explicit replacement of the persisted rows.
+    /// </summary>
+    public SessionHistoryPersistenceSnapshot CaptureHistoryForPersistence()
+    {
+        lock (_lock)
+        {
+            var requiresReplacement = _destructiveVersion != _persistedDestructiveVersion
+                || _persistedHistoryCount > Session.History.Count;
+            var startIndex = requiresReplacement ? 0 : _persistedHistoryCount;
+            var entries = Session.History.GetRange(startIndex, Session.History.Count - startIndex).ToArray();
+            foreach (var entry in entries)
+            {
+                entry.PersistenceId ??= _nextTransientPersistenceId--;
+                if (entry.PersistenceId < 0)
+                {
+                    entry.PersistenceKey ??= Guid.NewGuid().ToString("N");
+                    _ownedPersistenceKeys.Add(entry.PersistenceKey);
+                }
+            }
+
+            IReadOnlyList<long> removedPersistedIds = [];
+            IReadOnlyList<string> removedPersistenceKeys = [];
+            if (requiresReplacement)
+            {
+                var retainedPersistedIds = Session.History
+                    .Select(static entry => entry.PersistenceId)
+                    .OfType<long>()
+                    .Where(static id => id > 0)
+                    .ToHashSet();
+                removedPersistedIds = _observedPersistedHistoryIds
+                    .Where(id => !retainedPersistedIds.Contains(id))
+                    .ToArray();
+                var retainedPersistenceKeys = Session.History
+                    .Select(static entry => entry.PersistenceKey)
+                    .OfType<string>()
+                    .ToHashSet(StringComparer.Ordinal);
+                removedPersistenceKeys = _ownedPersistenceKeys
+                    .Where(key => !retainedPersistenceKeys.Contains(key))
+                    .ToArray();
+            }
+            return new SessionHistoryPersistenceSnapshot(
+                entries,
+                removedPersistedIds,
+                removedPersistenceKeys,
+                requiresReplacement,
+                startIndex,
+                Session.History.Count,
+                _destructiveVersion);
+        }
+    }
+
+    /// <summary>
+    /// Marks only the prefix represented by <paramref name="snapshot"/> as durable. Concurrent
+    /// appends remain beyond the cursor for the next save. If history was destructively changed
+    /// during the write, the acknowledgement is ignored so the next save reconciles by replacement.
+    /// </summary>
+    public void AcknowledgeHistoryPersistence(
+        SessionHistoryPersistenceSnapshot snapshot,
+        IReadOnlyDictionary<long, long> insertedRowIds)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(insertedRowIds);
+        lock (_lock)
+        {
+            // The captured entries are the live objects on the ordinary append path, so applying
+            // returned row ids costs O(delta). Only a destructive mutation racing the write can
+            // replace them with `with` clones; that exceptional path scans the current history to
+            // transfer the durable ids before leaving reconciliation pending.
+            foreach (var entry in snapshot.Entries)
+            {
+                if (entry.PersistenceId is { } transientId
+                    && insertedRowIds.TryGetValue(transientId, out var durableId))
+                {
+                    entry.PersistenceId = durableId;
+                }
+            }
+
+            if (_destructiveVersion != snapshot.DestructiveVersion)
+            {
+                foreach (var entry in Session.History)
+                {
+                    if (entry.PersistenceId is { } transientId
+                        && insertedRowIds.TryGetValue(transientId, out var durableId))
+                    {
+                        entry.PersistenceId = durableId;
+                    }
+                }
+            }
+
+            foreach (var removedId in snapshot.RemovedPersistedIds)
+                _observedPersistedHistoryIds.Remove(removedId);
+            foreach (var removedKey in snapshot.RemovedPersistenceKeys)
+                _ownedPersistenceKeys.Remove(removedKey);
+            foreach (var durableId in insertedRowIds.Values)
+                _observedPersistedHistoryIds.Add(durableId);
+
+            if (_destructiveVersion != snapshot.DestructiveVersion)
+                return;
+
+            if (!snapshot.RequiresReplacement && _persistedHistoryCount != snapshot.StartIndex)
+                return;
+
+            _persistedHistoryCount = snapshot.EndIndex;
+            _persistedDestructiveVersion = snapshot.DestructiveVersion;
+        }
+    }
+
+    /// <summary>
+    /// Initializes a hydrated session's cursor after its complete history has been read from the
+    /// store. New sessions deliberately do not call this method, so their initial history is pending.
+    /// </summary>
+    public void MarkCurrentHistoryPersisted()
+    {
+        lock (_lock)
+        {
+            _persistedHistoryCount = Session.History.Count;
+            _persistedDestructiveVersion = _destructiveVersion;
+            _observedPersistedHistoryIds.Clear();
+            _ownedPersistenceKeys.Clear();
+            foreach (var id in Session.History
+                         .Select(static entry => entry.PersistenceId)
+                         .OfType<long>()
+                         .Where(static id => id > 0))
+            {
+                _observedPersistedHistoryIds.Add(id);
+            }
+            foreach (var key in Session.History
+                         .Select(static entry => entry.PersistenceKey)
+                         .OfType<string>())
+            {
+                _ownedPersistenceKeys.Add(key);
+            }
+        }
+    }
+
+    /// <summary>
     /// Executes get history snapshot.
     /// </summary>
     /// <param name="offset">The offset.</param>
@@ -279,3 +464,18 @@ public sealed class GatewaySessionRuntime
     }
 
 }
+
+/// <summary>
+/// Immutable history work item captured for one persistence attempt. Entries have stable positive
+/// durable identities or negative transient identities assigned under the history mutation lock.
+/// Removed identities contain only rows this aggregate previously observed and explicitly removed;
+/// rows concurrently appended through another store path are outside its deletion authority.
+/// </summary>
+public sealed record SessionHistoryPersistenceSnapshot(
+    IReadOnlyList<SessionEntry> Entries,
+    IReadOnlyList<long> RemovedPersistedIds,
+    IReadOnlyList<string> RemovedPersistenceKeys,
+    bool RequiresReplacement,
+    int StartIndex,
+    int EndIndex,
+    long DestructiveVersion);

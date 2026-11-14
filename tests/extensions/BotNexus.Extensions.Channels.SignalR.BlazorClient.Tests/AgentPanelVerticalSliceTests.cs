@@ -34,9 +34,11 @@ public sealed class AgentPanelVerticalSliceTests : IDisposable
                 CreatedAt: DateTimeOffset.UtcNow,
                 UpdatedAt: DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "agent-1";
+        _store.SelectView("agent-1", string.Empty, SelectionSource.UserClick);
 
         _ctx.Services.AddSingleton<IClientStateStore>(_store);
+        // #3064: Home injects the per-agent conversation MRU at the route seam.
+        _ctx.Services.AddSingleton<IConversationMruService, ConversationMruService>();
         _ctx.Services.AddSingleton(_portalLoad);
         _ctx.Services.AddSingleton(Substitute.For<IAgentInteractionService>());
         _ctx.Services.AddSingleton<ISlashCommandDispatcher>(sp => new SlashCommandDispatcher(sp.GetRequiredService<IAgentInteractionService>()));
@@ -134,8 +136,8 @@ public sealed class AgentPanelVerticalSliceTests : IDisposable
     [Fact]
     public void SubAgent_workspace_tab_url_is_suppressed_to_conversation()
     {
-        // Register agent-1 as a sub-agent
-        _store.RegisterSession("agent-1", "session-sub-1", "signalr", "agent-subagent");
+        // #2248: a GENUINE sub-agent observer entry (immutable IsObserverAgent) suppresses Workspace.
+        SeedAgentOneAsObserver();
 
         _ctx.Services.GetRequiredService<NavigationManager>()
             .NavigateTo("http://localhost/chat/agent-1/conv-1?tab=workspace");
@@ -172,8 +174,8 @@ public sealed class AgentPanelVerticalSliceTests : IDisposable
     [Fact]
     public void SubAgent_reports_tab_url_is_suppressed_to_conversation()
     {
-        // Register agent-1 as a sub-agent
-        _store.RegisterSession("agent-1", "session-sub-1", "signalr", "agent-subagent");
+        // #2248: a GENUINE sub-agent observer entry (immutable IsObserverAgent) suppresses Reports.
+        SeedAgentOneAsObserver();
 
         _ctx.Services.GetRequiredService<NavigationManager>()
             .NavigateTo("http://localhost/chat/agent-1/conv-1?tab=reports");
@@ -204,6 +206,21 @@ public sealed class AgentPanelVerticalSliceTests : IDisposable
         Assert.Contains(".agent-panel-tab", css);
         Assert.Contains(".canvas-panel", css);
         Assert.Contains("@media (max-width: 768px)", css);
+
+        // #2441: portal chrome spacing is expressed as themeable density tokens with both a
+        // compact and a comfortable value set, not hard-coded numbers.
+        Assert.Contains("[data-density=\"compact\"]", css);
+        Assert.Contains("[data-density=\"comfortable\"]", css);
+        foreach (var token in new[]
+                 {
+                     "--density-row-pad-y", "--density-row-pad-x", "--density-gap",
+                     "--density-control-h", "--density-bar-h", "--density-font-sm",
+                     "--density-font-xs", "--density-nav-pad-y", "--density-nav-pad-x",
+                     "--density-subnav-indent", "--density-group-pad-y"
+                 })
+        {
+            Assert.Contains(token, css);
+        }
     }
 
     private IRenderedComponent<Home> RenderHomeForAgentConversation() =>
@@ -211,17 +228,46 @@ public sealed class AgentPanelVerticalSliceTests : IDisposable
             .Add(c => c.AgentId, "agent-1")
             .Add(c => c.ConversationId, "conv-1"));
 
+    // #2248: re-seed agent-1 as a GENUINE sub-agent observer (immutable IsObserverAgent) while
+    // preserving its seeded conversation, so tests that need a real sub-agent no longer rely on
+    // session-type poisoning (which no longer classifies a user agent as a sub-agent).
+    private void SeedAgentOneAsObserver()
+    {
+        _store.RemoveAgent("agent-1");
+        _store.UpsertAgent(new AgentState
+        {
+            AgentId = "agent-1",
+            DisplayName = "Alpha",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+        _store.SeedConversations("agent-1", [
+            new ConversationSummaryDto(
+                ConversationId: "conv-1",
+                AgentId: "agent-1",
+                Title: "General",
+                IsDefault: true,
+                Status: "Active",
+                ActiveSessionId: null,
+                BindingCount: 0,
+                CreatedAt: DateTimeOffset.UtcNow,
+                UpdatedAt: DateTimeOffset.UtcNow)
+        ]);
+        _store.SelectView("agent-1", string.Empty, SelectionSource.SubAgentView);
+    }
+
     private static string FindRepositoryRoot()
     {
         var current = new DirectoryInfo(AppContext.BaseDirectory);
         while (current is not null)
         {
-            if (File.Exists(Path.Combine(current.FullName, "BotNexus.slnx")))
+            if (File.Exists(Path.Combine(current.FullName, "Directory.Packages.props")))
                 return current.FullName;
 
             current = current.Parent;
         }
 
-        throw new DirectoryNotFoundException("Unable to locate BotNexus.slnx from test base directory.");
+        throw new DirectoryNotFoundException("Unable to locate Directory.Packages.props from test base directory.");
     }
 }

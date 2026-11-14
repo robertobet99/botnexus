@@ -377,17 +377,17 @@ public sealed class CopilotIntegrationTests
             }
         }
 
-        public Task<AgentResponse> PromptAsync(UserMessage message, CancellationToken cancellationToken = default)
+        public Task<AgentResponse> PromptAsync(BotNexus.Gateway.Abstractions.Models.AgentUserMessage message, CancellationToken cancellationToken = default)
             => PromptAsync(message.Content, cancellationToken);
 
-        public IAsyncEnumerable<AgentStreamEvent> StreamAsync(UserMessage message, CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<AgentStreamEvent> StreamAsync(BotNexus.Gateway.Abstractions.Models.AgentUserMessage message, CancellationToken cancellationToken = default)
             => StreamAsync(message.Content, cancellationToken);
 
         public Task AbortAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task InterruptAndSteerAsync(string message, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task SteerAsync(string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task FollowUpAsync(string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
-        public Task FollowUpAsync(AgentMessage message, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task FollowUpAsync(AgentTranscriptMessage message, CancellationToken cancellationToken = default) => Task.CompletedTask;
 
         public ValueTask DisposeAsync()
         {

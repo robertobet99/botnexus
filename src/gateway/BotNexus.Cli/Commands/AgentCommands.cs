@@ -5,6 +5,7 @@ using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Configuration;
 using Spectre.Console;
 using ValidationResult = Spectre.Console.ValidationResult;
+using BotNexus.Cli.Services;
 
 namespace BotNexus.Cli.Commands;
 
@@ -158,6 +159,10 @@ internal sealed class AgentCommands
         command.AddCommand(showCommand);
         command.AddCommand(exportCommand);
         command.AddCommand(importCommand);
+        // #2396: the one subcommand in this group that makes the agent RUN, rather than editing its
+        // configuration. It lives in its own file because its concerns (gateway transport, exit
+        // codes, stdout/stderr discipline) share nothing with the config-editing subcommands.
+        command.AddCommand(AgentExecCommand.Build(verboseOption));
         return command;
     }
 
@@ -185,7 +190,7 @@ internal sealed class AgentCommands
         foreach (var (agentId, agent) in config.Agents.OrderBy(a => a.Key, StringComparer.OrdinalIgnoreCase))
         {
             table.AddRow(
-                Markup.Escape(agentId),
+                CliText.SafeDisplay(agentId),
                 agent.Provider ?? "[dim](unset)[/]",
                 agent.Model ?? "[dim](unset)[/]",
                 agent.Enabled ? "[green]Yes[/]" : "[red]No[/]");
@@ -194,7 +199,7 @@ internal sealed class AgentCommands
         AnsiConsole.Write(table);
 
         if (verbose)
-            AnsiConsole.MarkupLine($"[dim]Loaded from: {Markup.Escape(configPath)}[/]");
+            AnsiConsole.MarkupLine($"[dim]Loaded from: {CliText.SafeDisplay(configPath)}[/]");
 
         return 0;
     }
@@ -259,8 +264,7 @@ internal sealed class AgentCommands
         if (string.IsNullOrWhiteSpace(displayName))
             displayName = id;
 
-        config.Agents ??= new Dictionary<string, AgentDefinitionConfig>(StringComparer.OrdinalIgnoreCase);
-        config.Agents[id] = new AgentDefinitionConfig
+        var definition = new AgentDefinitionConfig
         {
             DisplayName = displayName,
             Description = string.IsNullOrWhiteSpace(description) ? null : description,
@@ -275,7 +279,7 @@ internal sealed class AgentCommands
             }
         };
 
-        var saveCode = await SaveAndValidateAsync(config, configPath, verbose, cancellationToken);
+        var saveCode = await SetAgentEntryAsync(configPath, id, definition, verbose, cancellationToken);
         if (saveCode != 0)
             return saveCode;
 
@@ -283,7 +287,8 @@ internal sealed class AgentCommands
         var botNexusHome = new BotNexusHome(homePath);
         botNexusHome.GetAgentDirectory(id);
 
-        AnsiConsole.MarkupLine($"[green]✓[/] Agent [green]{Markup.Escape(id)}[/] added successfully.");
+        AnsiConsole.MarkupLine($"[green]✓[/] Agent [green]{CliText.SafeDisplay(id)}[/] added successfully.");
+        saveCode.PrintReceipt();
         return 0;
     }
 
@@ -308,11 +313,11 @@ internal sealed class AgentCommands
         config.Agents ??= new Dictionary<string, AgentDefinitionConfig>(StringComparer.OrdinalIgnoreCase);
         if (ContainsDictionaryKey(config.Agents, id))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Agent [green]{Markup.Escape(id)}[/] already exists.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Agent [green]{CliText.SafeDisplay(id)}[/] already exists.");
             return 1;
         }
 
-        config.Agents[id] = new AgentDefinitionConfig
+        var definition = new AgentDefinitionConfig
         {
             DisplayName = string.IsNullOrWhiteSpace(displayName) ? null : displayName,
             Description = string.IsNullOrWhiteSpace(description) ? null : description,
@@ -328,7 +333,7 @@ internal sealed class AgentCommands
             }
         };
 
-        var saveCode = await SaveAndValidateAsync(config, configPath, verbose, cancellationToken);
+        var saveCode = await SetAgentEntryAsync(configPath, id, definition, verbose, cancellationToken);
         if (saveCode != 0)
             return saveCode;
 
@@ -336,7 +341,8 @@ internal sealed class AgentCommands
         var botNexusHome = new BotNexusHome(homePath);
         botNexusHome.GetAgentDirectory(id);
 
-        AnsiConsole.MarkupLine($"[green]\u2713[/] Added agent [green]{Markup.Escape(id)}[/].");
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Added agent [green]{CliText.SafeDisplay(id)}[/].");
+        saveCode.PrintReceipt();
         return 0;
     }
 
@@ -357,7 +363,7 @@ internal sealed class AgentCommands
 
         if (config.Agents is null || !TryFindDictionaryKey(config.Agents, id, out var matchedId))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Agent [green]{Markup.Escape(id)}[/] was not found.");
+            AnsiConsole.MarkupLine(AgentNotFoundMessage(id));
             return 1;
         }
 
@@ -365,15 +371,23 @@ internal sealed class AgentCommands
         if (!string.IsNullOrWhiteSpace(defaultAgent) &&
             string.Equals(defaultAgent, matchedId, StringComparison.OrdinalIgnoreCase))
         {
-            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Removing default agent [green]{Markup.Escape(matchedId)}[/]. Update gateway.defaultAgentId if needed.");
+            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Removing default agent [green]{CliText.SafeDisplay(matchedId)}[/]. Update gateway.defaultAgentId if needed.");
         }
 
-        config.Agents.Remove(matchedId);
-        var saveCode = await SaveAndValidateAsync(config, configPath, verbose, cancellationToken);
+        var saveCode = await CliConfigMutation.ApplyAsync(
+            configPath,
+            document => document.TryRemoveEntry(AgentsPath, matchedId, out var error) ? null : error,
+            "before-agent-remove",
+            verbose,
+            cancellationToken,
+            // #2816: removing the last agent legitimately empties `agents`; naming it here keeps
+            // that working without granting this command any reach into other sections.
+            namedSections: [AgentsPath]);
         if (saveCode != 0)
             return saveCode;
 
-        AnsiConsole.MarkupLine($"[green]\u2713[/] Removed agent [green]{Markup.Escape(matchedId)}[/].");
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Removed agent [green]{CliText.SafeDisplay(matchedId)}[/].");
+        saveCode.PrintReceipt();
         return 0;
     }
 
@@ -391,7 +405,7 @@ internal sealed class AgentCommands
 
         if (config.Agents is null || !TryFindDictionaryKey(config.Agents, id, out var matchedId))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Agent [green]{Markup.Escape(id)}[/] was not found.");
+            AnsiConsole.MarkupLine(AgentNotFoundMessage(id));
             return 1;
         }
 
@@ -410,25 +424,49 @@ internal sealed class AgentCommands
         }
 
         var table = new Table().AddColumn("Field").AddColumn("Value");
-        table.AddRow("id", Markup.Escape(matchedId));
-        table.AddRow("displayName", Markup.Escape(agent.DisplayName ?? string.Empty));
-        table.AddRow("description", Markup.Escape(agent.Description ?? string.Empty));
-        table.AddRow("provider", Markup.Escape(agent.Provider ?? string.Empty));
-        table.AddRow("model", Markup.Escape(agent.Model ?? string.Empty));
-        table.AddRow("enabled", agent.Enabled ? "[green]Yes[/]" : "[red]No[/]");
-        if (agent.AllowedModels is { Count: > 0 })
-            table.AddRow("allowedModels", Markup.Escape(string.Join(", ", agent.AllowedModels)));
-        if (agent.SubAgents is { Count: > 0 })
-            table.AddRow("subAgents", Markup.Escape(string.Join(", ", agent.SubAgents)));
-        if (agent.Extensions is { Count: > 0 })
-            table.AddRow("extensions", Markup.Escape(string.Join(", ", agent.Extensions.Keys)));
+        foreach (var (field, value) in BuildShowRows(matchedId, agent))
+            table.AddRow(field, value);
         AnsiConsole.Write(table);
 
         if (verbose)
-            AnsiConsole.MarkupLine($"[dim]Loaded from: {Markup.Escape(configPath)}[/]");
+            AnsiConsole.MarkupLine($"[dim]Loaded from: {CliText.SafeDisplay(configPath)}[/]");
 
         return 0;
     }
+
+    /// <summary>
+    /// Builds the field/value rows for <c>agent show</c>. Every value originates in the
+    /// on-disk config, which agents can write, so it is rendered through
+    /// <see cref="CliText.SafeDisplay"/> (issue #2722). Extracted so the sanitisation is
+    /// directly testable without a config file or a console.
+    /// </summary>
+    internal static List<(string Field, string Value)> BuildShowRows(string matchedId, AgentDefinitionConfig agent)
+    {
+        var rows = new List<(string, string)>
+        {
+            ("id", CliText.SafeDisplay(matchedId)),
+            ("displayName", CliText.SafeDisplay(agent.DisplayName)),
+            ("description", CliText.SafeDisplay(agent.Description)),
+            ("provider", CliText.SafeDisplay(agent.Provider)),
+            ("model", CliText.SafeDisplay(agent.Model)),
+            ("enabled", agent.Enabled ? "[green]Yes[/]" : "[red]No[/]")
+        };
+        if (agent.AllowedModels is { Count: > 0 })
+            rows.Add(("allowedModels", CliText.SafeDisplay(string.Join(", ", agent.AllowedModels))));
+        if (agent.SubAgents is { Count: > 0 })
+            rows.Add(("subAgents", CliText.SafeDisplay(string.Join(", ", agent.SubAgents))));
+        if (agent.Extensions is { Count: > 0 })
+            rows.Add(("extensions", CliText.SafeDisplay(string.Join(", ", agent.Extensions.Keys))));
+        return rows;
+    }
+
+    /// <summary>
+    /// The lookup-miss message. It echoes caller-supplied input straight back to the
+    /// terminal, so the id is sanitised here rather than at each of the three call sites
+    /// (issue #2722).
+    /// </summary>
+    internal static string AgentNotFoundMessage(string id)
+        => $"[red]Error:[/] Agent [green]{CliText.SafeDisplay(id)}[/] was not found.";
 
     public async Task<int> ExecuteExportAsync(string id, string configPath, string? outputPath, bool verbose, CancellationToken cancellationToken)
     {
@@ -444,7 +482,7 @@ internal sealed class AgentCommands
 
         if (config.Agents is null || !TryFindDictionaryKey(config.Agents, id, out var matchedId))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Agent [green]{Markup.Escape(id)}[/] was not found.");
+            AnsiConsole.MarkupLine(AgentNotFoundMessage(id));
             return 1;
         }
 
@@ -460,7 +498,6 @@ internal sealed class AgentCommands
                 Emoji = agent.Emoji,
                 ModelId = agent.Model,
                 ApiProvider = provider,
-                SystemPrompt = ResolveSystemPrompt(agent, configPath),
                 ToolIds = agent.ToolIds is { Count: > 0 } ? new List<string>(agent.ToolIds) : null,
                 Thinking = agent.Thinking,
                 ContextWindow = agent.ContextWindow
@@ -480,24 +517,11 @@ internal sealed class AgentCommands
 
         await File.WriteAllTextAsync(destination, json, cancellationToken);
 
-        AnsiConsole.MarkupLine($"[green]\u2713[/] Exported agent [green]{Markup.Escape(matchedId)}[/] to [dim]{Markup.Escape(destination)}[/].");
+        AnsiConsole.MarkupLine($"[green]\u2713[/] Exported agent [green]{CliText.SafeDisplay(matchedId)}[/] to [dim]{CliText.SafeDisplay(destination)}[/].");
         if (verbose)
             AnsiConsole.MarkupLine($"[dim]Schema: {AgentTemplate.CurrentSchema}; requiredSecrets: {template.RequiredSecrets.Count}[/]");
 
         return 0;
-    }
-
-    private static string? ResolveSystemPrompt(AgentDefinitionConfig agent, string configPath)
-    {
-        if (string.IsNullOrWhiteSpace(agent.SystemPromptFile))
-            return null;
-
-        var homeDir = Path.GetDirectoryName(configPath) ?? BotNexusHome.ResolveHomePath();
-        var promptPath = Path.IsPathRooted(agent.SystemPromptFile)
-            ? agent.SystemPromptFile
-            : Path.Combine(homeDir, agent.SystemPromptFile);
-
-        return File.Exists(promptPath) ? File.ReadAllText(promptPath) : null;
     }
 
     private static List<RequiredSecret> BuildRequiredSecrets(string provider)
@@ -547,7 +571,7 @@ internal sealed class AgentCommands
 
         if (!File.Exists(filePath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Template file not found at [dim]{Markup.Escape(filePath)}[/].");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Template file not found at [dim]{CliText.SafeDisplay(filePath)}[/].");
             return 1;
         }
 
@@ -559,7 +583,7 @@ internal sealed class AgentCommands
         }
         catch (System.Text.Json.JsonException ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Template is not valid JSON: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Template is not valid JSON: {CliText.SafeDisplay(ex.Message)}");
             return 1;
         }
 
@@ -573,13 +597,13 @@ internal sealed class AgentCommands
         // template missing a field can still be completed at import time.
         if (!TryParseSets(sets, out var overrides, out var setError))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(setError)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(setError)}");
             return 1;
         }
 
         if (!TryApplyOverrides(template.Agent, overrides, out var applyError))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(applyError)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] {CliText.SafeDisplay(applyError)}");
             return 1;
         }
 
@@ -588,7 +612,7 @@ internal sealed class AgentCommands
         {
             AnsiConsole.MarkupLine("[red]Error:[/] Template failed schema validation:");
             foreach (var error in schemaErrors)
-                AnsiConsole.MarkupLine($"  [red]\u2022[/] {Markup.Escape(error)}");
+                AnsiConsole.MarkupLine($"  [red]\u2022[/] {CliText.SafeDisplay(error)}");
             return 1;
         }
 
@@ -607,7 +631,7 @@ internal sealed class AgentCommands
 
         if (!System.Text.RegularExpressions.Regex.IsMatch(targetId, @"^[a-z0-9][a-z0-9\-_]*$"))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Invalid agent id [green]{Markup.Escape(targetId)}[/]. Use lowercase letters, digits, hyphens, or underscores.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Invalid agent id [green]{CliText.SafeDisplay(targetId)}[/]. Use lowercase letters, digits, hyphens, or underscores.");
             return 1;
         }
 
@@ -620,7 +644,7 @@ internal sealed class AgentCommands
         var exists = TryFindDictionaryKey(config.Agents, targetId, out var existingKey);
         if (exists && !overwrite)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Agent [green]{Markup.Escape(targetId)}[/] already exists. Pass [green]--overwrite[/] to replace it, or choose another id with [green]--id[/] / [green]--set id=<value>[/].");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Agent [green]{CliText.SafeDisplay(targetId)}[/] already exists. Pass [green]--overwrite[/] to replace it, or choose another id with [green]--id[/] / [green]--set id=<value>[/].");
             return 1;
         }
 
@@ -647,22 +671,36 @@ internal sealed class AgentCommands
 
         var homeDir = Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? BotNexusHome.ResolveHomePath();
 
-        // Restore the system prompt into the agent workspace and reference it by relative
-        // path so the reconstructed agent is self-contained and portable.
+        // Preserve imported instructions through the standard workspace contract rather than
+        // recreating a retired custom prompt-file reference (#2941). IDENTITY.md is loaded for
+        // every agent and remains eligible for model variants and normal file-policy checks.
         if (!string.IsNullOrWhiteSpace(descriptor.SystemPrompt))
         {
-            var botNexusHome = new BotNexusHome(homeDir);
-            var agentDir = botNexusHome.GetAgentDirectory(targetId);
-            var promptPath = Path.Combine(agentDir, "IMPORTED_SYSTEM_PROMPT.md");
-            await File.WriteAllTextAsync(promptPath, descriptor.SystemPrompt, cancellationToken);
-            agent.SystemPromptFile = Path.GetRelativePath(homeDir, promptPath).Replace('\\', '/');
+            var agentDirectory = new BotNexusHome(homeDir).GetAgentDirectory(targetId);
+            await File.WriteAllTextAsync(
+                Path.Combine(agentDirectory, "IDENTITY.md"),
+                descriptor.SystemPrompt,
+                cancellationToken);
         }
 
-        if (exists)
-            config.Agents.Remove(existingKey);
-        config.Agents[targetId] = agent;
+        var saveCode = await CliConfigMutation.ApplyAsync(
+            configPath,
+            document =>
+            {
+                // Import replaces the whole agent entry by design (it reconstructs a complete
+                // descriptor), so remove any differently-cased existing key first rather than
+                // leaving a duplicate sibling behind.
+                if (exists && !document.TryRemoveEntry(AgentsPath, existingKey, out var removeError))
+                    return removeError;
 
-        var saveCode = await SaveAndValidateAsync(config, configPath, verbose, cancellationToken);
+                return document.TrySetEntryFrom(AgentsPath, targetId, agent, out var setError)
+                    ? null
+                    : setError;
+            },
+            "before-agent-import",
+            verbose,
+            cancellationToken,
+            namedSections: [AgentsPath]);
         if (saveCode != 0)
             return saveCode;
 
@@ -670,12 +708,13 @@ internal sealed class AgentCommands
         new BotNexusHome(homeDir).GetAgentDirectory(targetId);
 
         var verb = exists ? "Replaced" : "Imported";
-        AnsiConsole.MarkupLine($"[green]\u2713[/] {verb} agent [green]{Markup.Escape(targetId)}[/] from template [dim]{Markup.Escape(Path.GetFileName(filePath))}[/].");
+        AnsiConsole.MarkupLine($"[green]\u2713[/] {verb} agent [green]{CliText.SafeDisplay(targetId)}[/] from template [dim]{CliText.SafeDisplay(Path.GetFileName(filePath))}[/].");
+        saveCode.PrintReceipt();
         if (template.RequiredSecrets is { Count: > 0 })
         {
             AnsiConsole.MarkupLine("[yellow]Required secrets to re-provide before this agent can run:[/]");
             foreach (var secret in template.RequiredSecrets)
-                AnsiConsole.MarkupLine($"  [yellow]\u2022[/] {Markup.Escape(secret.Provider)}.{Markup.Escape(secret.Key)}");
+                AnsiConsole.MarkupLine($"  [yellow]\u2022[/] {CliText.SafeDisplay(secret.Provider)}.{CliText.SafeDisplay(secret.Key)}");
         }
         if (verbose)
             AnsiConsole.MarkupLine($"[dim]Schema: {AgentTemplate.CurrentSchema}; overrides applied: {overrides.Count}[/]");
@@ -783,54 +822,39 @@ internal sealed class AgentCommands
 
     private static async Task<PlatformConfig?> LoadConfigRequiredAsync(string configPath, CancellationToken cancellationToken)
     {
-        if (!File.Exists(configPath))
+        if (!ConfigPresence.Exists(configPath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Config file not found at [dim]{Markup.Escape(configPath)}[/]. Run [green]botnexus init[/] first.");
+            AnsiConsole.MarkupLine(configPath.NotFoundMessage());
             return null;
         }
 
         try
         {
-            return await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
+            return PlatformConfigAccessor.Shared.Get(configPath);
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {CliText.SafeDisplay(ex.Message)}");
             return null;
         }
     }
 
-    private static async Task<int> SaveAndValidateAsync(PlatformConfig config, bool verbose, CancellationToken cancellationToken)
-        => await SaveAndValidateAsync(config, PlatformConfigLoader.DefaultConfigPath, verbose, cancellationToken);
+    /// <summary>Canonical path of the agents section.</summary>
+    private const string AgentsPath = "agents";
 
-    private static async Task<int> SaveAndValidateAsync(PlatformConfig config, string configPath, bool verbose, CancellationToken cancellationToken)
-    {
-        await WriteConfigAsync(config, configPath, cancellationToken);
-
-        var reloaded = await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
-        var errors = PlatformConfigLoader.Validate(reloaded);
-        if (errors.Count > 0)
-        {
-            AnsiConsole.MarkupLine("[red]Config validation failed after write:[/]");
-            foreach (var error in errors)
-                AnsiConsole.MarkupLine($"  [red]\u2022[/] {Markup.Escape(error)}");
-            return 1;
-        }
-
-        if (verbose)
-            AnsiConsole.MarkupLine($"[dim]Saved config: {Markup.Escape(configPath)}[/]");
-
-        return 0;
-    }
-
-    private static async Task WriteConfigAsync(PlatformConfig config, string configPath, CancellationToken cancellationToken, string reason = "before-config-write")
-    {
-        PlatformConfigLoader.EnsureConfigDirectory(Path.GetDirectoryName(configPath) ?? PlatformConfigLoader.DefaultHomePath);
-        var fileSystem = new System.IO.Abstractions.FileSystem();
-        var backupsDir = Path.Combine(Path.GetDirectoryName(configPath) ?? BotNexusHome.ResolveHomePath(), "backups");
-        var writer = new PlatformConfigWriter(configPath, fileSystem, new ConfigBackupService(backupsDir, fileSystem));
-        await writer.UpdatePlatformConfigAsync(config, reason, cancellationToken);
-    }
+    private static async Task<CliConfigMutationResult> SetAgentEntryAsync(
+        string configPath,
+        string agentId,
+        AgentDefinitionConfig agent,
+        bool verbose,
+        CancellationToken cancellationToken)
+        => await CliConfigMutation.ApplyAsync(
+            configPath,
+            document => document.TrySetEntryFrom(AgentsPath, agentId, agent, out var error) ? null : error,
+            "before-agent-update",
+            verbose,
+            cancellationToken,
+            namedSections: [AgentsPath]);
 
     private static bool ContainsDictionaryKey<TKey, TValue>(Dictionary<TKey, TValue> dictionary, TKey key)
         where TKey : notnull
@@ -871,3 +895,4 @@ internal sealed class AgentCommands
     }
 
 }
+

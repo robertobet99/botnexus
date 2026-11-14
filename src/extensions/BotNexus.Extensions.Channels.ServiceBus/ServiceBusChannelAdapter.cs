@@ -6,8 +6,10 @@ using Azure.Messaging.ServiceBus;
 using BotNexus.Domain.Primitives;
 using BotNexus.Domain.World;
 using BotNexus.Gateway.Abstractions.Channels;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Channels;
+using BotNexus.Gateway.Channels.Startup;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -41,7 +43,7 @@ namespace BotNexus.Extensions.Channels.ServiceBus;
 /// <see cref="ServiceBusServiceCollectionExtensions.AddBotNexusServiceBusChannel"/>.
 /// </para>
 /// </remarks>
-public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventChannelAdapter
+public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventChannelAdapter, IConversationEventSink, IAddressableChannelAdapter
 {
     // Metadata keys stored in InboundMessage.Metadata for use by the outbound path.
     internal const string MetaReplyTo = "servicebus.replyTo";
@@ -57,16 +59,30 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
     /// </summary>
     internal const string MetaRequestKey = "servicebus.requestKey";
 
+    /// <summary>
+    /// Prefix minted by <see cref="ConversationId.Create"/> for INTERNAL BotNexus conversation ids.
+    /// Such an id identifies a conversation aggregate inside the gateway; it is never an address
+    /// any external transport can deliver to (#2815).
+    /// </summary>
+    internal const string InternalConversationIdPrefix = "c_";
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly ILogger<ServiceBusChannelAdapter> _logger;
-    private readonly ServiceBusChannelOptions _options;
+    private readonly LateBoundChannelOptions<ServiceBusChannelOptions> _optionsHolder;
+
+    // Read at point of use so a runtime config.json edit is reflected without a gateway restart (#2010).
+    private ServiceBusChannelOptions _options => _optionsHolder.Current;
 
     // Optional factory injected at construction time; null → create real factory in OnStartAsync.
     private readonly IServiceBusAdapterClientFactory? _injectedFactory;
 
     private IServiceBusAdapterClientFactory? _activeFactory;
     private ServiceBusProcessor? _processor;
+
+    // #2386: bounds the receive loop so a terminal fault parks the processor instead of
+    // re-erroring every few seconds for hours.
+    private readonly ChannelLoopCircuitBreaker _receiveBreaker = new("Azure Service Bus receive loop");
 
     // Senders are cached per queue name so we don't create a new sender on every reply.
     private readonly ConcurrentDictionary<string, IServiceBusSenderWrapper> _senders =
@@ -82,6 +98,29 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
     // Used by SendAsync as a fallback when OutboundMessage.Metadata does not carry
     // MetaRequestKey (the live gateway path does not propagate InboundMessage.Metadata).
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _pendingQueue =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // #2525 AC5: request keys whose work has already been dispatched successfully. A redelivery
+    // after a lock-lost completion carries the same broker MessageId, and the turn it represents
+    // has already run, so it must not run again. Entries are only added after a successful
+    // dispatch - a handler that threw was abandoned and genuinely does need to be retried.
+    private readonly ConcurrentDictionary<string, byte> _dispatchedMessages =
+        new(StringComparer.Ordinal);
+
+    // FIFO of dispatched keys, used to evict the oldest entries so a long-lived adapter cannot
+    // grow _dispatchedMessages without bound.
+    private readonly ConcurrentQueue<string> _dispatchedOrder = new();
+
+    // Retains roughly an hour of redelivery history at realistic inbound rates, which comfortably
+    // outlives any lock-renewal window, while bounding memory.
+    private const int MaxDispatchedMessages = 10_000;
+
+    // #2815: agent ids observed on inbound envelopes. An agent id is a legitimate SESSION-ROUTING
+    // key for internal channels, but it is never an external Service Bus destination - the Teams
+    // relay is fail-closed and dead-letters any envelope whose conversationId is an agent name.
+    // Recording the ids we have actually seen inbound lets the outbound validity clause recognise
+    // one without taking a dependency on the gateway's agent registry.
+    private readonly ConcurrentDictionary<string, byte> _knownAgentIds =
         new(StringComparer.OrdinalIgnoreCase);
 
     // Accumulators are keyed by the channel-native request identity, never conversation address,
@@ -110,7 +149,9 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
         : base(logger)
     {
         _logger = logger;
-        _options = ResolveOptions(optionsAccessor, configuration);
+        _optionsHolder = new LateBoundChannelOptions<ServiceBusChannelOptions>(
+            () => ResolveOptions(optionsAccessor, configuration),
+            configuration);
         _injectedFactory = clientFactory;
         AllowList = [.. _options.AllowedSenderIds];
     }
@@ -166,11 +207,28 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
     {
         _activeFactory = _injectedFactory ?? CreateDefaultFactory();
 
+        // #3501 AC1: an operator who points the reply queue at the inbound queue has configured an
+        // unbounded self-feeding loop. Startup is the only place this is visible before traffic
+        // arrives, and it is otherwise accepted silently. Warn rather than refuse to start, so a
+        // running deployment is not taken down by a config reload; the send-time guard in
+        // GuardAgainstSelfSend is the actual containment.
+        if (_options.DescribeSelfSendMisconfiguration() is { } misconfiguration)
+        {
+            _logger.LogWarning(
+                "{DisplayName} self-send misconfiguration: {Detail} Replies resolving to the inbound queue will be refused at send time.",
+                DisplayName,
+                misconfiguration);
+        }
+
         var processorOptions = new ServiceBusProcessorOptions
         {
             MaxConcurrentCalls = _options.MaxConcurrentCalls,
             // Manual completion — we complete after successful dispatch, abandon on error.
             AutoCompleteMessages = false,
+            // #2525: the SDK default renewal window is five minutes, which is shorter than many
+            // agent turns. When it lapses the completion call fails with a lock-lost error and
+            // Service Bus redelivers work that already succeeded.
+            MaxAutoLockRenewalDuration = TimeSpan.FromMinutes(_options.MaxAutoLockRenewalMinutes),
         };
 
         _processor = _activeFactory.CreateProcessor(_options.InboundQueueName, processorOptions);
@@ -205,6 +263,9 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
         _pendingReplies.Clear();
         _pendingQueue.Clear();
         _pendingStreams.Clear();
+        _knownAgentIds.Clear();
+        _dispatchedMessages.Clear();
+        _dispatchedOrder.Clear();
 
         if (_activeFactory is IAsyncDisposable disposable)
             await disposable.DisposeAsync();
@@ -220,13 +281,31 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
         var pending = ResolvePendingReplyContext(message.ChannelRequestId, message.ChannelAddress);
         var pendingCtx = pending.Context;
         var replyQueue = ResolveReplyQueue(message.Metadata, pendingCtx);
-        var (correlationId, conversationId) = ResolveReplyContext(message.Metadata, pendingCtx);
+        var (correlationId, inheritedConversationId) = ResolveReplyContext(message.Metadata, pendingCtx);
+
+        // #2529 (security, cross-conversation delivery): the destination conversation is
+        // never guessed. Precedence is strict and fail-closed:
+        //   1. The message's OWN ConversationId - the producing session knows its destination.
+        //   2. A conversation inherited from an EXACT pending reply context (ChannelRequestId
+        //      matched a registered inbound request). This is legitimate reply correlation.
+        //   3. A FIFO-borrowed conversation that disagrees with the channel address means an
+        //      unrelated in-flight inbound request. Adopting it would deliver this content into
+        //      someone else's conversation, so FAIL LOUDLY instead of guessing.
+        //   4. Otherwise the channel address is the unambiguous destination.
+        //   5. #2815 VALIDITY: whatever survived the rules above must actually be an EXTERNAL
+        //      destination. An agent id or an internal 'c_' conversation id is a routing key, not
+        //      a wire address, and an envelope carrying one is guaranteed to dead-letter.
+        var conversationId = ResolveOutboundConversationId(
+            message,
+            inheritedConversationId,
+            pending.IsExactMatch,
+            hasBorrowedContext: pendingCtx is not null && !pending.IsExactMatch);
 
         var envelope = new ServiceBusOutboundEnvelope
         {
             CorrelationId = correlationId,
             AgentId = GetMetadataString(message.Metadata, MetaAgentId),
-            ConversationId = conversationId ?? message.ConversationId ?? message.ChannelAddress.Value,
+            ConversationId = conversationId,
             SessionId = message.SessionId,
             Content = message.Content,
             Type = "done",
@@ -248,6 +327,16 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
             target,
             new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = delta },
             cancellationToken);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Service Bus streaming correlates by request identity, so a target without a
+    /// <see cref="ChannelStreamTarget.ChannelRequestId"/> can never be delivered. The guard in
+    /// <see cref="SendStreamEventAsync"/> is unchanged; this simply lets a fan-out caller learn
+    /// the precondition instead of discovering it as an exception.
+    /// </remarks>
+    public bool CanSendStreamEvent(ChannelStreamTarget target)
+        => !string.IsNullOrWhiteSpace(target.ChannelRequestId);
 
     /// <inheritdoc/>
     public async Task SendStreamEventAsync(
@@ -435,6 +524,12 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
         var replyTo = envelope.ReplyTo
             ?? GetApplicationProperty(applicationProperties, "replyTo");
 
+        // #2815: remember the agent id this transport actually talks to, so the outbound validity
+        // clause can recognise it if a gateway producer later hands it back as a channel address.
+        var inboundAgentId = envelope.AgentId ?? GetApplicationProperty(applicationProperties, "agentId");
+        if (!string.IsNullOrWhiteSpace(inboundAgentId))
+            _knownAgentIds.TryAdd(inboundAgentId, 0);
+
         var correlationId = envelope.CorrelationId
             ?? GetApplicationProperty(applicationProperties, "correlationId");
 
@@ -505,50 +600,206 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
             ChannelRequestId = requestKey,
         };
 
-        await DispatchInboundAsync(inbound, cancellationToken);
+        // #2525 AC5: a turn that outlives the message lock still succeeds, but the completion then
+        // fails with a lock-lost error and the broker redelivers the same MessageId. The work has
+        // already been done, so dispatching again would perform it twice. Only a key derived from
+        // the broker's own MessageId is trustworthy - a generated GUID differs on every delivery.
+        var isBrokerKeyed = !string.IsNullOrEmpty(messageId) || !string.IsNullOrEmpty(envelope.MessageId);
+        if (isBrokerKeyed && _dispatchedMessages.ContainsKey(requestKey))
+        {
+            _logger.LogInformation(
+                "{DisplayName} skipping redelivered Service Bus message {MessageId}; it was already processed on an earlier delivery",
+                DisplayName,
+                requestKey);
+            return;
+        }
+
+        // #3594: throw rather than return on the not-dispatched path. `ProcessMessageCoreAsync`
+        // settles on the handler returning without throwing, so a silent drop here acknowledged a
+        // message that was never routed and the broker never redelivered it.
+        await DispatchInboundOrThrowAsync(inbound, cancellationToken);
+
+        // Recorded only after the dispatch returns. A handler that threw propagates out of this
+        // method, is abandoned by the caller, and must still be retried on redelivery.
+        if (isBrokerKeyed)
+            MarkDispatched(requestKey);
+    }
+
+    /// <summary>
+    /// Records a request key as already processed for redelivery suppression (#2525), evicting the
+    /// oldest keys once the retention bound is reached.
+    /// </summary>
+    private void MarkDispatched(string requestKey)
+    {
+        if (!_dispatchedMessages.TryAdd(requestKey, 0))
+            return;
+
+        _dispatchedOrder.Enqueue(requestKey);
+
+        while (_dispatchedOrder.Count > MaxDispatchedMessages && _dispatchedOrder.TryDequeue(out var oldest))
+            _dispatchedMessages.TryRemove(oldest, out _);
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
 
-    private async Task OnProcessMessageAsync(ProcessMessageEventArgs args)
-    {
-        try
-        {
-            await HandleMessageBodyAsync(
+    private Task OnProcessMessageAsync(ProcessMessageEventArgs args)
+        => ProcessMessageCoreAsync(
+            ct => HandleMessageBodyAsync(
                 args.Message.Body.ToString(),
                 args.Message.ApplicationProperties,
                 args.Message.MessageId,
-                args.CancellationToken);
+                ct),
+            ct => args.CompleteMessageAsync(args.Message, ct),
+            () => args.AbandonMessageAsync(args.Message),
+            args.Message.MessageId,
+            args.CancellationToken);
 
-            await args.CompleteMessageAsync(args.Message, args.CancellationToken);
+    /// <summary>
+    /// Testable core of the processor callback (#2525). The handler runs first and the message is
+    /// only acknowledged afterwards, so delivery stays at-least-once: a mid-turn crash retries
+    /// rather than silently losing the request. The distinction this method adds is between a
+    /// <em>handler</em> failure — where the work did not happen and abandoning is correct — and an
+    /// <em>acknowledgement</em> failure that occurs after the work already succeeded.
+    /// </summary>
+    internal async Task<MessageProcessingOutcome> ProcessMessageCoreAsync(
+        Func<CancellationToken, Task> handleAsync,
+        Func<CancellationToken, Task> completeAsync,
+        Func<Task> abandonAsync,
+        string? messageId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await handleAsync(cancellationToken);
+        }
+        catch (ChannelStoppedException ex)
+        {
+            // #3594: the adapter was stopped, so the message never reached the routing pipeline.
+            // Nothing was done, so it must be abandoned rather than completed - completing here is
+            // the silent-loss defect this branch exists to prevent.
+            _logger.LogWarning(
+                "{DisplayName} could not dispatch Service Bus message {MessageId} because the channel is stopped; the message was NOT processed and will be abandoned for redelivery ({Reason})",
+                DisplayName,
+                messageId,
+                ex.Message);
+            await abandonAsync();
+            return MessageProcessingOutcome.AbandonedNotDispatched;
         }
         catch (OperationCanceledException)
         {
             // Shutdown is in progress — abandon so the message is retried on the next startup.
-            await args.AbandonMessageAsync(args.Message);
+            await abandonAsync();
+            return MessageProcessingOutcome.AbandonedForShutdown;
         }
         catch (Exception ex)
         {
             _logger.LogError(
                 ex,
-                "{DisplayName} unhandled error processing Service Bus message; message will be abandoned",
-                DisplayName);
+                "{DisplayName} unhandled error processing Service Bus message {MessageId}; message will be abandoned",
+                DisplayName,
+                messageId);
 
-            await args.AbandonMessageAsync(args.Message);
+            await abandonAsync();
+            return MessageProcessingOutcome.AbandonedAfterHandlerFailure;
+        }
+
+        // From here on the work has already been performed. Anything that fails is an
+        // acknowledgement problem, not a processing problem, and must not be logged as one.
+        try
+        {
+            await completeAsync(cancellationToken);
+            return MessageProcessingOutcome.Completed;
+        }
+        catch (ServiceBusException ex) when (
+            ex.Reason == ServiceBusFailureReason.MessageLockLost ||
+            ex.Reason == ServiceBusFailureReason.SessionLockLost)
+        {
+            // The lock expired while the turn was running. Abandoning is not attempted: with an
+            // invalid lock that call fails too, and the broker redelivers the message regardless.
+            // The honest statement is that the work succeeded and may be redelivered.
+            _logger.LogWarning(
+                ex,
+                "{DisplayName} processed Service Bus message {MessageId} successfully but the lock expired before it could be acknowledged; the broker may redeliver this message and the work may run again",
+                DisplayName,
+                messageId);
+
+            return MessageProcessingOutcome.CompleteFailedLockLost;
+        }
+        catch (Exception ex)
+        {
+            // A non-lock acknowledgement failure (transient/network). The lock may still be held,
+            // so abandon deliberately to release it promptly rather than waiting for expiry.
+            _logger.LogWarning(
+                ex,
+                "{DisplayName} processed Service Bus message {MessageId} successfully but could not acknowledge it; the message will be abandoned and may be redelivered",
+                DisplayName,
+                messageId);
+
+            await abandonAsync();
+            return MessageProcessingOutcome.CompleteFailedAbandoned;
         }
     }
 
     private Task OnProcessErrorAsync(ProcessErrorEventArgs args)
-    {
-        _logger.LogError(
-            args.Exception,
-            "{DisplayName} Service Bus processor error (source={ErrorSource}, entity={EntityPath})",
-            DisplayName,
-            args.ErrorSource,
-            args.EntityPath);
+        => HandleProcessorErrorAsync(args.Exception, args.ErrorSource.ToString(), args.EntityPath);
 
-        return Task.CompletedTask;
+    /// <summary>
+    /// Bounds the Service Bus receive loop (#2386). The Azure SDK re-invokes this callback for
+    /// every failed receive attempt, so a fault it cannot recover from - a revoked AAD grant
+    /// (AADSTS50173) being the observed case - previously produced an unbounded ERR stream at
+    /// ~13/min for six hours while inbound messages were silently not being received.
+    /// </summary>
+    /// <remarks>
+    /// Terminal failures stop the processor and emit exactly one actionable ERR line. Transient
+    /// failures are left to the SDK's own retry, logged at warning with a bounded backoff hint so
+    /// they no longer dominate the error log. Unclassifiable failures are treated as terminal.
+    /// </remarks>
+    internal async Task HandleProcessorErrorAsync(Exception exception, string errorSource, string? entityPath)
+    {
+        var response = _receiveBreaker.RecordFailure(exception);
+
+        if (!response.ShouldStop)
+        {
+            _logger.LogWarning(
+                exception,
+                "{DisplayName} Service Bus processor transient error (source={ErrorSource}, entity={EntityPath}, failure {FailureCount}); next attempt bounded to {RetryDelaySeconds}s",
+                DisplayName,
+                errorSource,
+                entityPath,
+                _receiveBreaker.ConsecutiveTransientFailures,
+                response.RetryDelay.TotalSeconds);
+            return;
+        }
+
+        if (response.CircuitOpened)
+        {
+            _logger.LogError(
+                exception,
+                "{DisplayName} receive loop on queue '{QueueName}' is DEGRADED and has been stopped: a non-transient failure was detected and will not clear by retrying (source={ErrorSource}). Inbound messages are NOT being received. Resolve the underlying fault - for a revoked Azure credential run 'az login --scope https://servicebus.azure.net/.default' - then restart the channel.",
+                DisplayName,
+                _options.InboundQueueName,
+                errorSource);
+        }
+
+        var processor = _processor;
+        if (processor is not null && !processor.IsClosed)
+        {
+            try
+            {
+                await processor.StopProcessingAsync(CancellationToken.None);
+            }
+            catch (Exception stopEx)
+            {
+                _logger.LogWarning(stopEx, "{DisplayName} failed to stop the degraded Service Bus processor", DisplayName);
+            }
+        }
     }
+
+    /// <summary>Exposed for tests: whether the receive-loop circuit breaker has tripped.</summary>
+    internal bool ReceiveCircuitIsOpen => _receiveBreaker.IsOpen;
+
+    /// <summary>Exposed for tests: clears the transient backoff after a successful receive.</summary>
+    internal void RecordReceiveSuccess() => _receiveBreaker.RecordSuccess();
 
     private IServiceBusAdapterClientFactory CreateDefaultFactory()
     {
@@ -589,14 +840,14 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
         return ServiceBusAuthMode.None;
     }
 
-    private (string? RequestKey, PendingReplyContext? Context) ResolvePendingReplyContext(
+    private (string? RequestKey, PendingReplyContext? Context, bool IsExactMatch) ResolvePendingReplyContext(
         string? explicitRequestKey,
         ChannelAddress channelAddress)
     {
         if (!string.IsNullOrWhiteSpace(explicitRequestKey)
             && _pendingReplies.TryGetValue(explicitRequestKey, out var explicitContext))
         {
-            return (explicitRequestKey, explicitContext);
+            return (explicitRequestKey, explicitContext, true);
         }
 
         if (_pendingQueue.TryGetValue(channelAddress.Value, out var queue))
@@ -604,7 +855,7 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
             while (queue.TryPeek(out var oldestKey))
             {
                 if (_pendingReplies.TryGetValue(oldestKey, out var fallbackContext))
-                    return (oldestKey, fallbackContext);
+                    return (oldestKey, fallbackContext, false);
 
                 // Successful sends remove the context first. Discard its stale FIFO key only
                 // when a later lookup observes that removal, so a failed send remains retryable.
@@ -612,7 +863,173 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
             }
         }
 
-        return (null, null);
+        return (null, null, false);
+    }
+
+    /// <summary>
+    /// Resolves the conversation an outbound envelope is addressed to, fail-closed (#2529, #2815).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The producing session's own <see cref="OutboundMessage.ConversationId"/> always wins.
+    /// An inherited conversation is only trusted when it came from an exact
+    /// <c>ChannelRequestId</c> match, which is genuine reply correlation. A conversation
+    /// borrowed from the FIFO-by-address fallback belongs to an unrelated in-flight request
+    /// and must never be adopted; an ambiguous destination throws rather than risking
+    /// delivery of content into a third party's conversation.
+    /// </para>
+    /// <para>
+    /// #2815 adds a VALIDITY clause on top of that precedence, and the two must be read together.
+    /// #2529 answers "WHICH conversation?"; #2815 answers "is that value an EXTERNAL destination
+    /// at all?". <c>ChannelAddress</c> is overloaded in this platform: for internal channels it is
+    /// a session-routing key, and gateway producers legitimately build one from an agent id or an
+    /// internal <c>c_</c> conversation id. On an external transport neither can ever be delivered -
+    /// the Teams relay runs with agent-fallback routing disabled (deliberately, because inferring a
+    /// destination from an agent name previously delivered replies into the WRONG chat) and
+    /// dead-letters the envelope. Emitting a message that is certain to dead-letter is not a
+    /// successful send, so this refuses loudly instead. Do not "fix" a dead-letter report by
+    /// deleting this clause or by re-enabling relay-side inference - that reintroduces exactly the
+    /// cross-conversation delivery defect #2529 exists to prevent.
+    /// </para>
+    /// </remarks>
+    private string ResolveOutboundConversationId(
+        OutboundMessage message,
+        string? inheritedConversationId,
+        bool isExactPendingMatch,
+        bool hasBorrowedContext)
+    {
+        var resolved = ResolveOutboundConversationIdCore(
+            message,
+            inheritedConversationId,
+            isExactPendingMatch,
+            hasBorrowedContext,
+            TryDescribeNonExternalDestination);
+
+        // 5. #2815 validity: the resolved value must be an external wire destination.
+        if (TryDescribeNonExternalDestination(resolved) is { } reason)
+        {
+            _logger.LogError(
+                "{DisplayName} refusing to emit an outbound envelope for session '{SessionId}': the only "
+                + "available destination '{ConversationId}' is {Reason}, not an external conversation "
+                + "address. Such an envelope is guaranteed to dead-letter at the relay. Set "
+                + "OutboundMessage.ConversationId to the originating external address, or thread the "
+                + "inbound ChannelRequestId through so the pending reply context supplies it (see #2815).",
+                DisplayName,
+                message.SessionId,
+                resolved,
+                reason);
+
+            throw new InvalidOperationException(
+                $"Refusing to send a Service Bus message addressed to '{resolved}': it is {reason}, "
+                + "not an external conversation address, so the message would certainly dead-letter. "
+                + "Set OutboundMessage.ConversationId or ChannelRequestId to identify the originating "
+                + "external destination (see issue #2815).");
+        }
+
+        return resolved;
+    }
+
+    /// <summary>
+    /// Classifies a candidate destination that is NOT an external address, returning a short
+    /// human-readable reason, or <c>null</c> when the value is an acceptable wire destination.
+    /// </summary>
+    private string? TryDescribeNonExternalDestination(string candidate)
+    {
+        if (candidate.StartsWith(InternalConversationIdPrefix, StringComparison.Ordinal))
+            return "an internal BotNexus conversation id";
+
+        if (_knownAgentIds.ContainsKey(candidate))
+            return "a known agent id";
+
+        return null;
+    }
+
+    /// <summary>
+    /// #3518: reports whether a fan-out to <paramref name="channelAddress"/> could ever be
+    /// addressed on this transport. A gateway-created binding addressed by AGENT ID has no
+    /// external Service Bus destination and no pending inbound request to inherit one from, so
+    /// the deliverer should skip it rather than build an envelope the #2815 guard must refuse.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately conservative: it answers <c>true</c> whenever a pending reply context exists
+    /// for the address, because that context can supply a genuine external conversation. Only an
+    /// address that is itself non-external AND has no pending context is reported undeliverable.
+    /// The outbound guard remains the authority - this never widens it.
+    /// </remarks>
+    public bool CanDeliverTo(ChannelAddress channelAddress, out string? reason)
+    {
+        reason = null;
+
+        if (string.IsNullOrWhiteSpace(channelAddress.Value))
+            return true;
+
+        var nonExternal = TryDescribeNonExternalDestination(channelAddress.Value);
+        if (nonExternal is null)
+            return true;
+
+        // A registered inbound request for this address can still supply an external destination.
+        if (_pendingQueue.TryGetValue(channelAddress.Value, out var queue) && !queue.IsEmpty)
+            return true;
+
+        reason = $"'{channelAddress.Value}' is {nonExternal} and no inbound Service Bus request is "
+            + "pending for it, so no external destination can be resolved";
+        return false;
+    }
+
+    private static string ResolveOutboundConversationIdCore(
+        OutboundMessage message,
+        string? inheritedConversationId,
+        bool isExactPendingMatch,
+        bool hasBorrowedContext,
+        Func<string, string?> describeNonExternal)
+    {
+        // 1. The producing session's own destination wins - PROVIDED it is a destination at all.
+        //
+        //    #3518: the gateway fan-out (OutboundResponseDeliverer, since #3418) stamps the
+        //    INTERNAL 'c_<guid>' conversation id here. That value is a routing key inside the
+        //    gateway, never an external wire address, so adopting it at step 1 short-circuits
+        //    the remaining precedence rules and hands step 5 a value it can only refuse -
+        //    31 refused envelopes in a 24h window, with the genuine external address sitting
+        //    unused in the pending reply context all along. Skipping a non-external own-id lets
+        //    rules 2-4 supply the real address instead. This is strictly NARROWER than the old
+        //    behaviour: nothing that used to be emitted stops being emitted, and the #2815
+        //    validity clause is untouched, so an envelope with no external address anywhere is
+        //    still refused rather than delivered (see TryDescribeNonExternalDestination).
+        if (message.ConversationId is { Length: > 0 } ownConversationId
+            && !string.IsNullOrWhiteSpace(ownConversationId)
+            && describeNonExternal(ownConversationId) is null)
+        {
+            return ownConversationId;
+        }
+
+        // 2. Genuine reply correlation: an exact ChannelRequestId match.
+        if (isExactPendingMatch
+            && inheritedConversationId is { Length: > 0 } exactConversationId
+            && !string.IsNullOrWhiteSpace(exactConversationId))
+        {
+            return exactConversationId;
+        }
+
+        // 3. A conversation was borrowed from the FIFO-by-address fallback (an unrelated
+        //    in-flight inbound request) and it DISAGREES with this message's channel address.
+        //    That is the #2529 leak condition: adopting it would deliver the content into the
+        //    other request's conversation. Fail closed rather than guess.
+        if (hasBorrowedContext
+            && !string.IsNullOrWhiteSpace(inheritedConversationId)
+            && !string.Equals(inheritedConversationId, message.ChannelAddress.Value, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Refusing to send a Service Bus message with an ambiguous destination conversation. "
+                + "The message carries no ConversationId and no matching ChannelRequestId, while an unrelated "
+                + $"inbound request for conversation '{inheritedConversationId}' is pending on channel address "
+                + $"'{message.ChannelAddress.Value}'. Set OutboundMessage.ConversationId or ChannelRequestId "
+                + "to identify the intended destination (see issue #2529).");
+        }
+
+        // 4. The channel address is the unambiguous destination. Note this is NOT the old
+        //    silent default: a borrowed conversation can no longer override it, and any
+        //    disagreement has already thrown above.
+        return message.ChannelAddress.Value;
     }
 
     private void CommitPendingReply(string? requestKey)
@@ -626,12 +1043,48 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
         PendingReplyContext? pendingCtx)
     {
         if (GetMetadataString(metadata, MetaReplyTo) is { Length: > 0 } metaQueue)
-            return metaQueue;
+            return GuardAgainstSelfSend(metaQueue, "outbound metadata 'servicebus.replyTo'");
 
         if (pendingCtx?.ReplyTo is { Length: > 0 } pendingQueue)
-            return pendingQueue;
+            return GuardAgainstSelfSend(pendingQueue, "the pending inbound context (envelope 'replyTo' or application property 'replyTo')");
 
-        return _options.DefaultReplyQueueName;
+        return GuardAgainstSelfSend(_options.DefaultReplyQueueName, "the configured default reply queue");
+    }
+
+    /// <summary>
+    /// #3501 AC2/AC3: refuses to publish into the queue this adapter's own processor consumes from.
+    /// </summary>
+    /// <remarks>
+    /// The guard sits inside <see cref="ResolveReplyQueue"/> rather than at any single call site so
+    /// that ALL THREE resolution branches are covered, including the per-message value an untrusted
+    /// producer can inject via the envelope <c>replyTo</c> field or a Service Bus
+    /// <c>applicationProperties["replyTo"]</c> entry — that injected value overrides the configured
+    /// default, so guarding only the default leaves the hostile path open. Placing it here also
+    /// covers the streaming publisher, which resolves through the same helper.
+    /// <para>
+    /// Failing loudly is deliberate. Silently rewriting the destination would deliver the reply
+    /// somewhere the producer did not ask for, and silently dropping it would hide a live
+    /// misconfiguration. Throwing surfaces the defect to the caller's existing retry/abandon path
+    /// with both the queue and the resolution source named, so an operator can tell a misconfigured
+    /// default apart from an injected per-message value.
+    /// </para>
+    /// </remarks>
+    private string GuardAgainstSelfSend(string replyQueue, string source)
+    {
+        if (!_options.IsInboundQueue(replyQueue))
+            return replyQueue;
+
+        _logger.LogError(
+            "{DisplayName} refused to publish a reply to queue '{ReplyQueue}' resolved from {Source}: "
+            + "it is this adapter's own inbound queue, so the reply would be re-consumed as new inbound work",
+            DisplayName,
+            replyQueue,
+            source);
+
+        throw new InvalidOperationException(
+            $"Service Bus reply refused: the reply queue '{replyQueue}', resolved from {source}, is this "
+            + $"adapter's own inbound queue '{_options.InboundQueueName}'. Publishing there would loop the "
+            + "reply back in as new inbound work until maxDeliveryCount dead-letters it.");
     }
 
     private static (string? CorrelationId, string? ConversationId) ResolveReplyContext(
@@ -674,4 +1127,32 @@ public sealed class ServiceBusChannelAdapter : ChannelAdapterBase, IStreamEventC
         public long NextSequence { get; set; }
         public bool Completed { get; set; }
     }
+    /// <inheritdoc />
+    public async Task OnConversationEventAsync(
+        ConversationEvent conversationEvent,
+        CancellationToken cancellationToken = default)
+    {
+        if (conversationEvent is not ConversationAgentEvent agentEvent)
+            return;
+
+        foreach (var target in ConversationEventStreamRouting.GetTargets(
+                     conversationEvent, ChannelType, ((IChannelAdapter)this).AdapterId))
+        {
+            if (target.ChannelRequestId is not { } requestKey ||
+                !((IStreamEventChannelAdapter)this).CanSendStreamEvent(target))
+                continue;
+
+            // The request key is channel-native but supplied by the event origin. An unrelated
+            // binding snapshot can carry the same key; do not send to (or retire) its pending
+            // request unless the binding still names the pending external conversation.
+            if (!_pendingReplies.TryGetValue(requestKey, out var pending) ||
+                (pending.ConversationId is { Length: > 0 } externalConversationId &&
+                 !string.Equals(target.ChannelAddress.Value, externalConversationId, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            await SendStreamEventAsync(target, agentEvent.StreamEvent, cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
 }

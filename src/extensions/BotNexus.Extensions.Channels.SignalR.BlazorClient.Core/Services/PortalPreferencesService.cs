@@ -31,7 +31,14 @@ public sealed class PortalPreferencesService : IPortalPreferencesService
             {
                 var loaded = JsonSerializer.Deserialize<PortalPreferences>(json);
                 if (loaded is not null)
+                {
+                    // A hand-edited or stale localStorage entry must never leak an unknown density
+                    // token into the DOM, so normalise on the way in as well as on the way out.
+                    loaded.Density = PortalDensity.Normalize(loaded.Density);
+                    loaded.Shell = PortalShell.Normalize(loaded.Shell);
+                    loaded.Theme = PortalTheme.Normalize(loaded.Theme);
                     _current = loaded;
+                }
             }
         }
         catch
@@ -44,6 +51,9 @@ public sealed class PortalPreferencesService : IPortalPreferencesService
     /// <inheritdoc/>
     public async Task SaveAsync()
     {
+        _current.Density = PortalDensity.Normalize(_current.Density);
+        _current.Shell = PortalShell.Normalize(_current.Shell);
+        _current.Theme = PortalTheme.Normalize(_current.Theme);
         var json = JsonSerializer.Serialize(_current);
         await _js.InvokeAsync<object>("portalPrefs.save", StorageKey, json);
     }
@@ -65,9 +75,45 @@ public sealed class PortalPreferencesService : IPortalPreferencesService
     }
 
     /// <inheritdoc/>
+    public async Task SetAnimateActiveRunIndicatorAsync(bool enabled)
+    {
+        _current.AnimateActiveRunIndicator = enabled;
+        await SaveAsync();
+        OnChanged.Invoke();
+    }
+
+    /// <inheritdoc/>
     public async Task SetArchiveConfirmAsync(bool enabled)
     {
         _current.ArchiveConfirmEnabled = enabled;
+        await SaveAsync();
+        OnChanged.Invoke();
+    }
+
+    /// <inheritdoc/>
+    public async Task SetDensityAsync(string density)
+    {
+        _current.Density = PortalDensity.Normalize(density);
+        await SaveAsync();
+        OnChanged.Invoke();
+    }
+
+    /// <inheritdoc/>
+    public async Task SetShellAsync(string shell)
+    {
+        _current.Shell = PortalShell.Normalize(shell);
+        await SaveAsync();
+        OnChanged.Invoke();
+    }
+
+    /// <inheritdoc/>
+    public async Task SetThemeAsync(string theme)
+    {
+        _current.Theme = PortalTheme.Normalize(theme);
+        // Applied to the DOM before the preference is persisted so the swap is instant even if
+        // localStorage is unavailable (private browsing, quota) - the theme still changes for the
+        // session rather than appearing to do nothing.
+        await _js.InvokeVoidAsync("portalPrefs.applyTheme", _current.Theme);
         await SaveAsync();
         OnChanged.Invoke();
     }

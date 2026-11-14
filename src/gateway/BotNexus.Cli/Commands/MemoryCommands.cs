@@ -9,6 +9,7 @@ using BotNexus.Memory;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Spectre.Console;
+using BotNexus.Cli.Services;
 
 namespace BotNexus.Cli.Commands;
 
@@ -113,7 +114,7 @@ internal sealed class MemoryCommands
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Session store type [green]{Markup.Escape(resolvedType)}[/] does not support backfill. Use [green]Sqlite[/] or [green]File[/].");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Session store type [green]{CliText.SafeDisplay(resolvedType)}[/] does not support backfill. Use [green]Sqlite[/] or [green]File[/].");
             return 1;
         }
 
@@ -144,7 +145,7 @@ internal sealed class MemoryCommands
             }
             catch (Exception ex)
             {
-                AnsiConsole.MarkupLine($"[red]Error:[/] Backfill failed \u2014 {Markup.Escape(ex.Message)}");
+                AnsiConsole.MarkupLine($"[red]Error:[/] Backfill failed \u2014 {CliText.SafeDisplay(ex.Message)}");
                 if (verbose)
                     AnsiConsole.WriteException(ex);
                 return 1;
@@ -157,20 +158,21 @@ internal sealed class MemoryCommands
 
     private static async Task<PlatformConfig?> LoadConfigRequiredAsync(string configPath, CancellationToken cancellationToken)
     {
-        if (!File.Exists(configPath))
+        if (!ConfigPresence.Exists(configPath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Config file not found at [dim]{Markup.Escape(configPath)}[/]. Run [green]botnexus init[/] first.");
+            AnsiConsole.MarkupLine(configPath.NotFoundMessage());
             return null;
         }
 
         try
         {
-            return await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
+            return PlatformConfigAccessor.Shared.Get(configPath);
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {CliText.SafeDisplay(ex.Message)}");
             return null;
         }
     }
 }
+

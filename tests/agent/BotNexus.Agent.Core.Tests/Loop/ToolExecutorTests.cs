@@ -1,7 +1,7 @@
-using System.Diagnostics;
 using System.Text.Json;
 using BotNexus.Agent.Core.Configuration;
-using BotNexus.Agent.Core.Hooks;
+using BotNexus.Agent.Core.ExtensionPoints.ToolExecution;
+using BotNexus.Agent.Core.ExtensionPoints.ToolResults;
 using BotNexus.Agent.Core.Loop;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Tests.TestUtils;
@@ -41,22 +41,34 @@ public class ToolExecutorTests
         });
     }
 
+    // Concurrency is asserted by OBSERVED OVERLAP, not by elapsed time (issue #3367). The previous form
+    // bounded the wall clock at 1500ms over two 200ms tools; serial execution takes ~400ms and passed the
+    // bound too, so the test was vacuous with respect to its own name — and it still flaked at 1586ms on a
+    // loaded 4-CPU container. ConcurrencyGateTool blocks each entrant until every entrant has arrived, so
+    // serial dispatch can never open the gate on any machine, fast or slow.
     [Fact]
     public async Task ExecuteAsync_ParallelMode_RunsConcurrently()
     {
-        var tool = new RecordingTool("echo", delayMs: 200);
+        // Liveness bound only. Breaching it means the second tool NEVER entered while the first was held —
+        // i.e. execution was serial — not that the machine was slow. It is deliberately orders of magnitude
+        // larger than the work, so machine speed cannot decide the outcome.
+        using var tool = new ConcurrencyGateTool("echo", expectedConcurrency: 2, livenessTimeout: TimeSpan.FromSeconds(30));
         var context = new AgentContext(null, [], [tool]);
         var assistant = CreateAssistantMessage(("t1", "echo", "first"), ("t2", "echo", "second"));
         var config = TestHelpers.CreateTestConfig(toolExecutionMode: ToolExecutionMode.Parallel);
-        var stopwatch = Stopwatch.StartNew();
 
         var results = await ToolExecutor.ExecuteAsync(context, assistant, config, _ => Task.CompletedTask, CancellationToken.None);
-        stopwatch.Stop();
 
         results.Count().ShouldBe(2);
-        stopwatch.ElapsedMilliseconds.ShouldBeLessThan(1500);
+        results.ShouldAllBe(result => !result.IsError);
+        tool.PeakConcurrency.ShouldBe(2);
+        tool.ObservedFullOverlap.ShouldBeTrue();
     }
 
+    // The 60/30/0ms hook delays below are a deliberate INVERSION of tool-call order, not a wall-clock
+    // bound: if the executor recorded hook completion order rather than tool-call order the observed list
+    // would be t3,t2,t1. There is no upper bound on elapsed time here, so a slow machine cannot fail it
+    // (reviewed for issue #3367 AC5).
     [Fact]
     public async Task ExecuteAsync_ParallelMode_BeforeToolCallHooksRunInToolCallOrder()
     {
@@ -125,6 +137,87 @@ public class ToolExecutorTests
         tool.ExecuteCount.ShouldBe(0);
     }
 
+    // Streaming tool-call parsing boxes JSON integers as CLR long. The dispatch seam must normalise
+    // every argument to a JsonElement so a tool that reads JsonElement numbers works regardless of the
+    // original CLR box — even when no sibling argument triggers coercion (issue #2415).
+    [Fact]
+    public async Task ExecuteAsync_WhenNumericArgIsBoxedLong_DispatchesJsonElementNumber()
+    {
+        var tool = new ArgCapturingTool("int_tool");
+        var context = new AgentContext(null, [], [tool]);
+        var assistant = new AssistantAgentMessage(
+            Content: string.Empty,
+            ToolCalls:
+            [
+                new ToolCallContent(
+                    "t1",
+                    "int_tool",
+                    new Dictionary<string, object?> { ["count"] = 600L })
+            ],
+            FinishReason: StopReason.ToolUse);
+        var config = TestHelpers.CreateTestConfig();
+
+        var results = await ToolExecutor.ExecuteAsync(context, assistant, config, _ => Task.CompletedTask, CancellationToken.None);
+
+        results.ShouldHaveSingleItem();
+        results[0].IsError.ShouldBeFalse();
+        tool.CapturedCount.ShouldBe(600);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenNumericArgIsBoxedLongWithCoercibleSibling_StillDispatchesJsonElementNumber()
+    {
+        var tool = new ArgCapturingTool("int_tool");
+        var context = new AgentContext(null, [], [tool]);
+        var assistant = new AssistantAgentMessage(
+            Content: string.Empty,
+            ToolCalls:
+            [
+                new ToolCallContent(
+                    "t1",
+                    "int_tool",
+                    new Dictionary<string, object?> { ["count"] = 600L, ["label"] = "42" })
+            ],
+            FinishReason: StopReason.ToolUse);
+        var config = TestHelpers.CreateTestConfig();
+
+        var results = await ToolExecutor.ExecuteAsync(context, assistant, config, _ => Task.CompletedTask, CancellationToken.None);
+
+        results.ShouldHaveSingleItem();
+        results[0].IsError.ShouldBeFalse();
+        tool.CapturedCount.ShouldBe(600);
+    }
+
+    // A boxed int is already accepted by every numeric tool argument reader, so the seam must leave it
+    // as a CLR int rather than rewriting it to a JsonElement — otherwise a reader that pattern-matches
+    // `is int` would silently stop seeing the value. StreamingJsonParser never boxes an int (it uses
+    // long), so this only guards non-streaming/programmatic callers, but the narrowing is deliberate.
+    [Fact]
+    public async Task ExecuteAsync_WhenNumericArgIsBoxedInt_IsLeftUnchangedForIsIntReaders()
+    {
+        var tool = new ArgCapturingTool("int_tool");
+        var context = new AgentContext(null, [], [tool]);
+        var assistant = new AssistantAgentMessage(
+            Content: string.Empty,
+            ToolCalls:
+            [
+                new ToolCallContent(
+                    "t1",
+                    "int_tool",
+                    new Dictionary<string, object?> { ["count"] = 600 })
+            ],
+            FinishReason: StopReason.ToolUse);
+        var config = TestHelpers.CreateTestConfig();
+
+        var results = await ToolExecutor.ExecuteAsync(context, assistant, config, _ => Task.CompletedTask, CancellationToken.None);
+
+        results.ShouldHaveSingleItem();
+        results[0].IsError.ShouldBeFalse();
+        tool.CapturedCountClrType.ShouldBe(nameof(Int32));
+        tool.CapturedCountAsInt.ShouldBe(600);
+        tool.CapturedCount.ShouldBeNull();
+    }
+
     [Theory]
     [InlineData("bash", "Bash")]
     [InlineData("bash", "BASH")]
@@ -184,7 +277,7 @@ public class ToolExecutorTests
         var context = new AgentContext(null, [], [tool]);
         var assistant = CreateAssistantMessage(("t1", "echo", "first"));
         var config = TestHelpers.CreateTestConfig(
-            beforeToolCall: (_, _) => Task.FromResult<BeforeToolCallResult?>(new BeforeToolCallResult(true, "blocked")));
+            beforeToolCall: (_, _) => Task.FromResult<ToolExecutionDecision?>(new ToolExecutionDecision(true, "blocked")));
 
         var results = await ToolExecutor.ExecuteAsync(context, assistant, config, _ => Task.CompletedTask, CancellationToken.None);
 
@@ -219,7 +312,7 @@ public class ToolExecutorTests
         var assistant = CreateAssistantMessage(("t1", "echo", "first"));
         var modifiedContent = new AgentToolContent(AgentToolContentType.Text, "modified");
         var config = TestHelpers.CreateTestConfig(
-            afterToolCall: (_, _) => Task.FromResult<AfterToolCallResult?>(new AfterToolCallResult([modifiedContent], IsError: false)));
+            afterToolCall: (_, _) => Task.FromResult<ToolResultTransformResult?>(new ToolResultTransformResult([modifiedContent], IsError: false)));
 
         var results = await ToolExecutor.ExecuteAsync(context, assistant, config, _ => Task.CompletedTask, CancellationToken.None);
 
@@ -304,6 +397,59 @@ public class ToolExecutorTests
     }
 
     [Fact]
+    public void AssertMatchingToolEventOrder_EquivalentIdsInDifferentInsertionOrders_Passes()
+    {
+        AgentEvent[] events =
+        [
+            StartEvent("t1"),
+            StartEvent("t2"),
+            EndEvent("t2"),
+            EndEvent("t1")
+        ];
+
+        AssertMatchingToolEventOrder(events);
+    }
+
+    [Fact]
+    public void AssertMatchingToolEventOrder_MissingEnd_FailsWithToolId()
+    {
+        AgentEvent[] events = [StartEvent("t1"), StartEvent("missing"), EndEvent("t1")];
+
+        var exception = Should.Throw<Shouldly.ShouldAssertException>(() => AssertMatchingToolEventOrder(events));
+
+        exception.Message.ShouldContain("missing");
+    }
+
+    [Fact]
+    public void AssertMatchingToolEventOrder_UnexpectedEnd_FailsWithToolId()
+    {
+        AgentEvent[] events = [StartEvent("t1"), EndEvent("t1"), EndEvent("unexpected")];
+
+        var exception = Should.Throw<Shouldly.ShouldAssertException>(() => AssertMatchingToolEventOrder(events));
+
+        exception.Message.ShouldContain("unexpected");
+    }
+
+    [Fact]
+    public void AssertMatchingToolEventOrder_MismatchedIds_FailsWithToolIds()
+    {
+        AgentEvent[] events = [StartEvent("t1"), StartEvent("start-only"), EndEvent("t1"), EndEvent("end-only")];
+
+        var exception = Should.Throw<Shouldly.ShouldAssertException>(() => AssertMatchingToolEventOrder(events));
+
+        exception.Message.ShouldContain("start-only");
+        exception.Message.ShouldContain("end-only");
+    }
+
+    [Fact]
+    public void AssertMatchingToolEventOrder_EndBeforeMatchingStart_Fails()
+    {
+        AgentEvent[] events = [EndEvent("t1"), StartEvent("t1")];
+
+        Should.Throw<Shouldly.ShouldAssertException>(() => AssertMatchingToolEventOrder(events));
+    }
+
+    [Fact]
     public async Task ExecuteAsync_ParallelMode_ToolExecutionStartAlwaysPrecedesMatchingEnd()
     {
         var tool = new RecordingTool("echo", delayMs: 20);
@@ -318,15 +464,32 @@ public class ToolExecutorTests
             return Task.CompletedTask;
         }, CancellationToken.None);
 
-        var starts = events.OfType<ToolExecutionStartEvent>().ToDictionary(evt => evt.ToolCallId, evt => events.IndexOf(evt));
-        var ends = events.OfType<ToolExecutionEndEvent>().ToDictionary(evt => evt.ToolCallId, evt => events.IndexOf(evt));
+        AssertMatchingToolEventOrder(events);
+    }
 
-        starts.Keys.ShouldBe(ends.Keys);
+    private static void AssertMatchingToolEventOrder(IReadOnlyList<AgentEvent> events)
+    {
+        var indexedEvents = events.Select((evt, index) => (Event: evt, Index: index)).ToList();
+        var starts = indexedEvents
+            .Where(item => item.Event is ToolExecutionStartEvent)
+            .ToDictionary(item => ((ToolExecutionStartEvent)item.Event).ToolCallId, item => item.Index);
+        var ends = indexedEvents
+            .Where(item => item.Event is ToolExecutionEndEvent)
+            .ToDictionary(item => ((ToolExecutionEndEvent)item.Event).ToolCallId, item => item.Index);
+
+        starts.Keys.OrderBy(static key => key, StringComparer.Ordinal)
+            .ShouldBe(ends.Keys.OrderBy(static key => key, StringComparer.Ordinal));
         foreach (var toolCallId in starts.Keys)
         {
             starts[toolCallId].ShouldBeLessThan(ends[toolCallId]);
         }
     }
+
+    private static ToolExecutionStartEvent StartEvent(string toolCallId) =>
+        new(toolCallId, "echo", new Dictionary<string, object?>(), DateTimeOffset.UtcNow);
+
+    private static ToolExecutionEndEvent EndEvent(string toolCallId) =>
+        new(toolCallId, "echo", new AgentToolResult([]), false, DateTimeOffset.UtcNow);
 
     private static AssistantAgentMessage CreateAssistantMessage(params (string id, string name, string value)[] toolCalls)
     {
@@ -370,6 +533,84 @@ public class ToolExecutorTests
 
             var value = arguments.TryGetValue("value", out var raw) ? raw?.ToString() ?? string.Empty : string.Empty;
             return new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, value)]);
+        }
+    }
+
+    /// <summary>
+    /// Blocks every entrant until <paramref name="expectedConcurrency"/> entrants have arrived, so a test can
+    /// assert that tool executions genuinely OVERLAPPED rather than inferring it from elapsed time. Under
+    /// serial dispatch the first entrant waits alone, the gate never opens, and the liveness timeout turns
+    /// into a deterministic failure on fast and slow machines alike.
+    /// </summary>
+    private sealed class ConcurrencyGateTool(string name, int expectedConcurrency, TimeSpan livenessTimeout)
+        : IAgentTool, IDisposable
+    {
+        private static readonly JsonElement Schema = JsonDocument.Parse("""{"type":"object"}""").RootElement.Clone();
+        private readonly CountdownEvent _arrivals = new(expectedConcurrency);
+        private readonly TaskCompletionSource _allArrived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _inFlight;
+        private int _peakConcurrency;
+
+        public string Name => name;
+        public string Label => name;
+        public Tool Definition => new(name, "concurrency gate tool", Schema);
+
+        /// <summary>Highest number of executions observed inside the tool at the same instant.</summary>
+        public int PeakConcurrency => Volatile.Read(ref _peakConcurrency);
+
+        /// <summary>True only once every expected entrant was simultaneously inside <c>ExecuteAsync</c>.</summary>
+        public bool ObservedFullOverlap => _allArrived.Task.IsCompletedSuccessfully;
+
+        public Task<IReadOnlyDictionary<string, object?>> PrepareArgumentsAsync(
+            IReadOnlyDictionary<string, object?> arguments,
+            CancellationToken cancellationToken = default) => Task.FromResult(arguments);
+
+        public async Task<AgentToolResult> ExecuteAsync(
+            string toolCallId,
+            IReadOnlyDictionary<string, object?> arguments,
+            CancellationToken cancellationToken = default,
+            AgentToolUpdateCallback? onUpdate = null)
+        {
+            var current = Interlocked.Increment(ref _inFlight);
+            int observedPeak;
+            while (current > (observedPeak = Volatile.Read(ref _peakConcurrency)))
+            {
+                Interlocked.CompareExchange(ref _peakConcurrency, current, observedPeak);
+            }
+
+            try
+            {
+                if (_arrivals.Signal())
+                {
+                    _allArrived.TrySetResult();
+                }
+
+                try
+                {
+                    await _allArrived.Task.WaitAsync(livenessTimeout, cancellationToken);
+                }
+                catch (TimeoutException)
+                {
+                    throw new InvalidOperationException(
+                        $"Tool '{toolCallId}' waited {livenessTimeout.TotalSeconds:0}s and only " +
+                        $"{expectedConcurrency - _arrivals.CurrentCount} of {expectedConcurrency} executions ever " +
+                        "entered concurrently — tool calls did not overlap, so execution was not parallel.");
+                }
+
+                var value = arguments.TryGetValue("value", out var raw) ? raw?.ToString() ?? string.Empty : string.Empty;
+                return new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, value)]);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inFlight);
+            }
+        }
+
+        public void Dispose()
+        {
+            // Release any entrant still parked on the gate before the fixture tears down.
+            _allArrived.TrySetResult();
+            _arrivals.Dispose();
         }
     }
 
@@ -430,6 +671,52 @@ public class ToolExecutorTests
             AgentToolUpdateCallback? onUpdate = null)
         {
             Interlocked.Increment(ref _executeCount);
+            return Task.FromResult(new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, "ok")]));
+        }
+    }
+
+    /// <summary>
+    /// Captures the dispatched <c>count</c> argument three ways — the raw CLR type name, an <c>is int</c>
+    /// read, and the standard JsonElement-number reader idiom every tool shares — so tests can prove both
+    /// that the dispatch seam normalises a boxed CLR <see cref="long"/> to a <see cref="JsonElement"/>
+    /// number and that a boxed <see cref="int"/> is left untouched for <c>is int</c> readers.
+    /// </summary>
+    private sealed class ArgCapturingTool(string name) : IAgentTool
+    {
+        private static readonly JsonElement Schema = JsonDocument.Parse("""
+            {
+              "type": "object",
+              "properties": {
+                "count": { "type": "integer" },
+                "label": { "type": "integer" }
+              },
+              "required": ["count"]
+            }
+            """).RootElement.Clone();
+
+        public string Name => name;
+        public string Label => name;
+        public int? CapturedCount { get; private set; }
+        public int? CapturedCountAsInt { get; private set; }
+        public string? CapturedCountClrType { get; private set; }
+        public Tool Definition => new(name, "arg capturing tool", Schema);
+
+        public Task<IReadOnlyDictionary<string, object?>> PrepareArgumentsAsync(
+            IReadOnlyDictionary<string, object?> arguments,
+            CancellationToken cancellationToken = default) => Task.FromResult(arguments);
+
+        public Task<AgentToolResult> ExecuteAsync(
+            string toolCallId,
+            IReadOnlyDictionary<string, object?> arguments,
+            CancellationToken cancellationToken = default,
+            AgentToolUpdateCallback? onUpdate = null)
+        {
+            var hasCount = arguments.TryGetValue("count", out var raw);
+            CapturedCountClrType = hasCount ? raw?.GetType().Name : null;
+            CapturedCountAsInt = hasCount && raw is int boxedInt ? boxedInt : null;
+            CapturedCount = hasCount && raw is JsonElement { ValueKind: JsonValueKind.Number } element && element.TryGetInt32(out var value)
+                ? value
+                : null;
             return Task.FromResult(new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, "ok")]));
         }
     }

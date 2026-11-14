@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Text.RegularExpressions;
+using BotNexus.Domain.Text;
 
 namespace BotNexus.Gateway.Channels;
 
@@ -31,7 +32,7 @@ public static class AssistantTextSanitizer
 
     // Leaked tool-call XML: some models (notably opus via github-copilot) serialise a tool call as
     // Anthropic <invoke>/<tool_use> markup inside the assistant TEXT channel instead of a structured
-    // tool_use block (issue #1698). Mirror the proven MemoryContentSanitizer filters so raw XML never
+    // tool_use block (issue #1698). Mirror the proven UntrustedContentSanitizer filters so raw XML never
     // reaches a channel. Block form first (removes nested <parameter> JSON), then stray open/close tags
     // including bare <parameter>.
     private static readonly Regex ToolCallBlockPattern = new(
@@ -45,6 +46,12 @@ public static class AssistantTextSanitizer
     private static readonly Regex CourtJunkPrefixPattern = new(
         @"\bcourt(?=\s*<(?:invoke|tool_use|tool_call|function_calls)\b)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // Collapses a run of three OR MORE newlines down to a single blank line. The quantifier must be
+    // open-ended: the fixed-width \n{3} (no comma) matched EXACTLY three newlines over non-overlapping matches,
+    // so a seven-newline run collapsed to five rather than two (issue #3578).
+    private static readonly Regex BlankLineRunPattern = new(
+        @"\n{3,}",
+        RegexOptions.Compiled);
 
     /// <summary>
     /// Strips any embedded thinking/reasoning XML tags from assistant text.
@@ -65,7 +72,7 @@ public static class AssistantTextSanitizer
         var stripped = ThinkingTagPattern.Replace(text, string.Empty);
 
         // Collapse multiple consecutive blank lines left after tag removal.
-        stripped = Regex.Replace(stripped, @"\n{3}", "\n\n");
+        stripped = BlankLineRunPattern.Replace(stripped, "\n\n");
 
         return stripped.Trim();
     }
@@ -103,13 +110,15 @@ public static class AssistantTextSanitizer
     {
         if (string.IsNullOrEmpty(text))
             return text;
-        if (text.IndexOf('<') < 0)
+        if (!MightContainMarkup(text))
             return text;
-        var stripped = ThinkingTagPattern.Replace(text, string.Empty);
+        // Escaped spellings are handled by consuming the single EscapedMarkupNormalizer seam
+        // (#2808); this file deliberately owns no escaped-form copy of the patterns above.
+        var stripped = EscapedMarkupNormalizer.ReplaceMatches(text, ThinkingTagPattern);
         stripped = CourtJunkPrefixPattern.Replace(stripped, string.Empty);
-        stripped = ToolCallBlockPattern.Replace(stripped, string.Empty);
-        stripped = ToolCallStrayTagPattern.Replace(stripped, string.Empty);
-        stripped = Regex.Replace(stripped, @"\n{3}", "\n\n");
+        stripped = EscapedMarkupNormalizer.ReplaceMatches(stripped, ToolCallBlockPattern);
+        stripped = EscapedMarkupNormalizer.ReplaceMatches(stripped, ToolCallStrayTagPattern);
+        stripped = BlankLineRunPattern.Replace(stripped, "\n\n");
         return stripped.Trim();
     }
 
@@ -124,11 +133,16 @@ public static class AssistantTextSanitizer
     {
         if (string.IsNullOrEmpty(text))
             return text;
-        if (text.IndexOf('<') < 0)
+        if (!MightContainMarkup(text))
             return text;
         var stripped = CourtJunkPrefixPattern.Replace(text, string.Empty);
-        stripped = ToolCallBlockPattern.Replace(stripped, string.Empty);
-        stripped = ToolCallStrayTagPattern.Replace(stripped, string.Empty);
+        stripped = EscapedMarkupNormalizer.ReplaceMatches(stripped, ToolCallBlockPattern);
+        stripped = EscapedMarkupNormalizer.ReplaceMatches(stripped, ToolCallStrayTagPattern);
         return stripped.Trim();
     }
+
+    // An escaped marker (\u003cinvoke..., &lt;invoke...) contains no literal '<', so the cheap
+    // pre-check must admit the escape introducers too (#2808).
+    private static bool MightContainMarkup(string text)
+        => text.IndexOf('<') >= 0 || text.IndexOf('\\') >= 0 || text.IndexOf('&') >= 0;
 }

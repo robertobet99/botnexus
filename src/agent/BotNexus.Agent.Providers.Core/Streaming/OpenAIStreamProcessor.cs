@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
+using BotNexus.Agent.Providers.Core.Diagnostics;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Utilities;
+using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Agent.Providers.Core.Streaming;
 
@@ -47,12 +49,18 @@ public sealed class OpenAIStreamProcessor
         string? responseId = null;
 
         var currentTextIndex = -1;
+        var currentRefusalIndex = -1;
         var currentThinkingIndex = -1;
         string? currentThinkingSignature = null;
         var textAccumulator = new StringBuilder();
+        var refusalAccumulator = new StringBuilder();
         var thinkingAccumulator = new StringBuilder();
 
         var toolCallState = new Dictionary<int, (string Id, string Name, StringBuilder Args, int ContentIndex, string? ThoughtSignature, Dictionary<string, object?>? LastParsedArgs, int LastParsedLength)>();
+
+        // One budget per streamed tool call, bounding the cumulative UTF-8 byte cost of its
+        // arguments fragments (#2902). Keyed by the same tool-call index as toolCallState.
+        var argumentBudgets = new Dictionary<int, StreamToolArgumentBudget>();
 
         var startEmitted = false;
         StopReason? stopReason = null;
@@ -96,6 +104,17 @@ public sealed class OpenAIStreamProcessor
             catch (JsonException)
             {
                 onMalformedChunk?.Invoke();
+                // A skipped frame means the turn may have silently lost content. The debug-log
+                // callback above cannot be reacted to, asserted on without a log sink, or recorded
+                // in a transcript, so the same finding is also reported on the contract as a
+                // non-terminal warning (#3291). No chunk bytes are included - the payload is the
+                // untrusted, possibly content-bearing thing that was skipped.
+                stream.Push(new WarningEvent(
+                    WarningCodes.MalformedChunkSkipped,
+                    "Skipping malformed SSE chunk: the frame could not be parsed as JSON and was " +
+                    $"discarded. api={api} model={model.Id} provider={model.Provider}. " +
+                    "Content for this frame is lost; the turn continues.",
+                    BuildPartial()));
                 continue;
             }
 
@@ -146,17 +165,41 @@ public sealed class OpenAIStreamProcessor
                     if (!choice.TryGetProperty("delta", out var delta))
                         continue;
 
+                    string? refusalDelta = null;
                     if (delta.TryGetProperty("refusal", out var refusalProp) &&
                         refusalProp.ValueKind == JsonValueKind.String &&
                         !string.IsNullOrWhiteSpace(refusalProp.GetString()))
                     {
                         stopReason = StopReason.Refusal;
+                        // The string itself used to be read for presence and thrown away, so a
+                        // refused turn rendered as an empty assistant message. It is accumulated
+                        // into a RefusalContent block below (#3295).
+                        refusalDelta = refusalProp.GetString();
                     }
 
                     if (!startEmitted)
                     {
                         stream.Push(new StartEvent(BuildPartial()));
                         startEmitted = true;
+                    }
+
+                    if (refusalDelta is { Length: > 0 })
+                    {
+                        // Refusal gets its own block and its own index rather than being folded
+                        // into the text accumulator, so a consumer can distinguish safety output
+                        // from prose at the moment it streams (#3295). It reuses the text triad
+                        // events because RefusalContent is a TextContent, so existing consumers
+                        // keep rendering it unchanged.
+                        if (currentRefusalIndex < 0)
+                        {
+                            currentRefusalIndex = contentBlocks.Count;
+                            contentBlocks.Add(new RefusalContent(string.Empty));
+                            stream.Push(new TextStartEvent(currentRefusalIndex, BuildPartial()));
+                        }
+
+                        refusalAccumulator.Append(refusalDelta);
+                        contentBlocks[currentRefusalIndex] = new RefusalContent(refusalAccumulator.ToString());
+                        stream.Push(new TextDeltaEvent(currentRefusalIndex, refusalDelta, BuildPartial()));
                     }
 
                     string? reasoningField = null;
@@ -204,6 +247,7 @@ public sealed class OpenAIStreamProcessor
                         contentProp.ValueKind == JsonValueKind.String)
                     {
                         var text = contentProp.GetString() ?? "";
+                        // Byte-identical accumulation (#3442): no transport normalization hook.
                         if (text.Length > 0)
                         {
                             if (currentThinkingIndex >= 0)
@@ -286,8 +330,10 @@ public sealed class OpenAIStreamProcessor
                                 var contentIndex = contentBlocks.Count;
                                 contentBlocks.Add(new ToolCallContent(tcId, fnName, []));
                                 toolCallState[tcIndex] = (tcId, fnName, new StringBuilder(), contentIndex, thoughtSignature, null, -1);
+                                argumentBudgets[tcIndex] = StreamToolArgumentBudget.ForToolCall(
+                                    model.Provider, model.Id, $"tool '{fnName}' (index {tcIndex})");
 
-                                stream.Push(new ToolCallStartEvent(contentIndex, BuildPartial()));
+                                stream.Push(new ToolCallStartEvent(contentIndex, BuildPartial(), tcId, fnName));
                             }
 
                             if (tc.TryGetProperty("function", out var fnDeltaProp) &&
@@ -298,7 +344,14 @@ public sealed class OpenAIStreamProcessor
                                 if (argsChunk.Length > 0)
                                 {
                                     var state = toolCallState[tcIndex];
-                                    state.Args.Append(argsChunk);
+                                    // Budgeted append: throws StreamToolArgumentsTooLargeException on
+                                    // overflow, which the stream engine turns into a terminal error
+                                    // event rather than emitting a truncated-and-therefore-invalid
+                                    // argument blob (#2902).
+                                    if (argumentBudgets.TryGetValue(tcIndex, out var budget))
+                                        budget.Append(state.Args, argsChunk);
+                                    else
+                                        state.Args.Append(argsChunk);
                                     if (thoughtSignature is not null)
                                         state.ThoughtSignature = thoughtSignature;
 
@@ -326,7 +379,7 @@ public sealed class OpenAIStreamProcessor
                                         new ToolCallContent(state.Id, state.Name, parsedArgs, state.ThoughtSignature);
 
                                     stream.Push(new ToolCallDeltaEvent(
-                                        state.ContentIndex, argsChunk, BuildPartial()));
+                                        state.ContentIndex, argsChunk, BuildPartial(), state.Id, state.Name));
                                 }
                             }
                         }
@@ -338,11 +391,29 @@ public sealed class OpenAIStreamProcessor
         if (currentThinkingIndex >= 0)
             stream.Push(new ThinkingEndEvent(currentThinkingIndex, thinkingAccumulator.ToString(), BuildPartial()));
 
+        if (currentRefusalIndex >= 0)
+            stream.Push(new TextEndEvent(currentRefusalIndex, refusalAccumulator.ToString(), BuildPartial()));
+
         if (currentTextIndex >= 0)
             stream.Push(new TextEndEvent(currentTextIndex, textAccumulator.ToString(), BuildPartial()));
 
-        foreach (var (_, state) in toolCallState)
+        // Tool-call accumulators whose function name never arrived are malformed provider frames,
+        // not tool calls. Emitting them substitutes an empty name for "the provider never sent one",
+        // which dispatches and fails downstream as the misleading `Tool '' is not registered.` They
+        // are dropped here, at the boundary where the defect is actually visible (#3467).
+        var droppedContentIndices = new List<int>();
+        var survivingToolCalls = 0;
+        foreach (var (tcIndex, state) in toolCallState)
         {
+            if (string.IsNullOrWhiteSpace(state.Name))
+            {
+                LogDroppedToolCall(model, tcIndex, state.Id);
+                droppedContentIndices.Add(state.ContentIndex);
+                continue;
+            }
+
+            survivingToolCalls++;
+
             // Reuse the args parsed on the final delta when the buffer has not grown since
             // (the common case — a tool call's last delta parses the complete buffer). Only
             // re-parse if no cached parse covers the current buffer length, e.g. a tool call
@@ -354,6 +425,15 @@ public sealed class OpenAIStreamProcessor
             contentBlocks[state.ContentIndex] = toolCall;
             stream.Push(new ToolCallEndEvent(state.ContentIndex, toolCall, BuildPartial()));
         }
+
+        // Descending order so each removal leaves the lower indices valid.
+        foreach (var contentIndex in droppedContentIndices.OrderByDescending(i => i))
+            contentBlocks.RemoveAt(contentIndex);
+
+        // A turn whose only tool calls were malformed has nothing to execute, so reporting ToolUse
+        // would send the loop back for a dispatch round trip with an empty tool set (#3467).
+        if (droppedContentIndices.Count > 0 && survivingToolCalls == 0 && stopReason == StopReason.ToolUse)
+            stopReason = StopReason.Stop;
 
         var finalMessage = BuildPartial() with
         {
@@ -386,6 +466,9 @@ public sealed class OpenAIStreamProcessor
         var output = CreatePartialMessage(model, api);
         var contentBuilder = new StringBuilder();
         var toolCallBuilders = new Dictionary<int, ToolCallBuilder>();
+        // One budget per streamed tool call, bounding the cumulative UTF-8 byte cost of its
+        // arguments fragments (#2902).
+        var argumentBudgets = new Dictionary<int, StreamToolArgumentBudget>();
         var contentIndex = 0;
         var started = false;
         string? responseId = null;
@@ -442,7 +525,7 @@ public sealed class OpenAIStreamProcessor
                 var text = contentProp.GetString() ?? "";
                 if (text.Length > 0)
                 {
-                    var sanitized = UnicodeSanitizer.SanitizeSurrogates(text);
+                    var sanitized = text.SanitizeSurrogates();
 
                     if (contentBuilder.Length == 0)
                         stream.Push(new TextStartEvent(contentIndex, output));
@@ -477,7 +560,11 @@ public sealed class OpenAIStreamProcessor
                                 builder.Name = nameProp.GetString() ?? "";
                         }
 
-                        stream.Push(new ToolCallStartEvent(contentIndex + tcIndex, output));
+                        argumentBudgets[tcIndex] = StreamToolArgumentBudget.ForToolCall(
+                            model.Provider, model.Id, $"tool '{builder.Name ?? ""}' (index {tcIndex})");
+
+                        stream.Push(new ToolCallStartEvent(
+                            contentIndex + tcIndex, output, builder.Id, builder.Name));
                     }
 
                     if (tc.TryGetProperty("function", out var fnDelta))
@@ -488,8 +575,15 @@ public sealed class OpenAIStreamProcessor
                         if (fnDelta.TryGetProperty("arguments", out var argsDelta))
                         {
                             var argChunk = argsDelta.GetString() ?? "";
-                            builder.ArgumentsJson.Append(argChunk);
-                            stream.Push(new ToolCallDeltaEvent(contentIndex + tcIndex, argChunk, output));
+                            // Budgeted append: throws StreamToolArgumentsTooLargeException on
+                            // overflow rather than emitting a truncated-and-therefore-invalid
+                            // argument blob as if it were complete (#2902).
+                            if (argumentBudgets.TryGetValue(tcIndex, out var budget))
+                                budget.Append(builder.ArgumentsJson, argChunk);
+                            else
+                                builder.ArgumentsJson.Append(argChunk);
+                            stream.Push(new ToolCallDeltaEvent(
+                                contentIndex + tcIndex, argChunk, output, builder.Id, builder.Name));
                         }
                     }
                 }
@@ -498,6 +592,17 @@ public sealed class OpenAIStreamProcessor
 
         if (contentBuilder.Length > 0 && toolCallBuilders.Count == 0)
             stream.Push(new TextEndEvent(contentIndex, contentBuilder.ToString(), output));
+
+        // Drop malformed accumulators (no function name) before anything is emitted, so neither the
+        // live events, the final content, nor the stop-reason decision below sees them (#3467).
+        foreach (var tcIndex in toolCallBuilders
+                     .Where(kvp => string.IsNullOrWhiteSpace(kvp.Value.Name))
+                     .Select(kvp => kvp.Key)
+                     .ToList())
+        {
+            LogDroppedToolCall(model, tcIndex, toolCallBuilders[tcIndex].Id);
+            toolCallBuilders.Remove(tcIndex);
+        }
 
         foreach (var (tcIndex, builder) in toolCallBuilders)
         {
@@ -537,6 +642,19 @@ public sealed class OpenAIStreamProcessor
             blocks.Add(new ToolCallContent(builder.Id, builder.Name ?? "", args));
         }
         return blocks;
+    }
+
+    /// <summary>
+    /// Reports a streamed tool call discarded because the provider never delivered a function name,
+    /// naming the tool-call index and id so the malformed frame is identifiable in the log. Mirrors
+    /// the existing <c>Skipping malformed SSE chunk</c> treatment of a bad frame (#3467).
+    /// </summary>
+    private static void LogDroppedToolCall(LlmModel model, int toolCallIndex, string toolCallId)
+    {
+        ProviderDiagnostics.CreateLogger(nameof(OpenAIStreamProcessor)).LogWarning(
+            "Dropping malformed streamed tool call with no function name from {Provider}/{Model}: " +
+            "tool-call index {ToolCallIndex}, id '{ToolCallId}'.",
+            model.Provider, model.Id, toolCallIndex, string.IsNullOrEmpty(toolCallId) ? "(none)" : toolCallId);
     }
 
     private static AssistantMessage CreatePartialMessage(LlmModel model, string api)
@@ -614,6 +732,17 @@ public sealed class OpenAIStreamProcessor
         public void Add(ContentBlock block)
         {
             _blocks.Add(block);
+            _snapshot = null;
+        }
+
+        /// <summary>
+        /// Removes the block at <paramref name="index"/> and invalidates the cached snapshot. Used
+        /// only to withdraw a malformed streamed tool call from the final content (#3467); callers
+        /// must remove in descending index order because removal shifts the blocks above it.
+        /// </summary>
+        public void RemoveAt(int index)
+        {
+            _blocks.RemoveAt(index);
             _snapshot = null;
         }
 

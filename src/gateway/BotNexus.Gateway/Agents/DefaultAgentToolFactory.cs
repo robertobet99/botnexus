@@ -1,4 +1,5 @@
 using BotNexus.Agent.Core.Tools;
+using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Security;
@@ -33,20 +34,28 @@ public sealed class DefaultAgentToolFactory : IAgentToolFactory
     private readonly ShellPreference _shellPreference;
     private readonly string? _platformConfigPath;
     private readonly string[]? _shellCommand;
+    private readonly ReadToolOptions? _readToolOptions;
+    private readonly LocalChildEnvironmentPolicy _environmentPolicy;
 
     public DefaultAgentToolFactory(
         ShellPreference shellPreference = ShellPreference.Auto,
         string? platformConfigPath = null,
-        string[]? shellCommand = null)
+        string[]? shellCommand = null,
+        ReadToolOptions? readToolOptions = null,
+        LocalChildEnvironmentPolicy? environmentPolicy = null)
     {
+        _environmentPolicy = environmentPolicy ?? LocalChildEnvironmentPolicy.Default;
         _shellPreference = shellPreference;
         _platformConfigPath = platformConfigPath;
         _shellCommand = shellCommand;
+        _readToolOptions = readToolOptions;
     }
 
-    public IReadOnlyList<IAgentTool> CreateTools(string workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
+    public IReadOnlyList<IAgentTool> CreateTools(WorkingDir workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
     {
-        var resolved = Path.GetFullPath(workingDirectory);
+        // WorkingDir guarantees the value is a non-empty, syntactically valid path; GetFullPath is
+        // still required because the value object deliberately does not promise absoluteness (#502).
+        var resolved = Path.GetFullPath(workingDirectory.Value);
         var fileSystem = new FileSystem();
 
         IPathValidator effectivePathValidator;
@@ -76,13 +85,18 @@ public sealed class DefaultAgentToolFactory : IAgentToolFactory
 
         return
         [
-            new ReadTool(resolved, effectivePathValidator, fileSystem),
+            new ReadTool(resolved, effectivePathValidator, fileSystem, _readToolOptions),
             new WriteTool(resolved, effectivePathValidator, fileSystem),
             new EditTool(resolved, effectivePathValidator, fileSystem),
-            new ShellTool(workingDirectory: resolved, shellPreference: _shellPreference, shellCommand: effectiveShellCommand),
+            new ShellTool(workingDirectory: resolved, shellPreference: _shellPreference, shellCommand: effectiveShellCommand,
+                environmentPolicy: _environmentPolicy),
             new ListDirectoryTool(resolved, effectivePathValidator, fileSystem),
             new GrepTool(resolved, effectivePathValidator, fileSystem),
-            new GlobTool(resolved, effectivePathValidator, fileSystem)
+            new GlobTool(resolved, effectivePathValidator, fileSystem),
+
+            // Registered unconditionally so a truncated result is ALWAYS recoverable (#2760): a
+            // continuation handle that no tool can read would be worse than no handle at all.
+            new ToolOutputContinuationTool()
         ];
     }
 }

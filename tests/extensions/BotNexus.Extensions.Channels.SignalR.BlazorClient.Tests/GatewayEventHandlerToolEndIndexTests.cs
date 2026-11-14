@@ -16,7 +16,7 @@ public sealed class GatewayEventHandlerToolEndIndexTests
 
     public GatewayEventHandlerToolEndIndexTests()
     {
-        _handler = new GatewayEventHandler(_store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance);
+        _handler = new GatewayEventHandler(_store, new GatewayHubConnection(), Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance, _store);
 
         _store.UpsertAgent(new AgentState
         {
@@ -24,7 +24,6 @@ public sealed class GatewayEventHandlerToolEndIndexTests
             DisplayName = "Agent 1",
             IsConnected = true,
             SessionId = "sess-1",
-            ActiveConversationId = "conv-1"
         });
 
         var agent = _store.GetAgent("agent-1")!;
@@ -35,6 +34,9 @@ public sealed class GatewayEventHandlerToolEndIndexTests
             ActiveSessionId = "sess-1"
         };
         _store.RegisterSession("agent-1", "sess-1");
+        // #3212: visibility is route-derived, so the fixture must state which pane is DISPLAYED.
+        // This replaces the ambient AgentState.ActiveConversationId the handler used to read.
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
     }
 
     private ConversationState Conv => _store.GetAgent("agent-1")!.Conversations["conv-1"];

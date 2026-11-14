@@ -22,7 +22,7 @@
             <button class="toolbar-btn primary" @onclick="SaveAsync" disabled="@(_saving || !CanSave)">
                 @(_saving ? "Saving..." : SaveLabel)
             </button>
-            <button class="toolbar-btn" @onclick="GoBack">&#x2190; Back to list</button>
+            <button class="toolbar-btn" @onclick="GoBack"><Icon Name="back" Size="14" Class="bn-icon-inherit" /> Back to list</button>
         </div>
     </div>
 
@@ -37,7 +37,7 @@
     }
     else if (_loadError is not null)
     {
-        <div class="agents-error" role="alert">&#x26A0;&#xFE0F; @_loadError</div>
+        <div class="agents-error" role="alert"><Icon Name="warning" Size="15" /> @_loadError</div>
     }
     else if (_model is not null)
     {
@@ -69,7 +69,7 @@
                     <label>Emoji</label>
                     <input class="cfg-input" maxlength="4" value="@_model.Emoji" @oninput="OnEmojiInput" />
 
-                    <label>Provider</label>
+                    <label>Provider instance</label>
                     <div>
                         @if (_providers.Count > 0)
                         {
@@ -77,7 +77,7 @@
                                 <option value="">- select provider -</option>
                                 @foreach (var p in _providers)
                                 {
-                                    <option value="@p.Id">@p.Name</option>
+                                    <option value="@p.Id">@p.DisplayName</option>
                                 }
                             </select>
                         }
@@ -134,7 +134,7 @@
                                 @foreach (var am in _model.AllowedModelIds.ToList())
                                 {
                                     var a = am;
-                                    <span class="agent-tag">@a <button @onclick="@(() => RemoveAllowedModel(a))">&#x2715;</button></span>
+                                    <span class="agent-tag">@a <button aria-label="@($"Remove allowed model {a}")" @onclick="@(() => RemoveAllowedModel(a))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                                 }
                             </div>
                             <div class="agent-tag-add-row">
@@ -179,35 +179,7 @@
             </div>
         </details>
 
-        @* ── System Prompt ─────────────────────────────────────── *@
-        <details class="agent-section">
-            <summary class="agent-section-title">System Prompt</summary>
-            <div class="agent-section-body">
-                <div class="agents-form-grid">
-                    <label>System Prompt</label>
-                    <textarea class="cfg-textarea" rows="6" @oninput="OnSystemPromptInput">@_model.SystemPrompt</textarea>
-
-                    <label>System Prompt File</label>
-                    <input class="cfg-input" value="@_model.SystemPromptFile" @oninput="OnSystemPromptFileInput" placeholder="Legacy single file path" />
-
-                    <label>System Prompt Files</label>
-                    <div>
-                        @for (int i = 0; i < _model.SystemPromptFiles.Count; i++)
-                        {
-                            var idx = i;
-                            <div class="agent-list-row">
-                                <input class="cfg-input" value="@_model.SystemPromptFiles[idx]"
-                                       @oninput="@(e => OnSpfInput(idx, e))" />
-                                <button class="toolbar-btn" @onclick="@(() => MoveSpfUp(idx))">&#x2191;</button>
-                                <button class="toolbar-btn" @onclick="@(() => MoveSpfDown(idx))">&#x2193;</button>
-                                <button class="toolbar-btn danger" @onclick="@(() => RemoveSpf(idx))">&#x2715;</button>
-                            </div>
-                        }
-                        <button class="toolbar-btn" @onclick="AddSpf">+ Add File</button>
-                    </div>
-                </div>
-            </div>
-        </details>
+        <p class="agents-field-loading">System prompts are managed by workspace instruction files, not this editor.</p>
 
         @* ── Tools & Sub-Agents ────────────────────────────────── *@
         <details class="agent-section">
@@ -220,7 +192,7 @@
                             @foreach (var tool in _model.ToolIds.ToList())
                             {
                                 var t = tool;
-                                <span class="agent-tag">@t <button @onclick="@(() => RemoveTool(t))">&#x2715;</button></span>
+                                <span class="agent-tag">@t <button aria-label="@($"Remove tool {t}")" @onclick="@(() => RemoveTool(t))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -230,7 +202,12 @@
                     </div>
 
                     <label>Tool Timeout (sec)</label>
-                    <input class="cfg-input" type="number" min="0" value="@(_model.ToolTimeoutSeconds ?? 0)" @oninput="OnToolTimeoutInput" />
+                    <input class="cfg-input" type="number" min="1" value="@(_model.ToolTimeoutSeconds?.ToString() ?? "")" @oninput="OnToolTimeoutInput" />
+
+                    @if (HasFieldError("ToolTimeoutSeconds"))
+                    {
+                        <span class="agents-field-error" role="alert">@GetFieldError("ToolTimeoutSeconds")</span>
+                    }
 
                     <label>Sub-Agent IDs</label>
                     <div>
@@ -238,7 +215,7 @@
                             @foreach (var sub in _model.SubAgentIds.ToList())
                             {
                                 var s = sub;
-                                <span class="agent-tag">@s <button @onclick="@(() => RemoveSubAgent(s))">&#x2715;</button></span>
+                                <span class="agent-tag">@s <button aria-label="@($"Remove sub-agent {s}")" @onclick="@(() => RemoveSubAgent(s))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -355,7 +332,7 @@
                             @foreach (var path in GetReadPaths())
                             {
                                 var p = path;
-                                <span class="agent-tag">@p <button @onclick="@(() => RemoveReadPath(p))">&#x2715;</button></span>
+                                <span class="agent-tag">@p <button aria-label="@($"Remove allowed read path {p}")" @onclick="@(() => RemoveReadPath(p))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -370,7 +347,7 @@
                             @foreach (var path in GetWritePaths())
                             {
                                 var p = path;
-                                <span class="agent-tag">@p <button @onclick="@(() => RemoveWritePath(p))">&#x2715;</button></span>
+                                <span class="agent-tag">@p <button aria-label="@($"Remove allowed write path {p}")" @onclick="@(() => RemoveWritePath(p))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -385,7 +362,7 @@
                             @foreach (var path in GetDenyPaths())
                             {
                                 var p = path;
-                                <span class="agent-tag">@p <button @onclick="@(() => RemoveDenyPath(p))">&#x2715;</button></span>
+                                <span class="agent-tag">@p <button aria-label="@($"Remove denied path {p}")" @onclick="@(() => RemoveDenyPath(p))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -417,7 +394,7 @@
                                 @foreach (var a in (_model.SessionAccess?.AllowedAgents ?? []).ToList())
                                 {
                                     var ag = a;
-                                    <span class="agent-tag">@ag <button @onclick="@(() => RemoveSessionAgent(ag))">&#x2715;</button></span>
+                                    <span class="agent-tag">@ag <button aria-label="@($"Remove session allowed agent {ag}")" @onclick="@(() => RemoveSessionAgent(ag))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                                 }
                             </div>
                             <select class="cfg-input" @onchange="OnSessionAgentAdd">
@@ -445,7 +422,7 @@
                                 @foreach (var a in (_model.ConversationAccess?.AllowedAgents ?? []).ToList())
                                 {
                                     var ag = a;
-                                    <span class="agent-tag">@ag <button @onclick="@(() => RemoveConversationAgent(ag))">&#x2715;</button></span>
+                                    <span class="agent-tag">@ag <button aria-label="@($"Remove conversation allowed agent {ag}")" @onclick="@(() => RemoveConversationAgent(ag))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                                 }
                             </div>
                             <select class="cfg-input" @onchange="OnConversationAgentAdd">
@@ -488,7 +465,7 @@
                             @foreach (var t in GetAlwaysApprove())
                             {
                                 var tool = t;
-                                <span class="agent-tag">@tool <button @onclick="@(() => RemoveAlwaysApprove(tool))">&#x2715;</button></span>
+                                <span class="agent-tag">@tool <button aria-label="@($"Remove always-approved tool {tool}")" @onclick="@(() => RemoveAlwaysApprove(tool))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -503,7 +480,7 @@
                             @foreach (var t in GetNeverApprove())
                             {
                                 var tool = t;
-                                <span class="agent-tag">@tool <button @onclick="@(() => RemoveNeverApprove(tool))">&#x2715;</button></span>
+                                <span class="agent-tag">@tool <button aria-label="@($"Remove never-approved tool {tool}")" @onclick="@(() => RemoveNeverApprove(tool))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -518,7 +495,7 @@
                             @foreach (var t in GetDeniedTools())
                             {
                                 var tool = t;
-                                <span class="agent-tag">@tool <button @onclick="@(() => RemoveDeniedTool(tool))">&#x2715;</button></span>
+                                <span class="agent-tag">@tool <button aria-label="@($"Remove denied tool {tool}")" @onclick="@(() => RemoveDeniedTool(tool))"><Icon Name="close" Size="14" Class="bn-icon-inherit" /></button></span>
                             }
                         </div>
                         <div class="agent-tag-add-row">
@@ -576,11 +553,8 @@
         public string ApiProvider { get; set; } = "";
         public string ModelId { get; set; } = "";
         public List<string> AllowedModelIds { get; set; } = [];
-        public string? SystemPrompt { get; set; }
-        public string? SystemPromptFile { get; set; }
         public string? Thinking { get; set; }
         public int? ContextWindow { get; set; }
-        public List<string> SystemPromptFiles { get; set; } = [];
         public List<string> ToolIds { get; set; } = [];
         public int? ToolTimeoutSeconds { get; set; }
         public List<string> SubAgentIds { get; set; } = [];
@@ -667,7 +641,12 @@
         public List<string> Denied { get; set; } = [];
     }
 
-    private record ProviderItem(string Id, string Name);
+    private sealed record ProviderItem(string Id, string Name, string? Type = null)
+    {
+        public string DisplayName => string.IsNullOrWhiteSpace(Type) || string.Equals(Id, Type, StringComparison.Ordinal)
+            ? Name
+            : $"{Name} ({Type})";
+    }
     private record ModelItem(string ModelId, string Name, List<string>? SupportedThinkingLevels = null, List<int>? SupportedContextSizes = null);
 
     // ── State ─────────────────────────────────────────────────────────────
@@ -698,7 +677,7 @@
     private string _newNeverApprove = "";
     private string _newDeniedTool = "";
 
-    private bool IsDirty => _model is not null && JsonSerializer.Serialize(_model) != _originalJson;
+    private bool IsDirty => _model is not null && (_explicitLeaves.Count > 0 || JsonSerializer.Serialize(_model) != _originalJson);
 
     // In create/clone the form starts pristine (nothing to update), so gate save on required fields
     // instead of dirtiness; in edit mode the existing dirty gate applies.
@@ -755,12 +734,12 @@
 
     // Recompute the thinking/context option sets from the currently selected model, clearing any
     // now-invalid selection so the editor never persists a value the model cannot honour (#1705).
-    private void RefreshModelCapabilities()
+    private void RefreshModelCapabilities(bool clearInvalid = true)
     {
         var selected = _models.FirstOrDefault(m => m.ModelId == _model?.ModelId);
         _supportedThinkingLevels = selected?.SupportedThinkingLevels ?? [];
         _supportedContextSizes = selected?.SupportedContextSizes ?? [];
-        if (_model is not null)
+        if (clearInvalid && _model is not null)
         {
             if (_model.Thinking is not null && !_supportedThinkingLevels.Contains(_model.Thinking))
                 _model.Thinking = null;
@@ -768,18 +747,11 @@
                 _model.ContextWindow = null;
         }
     }
-    private void OnSystemPromptInput(ChangeEventArgs e) { _model!.SystemPrompt = e.Value?.ToString(); MarkDirty(); }
-    private void OnSystemPromptFileInput(ChangeEventArgs e) { _model!.SystemPromptFile = e.Value?.ToString(); MarkDirty(); }
-    private void OnToolTimeoutInput(ChangeEventArgs e) { if (int.TryParse(e.Value?.ToString(), out var v)) { _model!.ToolTimeoutSeconds = v == 0 ? null : v; MarkDirty(); } }
+    private void OnToolTimeoutInput(ChangeEventArgs e) { _model!.ToolTimeoutSeconds = int.TryParse(e.Value?.ToString(), out var v) ? v : null; MarkDirty(); }
     private void OnIsolationChange(ChangeEventArgs e) { _model!.IsolationStrategy = e.Value?.ToString() ?? "in-process"; MarkDirty(); }
     private void OnMaxSessionsInput(ChangeEventArgs e) { if (int.TryParse(e.Value?.ToString(), out var v)) { _model!.MaxConcurrentSessions = v; MarkDirty(); } }
 
     // SPF handlers
-    private void OnSpfInput(int idx, ChangeEventArgs e) { _model!.SystemPromptFiles[idx] = e.Value?.ToString() ?? ""; MarkDirty(); }
-    private void MoveSpfUp(int idx) { if (idx > 0) { var t = _model!.SystemPromptFiles[idx - 1]; _model.SystemPromptFiles[idx - 1] = _model.SystemPromptFiles[idx]; _model.SystemPromptFiles[idx] = t; MarkDirty(); } }
-    private void MoveSpfDown(int idx) { if (idx < _model!.SystemPromptFiles.Count - 1) { var t = _model.SystemPromptFiles[idx + 1]; _model.SystemPromptFiles[idx + 1] = _model.SystemPromptFiles[idx]; _model.SystemPromptFiles[idx] = t; MarkDirty(); } }
-    private void RemoveSpf(int idx) { _model!.SystemPromptFiles.RemoveAt(idx); MarkDirty(); }
-    private void AddSpf() { _model!.SystemPromptFiles.Add(""); MarkDirty(); }
 
     // Tool handlers
     private void OnToolIdKeyDown(KeyboardEventArgs e) { if (e.Key == "Enter") AddToolId(); }
@@ -814,31 +786,31 @@
     private void OnQhTimezoneInput(ChangeEventArgs e) { EnsureQuietHours(); _model!.Heartbeat!.QuietHours!.Timezone = e.Value?.ToString(); MarkDirty(); }
 
     // File access helpers
-    private List<string> GetReadPaths() { EnsureFileAccess(); return _model!.FileAccess!.AllowedReadPaths; }
-    private List<string> GetWritePaths() { EnsureFileAccess(); return _model!.FileAccess!.AllowedWritePaths; }
-    private List<string> GetDenyPaths() { EnsureFileAccess(); return _model!.FileAccess!.DeniedPaths; }
-    private void AddReadPath() { if (!string.IsNullOrWhiteSpace(_newReadPath)) { GetReadPaths().Add(_newReadPath); _newReadPath = ""; MarkDirty(); } }
-    private void AddWritePath() { if (!string.IsNullOrWhiteSpace(_newWritePath)) { GetWritePaths().Add(_newWritePath); _newWritePath = ""; MarkDirty(); } }
-    private void AddDenyPath() { if (!string.IsNullOrWhiteSpace(_newDenyPath)) { GetDenyPaths().Add(_newDenyPath); _newDenyPath = ""; MarkDirty(); } }
+    private List<string> GetReadPaths() => _model?.FileAccess?.AllowedReadPaths ?? [];
+    private List<string> GetWritePaths() => _model?.FileAccess?.AllowedWritePaths ?? [];
+    private List<string> GetDenyPaths() => _model?.FileAccess?.DeniedPaths ?? [];
+    private void AddReadPath() { if (!string.IsNullOrWhiteSpace(_newReadPath)) { EnsureFileAccess(); _model!.FileAccess!.AllowedReadPaths.Add(_newReadPath); _newReadPath = ""; MarkDirty(); } }
+    private void AddWritePath() { if (!string.IsNullOrWhiteSpace(_newWritePath)) { EnsureFileAccess(); _model!.FileAccess!.AllowedWritePaths.Add(_newWritePath); _newWritePath = ""; MarkDirty(); } }
+    private void AddDenyPath() { if (!string.IsNullOrWhiteSpace(_newDenyPath)) { EnsureFileAccess(); _model!.FileAccess!.DeniedPaths.Add(_newDenyPath); _newDenyPath = ""; MarkDirty(); } }
     private void RemoveReadPath(string p) { GetReadPaths().Remove(p); MarkDirty(); }
     private void RemoveWritePath(string p) { GetWritePaths().Remove(p); MarkDirty(); }
     private void RemoveDenyPath(string p) { GetDenyPaths().Remove(p); MarkDirty(); }
 
     // Access control handlers
-    private void OnSessionLevelChange(ChangeEventArgs e) { EnsureSessionAccess(); _model!.SessionAccess!.Level = e.Value?.ToString() ?? "own"; MarkDirty(); }
+    private void OnSessionLevelChange(ChangeEventArgs e) { _explicitLeaves.Add("sessionAccess.level"); EnsureSessionAccess(); _model!.SessionAccess!.Level = e.Value?.ToString() ?? "own"; MarkDirty(); }
     private void OnSessionAgentAdd(ChangeEventArgs e) { var v = e.Value?.ToString(); if (!string.IsNullOrEmpty(v)) { EnsureSessionAccess(); _model!.SessionAccess!.AllowedAgents ??= []; _model.SessionAccess.AllowedAgents.Add(v); MarkDirty(); } }
     private void RemoveSessionAgent(string a) { _model?.SessionAccess?.AllowedAgents?.Remove(a); MarkDirty(); }
-    private void OnConversationLevelChange(ChangeEventArgs e) { EnsureConversationAccess(); _model!.ConversationAccess!.Level = e.Value?.ToString() ?? "own"; MarkDirty(); }
+    private void OnConversationLevelChange(ChangeEventArgs e) { _explicitLeaves.Add("conversationAccess.level"); EnsureConversationAccess(); _model!.ConversationAccess!.Level = e.Value?.ToString() ?? "own"; MarkDirty(); }
     private void OnConversationAgentAdd(ChangeEventArgs e) { var v = e.Value?.ToString(); if (!string.IsNullOrEmpty(v)) { EnsureConversationAccess(); _model!.ConversationAccess!.AllowedAgents ??= []; _model.ConversationAccess.AllowedAgents.Add(v); MarkDirty(); } }
     private void RemoveConversationAgent(string a) { _model?.ConversationAccess?.AllowedAgents?.Remove(a); MarkDirty(); }
 
     // Tool policy helpers
-    private List<string> GetAlwaysApprove() { EnsureToolPolicy(); return _model!.ToolPolicy!.AlwaysApprove; }
-    private List<string> GetNeverApprove() { EnsureToolPolicy(); return _model!.ToolPolicy!.NeverApprove; }
-    private List<string> GetDeniedTools() { EnsureToolPolicy(); return _model!.ToolPolicy!.Denied; }
-    private void AddAlwaysApprove() { if (!string.IsNullOrWhiteSpace(_newAlwaysApprove)) { GetAlwaysApprove().Add(_newAlwaysApprove); _newAlwaysApprove = ""; MarkDirty(); } }
-    private void AddNeverApprove() { if (!string.IsNullOrWhiteSpace(_newNeverApprove)) { GetNeverApprove().Add(_newNeverApprove); _newNeverApprove = ""; MarkDirty(); } }
-    private void AddDeniedTool() { if (!string.IsNullOrWhiteSpace(_newDeniedTool)) { GetDeniedTools().Add(_newDeniedTool); _newDeniedTool = ""; MarkDirty(); } }
+    private List<string> GetAlwaysApprove() => _model?.ToolPolicy?.AlwaysApprove ?? [];
+    private List<string> GetNeverApprove() => _model?.ToolPolicy?.NeverApprove ?? [];
+    private List<string> GetDeniedTools() => _model?.ToolPolicy?.Denied ?? [];
+    private void AddAlwaysApprove() { if (!string.IsNullOrWhiteSpace(_newAlwaysApprove)) { EnsureToolPolicy(); _model!.ToolPolicy!.AlwaysApprove.Add(_newAlwaysApprove); _newAlwaysApprove = ""; MarkDirty(); } }
+    private void AddNeverApprove() { if (!string.IsNullOrWhiteSpace(_newNeverApprove)) { EnsureToolPolicy(); _model!.ToolPolicy!.NeverApprove.Add(_newNeverApprove); _newNeverApprove = ""; MarkDirty(); } }
+    private void AddDeniedTool() { if (!string.IsNullOrWhiteSpace(_newDeniedTool)) { EnsureToolPolicy(); _model!.ToolPolicy!.Denied.Add(_newDeniedTool); _newDeniedTool = ""; MarkDirty(); } }
     private void RemoveAlwaysApprove(string t) { GetAlwaysApprove().Remove(t); MarkDirty(); }
     private void RemoveNeverApprove(string t) { GetNeverApprove().Remove(t); MarkDirty(); }
     private void RemoveDeniedTool(string t) { GetDeniedTools().Remove(t); MarkDirty(); }
@@ -868,7 +840,7 @@
                 return;
             }
 
-            var url = Nav.BaseUri.TrimEnd('/') + $"/api/agents/{Uri.EscapeDataString(AgentId)}";
+            var url = Nav.BaseUri.TrimEnd('/') + $"/api/agents/{Uri.EscapeDataString(AgentId)}" + (Mode == "edit" ? "/configuration" : "");
             using var response = await Http.GetAsync(url);
             if (!response.IsSuccessStatusCode)
             {
@@ -887,8 +859,9 @@
             }
 
             _originalJson = JsonSerializer.Serialize(_model);
+            _explicitLeaves.Clear();
             if (!string.IsNullOrEmpty(_model.ApiProvider))
-                await LoadModelsAsync(_model.ApiProvider);
+                await LoadModelsAsync(_model.ApiProvider, clearInvalid: false);
         }
         catch (Exception ex)
         {
@@ -908,7 +881,7 @@
         catch { _providers = []; }
     }
 
-    private async Task LoadModelsAsync(string provider)
+    private async Task LoadModelsAsync(string provider, bool clearInvalid = true)
     {
         _loadingModels = true;
         try
@@ -917,7 +890,7 @@
             var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
             var items = await Http.GetFromJsonAsync<List<ModelItem>>(url, opts);
             _models = items ?? [];
-            RefreshModelCapabilities();
+            RefreshModelCapabilities(clearInvalid);
         }
         catch { _models = []; }
         finally { _loadingModels = false; }
@@ -964,12 +937,14 @@
         if (_model is null) return;
         _model.ApiProvider = e.Value?.ToString() ?? "";
         _model.ModelId = "";
+        _model.Thinking = null;
+        _model.ContextWindow = null;
         _models = [];
         _supportedThinkingLevels = [];
         _supportedContextSizes = [];
         MarkDirty();
         if (!string.IsNullOrEmpty(_model.ApiProvider))
-            await LoadModelsAsync(_model.ApiProvider);
+            await LoadModelsAsync(_model.ApiProvider, clearInvalid: false);
     }
 
     // ── Map JSON to model ─────────────────────────────────────────────────
@@ -982,10 +957,8 @@
             Emoji = GetStr(el, "emoji"),
             Description = GetStr(el, "description"),
             Enabled = GetBool(el, "enabled", true),
-            ApiProvider = GetStr(el, "apiProvider") ?? "",
-            ModelId = GetStr(el, "modelId") ?? "",
-            SystemPrompt = GetStr(el, "systemPrompt"),
-            SystemPromptFile = GetStr(el, "systemPromptFile"),
+            ApiProvider = GetStr(el, "provider") ?? GetStr(el, "apiProvider") ?? "",
+            ModelId = GetStr(el, "model") ?? GetStr(el, "modelId") ?? "",
             Thinking = GetStr(el, "thinking"),
             ContextWindow = el.TryGetProperty("contextWindow", out var cwp) && cwp.ValueKind == JsonValueKind.Number ? cwp.GetInt32() : null,
             IsolationStrategy = GetStr(el, "isolationStrategy") ?? "in-process",
@@ -993,13 +966,11 @@
             ToolTimeoutSeconds = el.TryGetProperty("toolTimeoutSeconds", out var tp) && tp.ValueKind != JsonValueKind.Null ? tp.GetInt32() : null,
         };
 
-        if (el.TryGetProperty("systemPromptFiles", out var p) && p.ValueKind == JsonValueKind.Array)
-            m.SystemPromptFiles = p.EnumerateArray().Select(x => x.GetString() ?? "").ToList();
-        if (el.TryGetProperty("toolIds", out p) && p.ValueKind == JsonValueKind.Array)
+        if (el.TryGetProperty("toolIds", out var p) && p.ValueKind == JsonValueKind.Array)
             m.ToolIds = p.EnumerateArray().Select(x => x.GetString() ?? "").ToList();
-        if (el.TryGetProperty("allowedModelIds", out p) && p.ValueKind == JsonValueKind.Array)
+        if (el.TryGetProperty(el.TryGetProperty("allowedModels", out _) ? "allowedModels" : "allowedModelIds", out p) && p.ValueKind == JsonValueKind.Array)
             m.AllowedModelIds = p.EnumerateArray().Select(x => x.GetString() ?? "").ToList();
-        if (el.TryGetProperty("subAgentIds", out p) && p.ValueKind == JsonValueKind.Array)
+        if (el.TryGetProperty(el.TryGetProperty("subAgents", out _) ? "subAgents" : "subAgentIds", out p) && p.ValueKind == JsonValueKind.Array)
             m.SubAgentIds = p.EnumerateArray().Select(x => x.GetString() ?? "").ToList();
 
         if (el.TryGetProperty("memory", out p) && p.ValueKind == JsonValueKind.Object)
@@ -1025,9 +996,9 @@
 
         if (el.TryGetProperty("heartbeat", out p) && p.ValueKind == JsonValueKind.Object)
         {
-            var hb = new HeartbeatEditModel { Enabled = GetBool(p, "enabled", false), IntervalMinutes = GetInt(p, "intervalMinutes", 60), Prompt = GetStr(p, "prompt") };
+            var hb = new HeartbeatEditModel { Enabled = GetBool(p, "enabled", true), IntervalMinutes = GetInt(p, "intervalMinutes", 30), Prompt = GetStr(p, "prompt") };
             if (p.TryGetProperty("quietHours", out var qh) && qh.ValueKind == JsonValueKind.Object)
-                hb.QuietHours = new QuietHoursEditModel { Enabled = GetBool(qh, "enabled", false), Start = GetStr(qh, "start") ?? "22:00", End = GetStr(qh, "end") ?? "07:00", Timezone = GetStr(qh, "timezone") };
+                hb.QuietHours = new QuietHoursEditModel { Enabled = GetBool(qh, "enabled", false), Start = GetStr(qh, "start") ?? "23:00", End = GetStr(qh, "end") ?? "07:00", Timezone = GetStr(qh, "timezone") };
             m.Heartbeat = hb;
         }
 
@@ -1110,9 +1081,72 @@
     private bool ValidateNewAgent()
     {
         _fieldErrors.Clear();
+        if (_model?.ToolTimeoutSeconds is <= 0)
+            _fieldErrors["ToolTimeoutSeconds"] = "Tool timeout must be positive or unset.";
         if (Mode != "edit" && string.IsNullOrWhiteSpace(_model?.AgentId))
             _fieldErrors["AgentId"] = "Agent ID is required.";
         return _fieldErrors.Count == 0;
+    }
+
+    // Compare model snapshots, never submit the complete descriptor. Nested changes are leaf-only
+    // so hidden/future policy keys survive and rendering does not create operator intent.
+    private readonly HashSet<string> _explicitLeaves = [];
+
+    private System.Text.Json.Nodes.JsonObject BuildPatch()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var current = JsonSerializer.SerializeToNode(_model, options)?.AsObject() ?? new();
+        var previous = JsonSerializer.SerializeToNode(JsonSerializer.Deserialize<AgentEditModel>(_originalJson), options)?.AsObject() ?? new();
+        var patch = Changed(current, previous);
+        foreach (var (ui, config) in new[] { ("apiProvider", "provider"), ("modelId", "model"), ("allowedModelIds", "allowedModels"), ("subAgentIds", "subAgents") })
+            if (patch.ContainsKey(ui)) { var value = patch[ui]?.DeepClone(); patch.Remove(ui); patch[config] = value; }
+        foreach (var path in _explicitLeaves)
+        {
+            var parts = path.Split('.');
+            if (patch[parts[0]] is not System.Text.Json.Nodes.JsonObject parent)
+                patch[parts[0]] = parent = new System.Text.Json.Nodes.JsonObject();
+            parent[parts[1]] = current[parts[0]]?[parts[1]]?.DeepClone();
+        }
+        return patch;
+    }
+
+    private static System.Text.Json.Nodes.JsonObject Changed(System.Text.Json.Nodes.JsonObject current, System.Text.Json.Nodes.JsonObject? previous)
+    {
+        var patch = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (name, value) in current)
+        {
+            var old = previous?[name];
+            if (System.Text.Json.Nodes.JsonNode.DeepEquals(value, old)) continue;
+            patch[name] = value is System.Text.Json.Nodes.JsonObject nested
+                ? Changed(nested, old as System.Text.Json.Nodes.JsonObject ?? DefaultObject(name))
+                : value?.DeepClone();
+        }
+        return patch;
+    }
+
+    private static System.Text.Json.Nodes.JsonObject? DefaultObject(string name)
+    {
+        // New objects inherit persisted defaults, not the editor's rendered fallbacks.
+        // Include differing fallback leaves so creating a sibling cannot enable polling
+        // or silently change the displayed interval/quiet-hours start. Existing objects
+        // still compare against their original snapshot and remain leaf-only patches.
+        object? defaults = name switch
+        {
+            "toolPolicy" => new ToolPolicyEditModel(),
+            "fileAccess" => new FileAccessEditModel(),
+            "sessionAccess" => new SessionAccessEditModel(),
+            "conversationAccess" => new ConversationAccessEditModel(),
+            "memory" => new MemoryEditModel(),
+            "search" => new MemorySearchEditModel(),
+            "temporalDecay" => new TemporalDecayEditModel(),
+            "soul" => new SoulEditModel(),
+            // Mirror HeartbeatAgentConfig/QuietHoursConfig without adding server-domain
+            // dependencies to WASM; component tests deserialize patches into those types.
+            "heartbeat" => new HeartbeatEditModel { Enabled = true, IntervalMinutes = 30 },
+            "quietHours" => new QuietHoursEditModel { Start = "23:00" },
+            _ => null
+        };
+        return defaults is null ? null : JsonSerializer.SerializeToNode(defaults, new JsonSerializerOptions(JsonSerializerDefaults.Web))?.AsObject();
     }
 
     private async Task SaveAsync()
@@ -1131,8 +1165,8 @@
             HttpResponseMessage response;
             if (Mode == "edit")
             {
-                var url = Nav.BaseUri.TrimEnd('/') + $"/api/agents/{Uri.EscapeDataString(AgentId!)}";
-                response = await Http.PutAsJsonAsync(url, _model);
+                var url = Nav.BaseUri.TrimEnd('/') + $"/api/agents/{Uri.EscapeDataString(AgentId!)}/configuration";
+                response = await Http.PatchAsJsonAsync(url, BuildPatch());
             }
             else
             {
@@ -1148,7 +1182,10 @@
                 return;
             }
             _originalJson = JsonSerializer.Serialize(_model);
-            SetStatus(Mode == "edit" ? "Agent saved." : "Agent created.", "success");
+            _explicitLeaves.Clear();
+            SetStatus(_model.Enabled
+                ? "Configuration saved. Enabled for new work; provider authentication is checked when work starts."
+                : "Configuration saved. Disabled for new work; existing work is not cancelled.", "success");
             await OnSaved.InvokeAsync();
         }
         catch (Exception ex)

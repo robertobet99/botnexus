@@ -29,14 +29,10 @@ gateway_is_running() {
 }
 
 gateway_stop() {
-    local pidfile="$1" label="$2"
-    if [[ -f "$pidfile" ]]; then
-        local pid; pid=$(cat "$pidfile")
-        log "[$label] Stopping gateway (pid $pid)..."
-        kill "$pid" 2>/dev/null || true
-        sleep 2; kill -9 "$pid" 2>/dev/null || true
-        rm -f "$pidfile"
-    fi
+    local repo="$1" home="$2" label="$3"
+    log "[$label] Stopping gateway through the CLI..."
+    BOTNEXUS_HOME="$home" "$DOTNET" "$repo/src/gateway/BotNexus.Cli/bin/Debug/net10.0/BotNexus.Cli.dll" \
+        gateway stop --source "$repo" --target "$home" >> "$LOG_FILE" 2>&1
 }
 
 gateway_start() {
@@ -54,7 +50,7 @@ gateway_start() {
         log "[$label] Started (pid $pid)"
     else
         log "[$label] ERROR: Exited immediately — check $logfile"
-        rm -f "$pidfile"; return 1
+        return 1
     fi
 }
 
@@ -83,13 +79,13 @@ sync_instance() {
     git pull "$remote" main >> "$LOG_FILE" 2>&1
 
     log "[$label] Building..."
-    if ! "$DOTNET" build BotNexus.slnx --nologo --tl:off >> "$LOG_FILE" 2>&1; then
+    if ! "$DOTNET" build dirs.proj --nologo --tl:off >> "$LOG_FILE" 2>&1; then
         log "[$label] ERROR: Build failed — aborting."
         return 1
     fi
 
     log "[$label] Running tests..."
-    if ! "$DOTNET" test BotNexus.slnx --nologo --tl:off >> "$LOG_FILE" 2>&1; then
+    if ! "$DOTNET" test tests/dirs.proj --nologo --tl:off >> "$LOG_FILE" 2>&1; then
         log "[$label] ERROR: Tests failed — aborting restart."
         return 1
     fi
@@ -97,8 +93,14 @@ sync_instance() {
 
     # Deploy extensions — run CLI deploy then copy to the correct home
     log "[$label] Deploying extensions..."
-    BOTNEXUS_HOME="$home" "$DOTNET" "$repo/src/gateway/BotNexus.Cli/bin/Debug/net10.0/BotNexus.Cli.dll" \
-        gateway start --path "$repo" --dev >> "$LOG_FILE" 2>&1 || true
+    # --source/--skip-build, not --path/--dev: the CLI renamed these and rejects the old names.
+    # The `|| true` below is deliberate for a genuinely failed start, but it also swallowed the
+    # argument error, so this step silently deployed nothing at all for as long as the names were
+    # stale. Log the failure rather than discarding it.
+    if ! BOTNEXUS_HOME="$home" "$DOTNET" "$repo/src/gateway/BotNexus.Cli/bin/Debug/net10.0/BotNexus.Cli.dll" \
+        gateway start --source "$repo" --skip-build >> "$LOG_FILE" 2>&1; then
+        log "[$label] WARNING: gateway start reported failure — see $LOG_FILE."
+    fi
     # CLI always deploys to ~/.botnexus — copy to the right home if different
     if [[ "$home" != "$HOME/.botnexus" ]] && [[ -d "$HOME/.botnexus/extensions" ]]; then
         mkdir -p "$home/extensions"
@@ -115,7 +117,7 @@ sync_instance() {
     log "[$label] Extensions deployed."
 
     if gateway_is_running "$pidfile"; then
-        gateway_stop "$pidfile" "$label"
+        gateway_stop "$repo" "$home" "$label"
     fi
     gateway_start "$dll" "$home" "$port" "$pidfile" "$gwlog" "$label"
 }

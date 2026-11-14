@@ -1,3 +1,4 @@
+using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Prompts;
 
 namespace BotNexus.Gateway.Agents;
@@ -20,6 +21,12 @@ public sealed record RuntimeInfo
     public string? Provider { get; init; }
     public string? Model { get; init; }
     public string? DefaultModel { get; init; }
+    /// <summary>
+    /// The effective context-window size applied to this run (#2796), or null for the provider
+    /// default. Emitted on the runtime line so the window the agent reports cannot drift from the
+    /// window AgentOptions actually applied.
+    /// </summary>
+    public int? ContextWindow { get; init; }
     public string? Shell { get; init; }
     public string? Channel { get; init; }
     public string? ClientKind { get; init; }
@@ -28,7 +35,12 @@ public sealed record RuntimeInfo
     public string? SessionKey { get; init; }
 }
 
-public sealed record ConversationContext(string ConversationId, string Title, string? Purpose, string? Instructions = null, string? Todo = null);
+/// <param name="RunStartedAt">
+/// Start of the current recurring run, when the conversation is driven by one (cron). Lets the todo
+/// section separate this run's agenda from earlier runs' minutes (#2984). <c>null</c> for every
+/// interactive caller, which preserves the original rendering exactly.
+/// </param>
+public sealed record ConversationContext(string ConversationId, string Title, string? Purpose, string? Instructions = null, string? Todo = null, DateTimeOffset? RunStartedAt = null);
 
 public sealed record SystemPromptParams
 {
@@ -48,7 +60,30 @@ public sealed record SystemPromptParams
     public bool ReasoningTagHint { get; init; }
     public string? ReasoningLevel { get; init; }
     public string? MemoryPromptInjection { get; init; }
+
+    /// <summary>
+    /// Whether the conversation this prompt serves is owner-private or shared with non-owner
+    /// participants (issue #2846). Defaults to <see cref="ConversationScope.Private"/> so every
+    /// existing caller renders an unchanged prompt. <see cref="ConversationScope.Shared"/>
+    /// suppresses the memory-write guidance block, which would otherwise instruct the agent to
+    /// consult and write owner-private memory that is not in its context.
+    /// </summary>
+    public ConversationScope Scope { get; init; } = ConversationScope.Private;
     public ConversationContext? ConversationContext { get; init; }
+
+    /// <summary>
+    /// Prompt contributors resolved from the host container (#3667). Empty for every caller that
+    /// does not supply them, which renders an identical prompt to the pre-#3667 behaviour.
+    /// </summary>
+    /// <remarks>
+    /// This is the seam that makes <see cref="IPromptContributor"/> reachable from production at
+    /// all. Before #3667 the builder composed its pipeline exclusively from
+    /// <c>Add(IPromptSection)</c>, so a contributor registered in DI was constructed and silently
+    /// ignored. Threading them as a parameter rather than resolving DI inside the builder keeps
+    /// <c>SystemPromptBuilder</c> a static pure function of its inputs, which is what its ~40
+    /// snapshot tests depend on.
+    /// </remarks>
+    public IReadOnlyList<IPromptContributor>? PromptContributors { get; init; }
 }
 
 public static class SystemPromptBuilder
@@ -83,7 +118,9 @@ public static class SystemPromptBuilder
         public const int ConversationTodo = 128;
         public const int WorkspaceFilesHeader = 130;
         public const int ReplyTags = 140;
+        public const int Conversations = 145;
         public const int Messaging = 150;
+        public const int Canvas = 155;
         public const int Voice = 160;
         public const int Reasoning = 170;
         public const int StableProjectContext = 180;
@@ -145,7 +182,8 @@ public static class SystemPromptBuilder
                     inlineButtonsEnabled,
                     stableContextFiles,
                     dynamicContextFiles),
-                [ModelGuidanceSection.ModelIdExtensionKey] = @params.Runtime?.Model
+                [ModelGuidanceSection.ModelIdExtensionKey] = @params.Runtime?.Model,
+                [ModelGuidanceSection.ProviderIdExtensionKey] = @params.Runtime?.Provider
             }
         };
 
@@ -156,6 +194,7 @@ public static class SystemPromptBuilder
             .Add(new LambdaPromptSection(PromptOrder.Safety, BuildSafetySection, xmlTag: "safety"))
             .Add(new LambdaPromptSection(PromptOrder.Cli, BuildCliSection, xmlTag: "cli"))
             .Add(SkillsGuidanceSection.Create())
+            .Add(SubAgentScopingSection.Create())
             .Add(new LambdaPromptSection(PromptOrder.Memory, BuildMemoryGuidanceSection, xmlTag: "memory"))
             .Add(new LambdaPromptSection(PromptOrder.SelfUpdate, BuildSelfUpdateSection, static context => GetGatewayData(context).HasGateway && !GetGatewayData(context).IsMinimal))
             .Add(new LambdaPromptSection(PromptOrder.ModelAliases, BuildModelAliasesSection))
@@ -168,8 +207,11 @@ public static class SystemPromptBuilder
             .Add(new LambdaPromptSection(PromptOrder.ConversationTodo, BuildConversationTodoSection, HasConversationTodo, xmlTag: "conversation_todo"))
             .Add(new LambdaPromptSection(PromptOrder.WorkspaceFilesHeader, static _ => ["## Workspace Files (injected)", "These user-editable files are loaded by BotNexus and included below in Project Context.", string.Empty]))
             .Add(ModelGuidanceSection.Create())
+            .Add(ModelAwarenessSection.Create())
             .Add(new LambdaPromptSection(PromptOrder.ReplyTags, BuildReplyTagsGuidanceSection, static _ => IncludeReplyTagsSectionByDefault))
+            .Add(new LambdaPromptSection(PromptOrder.Conversations, BuildConversationsGuidanceSection, HasConversationTool, xmlTag: "conversations"))
             .Add(new LambdaPromptSection(PromptOrder.Messaging, BuildMessagingGuidanceSection, xmlTag: "messaging"))
+            .Add(new LambdaPromptSection(PromptOrder.Canvas, BuildCanvasGuidanceSection, HasCanvasTool, xmlTag: "canvas"))
             .Add(new LambdaPromptSection(PromptOrder.Voice, BuildVoiceGuidanceSection))
             .Add(new LambdaPromptSection(PromptOrder.Reasoning, BuildReasoningSection, static context => GetGatewayData(context).Parameters.ReasoningTagHint))
             .Add(new LambdaPromptSection(PromptOrder.StableProjectContext, BuildStableProjectContextSection))
@@ -179,6 +221,12 @@ public static class SystemPromptBuilder
             .Add(new LambdaPromptSection(PromptOrder.ExtraSystemPrompt, BuildExtraSystemPromptSection))
             .Add(new LambdaPromptSection(PromptOrder.Heartbeat, BuildHeartbeatSection, static context => !GetGatewayData(context).IsMinimal))
             .Add(new LambdaPromptSection(PromptOrder.Runtime, BuildRuntimeSection, xmlTag: "runtime"));
+
+        // #3667: the one call that makes IPromptContributor a real extension point. Contributors
+        // are ordered against the PromptOrder keys above by their Priority (or the contribution's
+        // own Order), so an extension can place its block between built-in sections. Passing an
+        // empty collection is a no-op, which is why every existing caller renders unchanged.
+        pipeline.AddContributors(@params.PromptContributors ?? []);
 
         var lines = pipeline.BuildLines(promptContext);
         return string.Join("\n", lines.Where(static line => !string.IsNullOrEmpty(line)));
@@ -230,7 +278,27 @@ public static class SystemPromptBuilder
 
     public static IReadOnlyList<string> BuildMemorySection(bool isMinimal, string? promptInjectionMode, IReadOnlySet<string> availableTools)
     {
+        return BuildMemorySection(isMinimal, promptInjectionMode, availableTools, ConversationScope.Private);
+    }
+
+    /// <summary>
+    /// Builds the memory-guidance block, or nothing at all in a shared conversation (issue #2846).
+    /// </summary>
+    /// <remarks>
+    /// In a shared conversation the owner-private files this guidance describes are withheld from
+    /// the prompt, so emitting the guidance would both describe absent context and instruct the
+    /// agent to write durable owner memory from a conversation it does not privately own.
+    /// </remarks>
+    public static IReadOnlyList<string> BuildMemorySection(
+        bool isMinimal,
+        string? promptInjectionMode,
+        IReadOnlySet<string> availableTools,
+        ConversationScope scope)
+    {
         if (isMinimal)
+            return [];
+
+        if (scope == ConversationScope.Shared)
             return [];
 
         var mode = NormalizeMemoryPromptInjection(promptInjectionMode);
@@ -293,6 +361,49 @@ public static class SystemPromptBuilder
         ];
     }
 
+    /// <summary>
+    /// Gate for the conversations capability section (#2938). Guidance about creating and querying
+    /// conversations is only actionable for an agent that actually holds the <c>conversation</c>
+    /// tool, and minimal prompts (sub-agents) deliberately carry no orchestration guidance.
+    /// </summary>
+    private static bool HasConversationTool(PromptContext context)
+    {
+        var data = GetGatewayData(context);
+        return !data.IsMinimal && data.NormalizedTools.Contains("conversation");
+    }
+
+    private static IReadOnlyList<string> BuildConversationsGuidanceSection(PromptContext context)
+    {
+        var data = GetGatewayData(context);
+        return BuildConversationsSection(data.IsMinimal, data.NormalizedTools);
+    }
+
+    /// <summary>
+    /// Concurrent-conversation capability guidance (#2938). Agents were defaulting to a
+    /// single-threaded, one-conversation-at-a-time mental model that does not match the platform:
+    /// there is no per-agent or per-conversation turn lock anywhere in the gateway. That gap pushed
+    /// agents toward <c>spawn_subagent</c> and cron jobs for parallelism they already had, and
+    /// toward rebuilding overlap-detection state externally. This is platform truth, kept short on
+    /// purpose - every line is paid for on every turn.
+    /// </summary>
+    public static IReadOnlyList<string> BuildConversationsSection(bool isMinimal, IReadOnlySet<string> availableTools)
+    {
+        ArgumentNullException.ThrowIfNull(availableTools);
+
+        if (isMinimal || !availableTools.Contains("conversation"))
+            return [];
+
+        return
+        [
+            "- You can hold many conversations at once. Turns in different conversations are NOT serialised against each other - they run concurrently, so work split across conversations does not queue up.",
+            "- You can start one yourself: `conversation new`, and an opening message with `speak_as: user` begins a turn there. No cron job and no sub-agent is needed just to start work.",
+            "- `conversation list` (filter by `status`, read title and purpose) shows what you are already doing across your own conversations - use it to avoid duplicate work and to check coverage before starting something new.",
+            "- Conversations are durable: they survive session restarts and context compaction, unlike the session-scoped sub-agent registry, which is blind across sessions.",
+            "- Every one of your conversations is the SAME agent identity - you. Opening one and speaking into it is not a second agent, and never narrate that work as someone else's. `spawn_subagent` remains the separate-worker primitive.",
+            string.Empty
+        ];
+    }
+
     public static IReadOnlyList<string> BuildMessagingSection(
         bool isMinimal,
         IReadOnlySet<string> availableTools,
@@ -306,10 +417,18 @@ public static class SystemPromptBuilder
         {
             "- Reply in current session → automatically routes to the source channel (Signal, Telegram, etc.)",
             "- Cross-session messaging → use sessions_send(sessionKey, message)",
-            "- Sub-agent orchestration → use subagents(action=list|steer|kill)",
+            "- Sub-agent orchestration: use spawn_subagent, list_subagents, and manage_subagent (status/wait/kill/result/history); live steering is unsupported",
             $"- Runtime-generated completion events may ask for a user update. Rewrite those in your normal assistant voice and send the update (do not forward raw internal metadata or default to {SilentReplyToken}).",
             "- Never use exec/curl for provider messaging; BotNexus handles all routing internally."
         };
+
+        if (availableTools.Contains("conversation"))
+        {
+            // #2938: this list previously routed only to sessions_send and subagents, i.e. away from
+            // conversations, reinforcing the single-conversation model the <conversations> section
+            // corrects. Insert the cross-reference next to the other routing choices.
+            lines.Insert(2, "- Another of your own conversations → use the `conversation` tool (`new` to start one, `message` to speak into it, `list` to see them); see <conversations>.");
+        }
 
         if (availableTools.Contains("message"))
         {
@@ -342,6 +461,30 @@ public static class SystemPromptBuilder
         return ["## Voice (TTS)", hint, ""];
     }
 
+    /// <summary>
+    /// Canvas guidance (#2974). This deliberately says what the canvas is FOR and when a file beats
+    /// it; the mechanics (render/clear/state/submitToAgent) already live in the tool description and
+    /// restating them here would be paid for on every single turn. It is written as a two-sided
+    /// trigger list on purpose: unconditional "prefer the canvas" encouragement produces canvas
+    /// renders for two-line answers, which is a worse outcome than the canvas going unused.
+    /// </summary>
+    public static IReadOnlyList<string> BuildCanvasSection(bool isMinimal, IReadOnlySet<string> availableTools)
+    {
+        ArgumentNullException.ThrowIfNull(availableTools);
+
+        if (isMinimal || !availableTools.Contains("canvas"))
+            return [];
+
+        return
+        [
+            "The canvas is a rendered HTML panel in the portal, alongside the conversation. It is for output the user LOOKS AT rather than processes.",
+            "Use it for: tabular or comparative data (especially sortable/filterable), anything graphable (trends, distributions, dependency or flow diagrams), and forms or choices the user hands back to you.",
+            "Do NOT use the canvas for: short prose answers; content the user will grep, diff, or feed to another tool -- a file is the right surface for that; or anything that must outlive the conversation, because canvas state is per-conversation.",
+            "The canvas is only visible in the portal. On other channels the reply must still carry the answer -- never respond with only a pointer to a render.",
+            ""
+        ];
+    }
+
     public static IReadOnlyList<string> BuildDocsSection(string? docsPath, bool isMinimal, string readToolName)
     {
         _ = readToolName;
@@ -372,6 +515,7 @@ public static class SystemPromptBuilder
             Os = runtime.Os,
             Arch = runtime.Arch,
             Provider = runtime.Provider,
+            ContextWindow = runtime.ContextWindow,
             Model = runtime.Model,
             DefaultModel = runtime.DefaultModel,
             Shell = runtime.Shell,
@@ -405,7 +549,7 @@ public static class SystemPromptBuilder
     private static IReadOnlyList<string> BuildMemoryGuidanceSection(PromptContext context)
     {
         var data = GetGatewayData(context);
-        return BuildMemorySection(data.IsMinimal, data.Parameters.MemoryPromptInjection, data.NormalizedTools);
+        return BuildMemorySection(data.IsMinimal, data.Parameters.MemoryPromptInjection, data.NormalizedTools, data.Parameters.Scope);
     }
 
     private static IReadOnlyList<string> BuildDocsGuidanceSection(PromptContext context)
@@ -442,6 +586,23 @@ public static class SystemPromptBuilder
     {
         var data = GetGatewayData(context);
         return BuildVoiceSection(data.IsMinimal, data.Parameters.TtsHint);
+    }
+
+    /// <summary>
+    /// Gate for the canvas guidance section. The canvas is a real output surface that agents were
+    /// simply never told about (#2974), but guidance an agent cannot act on is pure token cost, so
+    /// the section is emitted only when the agent actually holds the <c>canvas</c> tool.
+    /// </summary>
+    private static bool HasCanvasTool(PromptContext context)
+    {
+        var data = GetGatewayData(context);
+        return !data.IsMinimal && data.NormalizedTools.Contains("canvas");
+    }
+
+    private static IReadOnlyList<string> BuildCanvasGuidanceSection(PromptContext context)
+    {
+        var data = GetGatewayData(context);
+        return BuildCanvasSection(data.IsMinimal, data.NormalizedTools);
     }
 
     private static IReadOnlyList<string> BuildStableProjectContextSection(PromptContext context)
@@ -495,8 +656,8 @@ public static class SystemPromptBuilder
             ]);
         }
 
-        lines.Add("If a task is more complex or takes longer, spawn a sub-agent. Completion is push-based: it will auto-announce when done.");
-        lines.Add("Do not poll `subagents list` / `sessions_list` in a loop; only check status on-demand (for intervention, debugging, or when explicitly asked).");
+        lines.Add("If a task is more complex or takes longer, use spawn_subagent. By default spawn awaits completion; background=true returns early. Use manage_subagent action=wait to join background work. Completion does not push an automatic inbound turn. Use action=result/history for repeatable read-only retained child results/tool evidence from the original parent session; live messaging and steering are unsupported.");
+        lines.Add("Do not poll list_subagents or sessions in a loop; use manage_subagent wait to join, and inspect status/result/history on demand.");
         lines.Add(string.Empty);
         lines.Add(BuildExecApprovalPromptGuidance(data.RuntimeChannel, data.InlineButtonsEnabled));
         lines.Add("Never execute /approve through exec or any other shell/tool path; /approve is a user-facing approval command, not a shell command.");
@@ -639,13 +800,25 @@ public static class SystemPromptBuilder
     private static IReadOnlyList<string> BuildRuntimeSection(PromptContext context)
     {
         var data = GetGatewayData(context);
-        return
+        List<string> lines =
         [
             RuntimeLineFormatter.RuntimeContextBeginDelimiter,
-            BuildRuntimeLine(data.Parameters.Runtime),
-            $"Reasoning: {(data.Parameters.ReasoningLevel ?? "off")} (hidden unless on/stream). Toggle /reasoning; /status shows Reasoning when enabled.",
-            RuntimeLineFormatter.RuntimeContextEndDelimiter
+            BuildRuntimeLine(data.Parameters.Runtime)
         ];
+
+        // #2874: the old wording described an off|on|stream reasoning DISPLAY mode that no code
+        // implements - the client's thinking visibility is a bool defaulting to true applied as a
+        // CSS filter, and /reasoning is a per-conversation thinking-LEVEL override, not a toggle.
+        // Report only the resolved level, and omit the subject entirely when it is unresolvable.
+        var reasoningLevel = data.Parameters.ReasoningLevel;
+        if (!string.IsNullOrWhiteSpace(reasoningLevel) &&
+            !string.Equals(reasoningLevel, "off", StringComparison.OrdinalIgnoreCase))
+        {
+            lines.Add($"Reasoning: thinking level {reasoningLevel.Trim()} (per-conversation override: /reasoning <minimal|low|medium|high|xhigh|max> or /reasoning clear).");
+        }
+
+        lines.Add(RuntimeLineFormatter.RuntimeContextEndDelimiter);
+        return lines;
     }
 
     private static bool HasConversationContext(PromptContext context)
@@ -697,7 +870,7 @@ public static class SystemPromptBuilder
     {
         var conversationContext = GetGatewayData(context).Parameters.ConversationContext;
         return conversationContext is not null
-               && TodoPromptFormatter.BuildSection(conversationContext.Todo).Count > 0;
+               && TodoPromptFormatter.BuildSection(conversationContext.Todo, conversationContext.RunStartedAt).Count > 0;
     }
 
     private static IReadOnlyList<string> BuildConversationTodoSection(PromptContext context)
@@ -705,7 +878,9 @@ public static class SystemPromptBuilder
         var conversationContext = GetGatewayData(context).Parameters.ConversationContext
             ?? throw new InvalidOperationException("ConversationContext is required for BuildConversationTodoSection.");
 
-        return TodoPromptFormatter.BuildSection(conversationContext.Todo);
+        // #2984: RunStartedAt (cron only) splits this run's agenda from earlier runs' minutes. The
+        // gate above must use the SAME arguments, or a section could be admitted and then render empty.
+        return TodoPromptFormatter.BuildSection(conversationContext.Todo, conversationContext.RunStartedAt);
     }
 
     private sealed class LambdaPromptSection(

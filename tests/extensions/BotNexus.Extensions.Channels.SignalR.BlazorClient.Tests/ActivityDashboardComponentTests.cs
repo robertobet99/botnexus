@@ -25,7 +25,7 @@ public sealed class ActivityDashboardComponentTests : IDisposable
 
         _store.Agents.Returns(new Dictionary<string, AgentState>().AsReadOnly());
         _store.GetAgent(Arg.Any<string>()).Returns((AgentState?)null);
-        _rest.GetAllConversationsAsync(Arg.Any<CancellationToken>())
+        _rest.GetAllConversationsAsync(Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult<IReadOnlyList<ConversationSummaryDto>>(Array.Empty<ConversationSummaryDto>()));
 
         _ctx.Services.AddSingleton(_store);
@@ -42,15 +42,253 @@ public sealed class ActivityDashboardComponentTests : IDisposable
         string status = "Active",
         string? activeSessionId = null,
         int bindingCount = 0,
-        IReadOnlyList<ParticipantDto>? participants = null) =>
+        IReadOnlyList<ParticipantDto>? participants = null,
+        // #2305 (epic #2300): cron-ness is the SERVER-stamped source, never a `cron:` session-id
+        // prefix. Fixtures set it explicitly.
+        string source = "Channel",
+        string kind = "HumanAgent",
+        // #2692: visibility is server-stamped and already on the wire; fixtures set it explicitly.
+        string visibility = "UserFacing",
+        // #3105: the originating job / registration id, server-stamped alongside source (#2121).
+        string? sourceId = null,
+        // #3204: the author's stated purpose, server-persisted and now declared on the client DTO.
+        string? purpose = null) =>
         new(id, agentId, title, false, status, activeSessionId, bindingCount,
-            DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, Participants: participants);
+            DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, Kind: kind, Source: source,
+            Visibility: visibility, Participants: participants, SourceId: sourceId,
+            Purpose: purpose);
 
     private void SetupConversations(params ConversationSummaryDto[] conversations) =>
-        _rest.GetAllConversationsAsync(Arg.Any<CancellationToken>())
+        _rest.GetAllConversationsAsync(Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult<IReadOnlyList<ConversationSummaryDto>>(conversations));
 
+    private void SetupSessions(params (string Id, string Status)[] sessions) =>
+        _rest.GetSessionsAsync(
+                Arg.Any<string?>(),
+                Arg.Any<int?>(),
+                Arg.Any<int>(),
+                Arg.Any<string?>(),
+                Arg.Any<CancellationToken>())
+            .Returns(new SessionPageDto(
+                sessions.Select(session => new SessionSummary(
+                    session.Id,
+                    "alpha",
+                    "signalr",
+                    "interactive",
+                    session.Status,
+                    0)).ToList(),
+                sessions.Length,
+                false));
+
+    [Theory]
+    [InlineData("Week", 7)]
+    [InlineData("Month", 30)]
+    [InlineData("Any", 0)]
+    [InlineData("Today", -1)]
+    public void Recency_changes_request_the_matching_server_window(string window, int days)
+    {
+        var before = DateTimeOffset.UtcNow;
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-recency']").Change(window);
+        var after = DateTimeOffset.UtcNow;
+        var calls = _rest.ReceivedCalls()
+            .Where(c => c.GetMethodInfo().Name == nameof(IGatewayRestClient.GetAllConversationsAsync))
+            .Select(c => c.GetArguments()).Where(a => a.Length == 2).ToList();
+        calls.Count.ShouldBe(2);
+        ((DateTimeOffset?)calls[0][0]).ShouldNotBeNull();
+        var initial = (DateTimeOffset?)calls[0][0];
+        initial.GetValueOrDefault().ShouldBeInRange(before.AddHours(-24), after.AddHours(-24));
+        var cutoff = (DateTimeOffset?)calls[1][0];
+        if (days == 0)
+            cutoff.ShouldBeNull();
+        else if (days == -1)
+            cutoff.ShouldBe(new DateTimeOffset(DateTime.Today));
+        else
+        {
+            cutoff.ShouldNotBeNull();
+            cutoff.GetValueOrDefault().ShouldBeInRange(before.AddDays(-days), after.AddDays(-days));
+        }
+    }
+    [Fact]
+    public async Task Poll_refresh_reuses_selected_bounded_query_and_reset_restores_day()
+    {
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-recency']").Change("Week");
+        // Invoke the same load target used by the polling callback without a wall-clock delay.
+        var load = typeof(ActivityDashboard).GetMethod("LoadAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            ?? throw new InvalidOperationException("Missing polling load target");
+        var before = DateTimeOffset.UtcNow;
+        await cut.InvokeAsync(async () => await ((Task?)load.Invoke(cut.Instance, null)
+            ?? throw new InvalidOperationException("Missing load task")));
+        var after = DateTimeOffset.UtcNow;
+        var calls = _rest.ReceivedCalls()
+            .Where(c => c.GetMethodInfo().Name == nameof(IGatewayRestClient.GetAllConversationsAsync))
+            .Select(c => c.GetArguments()).Where(a => a.Length == 2).ToList();
+        calls.Count.ShouldBe(3);
+        ((DateTimeOffset?)calls[^1][0]).GetValueOrDefault()
+            .ShouldBeInRange(before.AddDays(-7), after.AddDays(-7));
+        cut.Find("[data-testid='activity-summary-conversations']").Click();
+        await _rest.Received(2).GetAllConversationsAsync(
+            Arg.Is<DateTimeOffset?>(at => at.HasValue && at.Value > before.AddHours(-25)),
+            Arg.Any<CancellationToken>());
+    }
+    [Fact]
+    public void Expanding_window_fetches_older_rows_and_reset_excludes_them_again()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var conversations = new[]
+        {
+            Conv("recent"),
+            Conv("week") with { UpdatedAt = now.AddDays(-3) },
+            Conv("month") with { UpdatedAt = now.AddDays(-20) },
+            Conv("history") with { UpdatedAt = now.AddDays(-90) }
+        };
+        _rest.GetAllConversationsAsync(Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
+            .Returns(call => Task.FromResult<IReadOnlyList<ConversationSummaryDto>>(
+                conversations.Where(c => call.ArgAt<DateTimeOffset?>(0) is not { } since
+                    || c.UpdatedAt >= since).ToArray()));
+        var cut = _ctx.Render<ActivityDashboard>();
+        RowIds(cut).ShouldBe(new[] { "recent" });
+        cut.Find("[data-testid='activity-filter-recency']").Change("Week");
+        RowIds(cut).ShouldBe(new[] { "recent", "week" });
+        cut.Find("[data-testid='activity-filter-recency']").Change("Month");
+        RowIds(cut).ShouldBe(new[] { "recent", "week", "month" });
+        cut.Find("[data-testid='activity-filter-recency']").Change("Any");
+        RowIds(cut).ShouldBe(new[] { "recent", "week", "month", "history" });
+        cut.Find("[data-testid='activity-summary-conversations']").Click();
+        RowIds(cut).ShouldBe(new[] { "recent" });
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Older_poll_cannot_replace_newer_any_time_rows_or_error(bool olderFails)
+    {
+        SetupConversations(Conv("initial"));
+        var cut = _ctx.Render<ActivityDashboard>();
+        var pending = new TaskCompletionSource<IReadOnlyList<ConversationSummaryDto>>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        _rest.GetAllConversationsAsync(Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
+            .Returns(pending.Task);
+        var load = typeof(ActivityDashboard).GetMethod("LoadAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            ?? throw new InvalidOperationException("Missing polling load target");
+        Task older = Task.CompletedTask;
+        await cut.InvokeAsync(() =>
+        {
+            older = (Task?)load.Invoke(cut.Instance, null)
+                ?? throw new InvalidOperationException("Missing load task");
+        });
+        SetupConversations(Conv("recent"), Conv("history") with
+        {
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-90),
+            UpdatedAt = DateTimeOffset.UtcNow.AddDays(-90)
+        });
+        await cut.Find("[data-testid='activity-filter-recency']")
+            .ChangeAsync(new ChangeEventArgs { Value = "Any" });
+        RowIds(cut).ShouldBe(new[] { "recent", "history" });
+        if (olderFails)
+            pending.SetException(new HttpRequestException("stale poll failure"));
+        else
+            pending.SetResult(new[] { Conv("stale") });
+        await older.WaitAsync(TimeSpan.FromSeconds(10));
+        await cut.InvokeAsync(() => cut.Render());
+        RowIds(cut).ShouldBe(new[] { "recent", "history" });
+        cut.FindAll("[data-testid='activity-error']").ShouldBeEmpty();
+        cut.FindAll("[data-testid='activity-loading']").ShouldBeEmpty();
+        cut.Find("[data-testid='activity-summary-conversations'] .activity-summary-value")
+            .TextContent.ShouldBe("2");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Older_completion_cannot_clear_newer_loading_state(bool olderFails)
+    {
+        var cut = _ctx.Render<ActivityDashboard>();
+        var olderReply = new TaskCompletionSource<IReadOnlyList<ConversationSummaryDto>>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var newerReply = new TaskCompletionSource<IReadOnlyList<ConversationSummaryDto>>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var load = typeof(ActivityDashboard).GetMethod("LoadAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            ?? throw new InvalidOperationException("Missing polling load target");
+        var loading = typeof(ActivityDashboard).GetField("_isLoading",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            ?? throw new InvalidOperationException("Missing loading state");
+        _rest.GetAllConversationsAsync(Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
+            .Returns(olderReply.Task);
+        Task older = Task.CompletedTask;
+        await cut.InvokeAsync(() =>
+        {
+            older = (Task?)load.Invoke(cut.Instance, null)
+                ?? throw new InvalidOperationException("Missing load task");
+        });
+        var newerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _rest.GetAllConversationsAsync(Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                newerStarted.SetResult();
+                return newerReply.Task;
+            });
+        var newer = cut.Find("[data-testid='activity-filter-recency']")
+            .ChangeAsync(new ChangeEventArgs { Value = "Any" });
+        await newerStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        if (olderFails)
+            olderReply.SetException(new HttpRequestException("stale failure"));
+        else
+            olderReply.SetResult(new[] { Conv("stale") });
+        await older.WaitAsync(TimeSpan.FromSeconds(10));
+        await cut.InvokeAsync(() =>
+        {
+            loading.GetValue(cut.Instance).ShouldBe(true);
+            cut.FindAll("[data-testid='activity-error']").ShouldBeEmpty();
+        });
+        newerReply.SetResult(new[] { Conv("latest") });
+        await newer.WaitAsync(TimeSpan.FromSeconds(10));
+        RowIds(cut).ShouldBe(new[] { "latest" });
+        loading.GetValue(cut.Instance).ShouldBe(false);
+    }
+
     // ── Structure ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Initial_load_selects_rolling_last_24_hours()
+    {
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        cut.Find("[data-testid='activity-filter-recency']").GetAttribute("value")
+            .ShouldBe("Last24Hours");
+        cut.Find("[data-testid='activity-filter-recency'] option[value='Last24Hours']")
+            .TextContent.ShouldBe("Last 24 hours");
+    }
+
+    [Fact]
+    public void Recency_can_expand_to_any_time_and_reset_returns_to_last_24_hours()
+    {
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-recency']").Change("Any");
+        cut.Find("[data-testid='activity-filter-recency']").GetAttribute("value").ShouldBe("Any");
+
+        cut.Find("[data-testid='activity-summary-conversations']").Click();
+
+        cut.Find("[data-testid='activity-filter-recency']").GetAttribute("value")
+            .ShouldBe("Last24Hours");
+    }
+
+    [Fact]
+    public void Initial_load_excludes_activity_older_than_rolling_day()
+    {
+        SetupConversations(Conv("recent"), Conv("old") with
+        {
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-3),
+            UpdatedAt = DateTimeOffset.UtcNow.AddHours(-25)
+        });
+
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        cut.WaitForAssertion(() => RowIds(cut).ShouldBe(new[] { "recent" }));
+    }
 
     [Fact]
     public void Renders_header_and_filter_bar()
@@ -63,6 +301,24 @@ public sealed class ActivityDashboardComponentTests : IDisposable
         cut.Find("[data-testid='activity-filter-agent']");
         cut.Find("[data-testid='activity-filter-status']");
         cut.Find("[data-testid='activity-filter-recency']");
+    }
+
+    [Fact]
+    public void Long_title_is_preserved_in_inner_wrapper_with_badges_and_purpose()
+    {
+        const string title = "Review the complete rendering regression for scheduled automation and conversation activity " +
+            "including this unbroken identifier abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
+        SetupConversations(Conv("long-title", title: title, source: "Webhook", purpose: "Keep the full identifying text readable."));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+        var cell = cut.Find("[data-testid='activity-row'] td.activity-cell-title");
+        cell.Children.ShouldHaveSingleItem().ClassList.ShouldContain("activity-title-content");
+        cell.QuerySelector(".activity-title-content > .activity-conversation-title")?.TextContent.ShouldBe(title);
+        cell.QuerySelector(".activity-title-content > [data-testid='activity-origin-badge']").ShouldNotBeNull();
+        cell.QuerySelector(".activity-title-content > [data-testid='activity-purpose']")?.TextContent
+            .ShouldBe("Keep the full identifying text readable.");
+        cut.FindAll("[data-testid='activity-row'] td").Count.ShouldBe(5);
     }
 
     // ── Empty state ────────────────────────────────────────────────────────
@@ -90,18 +346,29 @@ public sealed class ActivityDashboardComponentTests : IDisposable
         Assert.Contains("Beta chat", cut.Markup);
     }
 
+    // The cron assertions below are scoped to the rendered ROWS rather than the whole component
+    // markup. The filter bar legitimately contains the word "Scheduled" (it is an origin choice,
+    // #2385), so a whole-markup scan would answer a question about the chrome instead of the
+    // question under test. Keying on the row's conversation id is also strictly stronger than
+    // substring-matching a title, which any unrelated copy change could satisfy by accident.
+    private static IReadOnlyList<string> RowIds(IRenderedComponent<ActivityDashboard> cut) =>
+        cut.FindAll("[data-testid='activity-row']")
+            .Select(r => r.GetAttribute("data-conversation-id")!)
+            .ToList();
+
     [Fact]
     public void Cron_conversation_excluded_by_default()
     {
         SetupConversations(
             Conv("c1", title: "Normal"),
-            Conv("c2", title: "Scheduled", activeSessionId: "cron:job:20260710"));
+            Conv("c2", title: "Scheduled", source: "Cron"));
 
         var cut = _ctx.Render<ActivityDashboard>();
 
         cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
-        Assert.Contains("Normal", cut.Markup);
-        Assert.DoesNotContain("Scheduled", cut.Markup);
+        Assert.Equal(new[] { "c1" }, RowIds(cut));
+        Assert.Contains("Normal", cut.Find("[data-testid='activity-table']").TextContent);
+        Assert.DoesNotContain("Scheduled", cut.Find("[data-testid='activity-table']").TextContent);
     }
 
     [Fact]
@@ -109,7 +376,7 @@ public sealed class ActivityDashboardComponentTests : IDisposable
     {
         SetupConversations(
             Conv("c1", title: "Normal"),
-            Conv("c2", title: "Scheduled", activeSessionId: "cron:job:20260710"));
+            Conv("c2", title: "Scheduled", source: "Cron"));
 
         var cut = _ctx.Render<ActivityDashboard>();
         cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
@@ -117,7 +384,8 @@ public sealed class ActivityDashboardComponentTests : IDisposable
         cut.Find("[data-testid='activity-filter-cron']").Click();
 
         cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
-        Assert.Contains("Scheduled", cut.Markup);
+        Assert.Equal(new[] { "c1", "c2" }, RowIds(cut).OrderBy(x => x, StringComparer.Ordinal));
+        Assert.Contains("Scheduled", cut.Find("[data-testid='activity-table']").TextContent);
     }
 
     [Fact]
@@ -146,6 +414,56 @@ public sealed class ActivityDashboardComponentTests : IDisposable
     }
 
     [Fact]
+    public void Agent_chips_render_normalized_emoji_without_spacing_blank_emoji()
+    {
+        var agents = new Dictionary<string, AgentState>
+        {
+            ["alpha"] = new() { AgentId = "alpha", DisplayName = "Alpha", Emoji = "🚀\n" },
+            ["beta"] = new() { AgentId = "beta", DisplayName = "Beta", Emoji = "   " }
+        };
+        _store.Agents.Returns(agents.AsReadOnly());
+        _store.GetAgent(Arg.Any<string>()).Returns(ci => agents.GetValueOrDefault(ci.ArgAt<string>(0)));
+        SetupConversations(Conv("c1", agentId: "alpha", participants:
+        [
+            new ParticipantDto("Agent", "beta", "peer")
+        ]));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        cut.WaitForState(() => cut.FindAll(".activity-agent-chip").Count == 2);
+        var chips = cut.FindAll(".activity-agent-chip");
+        chips[0].TextContent.ShouldBe("🚀 Alpha");
+        chips[1].TextContent.ShouldBe("Betapeer");
+        chips[1].FirstChild?.TextContent.ShouldBe("Beta");
+    }
+
+    [Fact]
+    public void Agent_filter_option_renders_normalized_emoji()
+    {
+        var agents = new Dictionary<string, AgentState>
+        {
+            ["alpha"] = new() { AgentId = "alpha", DisplayName = "Alpha", Emoji = "🔬\t" }
+        };
+        _store.Agents.Returns(agents.AsReadOnly());
+        _store.GetAgent(Arg.Any<string>()).Returns(ci => agents.GetValueOrDefault(ci.ArgAt<string>(0)));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        cut.Find("[data-testid='activity-filter-agent'] option[value='alpha']").TextContent.ShouldBe("🔬 Alpha");
+    }
+
+    [Fact]
+    public void Unknown_agent_chip_keeps_bare_id_without_placeholder()
+    {
+        SetupConversations(Conv("c1", agentId: "unknown-agent"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        cut.WaitForState(() => cut.FindAll(".activity-agent-chip").Count == 1);
+        cut.Find(".activity-agent-chip").TextContent.ShouldBe("unknown-agent");
+    }
+
+    [Fact]
     public void Clicking_row_navigates_to_conversation()
     {
         var navMan = _ctx.Services.GetRequiredService<NavigationManager>() as BunitNavigationManager;
@@ -164,7 +482,7 @@ public sealed class ActivityDashboardComponentTests : IDisposable
     [Fact]
     public void Shows_error_state_when_load_fails()
     {
-        _rest.GetAllConversationsAsync(Arg.Any<CancellationToken>())
+        _rest.GetAllConversationsAsync(Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
             .Returns<Task<IReadOnlyList<ConversationSummaryDto>>>(_ => throw new HttpRequestException("boom"));
 
         var cut = _ctx.Render<ActivityDashboard>();
@@ -225,7 +543,7 @@ public sealed class ActivityDashboardComponentTests : IDisposable
     {
         SetupConversations(
             Conv("c1", title: "Normal"),
-            Conv("c2", title: "Scheduled", activeSessionId: "cron:job:20260710"));
+            Conv("c2", title: "Scheduled", source: "Cron"));
 
         var cut = _ctx.Render<ActivityDashboard>();
         cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
@@ -245,8 +563,8 @@ public sealed class ActivityDashboardComponentTests : IDisposable
     {
         SetupConversations(
             Conv("c1", agentId: "alpha", title: "Active normal"),
-            Conv("c2", agentId: "beta", title: "Active scheduled", activeSessionId: "cron:job:20260719"),
-            Conv("c3", agentId: "beta", title: "Archived scheduled", status: "Archived", activeSessionId: "cron:job:20260718"));
+            Conv("c2", agentId: "beta", title: "Active scheduled", source: "Cron"),
+            Conv("c3", agentId: "beta", title: "Archived scheduled", status: "Archived", source: "Cron"));
 
         var cut = _ctx.Render<ActivityDashboard>();
         cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
@@ -265,7 +583,7 @@ public sealed class ActivityDashboardComponentTests : IDisposable
         Assert.DoesNotContain("Archived scheduled", cut.Markup);
         Assert.Equal("", cut.Find("[data-testid='activity-filter-agent']").GetAttribute("value"));
         Assert.Equal(ActivityStatusFilter.Active.ToString(), cut.Find("[data-testid='activity-filter-status']").GetAttribute("value"));
-        Assert.Equal(ActivityRecencyWindow.Any.ToString(), cut.Find("[data-testid='activity-filter-recency']").GetAttribute("value"));
+        Assert.Equal(ActivityRecencyWindow.Last24Hours.ToString(), cut.Find("[data-testid='activity-filter-recency']").GetAttribute("value"));
         Assert.False(cut.Find("[data-testid='activity-filter-cron']").HasAttribute("aria-pressed"));
     }
 
@@ -274,7 +592,7 @@ public sealed class ActivityDashboardComponentTests : IDisposable
     {
         SetupConversations(
             Conv("c1", title: "Normal"),
-            Conv("c2", title: "Scheduled", activeSessionId: "cron:job:20260710"));
+            Conv("c2", title: "Scheduled", source: "Cron"));
 
         var cut = _ctx.Render<ActivityDashboard>();
         cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
@@ -289,5 +607,1006 @@ public sealed class ActivityDashboardComponentTests : IDisposable
         // Clicking again hides them.
         cut.Find("[data-testid='activity-summary-scheduled']").Click();
         cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+    }
+
+    [Fact]
+    public void Agents_stat_card_is_an_interactive_button_tied_to_the_agent_filter()
+    {
+        SetupConversations(
+            Conv("c1", agentId: "alpha", title: "Alpha chat"),
+            Conv("c2", agentId: "beta", title: "Beta chat"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
+
+        // The agents card is a button (navigation affordance), not inert display text.
+        var card = cut.Find("[data-testid='activity-summary-agents']");
+        Assert.Equal("button", card.NodeName, ignoreCase: true);
+        Assert.DoesNotContain("active", card.GetAttribute("class"));
+
+        // Selecting an agent lights up the card's active treatment (single source of truth = the picker).
+        cut.Find("[data-testid='activity-filter-agent']").Change("beta");
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+        Assert.Contains("active", cut.Find("[data-testid='activity-summary-agents']").GetAttribute("class"));
+
+        // Clicking the card is a no-throw focus affordance that leaves the filter untouched.
+        cut.Find("[data-testid='activity-summary-agents']").Click();
+        Assert.Equal("beta", cut.Find("[data-testid='activity-filter-agent']").GetAttribute("value"));
+    }
+
+    // ── Participant roles on agent chips (#2857) ───────────────────────────
+
+    [Fact]
+    public void Agent_chips_carry_the_participant_role_and_unroled_chips_render_unchanged()
+    {
+        SetupConversations(
+            // An agent-to-agent exchange with the roles the gateway actually stamps.
+            Conv("c1", title: "Peer", agentId: "alpha", source: "Agent", kind: "AgentAgent",
+                participants: new[]
+                {
+                    new ParticipantDto("Agent", "alpha", "initiator"),
+                    new ParticipantDto("Agent", "beta", "target")
+                }),
+            // An ordinary human/channel row: no roster, so no role, so no change from before #2857.
+            Conv("c2", title: "Jon DM", agentId: "gamma"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+
+        var chipsByRow = cut.FindAll("[data-testid='activity-row']")
+            .ToDictionary(
+                r => r.GetAttribute("data-conversation-id")!,
+                r => r.QuerySelectorAll("[data-testid='activity-agent-chip']").ToList());
+
+        // Roled row: both chips render, each carrying its own role and colour modifier.
+        var roled = chipsByRow["c1"];
+        Assert.Equal(2, roled.Count);
+        Assert.Equal("initiator", roled[0].GetAttribute("data-role"));
+        Assert.Contains("activity-agent-chip--initiator", roled[0].GetAttribute("class"));
+        Assert.Contains("initiator", roled[0].TextContent);
+        Assert.Equal("target", roled[1].GetAttribute("data-role"));
+        Assert.Contains("activity-agent-chip--target", roled[1].GetAttribute("class"));
+        // The role reaches assistive tech, not only the small visual suffix.
+        Assert.Contains("target", roled[1].GetAttribute("aria-label"));
+
+        // Unroled row: no role element, no modifier class - visually identical to pre-#2857.
+        var unroled = Assert.Single(chipsByRow["c2"]);
+        Assert.True(string.IsNullOrEmpty(unroled.GetAttribute("data-role")));
+        Assert.DoesNotContain("activity-agent-chip--", unroled.GetAttribute("class"));
+        Assert.Null(unroled.QuerySelector(".activity-agent-role"));
+    }
+
+    // ── Origin badges (#2385, epic #2300) ──────────────────────────────────
+
+    [Fact]
+    public void Renders_an_origin_badge_per_row_and_leaves_the_ordinary_human_channel_row_unbadged()
+    {
+        SetupConversations(
+            Conv("c1", title: "Jon DM"),
+            Conv("c2", title: "Nightly run", source: "Cron"),
+            Conv("c3", title: "Inbound hook", source: "Webhook"),
+            Conv("c4", title: "Worker", source: "Agent", kind: "AgentSubAgent"),
+            Conv("c5", title: "Peer", source: "Agent", kind: "AgentAgent"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        // Scheduled rows are default-excluded, so reveal them first - the badge set under test spans
+        // every origin including cron.
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-filter-cron']"));
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Equal(5, cut.FindAll("[data-testid='activity-row']").Count));
+
+        // Assert the OBSERVABLE badge set actually rendered into the DOM, keyed by row, rather than
+        // that the helper returns a string: a correct helper wired to nothing would pass the latter.
+        var badgesByRow = cut.FindAll("[data-testid='activity-row']")
+            .ToDictionary(
+                r => r.GetAttribute("data-conversation-id")!,
+                r => r.QuerySelector("[data-testid='activity-origin-badge']"));
+
+        Assert.Null(badgesByRow["c1"]);
+        Assert.Equal("Scheduled", badgesByRow["c2"]!.TextContent);
+        Assert.Equal("cron", badgesByRow["c2"]!.GetAttribute("data-origin"));
+        Assert.Equal("Webhook", badgesByRow["c3"]!.TextContent);
+        Assert.Equal("webhook", badgesByRow["c3"]!.GetAttribute("data-origin"));
+        Assert.Equal("Sub-agent", badgesByRow["c4"]!.TextContent);
+        Assert.Equal("subagent", badgesByRow["c4"]!.GetAttribute("data-origin"));
+        Assert.Equal("Agent-to-agent", badgesByRow["c5"]!.TextContent);
+        Assert.Equal("a2a", badgesByRow["c5"]!.GetAttribute("data-origin"));
+    }
+
+    [Fact]
+    public void Origin_badge_carries_the_full_source_and_kind_as_hover_detail()
+    {
+        SetupConversations(Conv("c1", title: "Worker", source: "Agent", kind: "AgentSubAgent"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-origin-badge']"));
+
+        var badge = cut.Find("[data-testid='activity-origin-badge']");
+        Assert.Equal("Source: Agent \u00b7 Kind: AgentSubAgent", badge.GetAttribute("title"));
+    }
+
+    // ── Originator attribution (#3105) ──────────────────────────────────
+
+    /// <summary>
+    /// AC5: the attribution renders for cron and webhook rows and is ABSENT for a human/channel row.
+    /// Asserted as one render over a mixed set, so the negative case cannot pass merely because the
+    /// fixture had nothing to render.
+    /// </summary>
+    [Fact]
+    public void Renders_the_originator_for_scheduled_and_webhook_rows_and_not_for_a_human_row()
+    {
+        SetupConversations(
+            Conv("c1", title: "Jon DM"),
+            Conv("c2", title: "Nightly", source: "Cron", sourceId: "daily-log-analysis"),
+            Conv("c3", title: "Hook", source: "Webhook", sourceId: "wh_farnsworth_1"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Equal(3, cut.FindAll("[data-testid='activity-row']").Count));
+
+        var byRow = cut.FindAll("[data-testid='activity-row']")
+            .ToDictionary(
+                r => r.GetAttribute("data-conversation-id")!,
+                r => r.QuerySelector("[data-testid='activity-source-id']"));
+
+        Assert.Null(byRow["c1"]);
+        Assert.Equal("daily-log-analysis", byRow["c2"]!.TextContent);
+        Assert.Equal("wh_farnsworth_1", byRow["c3"]!.TextContent);
+    }
+
+    /// <summary>
+    /// AC6: the full untruncated originator is reachable as hover detail on the EXISTING origin
+    /// badge, rather than as a second hover target. Uses an over-long id so the assertion also
+    /// proves the tooltip carries the raw value and not the elided label.
+    /// </summary>
+    [Fact]
+    public void Origin_badge_tooltip_carries_the_untruncated_originator()
+    {
+        var id = new string('j', ActivityDashboardProjection.SourceIdDisplayLength + 10);
+        SetupConversations(Conv("c1", title: "Nightly", source: "Cron", sourceId: id));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-origin-badge']"));
+
+        var badge = cut.Find("[data-testid='activity-origin-badge']");
+        Assert.Equal($"Source: Cron \u00b7 Kind: HumanAgent \u00b7 Originator: {id}", badge.GetAttribute("title"));
+
+        // The visible label is bounded even though the tooltip is not.
+        var visible = cut.Find("[data-testid='activity-source-id']").TextContent;
+        Assert.Equal(ActivityDashboardProjection.SourceIdDisplayLength + 1, visible.Length);
+    }
+
+    /// <summary>
+    /// AC7: a row with no originator renders exactly as it did before #3105 - no attribution element,
+    /// and an origin tooltip unchanged from the pre-existing <c>(source, kind)</c> pair. This is the
+    /// no-regression clause, and it is why the tooltip is gated on the label rather than on the raw id.
+    /// </summary>
+    [Fact]
+    public void An_unattributed_scheduled_row_is_unchanged_from_before()
+    {
+        SetupConversations(Conv("c1", title: "Nightly", source: "Cron"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-origin-badge']"));
+
+        Assert.Empty(cut.FindAll("[data-testid='activity-source-id']"));
+        Assert.Equal(
+            "Source: Cron \u00b7 Kind: HumanAgent",
+            cut.Find("[data-testid='activity-origin-badge']").GetAttribute("title"));
+    }
+
+    // ── Title truncation and derived labels (#2528) ────────────────────────
+
+    private const string RoutingId =
+        "servicebus:a:1lexPcP4_GMPlgVVbjGrdGzyqu_vhKl8pYMbpdTsQtXOvY1lWpznwGCftUS0BRbXu4Bu3TbCzOO5xGw7E4sRVj9w1J1";
+
+    [Fact]
+    public void Table_is_wrapped_in_a_horizontally_scrollable_container()
+    {
+        SetupConversations(Conv("c1", title: "Chat"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-row']"));
+
+        var scroller = cut.Find("[data-testid='activity-table-scroll']");
+        Assert.NotNull(scroller.QuerySelector("[data-testid='activity-table']"));
+    }
+
+    [Fact]
+    public void Row_with_a_raw_routing_id_as_title_renders_a_derived_label_not_the_raw_token()
+    {
+        SetupConversations(Conv("c1", agentId: "farnsworth", title: RoutingId));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-row']"));
+
+        var title = cut.Find(".activity-conversation-title");
+        Assert.NotEqual(RoutingId, title.TextContent);
+        Assert.Contains("farnsworth", title.TextContent, StringComparison.Ordinal);
+        Assert.StartsWith("servicebus", title.TextContent, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Long_title_is_complete_in_the_dom_and_the_full_value_is_available_on_hover()
+    {
+        var longTitle = string.Join(" ", Enumerable.Repeat("verbose", 200));
+        SetupConversations(Conv("c1", title: longTitle));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-row']"));
+
+        var title = cut.Find(".activity-conversation-title");
+        Assert.Equal(longTitle, title.TextContent);
+        Assert.Equal(longTitle, title.GetAttribute("title"));
+    }
+
+    [Fact]
+    public void Origin_badge_survives_alongside_a_truncated_title()
+    {
+        SetupConversations(Conv("c1", agentId: "farnsworth", title: RoutingId, source: "Webhook"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-row']"));
+
+        var cell = cut.Find(".activity-cell-title");
+        Assert.NotNull(cell.QuerySelector(".activity-conversation-title"));
+        Assert.Equal("Webhook", cell.QuerySelector("[data-testid='activity-origin-badge']")!.TextContent);
+    }
+    // ── Origin facet interaction (#2385) ───────────────────────────────────
+
+    private void SetupOriginMix() =>
+        SetupConversations(
+            Conv("c1", title: "Jon DM"),
+            Conv("c2", title: "Inbound hook", source: "Webhook"),
+            Conv("c3", title: "Worker", source: "Agent", kind: "AgentSubAgent"),
+            Conv("c4", title: "Peer", source: "Agent", kind: "AgentAgent"),
+            Conv("c5", title: "Self start", source: "Agent"));
+
+    [Fact]
+    public void Origin_filter_control_is_rendered_and_defaults_to_all()
+    {
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        var select = cut.Find("[data-testid='activity-filter-origin']");
+        Assert.Equal(nameof(ActivityOriginFilter.All), select.GetAttribute("value"));
+    }
+
+    [Fact]
+    public void Selecting_an_origin_narrows_the_table_to_that_origin_only()
+    {
+        SetupOriginMix();
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(5, cut.FindAll("[data-testid='activity-row']").Count));
+
+        cut.Find("[data-testid='activity-filter-origin']")
+           .Change(nameof(ActivityOriginFilter.Webhook));
+
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+        var row = cut.Find("[data-testid='activity-row']");
+        Assert.Equal("c2", row.GetAttribute("data-conversation-id"));
+        Assert.Equal("webhook", row.QuerySelector("[data-testid='activity-origin-badge']")!.GetAttribute("data-origin"));
+        Assert.DoesNotContain("Jon DM", cut.Markup);
+    }
+
+    [Fact]
+    public void Selecting_the_sub_agent_origin_excludes_the_peer_agent_row()
+    {
+        SetupOriginMix();
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(5, cut.FindAll("[data-testid='activity-row']").Count));
+
+        cut.Find("[data-testid='activity-filter-origin']")
+           .Change(nameof(ActivityOriginFilter.SubAgent));
+
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+        Assert.Equal("c3", cut.Find("[data-testid='activity-row']").GetAttribute("data-conversation-id"));
+        Assert.DoesNotContain("Peer", cut.Markup);
+    }
+
+    /// <summary>
+    /// The unbadged human/channel origin is still selectable: "no badge" is a real origin, not an
+    /// absence the filter bar cannot express.
+    /// </summary>
+    [Fact]
+    public void Selecting_the_human_origin_keeps_only_the_unbadged_rows()
+    {
+        SetupOriginMix();
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(5, cut.FindAll("[data-testid='activity-row']").Count));
+
+        cut.Find("[data-testid='activity-filter-origin']")
+           .Change(nameof(ActivityOriginFilter.Human));
+
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+        Assert.Empty(cut.FindAll("[data-testid='activity-origin-badge']"));
+        Assert.Contains("Jon DM", cut.Markup);
+    }
+
+    [Fact]
+    public void Origin_filter_with_no_matches_shows_the_empty_state()
+    {
+        SetupConversations(Conv("c1", title: "Jon DM"));
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+
+        cut.Find("[data-testid='activity-filter-origin']")
+           .Change(nameof(ActivityOriginFilter.Webhook));
+
+        cut.WaitForAssertion(() => cut.Find("[data-testid='activity-empty']"));
+        Assert.Empty(cut.FindAll("[data-testid='activity-row']"));
+    }
+
+    /// <summary>
+    /// Origin composes with the cron toggle rather than overriding it: the scheduled origin shows
+    /// nothing until cron is revealed, mirroring the projection contract.
+    /// </summary>
+    [Fact]
+    public void Origin_scheduled_composes_with_the_cron_toggle()
+    {
+        SetupConversations(
+            Conv("c1", title: "Jon DM"),
+            Conv("c2", title: "Nightly run", source: "Cron"));
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+
+        cut.Find("[data-testid='activity-filter-origin']")
+           .Change(nameof(ActivityOriginFilter.Scheduled));
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll("[data-testid='activity-row']")));
+
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+        Assert.Equal("c2", cut.Find("[data-testid='activity-row']").GetAttribute("data-conversation-id"));
+    }
+
+    /// <summary>
+    /// The conversations stat card resets every facet, including the new one - a filter the reset
+    /// affordance cannot clear is a trap.
+    /// </summary>
+    [Fact]
+    public void Clearing_filters_resets_the_origin_facet_too()
+    {
+        SetupOriginMix();
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(5, cut.FindAll("[data-testid='activity-row']").Count));
+
+        cut.Find("[data-testid='activity-filter-origin']")
+           .Change(nameof(ActivityOriginFilter.Webhook));
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+
+        cut.Find("[data-testid='activity-summary-conversations']").Click();
+
+        cut.WaitForAssertion(() => Assert.Equal(5, cut.FindAll("[data-testid='activity-row']").Count));
+        Assert.Equal(nameof(ActivityOriginFilter.All),
+            cut.Find("[data-testid='activity-filter-origin']").GetAttribute("value"));
+    }
+
+    // ---- Pin state (#2619) ------------------------------------------------
+
+    private static ConversationSummaryDto PinnedConv(
+        string id,
+        bool isPinned,
+        DateTimeOffset updatedAt,
+        string title = "Chat") =>
+        new(id, "alpha", title, false, "Active", null, 0,
+            updatedAt.AddMinutes(-5), updatedAt, Kind: "HumanAgent", Source: "Channel",
+            IsPinned: isPinned, PinnedAt: isPinned ? updatedAt : null, Participants: null);
+
+    /// <summary>
+    /// AC4: the pin indicator renders in the pinned row's DOM and is absent from the unpinned row's
+    /// DOM. Scoped per row rather than to the whole markup so the filter chrome cannot satisfy it.
+    /// </summary>
+    [Fact]
+    public void Pin_indicator_renders_on_pinned_rows_only()
+    {
+        var now = DateTimeOffset.UtcNow;
+        SetupConversations(
+            PinnedConv("pinned", isPinned: true, updatedAt: now.AddHours(-4), title: "Pinned chat"),
+            PinnedConv("loose", isPinned: false, updatedAt: now, title: "Loose chat"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+
+        var rows = cut.FindAll("[data-testid='activity-row']");
+        var pinnedRow = rows.Single(r => r.GetAttribute("data-conversation-id") == "pinned");
+        var looseRow = rows.Single(r => r.GetAttribute("data-conversation-id") == "loose");
+
+        Assert.Single(pinnedRow.QuerySelectorAll("[data-testid='activity-pin-badge']"));
+        Assert.Empty(looseRow.QuerySelectorAll("[data-testid='activity-pin-badge']"));
+        Assert.Contains("activity-row-pinned", pinnedRow.GetAttribute("class"));
+        Assert.DoesNotContain("activity-row-pinned", looseRow.GetAttribute("class") ?? string.Empty);
+    }
+
+    /// <summary>
+    /// AC2 at the rendered-DOM layer: the pinned row is painted above a newer unpinned row.
+    /// </summary>
+    [Fact]
+    public void Pinned_row_renders_above_a_newer_unpinned_row()
+    {
+        var now = DateTimeOffset.UtcNow;
+        SetupConversations(
+            PinnedConv("loose", isPinned: false, updatedAt: now),
+            PinnedConv("pinned", isPinned: true, updatedAt: now.AddDays(-3)));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-recency']").Change("Any");
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+
+        Assert.Equal(new[] { "pinned", "loose" }, RowIds(cut));
+    }
+
+    /// <summary>The pin facet is present in the filter bar and defaults to the inert All choice.</summary>
+    [Fact]
+    public void Renders_pin_filter_defaulted_to_all()
+    {
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        var select = cut.Find("[data-testid='activity-filter-pinned']");
+        Assert.Equal(nameof(ActivityPinFilter.All), select.GetAttribute("value"));
+    }
+
+    /// <summary>
+    /// AC5 at the DOM layer: selecting the pinned facet narrows the table to the pinned rows, and it
+    /// composes with the cron toggle rather than overriding it.
+    /// </summary>
+    [Fact]
+    public void Pin_filter_narrows_the_table_and_composes_with_cron()
+    {
+        var now = DateTimeOffset.UtcNow;
+        SetupConversations(
+            PinnedConv("pinned", isPinned: true, updatedAt: now),
+            PinnedConv("loose", isPinned: false, updatedAt: now),
+            new("pinned-cron", "alpha", "Cron chat", false, "Active", null, 0,
+                now.AddMinutes(-5), now, Kind: "HumanAgent", Source: "Cron",
+                IsPinned: true, PinnedAt: now, Participants: null));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+
+        cut.Find("[data-testid='activity-filter-pinned']").Change(nameof(ActivityPinFilter.Pinned));
+        cut.WaitForAssertion(() => Assert.Equal(new[] { "pinned" }, RowIds(cut)));
+
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+        Assert.Contains("pinned-cron", RowIds(cut));
+        Assert.DoesNotContain("loose", RowIds(cut));
+    }
+
+    /// <summary>Clearing filters must reset the pin facet too - a filter reset cannot miss one.</summary>
+    [Fact]
+    public void Clearing_filters_resets_the_pin_facet_too()
+    {
+        var now = DateTimeOffset.UtcNow;
+        SetupConversations(
+            PinnedConv("pinned", isPinned: true, updatedAt: now),
+            PinnedConv("loose", isPinned: false, updatedAt: now));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+
+        cut.Find("[data-testid='activity-filter-pinned']").Change(nameof(ActivityPinFilter.Pinned));
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+
+        cut.Find("[data-testid='activity-summary-conversations']").Click();
+
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+        Assert.Equal(nameof(ActivityPinFilter.All),
+            cut.Find("[data-testid='activity-filter-pinned']").GetAttribute("value"));
+    }
+
+    // ── Visibility (#2692) ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// AC6: the rendered DOM contains no row for an InternalHidden conversation. Keyed on the row's
+    /// conversation id rather than a title substring, so unrelated copy cannot satisfy it.
+    /// </summary>
+    [Fact]
+    public void Internal_hidden_conversation_is_not_rendered()
+    {
+        SetupConversations(
+            Conv("c1", title: "Visible"),
+            Conv("h1", title: "Bookkeeping", visibility: "InternalHidden"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+        Assert.Equal(new[] { "c1" }, RowIds(cut));
+        Assert.DoesNotContain("Bookkeeping", cut.Find("[data-testid='activity-table']").TextContent);
+    }
+
+    /// <summary>
+    /// AC3/AC6: an InspectableReadOnly conversation IS rendered and carries the read-only marker,
+    /// while a UserFacing row stays unmarked so the marker carries signal.
+    /// </summary>
+    [Fact]
+    public void Inspectable_read_only_conversation_is_rendered_with_read_only_badge()
+    {
+        SetupConversations(
+            Conv("c1", title: "Mine"),
+            Conv("r1", title: "Observed", visibility: "InspectableReadOnly"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
+        Assert.Contains("r1", RowIds(cut));
+
+        var badges = cut.FindAll("[data-testid='activity-readonly-badge']");
+        var badge = Assert.Single(badges);
+        Assert.Contains("activity-badge", badge.GetAttribute("class"));
+        Assert.Contains("Read-only", badge.TextContent);
+
+        var readOnlyRow = cut.FindAll("[data-testid='activity-row']")
+            .Single(r => r.GetAttribute("data-conversation-id") == "r1");
+        Assert.Single(readOnlyRow.QuerySelectorAll("[data-testid='activity-readonly-badge']"));
+
+        var userFacingRow = cut.FindAll("[data-testid='activity-row']")
+            .Single(r => r.GetAttribute("data-conversation-id") == "c1");
+        Assert.Empty(userFacingRow.QuerySelectorAll("[data-testid='activity-readonly-badge']"));
+    }
+    // ---- #1888/#3713: live (running-session) surface ----------------------
+
+    [Fact]
+    public void Session_roster_controls_badges_count_and_live_idle_filters()
+    {
+        SetupConversations(
+            Conv("active", activeSessionId: "s-active"),
+            Conv("sealed", activeSessionId: "s-sealed"),
+            Conv("expired", activeSessionId: "s-expired"),
+            Conv("absent", activeSessionId: "s-absent"));
+        SetupSessions(
+            ("s-active", "Active"),
+            ("s-sealed", "Sealed"),
+            ("s-expired", "Expired"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 4);
+
+        Assert.Equal("1", cut.Find("[data-testid='activity-summary-live'] .activity-summary-value").TextContent.Trim());
+        var badge = Assert.Single(cut.FindAll("[data-testid='activity-live-badge']"));
+        Assert.Equal("s-active", badge.Closest("[data-testid='activity-row']")?.GetAttribute("data-session-id"));
+
+        cut.Find("[data-testid='activity-filter-live']").Change(nameof(ActivityLiveFilter.Live));
+        cut.WaitForState(() => RowIds(cut).SequenceEqual(new[] { "active" }));
+
+        cut.Find("[data-testid='activity-filter-live']").Change(nameof(ActivityLiveFilter.Idle));
+        cut.WaitForState(() => RowIds(cut).OrderBy(id => id, StringComparer.Ordinal)
+            .SequenceEqual(new[] { "absent", "expired", "sealed" }));
+    }
+
+    [Fact]
+    public void Empty_successful_roster_treats_an_unknown_pointer_as_idle()
+    {
+        SetupConversations(Conv("absent", activeSessionId: "s-absent"));
+        SetupSessions();
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+
+        Assert.Empty(cut.FindAll("[data-testid='activity-live-badge']"));
+        Assert.Equal("0", cut.Find("[data-testid='activity-summary-live'] .activity-summary-value").TextContent.Trim());
+    }
+
+    [Fact]
+    public void Stopped_session_pointer_remains_inspectable_without_a_live_badge()
+    {
+        SetupConversations(Conv("sealed", activeSessionId: "s-sealed"));
+        SetupSessions(("s-sealed", "Sealed"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+
+        var row = cut.Find("[data-testid='activity-row']");
+        Assert.Empty(row.QuerySelectorAll("[data-testid='activity-live-badge']"));
+        Assert.Equal("s-sealed", row.GetAttribute("data-session-id"));
+        Assert.Contains("s-sealed", row.GetAttribute("title"));
+    }
+
+    [Fact]
+    public void Failed_session_roster_preserves_compatibility_liveness()
+    {
+        SetupConversations(Conv("running", activeSessionId: "s-unknown"));
+        _rest.GetSessionsAsync(
+                Arg.Any<string?>(),
+                Arg.Any<int?>(),
+                Arg.Any<int>(),
+                Arg.Any<string?>(),
+                Arg.Any<CancellationToken>())
+            .Returns<Task<SessionPageDto>>(_ => throw new HttpRequestException("session roster unavailable"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+
+        Assert.Single(cut.FindAll("[data-testid='activity-live-badge']"));
+        Assert.Equal("1", cut.Find("[data-testid='activity-summary-live'] .activity-summary-value").TextContent.Trim());
+        Assert.Empty(cut.FindAll("[data-testid='activity-error']"));
+    }
+
+    /// <summary>
+    /// A conversation with a running session renders the live badge; an idle one does not, so the
+    /// badge carries signal rather than decorating every row.
+    /// </summary>
+    [Fact]
+    public void Running_conversation_renders_a_live_badge_and_idle_one_does_not()
+    {
+        SetupConversations(
+            Conv("c1", title: "Running", activeSessionId: "sess-1"),
+            Conv("c2", title: "Parked"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
+
+        var badge = Assert.Single(cut.FindAll("[data-testid='activity-live-badge']"));
+        Assert.Contains("activity-badge", badge.GetAttribute("class"));
+        Assert.Contains("Live", badge.TextContent);
+        Assert.Contains("sess-1", badge.GetAttribute("title"));
+
+        var liveRow = cut.FindAll("[data-testid='activity-row']")
+            .Single(r => r.GetAttribute("data-conversation-id") == "c1");
+        Assert.Contains("activity-row-live", liveRow.GetAttribute("class"));
+
+        var idleRow = cut.FindAll("[data-testid='activity-row']")
+            .Single(r => r.GetAttribute("data-conversation-id") == "c2");
+        Assert.Empty(idleRow.QuerySelectorAll("[data-testid='activity-live-badge']"));
+        Assert.DoesNotContain("activity-row-live", idleRow.GetAttribute("class"));
+    }
+
+    /// <summary>
+    /// The live stat card counts exactly the rows carrying the live badge - the strip and the table
+    /// read the same derivation, so they cannot disagree.
+    /// </summary>
+    [Fact]
+    public void Live_stat_card_counts_the_rows_that_carry_the_live_badge()
+    {
+        SetupConversations(
+            Conv("c1", activeSessionId: "s1"),
+            Conv("c2", activeSessionId: "s2"),
+            Conv("c3"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 3);
+
+        var card = cut.Find("[data-testid='activity-summary-live']");
+        Assert.Equal("2", card.QuerySelector(".activity-summary-value")!.TextContent.Trim());
+        Assert.Equal(2, cut.FindAll("[data-testid='activity-live-badge']").Count);
+    }
+
+    /// <summary>
+    /// Clicking the live stat card narrows the table to exactly the rows it counted, and clicking
+    /// again clears the facet - the same toggle affordance the scheduled card has.
+    /// </summary>
+    [Fact]
+    public void Clicking_live_stat_card_toggles_the_live_filter()
+    {
+        SetupConversations(
+            Conv("c1", activeSessionId: "s1"),
+            Conv("c2"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
+
+        // Blazor omits a bool-bound attribute when false, so "not pressed" is the ABSENCE of
+        // aria-pressed - the same rendering the existing scheduled card produces.
+        var card = cut.Find("[data-testid='activity-summary-live']");
+        Assert.Null(card.GetAttribute("aria-pressed"));
+        Assert.DoesNotContain("active", card.GetAttribute("class"));
+
+        card.Click();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+        Assert.Equal(new[] { "c1" }, RowIds(cut));
+        Assert.Contains("active", cut.Find("[data-testid='activity-summary-live']").GetAttribute("class"));
+        // Blazor renders a true bool attribute as valueless, so "pressed" is its PRESENCE.
+        Assert.NotNull(cut.Find("[data-testid='activity-summary-live']").GetAttribute("aria-pressed"));
+
+        cut.Find("[data-testid='activity-summary-live']").Click();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
+    }
+
+    /// <summary>
+    /// The live facet is also reachable from the filter bar, including the Idle complement the stat
+    /// card deliberately never lands on.
+    /// </summary>
+    [Fact]
+    public void Live_filter_select_applies_live_and_idle_facets()
+    {
+        SetupConversations(
+            Conv("c1", activeSessionId: "s1"),
+            Conv("c2"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
+
+        var select = cut.Find("[data-testid='activity-filter-live']");
+        select.Change(nameof(ActivityLiveFilter.Idle));
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+        Assert.Equal(new[] { "c2" }, RowIds(cut));
+
+        cut.Find("[data-testid='activity-filter-live']").Change(nameof(ActivityLiveFilter.Live));
+        cut.WaitForState(() => RowIds(cut).SequenceEqual(new[] { "c1" }));
+    }
+
+    // ── #3204: author-stated purpose ───────────────────────────────────────
+
+    /// <summary>
+    /// AC5: a row whose author stated a purpose renders exactly one purpose element carrying the
+    /// bounded label, with the untruncated original preserved on <c>title</c> for hover.
+    /// </summary>
+    [Fact]
+    public void A_row_with_a_purpose_renders_it_with_the_full_value_on_hover()
+    {
+        SetupConversations(Conv("c1", purpose: "Track the Q3 migration rollout"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 1);
+
+        var purposes = cut.FindAll("[data-testid='activity-purpose']");
+        Assert.Single(purposes);
+        Assert.Equal("Track the Q3 migration rollout", purposes[0].TextContent.Trim());
+        Assert.Equal("Track the Q3 migration rollout", purposes[0].GetAttribute("title"));
+    }
+
+    /// <summary>
+    /// AC5 (complement): a row with no stated purpose renders ZERO purpose elements, so the
+    /// overwhelmingly common row is byte-identical to how it rendered before #3204. Without this
+    /// pin an implementation that always emitted an empty element would still satisfy the positive
+    /// case.
+    /// </summary>
+    [Fact]
+    public void A_row_without_a_purpose_renders_no_purpose_element()
+    {
+        SetupConversations(Conv("c1"), Conv("c2", purpose: "   "));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-row']").Count == 2);
+
+        Assert.Empty(cut.FindAll("[data-testid='activity-purpose']"));
+    }
+
+    /// <summary>
+    /// AC5: a purpose over the display bound reaches the DOM elided, while the full text stays on
+    /// <c>title</c>. This is the pin that makes the cap structural rather than cosmetic - a CSS-only
+    /// ellipsis would leave the whole string in the DOM and pass every other clause.
+    /// </summary>
+    [Fact]
+    public void A_long_purpose_reaches_the_dom_elided_with_the_full_text_on_hover()
+    {
+        var purpose = new string('p', ActivityDashboardProjection.PurposeDisplayLength + 40);
+        SetupConversations(Conv("c1", purpose: purpose));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-purpose']").Count == 1);
+
+        var element = cut.Find("[data-testid='activity-purpose']");
+        Assert.Equal(
+            ActivityDashboardProjection.PurposeDisplayLength + 1,
+            element.TextContent.Trim().Length);
+        Assert.Equal(purpose, element.GetAttribute("title"));
+    }
+
+    /// <summary>
+    /// AC6: purpose is prose, not a classifier, so it must NOT wear the badge idiom. Pinning the
+    /// absence of <c>activity-badge</c> is what stops a later contributor from "tidying" it into the
+    /// badge row, which is precisely what would destroy the badges' scannability.
+    /// </summary>
+    [Fact]
+    public void The_purpose_element_is_not_a_badge()
+    {
+        SetupConversations(Conv("c1", purpose: "Track the Q3 migration rollout"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.WaitForState(() => cut.FindAll("[data-testid='activity-purpose']").Count == 1);
+
+        var element = cut.Find("[data-testid='activity-purpose']");
+        Assert.Contains("activity-purpose", element.GetAttribute("class"));
+        Assert.DoesNotContain("activity-badge", element.GetAttribute("class"));
+    }
+
+    // ── Cron job health (#3421) ──────────────────────────────────────────
+
+    /// <summary>
+    /// Stub handler so the component test can register a REAL <see cref="CronApiClient"/> - the type
+    /// is a concrete class over <see cref="HttpClient"/> with no interface, so the seam is the
+    /// transport, not the client. Serving canned JSON keeps the test exercising the client's own
+    /// deserialisation rather than a hand-built double that could drift from it.
+    /// </summary>
+    private sealed class StubCronHandler(string json, bool fail) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (fail)
+                throw new HttpRequestException("cron api unavailable");
+
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+            });
+        }
+    }
+
+    private void SetupCronJobs(string json, bool fail = false)
+    {
+        var http = new HttpClient(new StubCronHandler(json, fail))
+        {
+            BaseAddress = new Uri("http://localhost")
+        };
+        _ctx.Services.AddSingleton(new CronApiClient(http));
+    }
+
+    /// <summary>
+    /// AC7: a scheduled row whose job id resolves renders the job's NAME in the attribution slot and
+    /// a health dot beside it, while the raw id stays reachable in hover detail. Asserted together
+    /// because "resolved the name" and "did not lose the id" are the two halves of one contract.
+    /// </summary>
+    [Fact]
+    public void Renders_the_resolved_cron_job_name_and_a_health_dot()
+    {
+        SetupConversations(Conv("c1", title: "Nightly", source: "Cron", sourceId: "j1"));
+        SetupCronJobs("""[{"id":"j1","name":"Nightly digest","lastRunStatus":"failed"}]""");
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+
+        cut.WaitForAssertion(() =>
+            Assert.Equal("Nightly digest", cut.Find("[data-testid='activity-source-id']").TextContent));
+
+        var dot = cut.Find("[data-testid='activity-cron-health']");
+        Assert.Equal("failed", dot.GetAttribute("data-health"));
+
+        // The dot is colour-only visually, so its accessible text must carry the same claim.
+        Assert.Contains("Nightly digest", dot.GetAttribute("aria-label"), StringComparison.Ordinal);
+        Assert.Contains("failed", dot.GetAttribute("aria-label"), StringComparison.Ordinal);
+
+        // Resolving the name must not lose the id - it stays in the attribution's hover detail.
+        Assert.Contains(
+            "j1",
+            cut.Find("[data-testid='activity-source-id']").GetAttribute("title"),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Failed_cron_health_tooltip_includes_bounded_reason_and_job_id_without_visible_prose()
+    {
+        var longLine = new string('x', ActivityDashboardProjection.CronErrorDisplayLength + 20);
+        SetupConversations(Conv("c1", title: "Nightly", source: "Cron", sourceId: "j1"));
+        SetupCronJobs($$"""[{"id":"j1","name":"Nightly digest","lastRunStatus":"failed","lastRunError":"  {{longLine}}\nstack trace"}]""");
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-cron-health']")));
+
+        var dot = cut.Find("[data-testid='activity-cron-health']");
+        var title = dot.GetAttribute("title");
+        Assert.NotNull(title);
+        Assert.Contains("Job id: j1", title, StringComparison.Ordinal);
+        Assert.Contains($"Error: {new string('x', ActivityDashboardProjection.CronErrorDisplayLength)}\u2026", title, StringComparison.Ordinal);
+        Assert.DoesNotContain("stack trace", title, StringComparison.Ordinal);
+        Assert.DoesNotContain('\n', title);
+        Assert.DoesNotContain(longLine, cut.Markup, StringComparison.Ordinal);
+        Assert.Empty(cut.FindAll("[data-testid='activity-cron-error']"));
+    }
+
+    [Theory]
+    [InlineData("ok")]
+    [InlineData(null)]
+    public void Nonfailed_cron_health_tooltip_suppresses_stale_error(string? status)
+    {
+        var statusJson = status is null ? "null" : $"\"{status}\"";
+        SetupConversations(Conv("c1", title: "Nightly", source: "Cron", sourceId: "j1"));
+        SetupCronJobs($$"""[{"id":"j1","lastRunStatus":{{statusJson}},"lastRunError":"stale failure"}]""");
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-cron-health']")));
+
+        Assert.DoesNotContain("stale failure", cut.Find("[data-testid='activity-cron-health']").GetAttribute("title"), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Expired_and_disabled_jobs_override_ok_without_losing_last_run_outcome()
+    {
+        SetupConversations(
+            Conv("c-expired", title: "Expired", source: "Cron", sourceId: "expired"),
+            Conv("c-disabled", title: "Disabled", source: "Cron", sourceId: "disabled"),
+            Conv("c-live", title: "Live", source: "Cron", sourceId: "live"));
+        SetupCronJobs("""
+            [
+              {"id":"expired","name":"Expired job","enabled":true,"expiresAt":"2000-01-01T00:00:00Z","lastRunStatus":"ok"},
+              {"id":"disabled","name":"Disabled job","enabled":false,"expiresAt":"2999-01-01T00:00:00Z","lastRunStatus":"ok"},
+              {"id":"live","name":"Live job","enabled":true,"lastRunStatus":"ok"}
+            ]
+            """);
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Equal(3, cut.FindAll("[data-testid='activity-cron-health']").Count));
+
+        var dots = cut.FindAll("[data-testid='activity-cron-health']")
+            .ToDictionary(dot => dot.GetAttribute("data-health")!, dot => dot);
+
+        Assert.Contains("expired", dots.Keys);
+        Assert.Contains("disabled", dots.Keys);
+        Assert.Contains("ok", dots.Keys);
+        Assert.DoesNotContain("activity-cron-health--ok", dots["expired"].GetAttribute("class"));
+        Assert.Contains("Last run status: ok", dots["expired"].GetAttribute("title"), StringComparison.Ordinal);
+        Assert.Contains("Expired:", dots["expired"].GetAttribute("title"), StringComparison.Ordinal);
+        Assert.Contains("Last run status: ok", dots["disabled"].GetAttribute("title"), StringComparison.Ordinal);
+        Assert.Contains("Disabled", dots["disabled"].GetAttribute("title"), StringComparison.Ordinal);
+        Assert.DoesNotContain("System", cut.Markup, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// AC7: a row whose job id resolves to nothing renders NO health element and keeps showing the
+    /// raw id - i.e. exactly its pre-#3421 rendering. Asserted in the same render as a resolving
+    /// row so the negative cannot pass merely because the fixture had nothing to render.
+    /// </summary>
+    [Fact]
+    public void Renders_no_health_element_for_a_row_whose_job_is_unknown()
+    {
+        SetupConversations(
+            Conv("c1", title: "Known", source: "Cron", sourceId: "j1"),
+            Conv("c2", title: "Unknown", source: "Cron", sourceId: "ghost"));
+        SetupCronJobs("""[{"id":"j1","name":"Nightly digest","lastRunStatus":"ok"}]""");
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Equal(2, cut.FindAll("[data-testid='activity-row']").Count));
+
+        cut.WaitForAssertion(() =>
+            Assert.Single(cut.FindAll("[data-testid='activity-cron-health']")));
+
+        var byRow = cut.FindAll("[data-testid='activity-row']")
+            .ToDictionary(
+                r => r.GetAttribute("data-conversation-id")!,
+                r => r);
+
+        Assert.NotNull(byRow["c1"].QuerySelector("[data-testid='activity-cron-health']"));
+        Assert.Null(byRow["c2"].QuerySelector("[data-testid='activity-cron-health']"));
+
+        // The unresolved row still shows its raw id, unchanged from before this shipped.
+        Assert.Equal(
+            "ghost",
+            byRow["c2"].QuerySelector("[data-testid='activity-source-id']")!.TextContent);
+    }
+
+    /// <summary>
+    /// AC8: a failed cron fetch must degrade, not break. The table still renders every row, the raw
+    /// id attribution is untouched, and no health element appears anywhere - asserted against the
+    /// live DOM rather than inferred from the projection, because the failure being guarded is the
+    /// component throwing out of its load path.
+    /// </summary>
+    [Fact]
+    public void A_failed_cron_fetch_leaves_the_dashboard_rendering_exactly_as_before()
+    {
+        SetupConversations(Conv("c1", title: "Nightly", source: "Cron", sourceId: "j1"));
+        SetupCronJobs("[]", fail: true);
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+
+        Assert.Empty(cut.FindAll("[data-testid='activity-cron-health']"));
+        Assert.Equal("j1", cut.Find("[data-testid='activity-source-id']").TextContent);
+        Assert.Empty(cut.FindAll("[data-testid='activity-error']"));
+    }
+
+    /// <summary>
+    /// A host that never registered the cron client must render the dashboard unchanged rather than
+    /// throwing at construction. Pins the optional-resolution decision: every pre-existing fixture in
+    /// this class relies on it, so a regression to a hard <c>@inject</c> would fail broadly and
+    /// confusingly - this test names the reason.
+    /// </summary>
+    [Fact]
+    public void Renders_without_a_registered_cron_client()
+    {
+        SetupConversations(Conv("c1", title: "Nightly", source: "Cron", sourceId: "j1"));
+
+        var cut = _ctx.Render<ActivityDashboard>();
+        cut.Find("[data-testid='activity-filter-cron']").Click();
+        cut.WaitForAssertion(() => Assert.Single(cut.FindAll("[data-testid='activity-row']")));
+
+        Assert.Empty(cut.FindAll("[data-testid='activity-cron-health']"));
+        Assert.Equal("j1", cut.Find("[data-testid='activity-source-id']").TextContent);
     }
 }

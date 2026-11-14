@@ -84,6 +84,9 @@ public sealed class GatewayHubConnection : IAsyncDisposable
     /// <summary>Raised when a conversation is created, updated, or archived on the server.</summary>
     public event Action<ConversationChangedPayload>? OnConversationChanged;
 
+    /// <summary>Raised when this reader's durable cursor advances on any connected device.</summary>
+    public event Action<ConversationReadStateChangedPayload>? OnConversationReadStateChanged;
+
     /// <summary>Raised when agent configuration changes on the server (add/update/delete).</summary>
     public event Action<AgentsChangedPayload>? OnAgentsChanged;
 
@@ -97,6 +100,13 @@ public sealed class GatewayHubConnection : IAsyncDisposable
 
     /// <summary>Raised when the connection is closed (after reconnect exhaustion or explicit stop).</summary>
     public event Action? OnDisconnected;
+
+    /// <summary>
+    /// Test seam (#2625): raises <see cref="OnDisconnected"/> without a live transport, so the
+    /// handler-accumulation behaviour of the rebuild path's wiring can be asserted without a
+    /// reachable gateway to negotiate against. Internal -- not part of the client surface.
+    /// </summary>
+    internal void RaiseOnDisconnectedForTest() => OnDisconnected?.Invoke();
 
     // ── State ───────────────────────────────────────────────────────────
 
@@ -112,7 +122,7 @@ public sealed class GatewayHubConnection : IAsyncDisposable
     /// Builds a new <see cref="HubConnection"/>, registers all event handlers,
     /// and starts the connection.
     /// </summary>
-    /// <param name="hubUrl">Absolute URL of the Gateway hub (e.g. <c>https://localhost:5000/hub/gateway</c>).</param>
+    /// <param name="hubUrl">Absolute URL of the Gateway hub (e.g. <c>http://localhost:5005/hub/gateway</c>).</param>
     /// <param name="clientKind">
     /// The connecting client kind ("desktop" or "mobile"). Appended as a <c>client</c> query
     /// parameter so the gateway can distinguish device classes per connection (#1209).
@@ -175,13 +185,42 @@ public sealed class GatewayHubConnection : IAsyncDisposable
         _connection.On<string, string, object?>("CanvasStateChanged", (conversationId, key, value) => OnCanvasStateChanged?.Invoke(conversationId, key, value));
         _connection.On<string, string, string?>("TodoUpdated", (agentId, conversationId, todoJson) => OnTodoUpdated?.Invoke(agentId, conversationId, todoJson));
         _connection.On<AgentsChangedPayload>("AgentsChanged", p => OnAgentsChanged?.Invoke(p));
+        _connection.On<ConversationReadStateChangedPayload>("ConversationReadStateChanged", p => OnConversationReadStateChanged?.Invoke(p));
                 _connection.On<ConversationChangedPayload>("ConversationChanged", p => OnConversationChanged?.Invoke(p));
 
         _connection.Reconnecting += _ => { OnReconnecting?.Invoke(); return Task.CompletedTask; };
         _connection.Reconnected += _ => { OnReconnected?.Invoke(); return Task.CompletedTask; };
         _connection.Closed += _ => { OnDisconnected?.Invoke(); return Task.CompletedTask; };
 
-        await _connection.StartAsync();
+        // #2625: a HubConnection whose StartAsync never succeeded is inert -- SignalR only runs
+        // automatic reconnect on a connection that reached Connected at least once, so a failed
+        // start leaves an object that reports Disconnected forever and re-dials nothing. Retaining
+        // it in _connection made every subsequent recovery attempt operate on a dead handle and
+        // leaked one un-disposed transport per attempt across a multi-minute outage. Discard it and
+        // restore the no-connection state so the NEXT ConnectAsync builds cleanly from scratch and
+        // IsConnected can become true again without a page reload (AC2).
+        var pending = _connection;
+        try
+        {
+            await pending.StartAsync();
+        }
+        catch
+        {
+            _connection = null;
+            try
+            {
+                await pending.DisposeAsync();
+            }
+            catch
+            {
+                // Disposing a connection that never started can itself throw; the start failure is
+                // the one the caller needs to see, so this secondary failure is swallowed.
+            }
+
+            // Rethrown so callers (the resume path, the mobile retry loop) still treat this as a
+            // failed attempt and back off, rather than believing a connection was established.
+            throw;
+        }
     }
 
     // ── Client → Server invocations ─────────────────────────────────────
@@ -207,8 +246,22 @@ public sealed class GatewayHubConnection : IAsyncDisposable
     }
 
     /// <summary>Subscribe to all active sessions. Returns current session list.</summary>
-    public async Task<SubscribeAllResult> SubscribeAllAsync()
-        => await _connection!.InvokeAsync<SubscribeAllResult>("SubscribeAll");
+    /// <remarks>
+    /// The returned <c>Sessions</c> payload is deliberately NOT written into the client store by the
+    /// portal load paths (#2541) -- REST owns session/conversation LOAD. See
+    /// <c>PortalLoadService</c> for why. This verb is retained for its GROUP-JOINING side effect,
+    /// which is the only thing the hub is responsible for on that path.
+    /// </remarks>
+    public async Task<SubscribeAllResult> SubscribeAllAsync(CancellationToken cancellationToken = default)
+        => await _connection!.InvokeAsync<SubscribeAllResult>("SubscribeAll", cancellationToken);
+
+    /// <summary>
+    /// Joins the per-agent notification groups so this connection receives
+    /// <c>ConversationChanged</c> for the given agents only (#2541). Idempotent server-side, so it
+    /// is safe to call on every connect, reconnect and rebuild.
+    /// </summary>
+    public async Task SubscribeAgentsAsync(IReadOnlyList<string> agentIds)
+        => await _connection!.InvokeAsync("SubscribeAgents", agentIds);
 
     /// <summary>
     /// Performs a lightweight liveness round-trip against the hub (#1838). Invokes the server
@@ -267,23 +320,51 @@ public sealed class GatewayHubConnection : IAsyncDisposable
     }
 
     /// <summary>Send a message to the specified agent, optionally targeting a specific conversation.</summary>
-    public async Task<SendMessageResult> SendMessageAsync(string agentId, string channelType, string content, string? conversationId = null)
+    public async Task<SendMessageResult> SendMessageAsync(
+        string agentId,
+        string channelType,
+        string content,
+        string conversationId,
+        InboundDeliveryMode deliveryMode)
     {
-        // Hub.SendMessage now accepts an optional conversationId — no separate SendMessageToConversation method.
-        return await _connection!.InvokeAsync<SendMessageResult>("SendMessage", agentId, channelType, content, conversationId);
+        return await _connection!.InvokeAsync<SendMessageResult>(
+            "DeliverMessage", agentId, channelType, content, conversationId, deliveryMode);
     }
 
+    /// <summary>
+    /// Submits a canvas <c>submitToAgent</c> click into a specific conversation (#2449). Distinct
+    /// from <see cref="SendMessageAsync"/> so the SERVER stamps the canvas provenance kind from the
+    /// hub verb that was invoked, rather than trusting a client-supplied provenance field.
+    /// </summary>
+    public async Task<SendMessageResult> SubmitCanvasPromptAsync(string agentId, string channelType, string content, string conversationId)
+        => await _connection!.InvokeAsync<SendMessageResult>("SubmitCanvasPrompt", agentId, channelType, content, conversationId);
+
     /// <summary>Sends optional text and generic content parts to a specific conversation.</summary>
-    public async Task<SendMessageResult> SendMessageWithMediaAsync(string agentId, string channelType, string content, IReadOnlyList<MediaContentPartDto> parts, string? conversationId = null)
-        => await _connection!.InvokeAsync<SendMessageResult>("SendMessageWithMedia", agentId, channelType, content, parts, conversationId);
+    public async Task<SendMessageResult> SendMessageWithMediaAsync(
+        string agentId,
+        string channelType,
+        string content,
+        IReadOnlyList<MediaContentPartDto> parts,
+        string conversationId,
+        InboundDeliveryMode deliveryMode)
+        => await _connection!.InvokeAsync<SendMessageResult>(
+            "DeliverMessageWithMedia", agentId, channelType, content, parts, conversationId, deliveryMode);
 
     /// <summary>Steer an in-progress agent response.</summary>
     public async Task<SendMessageResult> SteerAsync(string agentId, string sessionId, string content, string? conversationId)
         => await _connection!.InvokeAsync<SendMessageResult>("Steer", agentId, sessionId, content, conversationId);
 
+    /// <summary>Steer an in-progress agent response, carrying draft attachments (#2484).</summary>
+    public async Task<SendMessageResult> SteerWithMediaAsync(string agentId, string sessionId, string content, IReadOnlyList<MediaContentPartDto> parts, string? conversationId)
+        => await _connection!.InvokeAsync<SendMessageResult>("SteerWithMedia", agentId, sessionId, content, parts, conversationId);
+
     /// <summary>Send a follow-up message into an existing session.</summary>
     public async Task FollowUpAsync(string agentId, string sessionId, string content)
         => await _connection!.InvokeAsync("FollowUp", agentId, sessionId, content);
+
+    /// <summary>Send a follow-up message carrying draft attachments (#2484).</summary>
+    public async Task FollowUpWithMediaAsync(string agentId, string sessionId, string content, IReadOnlyList<MediaContentPartDto> parts)
+        => await _connection!.InvokeAsync("FollowUpWithMedia", agentId, sessionId, content, parts);
 
     /// <summary>Abort an in-progress agent response.</summary>
     public async Task AbortAsync(string agentId, string sessionId)
@@ -293,6 +374,11 @@ public sealed class GatewayHubConnection : IAsyncDisposable
     /// <returns><c>true</c> when the interrupt was delivered to a live handle; <c>false</c> when the agent was idle.</returns>
     public async Task<bool> InterruptAndSteerAsync(string agentId, string sessionId, string message)
         => await _connection!.InvokeAsync<bool>("InterruptAndSteer", agentId, sessionId, message);
+
+    /// <summary>Atomically abort the current turn and redirect, carrying draft attachments (#2484).</summary>
+    /// <returns><c>true</c> when the interrupt was delivered to a live handle; <c>false</c> when the agent was idle.</returns>
+    public async Task<bool> InterruptAndSteerWithMediaAsync(string agentId, string sessionId, string message, IReadOnlyList<MediaContentPartDto> parts)
+        => await _connection!.InvokeAsync<bool>("InterruptAndSteerWithMedia", agentId, sessionId, message, parts);
 
     /// <summary>Reset (archive) a session and start fresh.</summary>
     public async Task ResetSessionAsync(string agentId, string sessionId)

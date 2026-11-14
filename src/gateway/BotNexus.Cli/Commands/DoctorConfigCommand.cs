@@ -1,5 +1,4 @@
 using System.CommandLine;
-using System.Text.Json.Nodes;
 using BotNexus.Cli.Commands.Doctor;
 using BotNexus.Gateway.Configuration;
 using Spectre.Console;
@@ -13,17 +12,42 @@ namespace BotNexus.Cli.Commands;
 /// </summary>
 internal sealed class DoctorConfigCommand
 {
-    /// <summary>All registered checks, evaluated in order.</summary>
-    private static readonly IReadOnlyList<IConfigCheck> Checks =
-    [
-        new ExtensionsBlockCheck(),
-        new SkillsWorldDefaultCheck(),
-        new CronCheck(),
-        new MemoryAgentDefaultCheck(),
-        new CompactionModelCheck(),
-        new CompactionModelMissingCheck(),
-        new DevOriginEnforcementCheck(),
-    ];
+    /// <summary>All registered checks, evaluated in order. Internal so the aggregate doctor suite
+    /// (ConfigHealthCheck) can reuse the exact same set for its read-only assessment.
+    /// <para>
+    /// GENERATED from the <c>[DoctorCheck(Suite = DoctorSuite.Config)]</c> declarations (#3319), not
+    /// hand-written: a check class carrying the attribute is registered by construction, so the
+    /// "compiles, has tests, never runs" failure has no way to occur.
+    /// </para>
+    /// </summary>
+    internal static readonly IReadOnlyList<IConfigCheck> Checks = GeneratedDoctorChecks.CreateConfigChecks();
+
+    /// <summary>
+    /// Read-only findings the operator should see but which are NEVER auto-applied (issue #2798).
+    /// Deliberately a separate list from <see cref="Checks"/>: <see cref="IConfigAdvisory"/> has no
+    /// <c>Apply</c>, so nothing here can be wired into the <c>--yes</c> loop even by accident.
+    /// <para>
+    /// Generated separately for the same reason (#3319). The suite is a DECLARED attribute argument
+    /// rather than something inferred from the implemented interface, so the check/advisory split
+    /// survives the generator instead of depending on a heuristic getting it right.
+    /// </para>
+    /// </summary>
+    internal static readonly IReadOnlyList<IConfigAdvisory> Advisories = GeneratedDoctorChecks.CreateAdvisories();
+
+    /// <summary>
+    /// Renders every applicable advisory. Emits nothing when none apply - an advisory that always
+    /// printed would be boilerplate an operator learns to skip, so its presence alone must mean a
+    /// finding exists (issue #2798 AC4).
+    /// </summary>
+    private static void ReportAdvisories(ConfigDocument config)
+    {
+        foreach (var advisory in Advisories.Where(a => a.IsApplicable(config)))
+        {
+            AnsiConsole.MarkupLine($"[yellow]![/] [bold]{CliText.SafeDisplay(advisory.Id)}[/]");
+            AnsiConsole.MarkupLine($"        {CliText.SafeDisplay(advisory.Describe(config))}");
+            AnsiConsole.MarkupLine($"        [dim]Advisory only - not changed automatically:[/] {CliText.SafeDisplay(advisory.Remediation)}\n");
+        }
+    }
 
     public Command Build(Option<bool> verboseOption, Option<string?> targetOption)
     {
@@ -57,30 +81,56 @@ internal sealed class DoctorConfigCommand
         bool verbose,
         CancellationToken cancellationToken)
     {
-        if (!File.Exists(configPath))
+        var storePath = ConfigStoreBootstrap.ResolveStorePath(configPath, new System.IO.Abstractions.FileSystem());
+        if (!File.Exists(configPath) && !File.Exists(storePath))
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Config not found at [dim]{Markup.Escape(configPath)}[/]. Run [green]botnexus init[/] first.");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Config not found at [dim]{CliText.SafeDisplay(configPath)}[/]. Run [green]botnexus init[/] first.");
             return 1;
         }
 
-        PlatformConfig config;
+        AnsiConsole.MarkupLine($"  Checking config at [dim]{CliText.SafeDisplay(configPath)}[/]...\n");
+
+        // Read through the canonical writer so store-only homes and store-wins homes inspect the
+        // same authoritative document the gateway uses.
+        ConfigDocument document;
         try
         {
-            config = await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
+            document = await CliConfigMutation.ReadAsync(configPath, cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or InvalidOperationException)
         {
-            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {Markup.Escape(ex.Message)}");
+            AnsiConsole.MarkupLine($"[red]Error:[/] Unable to load config: {CliText.SafeDisplay(ex.Message)}");
             return 1;
         }
 
-        AnsiConsole.MarkupLine($"  Checking config at [dim]{Markup.Escape(configPath)}[/]...\n");
+        // Checks are ordered migrations. Determine applicability against the projected document
+        // after each earlier applicable fix, so later checks observe canonical paths created by a
+        // migration rather than the stale pre-migration shape.
+        var applicabilityProjection = ConfigDocument.Parse(document.ToJsonString());
+        var applicable = new List<IConfigCheck>();
+        foreach (var check in Checks)
+        {
+            if (!check.IsApplicable(applicabilityProjection))
+                continue;
 
-        // Load raw JSON so checks operate on the actual persisted nodes
-        var rawJson = await File.ReadAllTextAsync(configPath, cancellationToken);
-        var root = JsonNode.Parse(rawJson)?.AsObject() ?? new JsonObject();
+            applicable.Add(check);
+            try
+            {
+                check.Apply(applicabilityProjection);
+            }
+            catch (InvalidOperationException)
+            {
+                // Keep the failing check visible. Preview validation below owns the actionable
+                // rejection and guarantees the persisted document remains untouched.
+                break;
+            }
+        }
 
-        var applicable = Checks.Where(c => c.IsApplicable(root)).ToList();
+        // Issue #2798 AC4: advisories are REPORTED and never applied, so they are evaluated and
+        // rendered separately from the auto-applied checks above. A wildcard bind may be a
+        // deliberate operator choice, and AC3 requires an existing config to survive untouched -
+        // so the finding must be visible without --yes ever rewriting it.
+        ReportAdvisories(document);
 
         if (applicable.Count == 0)
         {
@@ -88,39 +138,58 @@ internal sealed class DoctorConfigCommand
             return 0;
         }
 
-        var interactive = AnsiConsole.Profile.Capabilities.Interactive && !autoApply;
+        // Only prompt when a real interactive stdin is attached. Checking
+        // AnsiConsole.Profile.Capabilities.Interactive alone is not sufficient:
+        // under `dotnet test` (and other automation) a terminal may be reported
+        // as interactive while stdin is unavailable, so AnsiConsole.Confirm would
+        // block forever waiting on input that never arrives. Guarding with
+        // Console.IsInputRedirected keeps the CLI from hanging in non-tty contexts.
+        var canPrompt = AnsiConsole.Profile.Capabilities.Interactive
+            && !Console.IsInputRedirected
+            && !autoApply;
         var appliedCount = 0;
         var skippedCount = 0;
+        var acceptedChecks = new List<IConfigCheck>();
         var alreadyOkCount = Checks.Count - applicable.Count;
 
         for (var i = 0; i < applicable.Count; i++)
         {
             var check = applicable[i];
-            AnsiConsole.MarkupLine($"  [bold]{Markup.Escape($"[{i + 1}/{applicable.Count}]")}[/] [bold]{Markup.Escape(check.Id)}[/]");
-            AnsiConsole.MarkupLine($"        {Markup.Escape(check.Description)}");
-            AnsiConsole.MarkupLine($"        [dim]Suggested fix:[/] {Markup.Escape(check.FixDescription)}");
+            AnsiConsole.MarkupLine($"  [bold]{CliText.SafeDisplay($"[{i + 1}/{applicable.Count}]")}[/] [bold]{CliText.SafeDisplay(check.Id)}[/]");
+            AnsiConsole.MarkupLine($"        {CliText.SafeDisplay(check.Description)}");
+            AnsiConsole.MarkupLine($"        [dim]Suggested fix:[/] {CliText.SafeDisplay(check.FixDescription)}");
 
             if (dryRun)
             {
                 AnsiConsole.MarkupLine("        [yellow]--dry-run[/]: would apply\n");
+                acceptedChecks.Add(check);
                 appliedCount++;
                 continue;
             }
 
             bool apply;
-            if (interactive)
+            if (autoApply)
+            {
+                apply = true;
+                AnsiConsole.MarkupLine("        [dim]--yes: applying...[/]");
+            }
+            else if (canPrompt)
             {
                 apply = AnsiConsole.Confirm("        Apply?", defaultValue: true);
             }
             else
             {
-                apply = true;
-                AnsiConsole.MarkupLine("        [dim]--yes: applying...[/]");
+                // No interactive stdin and --yes was not passed: never block on a
+                // prompt. Skip the fix and hint at the non-interactive flag.
+                apply = false;
+                AnsiConsole.MarkupLine("        [dim]— skipped (no interactive input; re-run with [green]--yes[/] to apply)[/]");
+                skippedCount++;
+                continue;
             }
 
             if (apply)
             {
-                check.Apply(root);
+                acceptedChecks.Add(check);
                 appliedCount++;
                 AnsiConsole.MarkupLine("        [green]✓ applied[/]\n");
             }
@@ -131,20 +200,60 @@ internal sealed class DoctorConfigCommand
             }
         }
 
-        // Write back if anything was applied (and not dry-run)
+        if (acceptedChecks.Count > 0)
+        {
+            var preview = ConfigDocument.Parse(document.ToJsonString());
+            try
+            {
+                ApplyAcceptedChecks(preview, acceptedChecks);
+            }
+            catch (InvalidOperationException ex)
+            {
+                AnsiConsole.MarkupLine("[red]Config validation failed; the existing config was not modified:[/]");
+                AnsiConsole.MarkupLine($"  [red]\u2022[/] {CliText.SafeDisplay(ex.Message)}");
+                return 1;
+            }
+
+            var previewErrors = PlatformConfigLoader.ValidateRawJson(preview.ToJsonString());
+            if (previewErrors.Count > 0)
+            {
+                AnsiConsole.MarkupLine("[red]Config validation failed; the existing config was not modified:[/]");
+                foreach (var error in previewErrors)
+                    AnsiConsole.MarkupLine($"  [red]\u2022[/] {CliText.SafeDisplay(error)}");
+                return 1;
+            }
+        }
+
+        // Re-run the selected fixes against the authoritative document inside the writer lock and
+        // use the validating overload. A concurrent change is therefore preserved and malformed
+        // output can never reach either backend.
         if (!dryRun && appliedCount > 0)
         {
-            var fileSystem = new System.IO.Abstractions.FileSystem();
-            var backupsDir = Path.Combine(Path.GetDirectoryName(configPath) ?? PlatformConfigLoader.DefaultHomePath, "backups");
-            var writer = new PlatformConfigWriter(configPath, fileSystem, new ConfigBackupService(backupsDir, fileSystem));
-            var updatedJson = root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-            await writer.MutateAsync(rootNode =>
+            var writer = CliConfigMutation.CreateWriter(configPath);
+            var errors = await writer.MutateDocumentValidatedAsync(
+                persisted =>
+                {
+                    try
+                    {
+                        ApplyAcceptedChecks(persisted, acceptedChecks);
+                        return null;
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        return ex.Message;
+                    }
+                },
+                "doctor-config",
+                cancellationToken,
+                ["gateway", "agents"]);
+
+            if (errors.Count > 0)
             {
-                var replacement = JsonNode.Parse(updatedJson)?.AsObject() ?? new JsonObject();
-                rootNode.Clear();
-                foreach (var kvp in replacement)
-                    rootNode[kvp.Key] = kvp.Value?.DeepClone();
-            }, "doctor-config", cancellationToken);
+                AnsiConsole.MarkupLine("[red]Config validation failed; the existing config was not modified:[/]");
+                foreach (var error in errors)
+                    AnsiConsole.MarkupLine($"  [red]\u2022[/] {CliText.SafeDisplay(error)}");
+                return 1;
+            }
         }
 
         AnsiConsole.WriteLine();
@@ -157,8 +266,18 @@ internal sealed class DoctorConfigCommand
         { Justification = Justify.Left });
 
         if (verbose)
-            AnsiConsole.MarkupLine($"\n[dim]Config path: {Markup.Escape(configPath)}[/]");
+            AnsiConsole.MarkupLine($"\n[dim]Config path: {CliText.SafeDisplay(configPath)}[/]");
 
         return 0;
     }
+    internal static void ApplyAcceptedChecks(ConfigDocument document, IEnumerable<IConfigCheck> acceptedChecks)
+    {
+        foreach (var check in acceptedChecks)
+        {
+            if (check.IsApplicable(document))
+                check.Apply(document);
+        }
+    }
+
 }
+

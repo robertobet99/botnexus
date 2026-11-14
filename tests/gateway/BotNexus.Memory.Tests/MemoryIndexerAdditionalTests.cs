@@ -1,3 +1,4 @@
+using BotNexus.Memory.Embeddings;
 using System.Collections.Concurrent;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Models;
@@ -26,7 +27,6 @@ public sealed class MemoryIndexerAdditionalTests
         try
         {
             await lifecycle.RaiseAsync(new SessionLifecycleEvent("s-null", "agent-a", SessionLifecycleEventType.Closed, null));
-            await Task.Delay(100);
             store.All.ShouldBeEmpty();
         }
         finally
@@ -52,7 +52,6 @@ public sealed class MemoryIndexerAdditionalTests
             ]);
 
             await lifecycle.RaiseAsync(new SessionLifecycleEvent("s-created", "agent-a", SessionLifecycleEventType.Created, session));
-            await Task.Delay(100);
             store.All.ShouldBeEmpty();
         }
         finally
@@ -82,11 +81,17 @@ public sealed class MemoryIndexerAdditionalTests
             ]);
 
             await lifecycle.RaiseAsync(new SessionLifecycleEvent("s-expired", "agent-a", SessionLifecycleEventType.Expired, session));
-            await WaitForAsync(() => store.All.Count == 2);
+            await TestAwait.EventuallyAsync(
+                () => store.All.Count == 2,
+                "both indexed conversation exchanges to be stored");
 
             store.All.ShouldAllBe(entry => entry.SourceType == "conversation");
-            store.All.Select(entry => entry.Content).ShouldContain(content => content.Contains("User: one", StringComparison.Ordinal));
-            store.All.Select(entry => entry.Content).ShouldContain(content => content.Contains("User: two", StringComparison.Ordinal));
+            // Decode rather than match the wire shape: payloads are quoted since #2954.
+            var decoded = store.All
+                .Select(entry => TranscriptTurnFormat.TryDecode(entry.Content, out var u, out _) ? u : null)
+                .ToList();
+            decoded.ShouldContain("one");
+            decoded.ShouldContain("two");
         }
         finally
         {
@@ -116,7 +121,9 @@ public sealed class MemoryIndexerAdditionalTests
                 });
 
             await Task.WhenAll(tasks);
-            await WaitForAsync(() => store.All.Count == 8);
+            await TestAwait.EventuallyAsync(
+                () => store.All.Count == 8,
+                "all bounded conversation exchanges to be stored");
             store.All.Count().ShouldBe(8);
         }
         finally
@@ -149,7 +156,9 @@ public sealed class MemoryIndexerAdditionalTests
             await lifecycle.RaiseAsync(new SessionLifecycleEvent("s-fail", "agent-a", SessionLifecycleEventType.Closed, first));
             await store.WaitForFirstInsertAttemptAsync();
             await lifecycle.RaiseAsync(new SessionLifecycleEvent("s-pass", "agent-a", SessionLifecycleEventType.Closed, second));
-            await WaitForAsync(() => store.All.Any(entry => entry.SessionId == "s-pass"));
+            await TestAwait.EventuallyAsync(
+                () => store.All.Any(entry => entry.SessionId == "s-pass"),
+                "the valid session exchange to be stored");
 
             store.All.ShouldHaveSingleItem().SessionId.ShouldBe("s-pass");
         }
@@ -174,21 +183,8 @@ public sealed class MemoryIndexerAdditionalTests
             new SessionEntry { Role = MessageRole.Assistant, Content = "a" }
         ]);
         await lifecycle.RaiseAsync(new SessionLifecycleEvent("s-after-stop", "agent-a", SessionLifecycleEventType.Closed, session));
-        await Task.Delay(100);
 
         store.All.ShouldBeEmpty();
-    }
-
-    private static async Task WaitForAsync(Func<bool> condition, int timeoutMs = 5000)
-    {
-        var started = DateTime.UtcNow;
-        while (!condition())
-        {
-            if ((DateTime.UtcNow - started).TotalMilliseconds > timeoutMs)
-                throw new TimeoutException("Timed out waiting for indexing.");
-
-            await Task.Delay(20);
-        }
     }
 
     private static GatewaySession CreateSession(string sessionId, string agentId, IReadOnlyList<SessionEntry> entries)
@@ -209,7 +205,7 @@ public sealed class MemoryIndexerAdditionalTests
     private sealed class TestFactory(RecordingMemoryStore store) : IMemoryStoreFactory
     {
         private readonly RecordingMemoryStore _store = store;
-        public IMemoryStore Create(string agentId) => _store;
+        public IMemoryStore Create(AgentId agentId) => _store;
     }
 
     private sealed class RecordingMemoryStore : IMemoryStore
@@ -256,6 +252,19 @@ public sealed class MemoryIndexerAdditionalTests
         public Task<IReadOnlyList<MemoryEntry>> SearchAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
 
+        // #2781: explicit pass-through. Required (not default-implemented) on IMemoryStore because
+        // Moq returns null for default interface methods rather than running the default body.
+        public async Task<IReadOnlyList<ScoredMemoryEntry>> SearchScoredAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+        {
+            var entries = await SearchAsync(query, topK, filter, ct);
+            return entries.Select(entry => new ScoredMemoryEntry(entry, 0d)).ToList();
+        }
+
+        // #3244: explicit pass-through with a NotAttempted scan report - this stub runs no bounded
+        // vector scan, so claiming any coverage would be a lie the caller could act on.
+        public async Task<MemorySearchResult> SearchWithReportAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+            => new(await SearchScoredAsync(query, topK, filter, ct), MemoryVectorScanReport.NotAttempted);
+
         public Task DeleteAsync(string id, CancellationToken ct = default)
         {
             _entries.TryRemove(id, out _);
@@ -280,4 +289,3 @@ public sealed class MemoryIndexerAdditionalTests
         }
     }
 }
-

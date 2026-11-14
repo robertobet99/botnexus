@@ -67,19 +67,27 @@ public sealed class EditToolNoMatchDiagnosticTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_WhenOnlyLeadingIndentationDiffers_SaysWhitespaceAndReRead()
+    public async Task ExecuteAsync_WhenBlockMissesOnLaterLine_NamesTheFirstDifferingLineNotWhitespace()
     {
-        // The file line has no indent; the oldText carries a leading tab that does not appear in
-        // the file. The fuzzy matcher only trims *trailing* whitespace, so a leading-indent drift
-        // on the oldText side reaches 0 matches (it is not a substring of the file either).
-        const string content = "class C\n{\nreturn compute(value);\n}";
-        var ex = await RunNoMatchAsync("indent.txt", content, "\treturn compute(value);");
+        // Issue #2421 changed the single-line leading-indent case: it now *applies* instead of
+        // erroring, so this test was migrated to keep covering the miss diagnostic on a block that
+        // genuinely still misses. Issue #2907 then corrected WHAT it may claim: the anchor line
+        // differs from the file only by indentation, but line 2 of oldText (`return second();`)
+        // has no counterpart at all - the file's line 4 is `}`. Asserting a whitespace-only cause
+        // here was an unverified claim that pointed the caller at the wrong line. The diagnostic
+        // must now name the first line that ACTUALLY differs and stay silent about whitespace.
+        const string content = "class C\n{\n    return compute(value);\n}";
+        var ex = await RunNoMatchAsync("indent.txt", content, "return compute(value);\nreturn second();");
 
         ex.Message.ShouldContain("found 0");
         ex.Message.ShouldContain("line 3");
-        // Hint that the only difference is whitespace/invisible characters and to re-read.
-        ex.Message.ShouldContain("whitespace");
         ex.Message.ShouldContain("read");
+        // The real drift is on line 2 of oldText, and the message must say so.
+        ex.Message.ShouldContain("return second();");
+        ex.Message.Contains("first line that actually differs", StringComparison.Ordinal)
+            .ShouldBeTrue($"message should name the first differing line but was: {ex.Message}");
+        // It must NOT assert a whitespace-only cause it has not verified.
+        ex.Message.ShouldNotContain("differs only in leading/trailing whitespace");
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using BotNexus.Domain.Primitives;
 namespace BotNexus.Gateway.Abstractions.Models;
@@ -21,14 +22,51 @@ public sealed record AgentExecutionContext
 /// </summary>
 public sealed record AgentResponse
 {
+    /// <summary>Authoritative agent execution identity; null means legacy or unmeasured.</summary>
+    public BotNexus.Domain.Primitives.AgentRunId? AgentRunId { get; init; }
     /// <summary>The full response content.</summary>
     public required string Content { get; init; }
     /// <summary>Token usage for this response, if available.</summary>
     public AgentResponseUsage? Usage { get; init; }
+
+    /// <summary>
+    /// #2641: token usage aggregated across <b>every</b> turn of the run, or <c>null</c> when the
+    /// provider reported no usage at all.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately separate from <see cref="Usage"/> rather than replacing it. <see cref="Usage"/>
+    /// is the LAST request's usage, and <c>ProviderTokenUsageRecorder</c> depends on exactly that
+    /// meaning: the compactor compares the most recent prompt against its estimate, so summing
+    /// prompt tokens over a 12-turn run would hand it a number several times larger than any prompt
+    /// the model actually saw. Cost accounting wants the sum; compaction wants the last. Two
+    /// questions, two properties.
+    /// </remarks>
+    public AgentResponseUsage? RunUsage { get; init; }
+
+    /// <summary>
+    /// #2641: number of model turns (assistant messages produced) in this run, or <c>null</c> when
+    /// the execution strategy does not report one. <c>null</c> means "not measured", never zero.
+    /// </summary>
+    public int? TurnCount { get; init; }
     /// <summary>Whether the agent wants to continue with tool results.</summary>
     public bool RequiresFollowUp { get; init; }
     /// <summary>Any tool calls the agent made during processing.</summary>
     public IReadOnlyList<AgentToolCallInfo> ToolCalls { get; init; } = [];
+
+    /// <summary>
+    /// #3565: the provider error carried by the run's TERMINAL assistant message, or <c>null</c>
+    /// when the run's last message ended normally.
+    /// </summary>
+    /// <remarks>
+    /// A blocking caller previously saw only <see cref="Content"/>, so a run whose final turn was
+    /// rejected by the provider was indistinguishable from one that simply said little. <c>null</c>
+    /// means "the terminal message reported no error", never "not measured" - a strategy that
+    /// cannot observe the finish reason leaves it null and the consumer's clean-run behaviour is
+    /// unchanged.
+    /// </remarks>
+    public string? TerminalError { get; init; }
+    /// <summary>Authoritative completion disposition for this run, when the strategy reports one.</summary>
+    public RunCompletionSignal? Completion { get; init; }
 }
 /// <summary>
 /// Token usage information for an agent response.
@@ -39,15 +77,86 @@ public sealed record AgentResponseUsage(
     int? CacheRead = null,
     int? CacheWrite = null);
 /// <summary>
-/// Information about a tool call made during agent execution.
+/// Information about a tool call made during agent execution, carried on
+/// <see cref="AgentResponse.ToolCalls"/> so blocking callers (cron, soul, heartbeat, sub-agents) can
+/// project a full tool timeline into session history - matching the tool-start / tool-end rows that
+/// interactive streaming persists (issue #2118). The blocking prompt path used to surface only
+/// id / name / error, which discarded the arguments and result content needed to reconstruct the
+/// timeline; those are now carried through so cron history has parity with the streaming path.
 /// </summary>
-public sealed record AgentToolCallInfo(string ToolCallId, string ToolName, bool IsError);
+/// <param name="ToolCallId">The tool call correlation id (matches the model's tool-use id).</param>
+/// <param name="ToolName">The tool name.</param>
+/// <param name="IsError">True when the tool execution failed.</param>
+/// <param name="Arguments">
+/// Serialized JSON arguments the model supplied for the call, or <c>null</c> when unavailable.
+/// Mirrors the <c>ToolArgs</c> stamped on an interactive tool-start row.
+/// </param>
+/// <param name="ResultContent">
+/// The tool result content (first content block), or <c>null</c> when the tool produced no textual
+/// result. Mirrors the content of an interactive tool-end row.
+/// </param>
+/// <param name="IsIncomplete">
+/// True when the tool call started but never produced a result because the run was cancelled or timed
+/// out mid-flight. Such a call is represented as an interrupted tool-end row so the transcript stays
+/// consistent (issue #2118 cancellation acceptance).
+/// </param>
+public sealed record AgentToolCallInfo(
+    string ToolCallId,
+    string ToolName,
+    bool IsError,
+    string? Arguments = null,
+    string? ResultContent = null,
+    bool IsIncomplete = false)
+{
+    /// <summary>Execution identity shared with the response.</summary>
+    public AgentRunId? AgentRunId { get; init; }
+}
+
+/// <summary>
+/// Thrown by a blocking agent prompt (<see cref="BotNexus.Gateway.Abstractions.Agents.IAgentHandle"/>'s
+/// <c>PromptAsync</c>) when the run is cancelled or times out mid-flight. Carries the
+/// <see cref="PartialResponse"/> assembled from tool activity that completed before the interruption
+/// so the caller (e.g. the cron trigger) can still persist a faithful tool timeline - including any
+/// in-flight tool that never returned - before re-surfacing the cancellation (issue #2118).
+/// </summary>
+/// <remarks>
+/// This deliberately derives from <see cref="Exception"/>, not <see cref="OperationCanceledException"/>.
+/// Throwing an <see cref="OperationCanceledException"/>-derived type out of an <c>async</c> method
+/// transitions the returned task to the <see cref="System.Threading.Tasks.TaskStatus.Canceled"/> state,
+/// which erases the concrete exception type - the caller would then observe a bare
+/// <see cref="System.Threading.Tasks.TaskCanceledException"/> and lose the <see cref="PartialResponse"/>.
+/// Keeping this a plain exception guarantees the faulted task preserves the type so the cron trigger can
+/// catch it, persist the tool rows, and then re-surface a normal cancellation via
+/// <see cref="CancellationToken"/>.
+/// </remarks>
+public sealed class AgentPromptInterruptedException : Exception
+{
+    /// <summary>
+    /// Initializes a new instance carrying the partial response assembled up to the interruption point.
+    /// </summary>
+    /// <param name="partialResponse">The response projected from tool activity completed before cancellation.</param>
+    /// <param name="cancellationToken">The token that triggered cancellation.</param>
+    public AgentPromptInterruptedException(AgentResponse partialResponse, CancellationToken cancellationToken)
+        : base("The agent run was interrupted (cancelled or timed out) mid-flight.")
+    {
+        PartialResponse = partialResponse;
+        CancellationToken = cancellationToken;
+    }
+
+    /// <summary>The tool activity captured before the run was interrupted.</summary>
+    public AgentResponse PartialResponse { get; }
+
+    /// <summary>The cancellation token that triggered the interruption, re-surfaced by the caller.</summary>
+    public CancellationToken CancellationToken { get; }
+}
 /// <summary>
 /// A streaming event from an agent, emitted during real-time interaction.
 /// Maps to the AgentEvent system in AgentCore but at the Gateway level.
 /// </summary>
 public sealed record AgentStreamEvent
 {
+    /// <summary>Authoritative agent execution identity; null means legacy or unmeasured.</summary>
+    public BotNexus.Domain.Primitives.AgentRunId? AgentRunId { get; init; }
     /// <summary>The type of stream event.</summary>
     public required AgentStreamEventType Type { get; init; }
     /// <summary>Incremental content delta (for <see cref=`AgentStreamEventType.ContentDelta`/>).</summary>
@@ -64,10 +173,25 @@ public sealed record AgentStreamEvent
     public string? ToolResult { get; init; }
     /// <summary>Whether the tool call errored (for <see cref=`AgentStreamEventType.ToolEnd`/>).</summary>
     public bool? ToolIsError { get; init; }
+    /// <summary>True when ToolEnd is a synthetic interruption, not a proven result.</summary>
+    public bool ToolIsIncomplete { get; init; }
     /// <summary>Error message (for <see cref=`AgentStreamEventType.Error`/>).</summary>
     public string? ErrorMessage { get; init; }
     /// <summary>Token usage (for <see cref=`AgentStreamEventType.MessageEnd`/>).</summary>
     public AgentResponseUsage? Usage { get; init; }
+    /// <summary>
+    /// The provider's own authoritative final text for the completed assistant message, carried on
+    /// <see cref=`AgentStreamEventType.MessageEnd`/> when the provider supplied one (#3336).
+    /// </summary>
+    /// <remarks>
+    /// The persistence path concatenates <see cref="ContentDelta"/> values, so a parser-level
+    /// reconciliation against the provider's final block text never reached <c>session_history</c>:
+    /// the deltas already emitted carried the transport artifact and the corrected block value had
+    /// nowhere to travel. This field is that channel. It is nullable and NULL means "the provider
+    /// gave us nothing to check against", never "the message was empty" - a consumer must fall back
+    /// to the accumulated deltas rather than treating absence as an empty message.
+    /// </remarks>
+    public string? FinalContent { get; init; }
     /// <summary>Message identifier for correlation.</summary>
     public string? MessageId { get; init; }
     /// <summary>Session identifier for client-side routing verification.</summary>
@@ -94,6 +218,10 @@ public sealed record AgentStreamEvent
     /// post-turn claim auditor flagged unbacked artifact claims in the agent's final message (#1600).
     /// </summary>
     public ClaimAuditSignal? ClaimAudit { get; init; }
+    /// <summary>Bounded provider retry/recovery lifecycle payload. Contains no credential or raw error text.</summary>
+    public ProviderRecoverySignal? ProviderRecovery { get; init; }
+    /// <summary>Authoritative run completion disposition carried by <see cref="AgentStreamEventType.RunEnded"/>.</summary>
+    public RunCompletionSignal? Completion { get; init; }
 }
 /// <summary>
 /// Types of streaming events from an agent.
@@ -151,7 +279,83 @@ public enum AgentStreamEventType
     /// final message that have no backing tool call (anti-fabrication control, #1600). Carries a
     /// <see cref="AgentStreamEvent.ClaimAudit"/> payload describing the unbacked claims.
     /// </summary>
-    ClaimAudit
+    ClaimAudit,
+    /// <summary>Bounded model-call retry and shared provider-recovery lifecycle signal.</summary>
+    ProviderRecovery
+}
+
+/// <summary>Bounded provider recovery signal projected from the agent core.</summary>
+public sealed record ProviderRecoverySignal(
+    string Stage,
+    string Provider,
+    string State,
+    int? Attempt,
+    int? MaxAttempts,
+    double? DelayMilliseconds,
+    int InFlightCalls,
+    int QueueLength,
+    DateTimeOffset? NextProbeAt);
+
+/// <summary>
+/// Channel-neutral run completion disposition. Values originate in the core loop's finalization gate.
+/// </summary>
+public sealed record RunCompletionSignal(
+    string Status,
+    IReadOnlyList<string> OpenItemIds,
+    string? StopReason,
+    string? Detail,
+    string? Evidence,
+    string? ContinuationOwner,
+    string? WakeCondition,
+    int ContinuationAttempts)
+{
+    /// <summary>Authoritative budget counts; absent for legacy runs or other stop reasons.</summary>
+    public ToolResultBudgetSignal? ToolResultBudget { get; init; }
+    /// <summary>Bounded payload-free guard evidence projected from the core.</summary>
+    public IReadOnlyList<GuardObservation> GuardObservations { get; init; } = [];
+    /// <summary>Canonical session-metadata key for the latest authoritative run completion.</summary>
+    public const string MetadataKey = "runCompletion";
+
+    /// <summary>
+    /// Reads the latest completion from session metadata. Session stores deserialize metadata values
+    /// as <see cref="System.Text.Json.JsonElement"/>, so this accepts both the live typed value and
+    /// its persisted JSON representation. Malformed legacy metadata is ignored rather than making
+    /// the session unreadable.
+    /// </summary>
+    public static RunCompletionSignal? FromMetadata(IReadOnlyDictionary<string, object?> metadata)
+    {
+        if (!metadata.TryGetValue(MetadataKey, out var raw) || raw is null)
+            return null;
+
+        if (raw is RunCompletionSignal completion)
+            return completion;
+
+        if (raw is not System.Text.Json.JsonElement { ValueKind: System.Text.Json.JsonValueKind.Object } element)
+            return null;
+
+        try
+        {
+            return element.Deserialize<RunCompletionSignal>(MetadataJsonOptions);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Writes or clears the latest authoritative completion in session metadata.</summary>
+    public static void WriteTo(IDictionary<string, object?> metadata, RunCompletionSignal? completion)
+    {
+        if (completion is null)
+            metadata.Remove(MetadataKey);
+        else
+            metadata[MetadataKey] = completion;
+    }
+
+    private static readonly System.Text.Json.JsonSerializerOptions MetadataJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
 }
 
 /// <summary>

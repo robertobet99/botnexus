@@ -6,6 +6,7 @@ using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Audit;
 using BotNexus.Gateway.Configuration;
 using BotNexus.Gateway.Tools;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -50,6 +51,29 @@ public sealed class AgentExchangeService : IAgentExchangeService
     private readonly AgentExchangeTurnEngine _turnEngine;
     private readonly ICrossWorldExchangeRouter _crossWorldRouter;
 
+    /// <summary>
+    /// Per-target admission control for inbound exchanges (#3494). Optional-with-fallback so the
+    /// many direct-construction test call sites keep compiling; every instance still gets a real
+    /// queue, because "no queue" is the defect itself and must not be reachable by omission.
+    /// </summary>
+    private readonly AgentExchangeInboundQueue _inboundQueue;
+
+    /// <summary>
+    /// Publishes handoff milestones back into the initiating conversation (#3176). Optional-with-
+    /// fallback so the many direct-construction test call sites keep compiling; the no-op instance
+    /// makes "emit progress" unconditional at every call site instead of null-guarded.
+    /// </summary>
+    private readonly IAgentExchangeProgressNotifier _progress;
+
+    /// <summary>
+    /// The single execution-layer tool-audit sink (#2614 AC4). The local agent-exchange turn is a
+    /// blocking <c>PromptAsync</c> boundary, so before this slice a target agent could run any
+    /// number of side-effecting tools during an exchange and leave nothing but its final text
+    /// behind. Optional-with-fallback so the many direct-construction test call sites keep working
+    /// while production DI still supplies the one registered instance.
+    /// </summary>
+    private readonly IToolAuditSink _toolAudit;
+
     public AgentExchangeService(
         IAgentRegistry registry,
         IAgentSupervisor supervisor,
@@ -62,7 +86,10 @@ public sealed class AgentExchangeService : IAgentExchangeService
         IOptions<AgentExchangeOptions>? exchangeOptions = null,
         AgentExchangeBudgetTracker? budgetTracker = null,
         AgentExchangeTurnEngine? turnEngine = null,
-        ICrossWorldExchangeRouter? crossWorldRouter = null)
+        ICrossWorldExchangeRouter? crossWorldRouter = null,
+        IToolAuditSink? toolAudit = null,
+        IAgentExchangeProgressNotifier? progressNotifier = null,
+        AgentExchangeInboundQueue? inboundQueue = null)
     {
         _registry = registry;
         _supervisor = supervisor;
@@ -72,6 +99,9 @@ public sealed class AgentExchangeService : IAgentExchangeService
         _logger = logger;
         _exchangeOptions = exchangeOptions ?? Options.Create(new AgentExchangeOptions());
         _budgetTracker = budgetTracker;
+        _toolAudit = toolAudit ?? DefaultToolAuditSink.Instance;
+        _progress = progressNotifier ?? NullAgentExchangeProgressNotifier.Instance;
+        _inboundQueue = inboundQueue ?? new AgentExchangeInboundQueue(_exchangeOptions);
 
         // The turn engine single-sources the shared loop/seal/archive; the router owns cross-world
         // federation. Both are injected in production DI. When omitted (the local-only construction
@@ -102,21 +132,54 @@ public sealed class AgentExchangeService : IAgentExchangeService
         if (request.MaxTurns <= 0)
             throw new ArgumentOutOfRangeException(nameof(request.MaxTurns), "MaxTurns must be greater than zero.");
 
+        // #2136: sub-agent worker archetypes (researcher, coder, planner, reviewer, writer, analyst)
+        // are implementation-only roles, not conversational peers. Reject them deterministically here
+        // - BEFORE any session or conversation is created - so a stale conversation/session targeting
+        // an archetype id fails fast with actionable guidance instead of reaching descriptor creation,
+        // hitting "ModelId is required; ApiProvider is required", and surfacing as a fatal
+        // UnobservedTaskException breadcrumb.
+        if (BuiltInArchetypes.IsReserved(request.TargetId.Value))
+            throw new ArgumentException(
+                $"'{request.TargetId.Value}' is a built-in sub-agent archetype, not a conversational agent. "
+                + $"Use spawn_subagent(archetype: \"{request.TargetId.Value}\") to delegate work to it, or "
+                + "agent_converse only with a genuine registered named agent (see list_agents).",
+                nameof(request));
+
         var initiatorDescriptor = _registry.Get(request.InitiatorId)
             ?? throw new KeyNotFoundException($"Initiator agent '{request.InitiatorId}' is not registered.");
+        // #2878 target resolution, in strict precedence order:
+        //   1. exact agent id  - always wins, so no existing id-addressed call can change meaning;
+        //   2. cross-world reference parsing - attempted BEFORE the display-name fallback, so a
+        //      "world:agent" target keeps its federation behaviour unchanged;
+        //   3. unambiguous case-insensitive display name - resolved to the owning agent id.
+        // Resolution happens BEFORE the access-policy check below and rewrites request.TargetId, so
+        // the policy (and the call chain, budget, conversation and supervisor handle) all evaluate
+        // against the RESOLVED agent. Display-name addressing therefore cannot bypass a whitelist.
         var isLocalTarget = _registry.Contains(request.TargetId);
+        // Exact registration wins even when disabled: do not fall through to a display-name
+        // match or reinterpret a local id as federation, and reject before any state is minted.
+        if (isLocalTarget && _registry.Get(request.TargetId, includeDisabled: true)?.Enabled == false)
+            throw new KeyNotFoundException($"Target agent '{request.TargetId}' is disabled.");
         var hasCrossWorldTarget = CrossWorldAgentReference.TryParse(request.TargetId, out var parsedCrossWorldTarget);
         if (!isLocalTarget && !hasCrossWorldTarget)
-            throw new KeyNotFoundException($"Target agent '{request.TargetId}' is not registered.");
+        {
+            var displayNameMatches = FindByDisplayName(request.TargetId);
+            if (displayNameMatches.Count != 1)
+                throw new KeyNotFoundException(BuildTargetResolutionFailureMessage(request.TargetId, displayNameMatches));
+
+            var resolved = displayNameMatches[0];
+            _logger.LogInformation(
+                "Agent exchange target '{RequestedTarget}' resolved by display name to agent '{ResolvedTarget}'.",
+                request.TargetId.Value, resolved.AgentId.Value);
+            request = request with { TargetId = resolved.AgentId };
+            isLocalTarget = true;
+        }
+
         var targetDescriptor = isLocalTarget ? _registry.Get(request.TargetId) : null;
 
-        if (!_exchangeOptions.Value.IsOpen)
-        {
-            if (!initiatorDescriptor.SubAgentIds.Contains(request.TargetId.Value, StringComparer.OrdinalIgnoreCase)
-                && !IsRoleGranted(initiatorDescriptor, targetDescriptor))
-                throw new UnauthorizedAccessException(
-                    $"Agent '{request.InitiatorId}' is not allowed to converse with '{request.TargetId}'.");
-        }
+        if (!PeerAccessPolicy.IsAllowed(_exchangeOptions.Value, initiatorDescriptor, request.TargetId, targetDescriptor))
+            throw new UnauthorizedAccessException(
+                $"Agent '{request.InitiatorId}' is not allowed to converse with '{request.TargetId}'.");
 
         _logger.LogInformation(
             "Agent exchange initiated: {Initiator} -> {Target} (policy={Policy})",
@@ -126,10 +189,34 @@ public sealed class AgentExchangeService : IAgentExchangeService
         EnsureCallChainAllowed(normalizedChain, request.TargetId);
 
         // Budget enforcement: daily cap, loop detection, cooldown
-        _budgetTracker?.EnsureWithinBudget(request.InitiatorId, request.TargetId);
+        // #3176: a refusal here is a HALT the initiating conversation must be able to see - it is
+        // the one terminal outcome that produces no child conversation at all, so without an event
+        // the delegating thread would show a bare exception with no handoff context.
+        try
+        {
+            _budgetTracker?.EnsureWithinBudget(request.InitiatorId, request.TargetId);
+        }
+        catch (InvalidOperationException ex)
+        {
+            await PublishProgressAsync(request, AgentExchangeProgressPhase.Halted, null, null, ex.Message, null, cancellationToken).ConfigureAwait(false);
+            throw;
+        }
 
         if (!isLocalTarget && parsedCrossWorldTarget is not null)
             return await _crossWorldRouter.ConverseCrossWorldAsync(request, parsedCrossWorldTarget, normalizedChain, cancellationToken).ConfigureAwait(false);
+
+        // #3494 admission gate. A local target is an in-process agent with exactly ONE execution
+        // slot, so a second exchange arriving while it is busy has to wait somewhere. Before this
+        // gate it waited nowhere: it minted a conversation + session, blocked downstream, and was
+        // killed by the caller's own deadline, leaving a one-row Active session and a bare
+        // "task was canceled".
+        //
+        // The gate sits BEFORE conversation/session creation on purpose. That ordering is what
+        // satisfies AC2 and AC4 at once: a refused or never-dispatched exchange mints no state at
+        // all, so there is nothing for a reaper to clean up and no session to strand. It is also
+        // placed AFTER the cross-world return above, because a federated target runs in another
+        // process and its slot is not ours to gate.
+        using var slot = await _inboundQueue.AcquireAsync(request.TargetId, cancellationToken).ConfigureAwait(false);
 
         // Phase 4 / F-3: create a real Conversation via IConversationStore so the exchange is
         // discoverable by ListByConversationAsync, the portal, and any future routing/permissions
@@ -140,7 +227,8 @@ public sealed class AgentExchangeService : IAgentExchangeService
             request.TargetId,
             channelType: null,
             request.Objective,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            request.InitiatorConversationId).ConfigureAwait(false);
 
         var sessionId = SessionId.Create();
         var session = await _sessionStore.GetOrCreateAsync(sessionId, request.InitiatorId, cancellationToken).ConfigureAwait(false);
@@ -180,11 +268,37 @@ public sealed class AgentExchangeService : IAgentExchangeService
         session.Metadata["objective"] = request.Objective;
         session.Metadata["maxTurns"] = request.MaxTurns;
         session.Metadata["conversationId"] = conversation.ConversationId.Value;
+        if (!string.IsNullOrWhiteSpace(request.ModelOverride))
+        {
+            session.Metadata["modelOverride"] = request.ModelOverride;
+            if (request.CronModelSource is not null)
+            {
+                session.Metadata["cronModelOverride"] = request.ModelOverride;
+                session.Metadata["cronRequestedModel"] = request.CronRequestedModel;
+                session.Metadata["cronModelSource"] = request.CronModelSource;
+                var separator = request.ModelOverride.LastIndexOf('/');
+                session.Metadata["cronEffectiveProvider"] = separator > 0 ? request.ModelOverride[..separator] : null;
+                session.Metadata["cronEffectiveModel"] = separator > 0 ? request.ModelOverride[(separator + 1)..] : request.ModelOverride;
+            }
+        }
 
         await _sessionStore.SaveAsync(session, cancellationToken).ConfigureAwait(false);
 
         conversation.ActiveSessionId = sessionId;
         await _conversationStore.SaveAsync(conversation, cancellationToken).ConfigureAwait(false);
+
+        // #3176 AC7: the STARTED event is emitted strictly AFTER the eager pin + save above, so the
+        // event can never advertise a child conversation whose session is not yet pinned to it.
+        // Deliberately placed here rather than inside the turn engine: the engine is shared with the
+        // cross-world router, and federated handoff visibility is out of scope for this issue.
+        await PublishProgressAsync(
+            request,
+            AgentExchangeProgressPhase.Started,
+            conversation.ConversationId,
+            sessionId,
+            reason: null,
+            turns: null,
+            cancellationToken).ConfigureAwait(false);
 
         // F-11 local turn: the completion gate is pinned per-turn (a fresh active-exchange id is
         // saved BEFORE the prompt and the prior finish payload cleared), then consumed from the
@@ -192,21 +306,92 @@ public sealed class AgentExchangeService : IAgentExchangeService
         // The target handle is created lazily on the first turn so a creation failure is caught by
         // the shared loop's error arm and seals the session (the original behaviour).
         IAgentHandle? targetHandle = null;
-        return await _turnEngine.RunExchangeLoopAsync(
+        AgentExchangeResult result;
+        try
+        {
+            result = await _turnEngine.RunExchangeLoopAsync(
             request,
             conversation,
             sessionId,
             session,
             sendTurnAsync: async (turn, message, ct) =>
             {
-                targetHandle ??= await _supervisor.GetOrCreateAsync(request.TargetId, sessionId, ct).ConfigureAwait(false);
-
                 var exchangeId = Guid.NewGuid().ToString("N");
-                AgentExchangeCompletionGate.PrepareTurn(session.Metadata, exchangeId);
-                await _sessionStore.SaveAsync(session, ct).ConfigureAwait(false);
+                try
+                {
+                    targetHandle ??= await _supervisor.GetOrCreateAsync(request.TargetId, sessionId, ct).ConfigureAwait(false);
 
-                var response = await targetHandle.PromptAsync(message, ct).ConfigureAwait(false);
+                    AgentExchangeCompletionGate.PrepareTurn(session.Metadata, exchangeId);
+                    await _sessionStore.SaveAsync(session, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException interrupted)
+                {
+                    // This boundary is before PromptAsync: no work was dispatched this turn.
+                    await ReloadCancellationHistoryAsync(session).ConfigureAwait(false);
+                    var evidence = CreateCancellationEvidence(session, conversation.ConversationId,
+                        turn == 0 ? "neverDispatched" : "betweenTurns");
+                    session.Metadata["interruptedExchangeEvidence"] = evidence;
+                    await SaveCancellationEvidenceAsync(session).ConfigureAwait(false);
+                    throw new AgentExchangeCancelledException(evidence,
+                        ct.IsCancellationRequested ? ct : interrupted.CancellationToken);
+                }
+
+                AgentResponse response;
+                try
+                {
+                    response = await targetHandle.PromptAsync(message, ct).ConfigureAwait(false);
+                }
+                catch (AgentPromptInterruptedException interrupted)
+                {
+                    // Keep prose as explicitly incomplete metadata, never as a final assistant row.
+                    // Use the same sanitisation policy as tool evidence; do not persist exception or
+                    // completion detail, which may contain provider diagnostics or thinking.
+                    await ReloadCancellationHistoryAsync(session).ConfigureAwait(false);
+                    var partial = interrupted.PartialResponse;
+                    var records = _toolAudit.CaptureBlockingRun(partial);
+                    foreach (var entry in _toolAudit.ProjectBlockingRun(records))
+                    {
+                        // A separate write-ahead aggregate may already have committed this result.
+                        // Only authoritative run/call identity permits suppression; legacy unknown
+                        // identities must not collapse unrelated invocations with reused call IDs.
+                        var retained = session.GetHistorySnapshot().Any(row =>
+                            row.Role == MessageRole.Tool && row.Kind == MessageKind.ToolResult
+                            && entry.AgentRunId is { } run && row.AgentRunId == run
+                            && !string.IsNullOrWhiteSpace(entry.ToolCallId)
+                            && row.ToolCallId == entry.ToolCallId
+                            && row.ToolIsIncomplete == entry.ToolIsIncomplete);
+                        if (!retained)
+                            session.AddEntry(entry);
+                    }
+                    var safeText = _toolAudit.SanitizePartialText(partial.Content);
+                    var evidence = CreateCancellationEvidence(session, conversation.ConversationId,
+                        "promptInterrupted") with
+                    {
+                        PartialText = safeText,
+                        Usage = partial.Usage,
+                        RunUsage = partial.RunUsage
+                    };
+                    session.Metadata["interruptedExchangeEvidence"] = evidence;
+                    await SaveCancellationEvidenceAsync(session).ConfigureAwait(false);
+                    throw new AgentExchangeCancelledException(evidence,
+                        ct.IsCancellationRequested ? ct : interrupted.CancellationToken);
+                }
+                catch (OperationCanceledException interrupted)
+                {
+                    // PromptAsync was entered, but this handle supplied no partial response.
+                    // Retain only known progress, never invent a never-dispatched outcome.
+                    await ReloadCancellationHistoryAsync(session).ConfigureAwait(false);
+                    var evidence = CreateCancellationEvidence(session, conversation.ConversationId, "promptInterrupted");
+                    session.Metadata["interruptedExchangeEvidence"] = evidence;
+                    await SaveCancellationEvidenceAsync(session).ConfigureAwait(false);
+                    // Preserve the original exception/message and inner-cancellation lifecycle.
+                    interrupted.Data[nameof(AgentExchangeCancellationEvidence)] = evidence;
+                    throw;
+                }
                 var responseText = response.Content ?? string.Empty;
+                // #2614 AC4: capture the tool timeline this turn executed and hand it to the shared
+                // loop, which persists it between the user and assistant rows.
+                var toolEntries = _toolAudit.ProjectBlockingRun(_toolAudit.CaptureBlockingRun(response));
 
                 // Reload the session: the tool execution mutated Session.Metadata in the store via
                 // its own ISessionStore handle, so the in-memory copy here may be stale.
@@ -226,17 +411,264 @@ public sealed class AgentExchangeService : IAgentExchangeService
                             FinishedSummary = string.IsNullOrEmpty(finishSummary) ? null : finishSummary
                         };
                     }
-                    return new AgentExchangeTurnEngine.ExchangeTurnOutcome(responseText, Finished: true, finishReason, finishSummary);
+                    return new AgentExchangeTurnEngine.ExchangeTurnOutcome(responseText, Finished: true, finishReason, finishSummary, toolEntries);
                 }
 
-                return new AgentExchangeTurnEngine.ExchangeTurnOutcome(responseText, Finished: false, null, null);
+                return new AgentExchangeTurnEngine.ExchangeTurnOutcome(responseText, Finished: false, null, null, toolEntries);
             },
             beforeSeal: s => s.ExchangeCompletion = s.ExchangeCompletion is { } c
                 ? c with { ActiveExchangeId = null }
                 : null,
             onSealSuccess: static _ => { },
             cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // #553 parity: caller cancellation is not an exchange failure and does not seal the
+            // session, so it does not get a terminal event either. Rethrow untouched.
+            //
+            // #3494 AC4: but it must not vanish silently either. The acceptance clause offers
+            // "seals OR marks", and marking is the only one compatible with #553 - sealing would
+            // reintroduce the 409 that made caller retries impossible. So we stamp an outcome and
+            // leave the status Active: the session stays retryable, and a reaper (or an operator
+            // reading the store) can now tell an abandoned exchange from a healthy in-flight one,
+            // which was impossible when both looked like "Active with one history row".
+            await MarkCallerCancelledAsync(sessionId).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await PublishProgressAsync(
+                request,
+                AgentExchangeProgressPhase.Failed,
+                conversation.ConversationId,
+                sessionId,
+                ex.Message,
+                turns: null,
+                CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+
+        // AC4: a turn-cap exit is a HALT, not a completion. The turn engine already distinguishes
+        // the two via CompletionReason; this maps that existing distinction onto the progress phase
+        // so a reader of the initiating conversation can tell "the target finished" from "we ran
+        // out of turns" without parsing the status text.
+        var halted = string.Equals(result.CompletionReason, "maxTurnsReached", StringComparison.Ordinal);
+        await PublishProgressAsync(
+            request,
+            halted ? AgentExchangeProgressPhase.Halted : AgentExchangeProgressPhase.Completed,
+            result.ConversationId,
+            result.SessionId,
+            result.CompletionReason,
+            result.Turns,
+            cancellationToken).ConfigureAwait(false);
+
+        return result;
     }
+
+    private async Task SaveCancellationEvidenceAsync(GatewaySession session)
+    {
+        try
+        {
+            await _sessionStore.SaveAsync(session, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The receipt remains available on the cancellation, but is not necessarily durable.
+            // Diagnostic persistence must not replace the cancellation that owns the lifecycle.
+            _logger.LogWarning(ex,
+                "Could not persist cancellation evidence for exchange session '{SessionId}'.", session.SessionId);
+        }
+    }
+
+    private async Task ReloadCancellationHistoryAsync(GatewaySession session)
+    {
+        try
+        {
+            await MergeCancellationHistoryAsync(session).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Continue with locally available evidence, including any partial response. A failed
+            // refresh must not prevent capture or turn caller cancellation into a sealed error.
+            _logger.LogWarning(ex,
+                "Could not refresh cancellation history for exchange session '{SessionId}'; using available evidence.",
+                session.SessionId);
+        }
+    }
+
+    private async Task MergeCancellationHistoryAsync(GatewaySession session)
+    {
+        // Write-ahead audit uses its own aggregate. Reload with an uncancelled token so
+        // independently committed results participate in the receipt, not just local rows.
+        var latest = await _sessionStore.GetAsync(session.SessionId, CancellationToken.None).ConfigureAwait(false);
+        if (latest is null || ReferenceEquals(latest, session))
+            return;
+
+        // Keep the working aggregate: the turn engine still owns this reference, including
+        // unsaved user/prior-turn rows. Append only durable rows it has not already observed;
+        // replacing history would discard pending turns or mark unrelated rows for deletion.
+        var local = session.GetHistorySnapshot();
+        var ids = local.Where(row => row.PersistenceId is > 0).Select(row => row.PersistenceId).ToHashSet();
+        var keys = local.Where(row => row.PersistenceKey is not null).Select(row => row.PersistenceKey).ToHashSet(StringComparer.Ordinal);
+        foreach (var row in latest.GetHistorySnapshot())
+        {
+            if ((row.PersistenceId is > 0 && ids.Contains(row.PersistenceId))
+                || (row.PersistenceKey is { } key && keys.Contains(key))
+                || local.Contains(row))
+                continue;
+            session.AddEntry(row);
+        }
+
+        // Subsequent cancellation/deadline lifecycle saves still use the working aggregate.
+        // Preserve the authoritative metadata, including deletions, rather than writing stale
+        // unrelated values back. The catches add only their own receipt after this refresh.
+        session.Metadata.Clear();
+        foreach (var (key, value) in latest.Metadata)
+            session.Metadata[key] = value;
+    }
+
+    private static AgentExchangeCancellationEvidence CreateCancellationEvidence(
+        GatewaySession session, ConversationId conversationId, string phase)
+    {
+        // Count retained results across ALL turns, not starts or just this prompt's records.
+        // Write-ahead and blocking projections can describe the same run-scoped invocation.
+        var results = session.GetHistorySnapshot()
+            .Where(row => row.Role == MessageRole.Tool && row.Kind == MessageKind.ToolResult)
+            .Select((row, index) => new
+            {
+                Row = row,
+                Key = row.AgentRunId is { } run && !string.IsNullOrWhiteSpace(row.ToolCallId)
+                    ? $"run:{run.Value.Length}:{run.Value}:{row.ToolCallId}"
+                    : row.PersistenceKey ?? $"row:{index}"
+            })
+            .GroupBy(item => item.Key, StringComparer.Ordinal)
+            .Select(group => group.Last().Row)
+            .ToArray();
+        return new AgentExchangeCancellationEvidence
+        {
+            ConversationId = conversationId, SessionId = session.SessionId, Phase = phase,
+            CompletedToolCount = results.Count(row => row.ToolIsIncomplete != true),
+            IncompleteToolCount = results.Count(row => row.ToolIsIncomplete == true)
+        };
+    }
+
+    /// <summary>
+    /// Stamps <c>exchangeOutcome=callerCancelled</c> on an exchange session abandoned by a caller
+    /// deadline, WITHOUT sealing it (#3494 AC4).
+    /// </summary>
+    /// <remarks>
+    /// Always persists with <see cref="CancellationToken.None"/>: the caller's token has already
+    /// fired by definition, so threading it here would make the marker the one thing cancellation
+    /// reliably prevents. Failures are logged and swallowed - a diagnostic marker turning a
+    /// cancellation into a different exception would be a strictly worse bug than a missing marker.
+    /// </remarks>
+    private async Task MarkCallerCancelledAsync(SessionId sessionId)
+    {
+        try
+        {
+            var latest = await _sessionStore.GetAsync(sessionId, CancellationToken.None).ConfigureAwait(false);
+            if (latest is null)
+                return;
+            latest.Metadata["exchangeOutcome"] = "callerCancelled";
+            await _sessionStore.SaveAsync(latest, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not mark exchange session '{SessionId}' as caller-cancelled.", sessionId);
+        }
+    }
+
+    /// <summary>
+    /// Emits one handoff milestone to the initiating conversation (#3176).
+    /// </summary>
+    /// <remarks>
+    /// A single funnel so every emission site produces an identically-shaped event, and so the
+    /// "observability must never break the exchange" rule is enforced in one place: the notifier
+    /// contract forbids throwing, and this method double-guards it because a progress failure
+    /// turning a successful handoff into a thrown call would be a strictly worse bug than silence.
+    /// </remarks>
+    private async Task PublishProgressAsync(
+        AgentExchangeRequest request,
+        AgentExchangeProgressPhase phase,
+        ConversationId? childConversationId,
+        SessionId? childSessionId,
+        string? reason,
+        int? turns,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _progress.PublishAsync(
+                new AgentExchangeProgressEvent
+                {
+                    Phase = phase,
+                    InitiatorId = request.InitiatorId,
+                    TargetId = request.TargetId,
+                    InitiatorSessionId = request.InitiatorSessionId,
+                    InitiatorConversationId = request.InitiatorConversationId,
+                    ChildConversationId = childConversationId,
+                    ChildSessionId = childSessionId,
+                    Reason = reason,
+                    Turns = turns
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Agent exchange progress '{Phase}' could not be published for {Initiator} -> {Target}. Exchange continues.",
+                phase, request.InitiatorId.Value, request.TargetId.Value);
+        }
+    }
+
+    /// <summary>
+    /// Builds the diagnostic thrown when an <c>agent_converse</c> target id resolves to nothing (#2877).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This throw site sits BEFORE any policy evaluation, so a bare "is not registered" was
+    /// indistinguishable from an authorization denial: the caller's rational next step was to stop
+    /// trying rather than to correct the identifier. The registry already holds the display name of
+    /// every agent, so the information needed to redirect the caller is in hand right here.
+    /// </para>
+    /// <para>
+    /// Since #2878 a SINGLE display-name match no longer reaches this method - it resolves and the
+    /// exchange proceeds. This builder therefore handles only the two remaining failures: ambiguity
+    /// (two or more agents share the display name) and no match at all. Ambiguity is reported as
+    /// ambiguity rather than collapsed into an arbitrary single choice, because silently picking one
+    /// of two same-named agents would route a conversation to the wrong peer.
+    /// </para>
+    /// </remarks>
+    private static string BuildTargetResolutionFailureMessage(AgentId targetId, IReadOnlyList<AgentDescriptor> displayNameMatches)
+    {
+        var prefix = $"Target agent '{targetId}' is not registered.";
+
+        if (displayNameMatches.Count > 1)
+        {
+            var candidates = string.Join(", ", displayNameMatches
+                .Select(d => $"'{d.AgentId.Value}'")
+                .Order(StringComparer.Ordinal));
+            return $"{prefix} Multiple registered agents have that display name: {candidates}. "
+                + "agent_converse resolves an unambiguous display name, but this one is ambiguous - specify one of those ids.";
+        }
+
+        return $"{prefix} No registered agent has that id, and none has it as a display name either - "
+            + "this is a target-resolution failure, not a policy denial. Call list_agents for the valid agent ids.";
+    }
+
+    /// <summary>
+    /// Returns every registered agent whose <c>DisplayName</c> equals <paramref name="targetId"/>
+    /// case-insensitively (#2878).
+    /// </summary>
+    /// <remarks>
+    /// Defensive against a registry stub that returns no collection: target resolution must never be
+    /// the thing that throws instead of reporting a resolution failure.
+    /// </remarks>
+    private List<AgentDescriptor> FindByDisplayName(AgentId targetId) =>
+        [.. (_registry.GetAll() ?? [])
+            .Where(d => string.Equals(d.DisplayName, targetId.Value, StringComparison.OrdinalIgnoreCase))];
 
     private static IReadOnlyList<AgentId> NormalizeChain(IReadOnlyList<AgentId> chain, AgentId initiatorId)
     {
@@ -267,23 +699,4 @@ public sealed class AgentExchangeService : IAgentExchangeService
         }
     }
 
-    /// <summary>
-    /// Returns true when the initiator's <c>SubAgentRoles</c> list contains at least one role
-    /// that matches the target's <c>metadata.role</c> value.
-    /// </summary>
-    private static bool IsRoleGranted(AgentDescriptor initiator, AgentDescriptor? target)
-    {
-        if (initiator.SubAgentRoles.Count == 0 || target is null)
-            return false;
-
-        if (!target.Metadata.TryGetValue("role", out var roleRaw) || roleRaw is null)
-            return false;
-
-        var targetRole = roleRaw is System.Text.Json.JsonElement je
-            ? je.GetString()
-            : roleRaw.ToString();
-
-        return !string.IsNullOrWhiteSpace(targetRole)
-            && initiator.SubAgentRoles.Contains(targetRole, StringComparer.OrdinalIgnoreCase);
-    }
 }

@@ -11,7 +11,58 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- #2305 (epic #2300): the client consumes the SINGLE canonical declaration of
+         ConversationKind / ConversationSource instead of hand-mirroring the wire enums. A
+         duplicated enum is a contract that can silently drift: a value added server-side would
+         not fail any client build, it would quietly degrade to the tolerant-parse fallback and
+         render wrong.
+
+         WASM PAYLOAD NOTE (#2329): this project feeds a Microsoft.NET.Sdk.BlazorWebAssembly app,
+         so every assembly reachable from here is DOWNLOADED BY THE BROWSER. It therefore
+         references BotNexus.Domain.Wire (dependency-free enums only) and deliberately NOT
+         BotNexus.Domain, which pulls Vogen.SharedTypes into the payload at runtime. Do not add
+         references here without checking what they drag in transitively. -->
+    <ProjectReference Include="..\..\domain\BotNexus.Domain.Wire\BotNexus.Domain.Wire.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #2305 (epic #2300): the conversation-origin enums have a SINGLE canonical declaration in
+         BotNexus.Gateway.Abstractions.Models; the client no longer re-declares them. Imported as
+         type ALIASES rather than a whole-namespace using so unrelated same-named types in that
+         namespace (e.g. SubAgentInfo) do not collide with the client's own models. -->
+    <Using Include="BotNexus.Gateway.Abstractions.Models.ConversationSource" Alias="ConversationSource" />
+    <Using Include="BotNexus.Gateway.Abstractions.Models.ConversationKind" Alias="ConversationKind" />
+    <Using Include="BotNexus.Gateway.Abstractions.Models.ConversationVisibility" Alias="ConversationVisibility" />
+    <Using Include="BotNexus.Gateway.Abstractions.Models.InboundDeliveryMode" Alias="InboundDeliveryMode" />
+    <!-- #2568: the SINGLE shared "is this MIME type textual enough to inline?" predicate, declared
+         in the zero-dependency BotNexus.Domain.Wire assembly referenced above and used by BOTH this
+         client's part builder and the server-side AgentUserMessageComposer. Two independent copies
+         of that predicate are exactly how #2294 -> #2484 -> #2568 recurred. -->
+    <Using Include="BotNexus.Gateway.Abstractions.Models.TextualMimeType" Alias="TextualMimeType" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="BotNexus.Extensions.Channels.SignalR.BlazorClient.Tests" />
   </ItemGroup>
+
+  <!-- #2322 / #2334: ask_user prompt reconciliation (AskUserPromptNormalizer) is shared by every
+       channel, and this client consumes it from BotNexus.Domain.Wire - referenced above - NOT from
+       BotNexus.Domain.
+
+       An earlier revision of this PR added a BotNexus.Domain ProjectReference here, justified as
+       "only a Vogen source-generator package reference, so it does not weigh down the WASM
+       payload". That justification was wrong, and BotNexus.Domain.csproj says so explicitly:
+       PrivateAssets="all" on Vogen was TRIED and EMPIRICALLY REJECTED there, because
+       Vogen.ValueObjectValidationException is a real runtime type caught by CitizenId.TryParse.
+       Vogen therefore flows as a RUNTIME asset and Vogen.SharedTypes.dll lands in the browser
+       download - which WasmPayloadDependencyArchitectureTests correctly failed on.
+
+       The fix is the one #2329 proposal 3 prescribes and the fence's own allowlist comment
+       demands: the shared ask_user wire shapes (AskUserPrompt, AskUserPromptChoice,
+       AskUserPromptNormalizer, AskUserPromptTextRenderer) live in the zero-dependency
+       BotNexus.Domain.Wire assembly, addressing conversations by plain string. The gateway maps
+       those strings to and from the typed Vogen ConversationId on the SERVER via
+       AskUserPromptProjection, which stays in BotNexus.Domain. Do NOT re-add a BotNexus.Domain
+       reference here, and do NOT allowlist it in the fence. -->
 
 </Project>

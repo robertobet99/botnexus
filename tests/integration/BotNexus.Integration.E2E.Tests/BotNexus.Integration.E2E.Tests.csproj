@@ -30,6 +30,7 @@
     </PackageReference>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="Microsoft.Playwright" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Xunit.SkippableFact" />
@@ -42,5 +43,11 @@
     <None Update="MockCatalogs\e2e-catalog.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- One copy of the orphan guard, linked rather than referenced: these seam projects
+         deliberately avoid ProjectReferences to other test projects. -->
+    <Compile Include="$(MSBuildThisFileDirectory)../Shared/SandboxProcessGuard.cs" Link="Shared/SandboxProcessGuard.cs" />
   </ItemGroup>
 </Project>

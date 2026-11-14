@@ -1,6 +1,7 @@
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Models;
+using BotNexus.Persistence.Sqlite;
 
 namespace BotNexus.Extensions.DataStore;
 
@@ -22,7 +23,9 @@ public sealed class DataStoreToolContributor : IAgentToolContributor
         if (!config.Enabled)
             return Task.FromResult(new AgentToolContribution(Array.Empty<IAgentTool>()));
 
-        var storePath = Path.Combine(context.WorkspacePath, ".store", "agent-data.db");
+        var storePath = SqliteStorePathPolicy.ResolveOwnedStorePath(
+            Path.Combine(context.WorkspacePath, ".store"),
+            "agent-data");
         var backend   = new SqliteDataStoreBackend(storePath, config.MaxSizeBytes, config.MaxQueryRows);
         IReadOnlyList<IAgentTool> tools = [new DataStoreTool(backend)];
 
@@ -30,20 +33,8 @@ public sealed class DataStoreToolContributor : IAgentToolContributor
     }
 
     private static DataStoreConfig ResolveConfig(AgentDescriptor descriptor)
-    {
-        if (descriptor.ExtensionConfig.TryGetValue("botnexus-data-store", out var element))
-        {
-            try
-            {
-                return System.Text.Json.JsonSerializer.Deserialize<DataStoreConfig>(element.GetRawText())
-                       ?? new DataStoreConfig();
-            }
-            catch
-            {
-                return new DataStoreConfig();
-            }
-        }
-
-        return new DataStoreConfig();
-    }
+        // Malformed or absent config both fall back to defaults: the data store is a local
+        // sandbox, so a typo should not silently disable an agent's storage.
+        => ExtensionConfigBinder.Bind<DataStoreConfig>(descriptor, "botnexus-data-store")
+           ?? new DataStoreConfig();
 }

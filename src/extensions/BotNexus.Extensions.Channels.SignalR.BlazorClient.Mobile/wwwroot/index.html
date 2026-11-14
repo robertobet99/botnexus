@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8" />
     <base href="/mobile/" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -11,11 +11,12 @@
     <link rel="icon" type="image/svg+xml" href="favicon.svg" />
     <link rel="apple-touch-icon" href="icon-192.png" />
     <link rel="manifest" href="manifest.json" crossorigin="use-credentials" />
+    <link rel="stylesheet" href="_content/BotNexus.Extensions.Channels.SignalR.BlazorClient.Core/css/icons.css" />
     <link rel="stylesheet" href="css/mobile.css" />
 </head>
 <body>
     <div id="app">
-        <div style="display:flex;align-items:center;justify-content:center;height:100dvh;background:#0a1628;color:#d0dff0;">
+        <div class="mobile-boot-screen">
             Loading…
         </div>
     </div>
@@ -27,7 +28,22 @@
     <script src="js/chatScroll.js"></script>
     <script src="js/canvasBridge.js"></script>
     <script src="js/appResume.js"></script>
-    <script src="_framework/blazor.webassembly.js"></script>
-    <script> if ('serviceWorker' in navigator) { navigator.serviceWorker.register('service-worker.js'); } </script>
+    <script src="js/swUpdate.js"></script>
+    <script src="js/bootDiagnostics.js"></script>
+    <script src="_framework/blazor.webassembly.js" autostart="false"></script>
+    <script>
+        // #2880: the mobile client has the same static loading div and the same default-autostart
+        // script tag as the desktop portal, so it is NOT exempt -- a failed boot behind the auth
+        // proxy would otherwise leave "Loading..." on screen indefinitely with no explanation.
+        window.BotNexusBoot.startBlazor();
+    </script>
+    <script>
+        // #2591: registration alone let a cached worker pin a stale bundle forever. BotNexusSwUpdate
+        // registers with updateViaCache:'none', re-checks on foreground return, and reloads when a
+        // new worker takes control. The published build swaps service-worker.js ->
+        // service-worker.published.js via the csproj <ServiceWorker> item, so this URL is correct
+        // for both dev and published.
+        window.BotNexusSwUpdate.register('service-worker.js');
+    </script>
 </body>
 </html>

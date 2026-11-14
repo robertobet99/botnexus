@@ -1,3 +1,4 @@
+using System.IO;
 using Bunit;
 using BotNexus.Extensions.Channels.SignalR.BlazorClient.Components;
 using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
@@ -47,7 +48,9 @@ public sealed class ChatPanelTests : IDisposable
         return agent;
     }
 
-    private static ConversationSummaryDto MakeConvDto(string convId, string agentId, string title = "Test Conv", bool isDefault = false, bool isPinned = false) =>
+    // #2305: `source`/`kind` are the IMMUTABLE server-supplied origin. Tests seed them through the
+    // DTO (the only legitimate way in) because ConversationState.Source/Kind are init-only.
+    private static ConversationSummaryDto MakeConvDto(string convId, string agentId, string title = "Test Conv", bool isDefault = false, bool isPinned = false, string kind = "HumanAgent", string source = "Channel") =>
         new ConversationSummaryDto(
             ConversationId: convId,
             AgentId: agentId,
@@ -58,6 +61,8 @@ public sealed class ChatPanelTests : IDisposable
             BindingCount: 0,
             CreatedAt: DateTimeOffset.UtcNow,
             UpdatedAt: DateTimeOffset.UtcNow,
+            Kind: kind,
+            Source: source,
             IsPinned: isPinned);
 
     [Fact]
@@ -65,7 +70,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", "My Assistant");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Contains("My Assistant", cut.Markup);
     }
@@ -87,10 +92,52 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var btn = cut.Find(".new-chat-btn");
         Assert.NotNull(btn);
+    }
+
+    [Fact]
+    public void Export_action_is_icon_only_and_opens_accessible_dialog()
+    {
+        CreateAndSeedAgent("agent-1");
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var button = cut.Find("[data-testid='chat-export-btn']");
+        Assert.Equal("Export conversation", button.GetAttribute("title"));
+        Assert.Equal("Export conversation", button.GetAttribute("aria-label"));
+        Assert.Equal(string.Empty, button.TextContent.Trim());
+        Assert.Contains("bn-icon-save", button.InnerHtml, StringComparison.Ordinal);
+
+        button.Click();
+
+        var dialog = cut.Find("[data-testid='export-dialog']");
+        Assert.Equal("Export conversation", dialog.GetAttribute("aria-label"));
+    }
+
+    [Fact]
+    public void Idle_send_action_is_an_accessible_icon_only_control()
+    {
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var button = cut.Find("[data-testid='chat-send']");
+        button.ClassList.ShouldContain("composer-action-btn");
+        button.ClassList.ShouldContain("send-btn");
+        button.GetAttribute("aria-label").ShouldBe("Send message");
+        button.GetAttribute("title").ShouldBe("Send message");
+        button.TextContent.Trim().ShouldBeEmpty();
+
+        var icon = button.QuerySelectorAll("svg.bn-icon-send").ShouldHaveSingleItem();
+        icon.GetAttribute("width").ShouldBe("18");
+        icon.GetAttribute("height").ShouldBe("18");
     }
 
     [Fact]
@@ -98,10 +145,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetStreaming("conv-1", true); // IsStreaming now reads per-conversation
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var btn = cut.Find(".new-chat-btn");
         Assert.True(btn.HasAttribute("disabled"));
@@ -112,7 +159,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isStreaming: false);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var btn = cut.Find(".new-chat-btn");
         Assert.False(btn.HasAttribute("disabled"));
@@ -123,10 +170,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         var agent = CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetStreaming("conv-1", true); // IsStreaming now reads per-conversation
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".streaming-badge");
     }
@@ -136,9 +183,96 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isStreaming: false);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Empty(cut.FindAll(".streaming-badge"));
+    }
+
+    [Fact]
+    public void Active_conversation_marks_composer_and_exposes_stable_working_status()
+    {
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.GetStreamState("conv-1").IsRunActive = true;
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var composer = cut.Find("[data-testid='chat-composer']");
+        composer.ClassList.ShouldContain("composer-active");
+        composer.ClassList.ShouldNotContain("composer-motion-disabled");
+        composer.GetAttribute("aria-busy").ShouldBe("true");
+        cut.Find("[data-testid='chat-composer-status']").TextContent.ShouldContain("Agent is working");
+        cut.Find("[data-testid='chat-input']").GetAttribute("placeholder").ShouldNotBeNull().ShouldContain("steer");
+        cut.Find("[data-testid='chat-steer-btn']");
+        cut.Find("[data-testid='chat-redirect-btn']");
+        cut.Find("[data-testid='chat-followup-btn']");
+        cut.Find("[data-testid='chat-abort-btn']");
+    }
+
+    [Fact]
+    public void Preference_change_stops_motion_immediately_without_hiding_active_semantics()
+    {
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.GetStreamState("conv-1").IsRunActive = true;
+        var preferences = _ctx.Services.GetRequiredService<IPortalPreferencesService>();
+        var snapshot = new PortalPreferences();
+        preferences.Current.Returns(snapshot);
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        snapshot.AnimateActiveRunIndicator = false;
+        preferences.OnChanged += Raise.Event<Action>();
+
+        var composer = cut.Find("[data-testid='chat-composer']");
+        composer.ClassList.ShouldContain("composer-active");
+        composer.ClassList.ShouldContain("composer-motion-disabled");
+        composer.GetAttribute("aria-busy").ShouldBe("true");
+        cut.Find("[data-testid='chat-composer-status']").TextContent.ShouldContain("Agent is working");
+        cut.Find("[data-testid='chat-abort-btn']");
+    }
+
+    [Fact]
+    public void Authoritative_completion_removes_composer_treatment_without_reload()
+    {
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        var streamState = _store.GetStreamState("conv-1");
+        streamState.IsRunActive = true;
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        streamState.IsRunActive = false;
+        _store.NotifyChanged();
+
+        cut.Find("[data-testid='chat-composer']").ClassList.ShouldNotContain("composer-active");
+        cut.Find("[data-testid='chat-composer']").GetAttribute("aria-busy").ShouldBe("false");
+        cut.FindAll("[data-testid='chat-composer-status']").ShouldBeEmpty();
+        cut.Find("[data-testid='chat-send']");
+    }
+
+    [Fact]
+    public void Routed_idle_conversation_does_not_inherit_active_composer_treatment()
+    {
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1",
+        [
+            MakeConvDto("active", "agent-1"),
+            MakeConvDto("idle", "agent-1")
+        ]);
+        _store.GetStreamState("active").IsRunActive = true;
+
+        using var activeCut = _ctx.Render<ChatPanel>(p => p
+            .Add(c => c.AgentId, "agent-1")
+            .Add(c => c.ConversationId, "active"));
+        activeCut.Find("[data-testid='chat-composer']").ClassList.ShouldContain("composer-active");
+
+        using var idleCut = _ctx.Render<ChatPanel>(p => p
+            .Add(c => c.AgentId, "agent-1")
+            .Add(c => c.ConversationId, "idle"));
+
+        idleCut.Find("[data-testid='chat-composer']").ClassList.ShouldNotContain("composer-active");
+        idleCut.FindAll("[data-testid='chat-composer-status']").ShouldBeEmpty();
     }
 
     [Fact]
@@ -146,7 +280,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "missing-conversation"));
 
         Assert.Contains("Select a conversation", cut.Markup);
     }
@@ -154,17 +288,26 @@ public sealed class ChatPanelTests : IDisposable
     [Fact]
     public void Read_only_sub_agent_view_hides_interactive_controls()
     {
-        CreateAndSeedAgent("sub-1", "Sub Agent", isConnected: true);
-        _store.SeedConversations("sub-1", [MakeConvDto("subagent-session:sub-1", "sub-1", "Sub-agent session")]);
-        _store.SetActiveConversation("sub-1", "subagent-session:sub-1");
+        // #2248: a genuine sub-agent observer entry is read-only via the IMMUTABLE IsObserverAgent
+        // kind, promoted to the active view only via the SubAgentView source.
+        _store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub Agent",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
+        _store.SeedConversations("sub-1", [MakeConvDto("subagent-session:sub-1", "sub-1", "Sub-agent session", source: "Agent")]);
+        _store.SelectView("sub-1", "subagent-session:sub-1", SelectionSource.RouteNavigation);
+        _store.SelectView("sub-1", "subagent-session:sub-1", SelectionSource.SubAgentView);
 
         var agent = _store.GetAgent("sub-1")!;
-        agent.SessionType = "agent-subagent";
         var conversation = agent.Conversations["subagent-session:sub-1"];
-        conversation.IsVirtualSession = true;
-        conversation.VirtualSessionKind = "subagent";
+        // #2305: read-only now comes from the IMMUTABLE (Kind, Source) pair, not a mutable flag.
+        Assert.Equal(ConversationSource.Agent, conversation.Source);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "sub-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "sub-1").Add(c => c.ConversationId, "subagent-session:sub-1"));
 
         cut.Find(".read-only-banner");
         Assert.Empty(cut.FindAll(".chat-input"));
@@ -172,13 +315,210 @@ public sealed class ChatPanelTests : IDisposable
         Assert.Empty(cut.FindAll(".conversation-title.editable"));
     }
 
+    [Theory]
+    [InlineData("Cron", "HumanAgent", "Cron conversation")]
+    [InlineData("Webhook", "HumanAgent", "Webhook conversation")]
+    [InlineData("Agent", "AgentAgent", "Peer-agent conversation")]
+    public void Read_only_origin_banner_uses_typed_conversation_projection(
+        string source,
+        string kind,
+        string expectedLabel)
+    {
+        var agent = CreateAndSeedAgent("agent-1");
+        var conversation = new ConversationState
+        {
+            ConversationId = "observer-conv",
+            Title = "Observed work",
+            Source = ConversationOrigin.ParseSource(source),
+            Kind = ConversationOrigin.ParseKind(kind),
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        agent.Conversations[conversation.ConversationId] = conversation;
+        _store.SelectView(agent.AgentId, conversation.ConversationId ?? string.Empty, SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<ChatPanel>(p => p
+            .Add(c => c.AgentId, "agent-1")
+            .Add(c => c.ConversationId, conversation.ConversationId));
+
+        var banner = cut.Find(".read-only-banner");
+        Assert.Contains(expectedLabel, banner.TextContent);
+        Assert.Contains("Idle", banner.TextContent);
+        Assert.DoesNotContain("Sub-agent session", banner.TextContent);
+        Assert.DoesNotContain("Completed", banner.TextContent);
+    }
+
+    [Theory]
+    [InlineData(SubAgentObserverStatus.Completed, "Completed", "completed")]
+    [InlineData(SubAgentObserverStatus.Failed, "Failed", "failed")]
+    [InlineData(SubAgentObserverStatus.Killed, "Killed", "killed")]
+    public void Read_only_sub_agent_banner_renders_explicit_terminal_outcome(
+        SubAgentObserverStatus outcome,
+        string expectedText,
+        string expectedClass)
+    {
+        _store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub Agent",
+            IsObserverAgent = true,
+            ObserverStatus = outcome,
+            IsConnected = true
+        });
+        var agent = _store.GetAgent("sub-1")!;
+        var conversation = new ConversationState
+        {
+            ConversationId = "subagent-session:sub-1",
+            Title = "Sub-agent session",
+            Source = ConversationSource.Agent,
+            Kind = ConversationKind.AgentSubAgent,
+            IsLocallySynthesised = true,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        agent.Conversations[conversation.ConversationId] = conversation;
+        _store.SelectView(agent.AgentId, conversation.ConversationId ?? string.Empty, SelectionSource.RouteNavigation);
+        _store.SelectView("sub-1", conversation.ConversationId ?? string.Empty, SelectionSource.SubAgentView);
+
+        var cut = _ctx.Render<ChatPanel>(p => p
+            .Add(c => c.AgentId, "sub-1")
+            .Add(c => c.ConversationId, conversation.ConversationId));
+
+        var banner = cut.Find(".read-only-banner");
+        Assert.Contains("Sub-agent session", banner.TextContent);
+        Assert.Contains(expectedText, banner.TextContent);
+        Assert.Contains(expectedClass, cut.Find(".read-only-status").ClassList);
+    }
+
+    [Fact]
+    public void Inactive_sub_agent_without_terminal_evidence_renders_idle_not_completed()
+    {
+        _store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub Agent",
+            IsObserverAgent = true,
+            ObserverStatus = SubAgentObserverStatus.Unknown,
+            IsConnected = true
+        });
+        var agent = _store.GetAgent("sub-1")!;
+        var conversation = new ConversationState
+        {
+            ConversationId = "subagent-session:sub-1",
+            Title = "Sub-agent session",
+            Source = ConversationSource.Agent,
+            Kind = ConversationKind.AgentSubAgent,
+            IsLocallySynthesised = true,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        agent.Conversations[conversation.ConversationId] = conversation;
+        _store.SelectView(agent.AgentId, conversation.ConversationId ?? string.Empty, SelectionSource.RouteNavigation);
+        _store.SelectView("sub-1", conversation.ConversationId ?? string.Empty, SelectionSource.SubAgentView);
+
+        var cut = _ctx.Render<ChatPanel>(p => p
+            .Add(c => c.AgentId, "sub-1")
+            .Add(c => c.ConversationId, conversation.ConversationId));
+
+        var banner = cut.Find(".read-only-banner");
+        Assert.Contains("Idle", banner.TextContent);
+        Assert.DoesNotContain("Completed", banner.TextContent);
+        Assert.DoesNotContain("bn-icon-check", banner.InnerHtml);
+    }
+
+    [Fact]
+    public void Explicit_running_sub_agent_renders_running_while_stream_is_idle()
+    {
+        _store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Sub Agent",
+            IsObserverAgent = true,
+            ObserverStatus = SubAgentObserverStatus.Running,
+            IsConnected = true
+        });
+        var agent = _store.GetAgent("sub-1")!;
+        var conversation = new ConversationState
+        {
+            ConversationId = "subagent-session:sub-1",
+            Title = "Sub-agent session",
+            Source = ConversationSource.Agent,
+            Kind = ConversationKind.AgentSubAgent,
+            IsLocallySynthesised = true,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        agent.Conversations[conversation.ConversationId] = conversation;
+        _store.SelectView(agent.AgentId, conversation.ConversationId ?? string.Empty, SelectionSource.RouteNavigation);
+        _store.SelectView("sub-1", conversation.ConversationId ?? string.Empty, SelectionSource.SubAgentView);
+
+        var cut = _ctx.Render<ChatPanel>(p => p
+            .Add(c => c.AgentId, "sub-1")
+            .Add(c => c.ConversationId, conversation.ConversationId));
+
+        var banner = cut.Find(".read-only-banner");
+        Assert.Contains("Running", banner.TextContent);
+        Assert.Contains("bn-icon-spin", banner.InnerHtml);
+        Assert.DoesNotContain("Completed", banner.TextContent);
+    }
+
+    [Fact]
+    public void Active_read_only_conversation_renders_running_regardless_of_prior_outcome()
+    {
+        var agent = CreateAndSeedAgent("agent-1");
+        var conversation = new ConversationState
+        {
+            ConversationId = "cron-conv",
+            Title = "Cron work",
+            Source = ConversationSource.Cron,
+            Kind = ConversationKind.HumanAgent,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow
+        };
+        conversation.StreamState.IsRunActive = true;
+        agent.Conversations[conversation.ConversationId] = conversation;
+        _store.SelectView(agent.AgentId, conversation.ConversationId ?? string.Empty, SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<ChatPanel>(p => p
+            .Add(c => c.AgentId, "agent-1")
+            .Add(c => c.ConversationId, conversation.ConversationId));
+
+        var banner = cut.Find(".read-only-banner");
+        Assert.Contains("Running", banner.TextContent);
+        Assert.Contains("bn-icon-spin", banner.InnerHtml);
+        Assert.DoesNotContain("Completed", banner.TextContent);
+    }
+
+    [Fact]
+    public void Session_type_poisoning_of_active_user_agent_keeps_composer_interactive()
+    {
+        // #2248 regression: a real user-agent conversation is active. An inbound sub-agent session
+        // event stamps the user agent's mutable SessionType="agent-subagent". The composer, send,
+        // and new-session controls MUST stay rendered and interactive (IsReadOnly==false), because
+        // read-only now keys on the immutable kind + view source, not the mutable SessionType.
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.UserClick);
+
+        // Inbound sub-agent session event poisons the user agent's SessionType.
+        _store.RegisterSession("agent-1", "sess-poison", sessionType: "agent-subagent");
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        Assert.DoesNotContain("read-only-banner", cut.Markup);
+        Assert.NotEmpty(cut.FindAll("[data-testid=chat-input]"));
+        Assert.NotEmpty(cut.FindAll("[data-testid=chat-send]"));
+        Assert.NotEmpty(cut.FindAll(".new-chat-btn"));
+    }
+
     [Fact]
     public void Stale_active_conversation_id_without_backing_conversation_shows_empty_state()
     {
         var agent = CreateAndSeedAgent("agent-1");
-        agent.ActiveConversationId = "missing-conversation";
+        _store.SelectView(agent.AgentId, "missing-conversation" ?? string.Empty, SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "missing-conversation"));
 
         Assert.Contains("Select a conversation", cut.Markup);
     }
@@ -187,9 +527,9 @@ public sealed class ChatPanelTests : IDisposable
     public void Stale_removed_cron_conversation_shows_empty_state_after_refresh()
     {
         var agent = CreateAndSeedAgent("agent-1");
-        agent.ActiveConversationId = "cron-session:removed-cron-session";
+        _store.SelectView(agent.AgentId, "cron-session:removed-cron-session" ?? string.Empty, SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "cron-session:removed-cron-session"));
 
         Assert.Contains("Select a conversation", cut.Markup);
     }
@@ -205,7 +545,7 @@ public sealed class ChatPanelTests : IDisposable
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.SetupVoid("chatScroll.forceScrollToBottom", _ => true);
 
-        _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var invocation = Assert.Single(_ctx.JSInterop.Invocations,
             i => i.Identifier == "chatScroll.preventEnterSubmit");
@@ -214,24 +554,59 @@ public sealed class ChatPanelTests : IDisposable
     }
 
     [Fact]
+    public void Active_inline_composer_offers_current_element_to_idempotent_paste_binder_on_rerender()
+    {
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+        var initialCount = _ctx.JSInterop.Invocations.Count(i => i.Identifier == "chatAttachments.bindPaste");
+
+        cut.Render();
+
+        _ctx.JSInterop.Invocations.Count(i => i.Identifier == "chatAttachments.bindPaste")
+            .ShouldBeGreaterThan(initialCount);
+    }
+
+    [Fact]
+    public void Expanded_composer_offers_recreated_element_to_idempotent_paste_binder_after_reopen()
+    {
+        CreateAndSeedAgent("agent-1", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+        cut.Find("[data-testid='chat-expand']").Click();
+        var firstOpenCount = _ctx.JSInterop.Invocations.Count(i => i.Identifier == "chatAttachments.bindPaste");
+        cut.Find("[data-testid='expanded-composer-close']").Click();
+        cut.Find("[data-testid='chat-expand']").Click();
+
+        _ctx.JSInterop.Invocations.Count(i => i.Identifier == "chatAttachments.bindPaste")
+            .ShouldBeGreaterThan(firstOpenCount);
+    }
+
+    [Fact]
     public void Read_only_sub_agent_view_does_not_bind_prevent_enter_submit()
     {
         CreateAndSeedAgent("sub-1", "Sub Agent", isConnected: true);
         _store.SeedConversations("sub-1", [MakeConvDto("subagent-session:sub-1", "sub-1", "Sub-agent session")]);
-        _store.SetActiveConversation("sub-1", "subagent-session:sub-1");
+        _store.SelectView("sub-1", "subagent-session:sub-1", SelectionSource.RouteNavigation);
+        // Read-only here is the observer-VIEW concern (#2299), which is what this test is about.
+        // It is asserted via SelectionSource rather than Source=Agent: since #2526 that source alone
+        // no longer implies read-only, because conversation_new mints (HumanAgent, Agent) for the
+        // user to talk in.
+        _store.SelectView("sub-1", "subagent-session:sub-1", SelectionSource.SubAgentView);
 
         var agent = _store.GetAgent("sub-1")!;
         agent.SessionType = "agent-subagent";
-        var conversation = agent.Conversations["subagent-session:sub-1"];
-        conversation.IsVirtualSession = true;
-        conversation.VirtualSessionKind = "subagent";
 
         _ctx.JSInterop.Mode = JSRuntimeMode.Strict;
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.SetupVoid("chatScroll.forceScrollToBottom", _ => true);
         _ctx.JSInterop.SetupVoid("chatScroll.observeTopForLoadMore", _ => true);
 
-        _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "sub-1"));
+        _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "sub-1").Add(c => c.ConversationId, "subagent-session:sub-1"));
 
         Assert.DoesNotContain(_ctx.JSInterop.Invocations,
             i => i.Identifier == "chatScroll.preventEnterSubmit");
@@ -242,10 +617,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "Hello!", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var userMsgs = cut.FindAll(".message.user");
         Assert.NotEmpty(userMsgs);
@@ -256,13 +631,13 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "Hello from user!", DateTimeOffset.UtcNow));
         // #1475: user messages now render through the Markdown pipeline (plain text still shows verbatim).
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<p>Hello from user!</p>");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Contains("Hello from user!", cut.Markup);
     }
@@ -272,10 +647,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Hello!", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var msgs = cut.FindAll(".message.assistant");
         Assert.NotEmpty(msgs);
@@ -291,16 +666,95 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         // An agent-authored post the gateway stamped MessageRole.Assistant.
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Posting as myself", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Single(cut.FindAll(".message.assistant"));
         Assert.Empty(cut.FindAll(".message.user"));
         var bubble = cut.Find("[data-message-role]");
         Assert.Equal("Assistant", bubble.GetAttribute("data-message-role"));
+    }
+
+    // #2185: assistant-role messages must show the participating agent's DisplayName as the
+    // author label (not the generic "Assistant" protocol role). The underlying protocol role
+    // must stay unchanged (data-message-role="Assistant") so assistant-vs-user classification
+    // and CSS keep working; the display name is surfaced via a separate data-author attribute
+    // and the visible .message-role label.
+    [Fact]
+    public void Assistant_message_author_label_shows_agent_display_name()
+    {
+        CreateAndSeedAgent("agent-1", "Farnsworth");
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Hello from the agent", DateTimeOffset.UtcNow));
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var label = cut.Find(".message .message-role");
+        Assert.Equal("Farnsworth", label.TextContent.Trim());
+        // Protocol role unchanged for classification semantics.
+        var bubble = cut.Find("[data-message-role]");
+        Assert.Equal("Assistant", bubble.GetAttribute("data-message-role"));
+        Assert.Equal("Farnsworth", bubble.GetAttribute("data-author"));
+    }
+
+    // #2185: when no agent identity is resolvable the label falls back cleanly so nothing
+    // renders blank.
+    [Fact]
+    public void Assistant_message_author_label_falls_back_when_no_display_name()
+    {
+        var agent = new AgentState { AgentId = "agent-1", DisplayName = "" };
+        _store.UpsertAgent(agent);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Hello", DateTimeOffset.UtcNow));
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var label = cut.Find(".message .message-role");
+        // The author label uses the same resolution as the header (DisplayName -> AgentId),
+        // so it is non-empty and never rendered blank.
+        Assert.False(string.IsNullOrWhiteSpace(label.TextContent));
+    }
+
+    // #2185: user-role messages keep the "User" author label -- the display-name substitution
+    // applies only to assistant-role messages.
+    [Fact]
+    public void User_message_author_label_is_unchanged()
+    {
+        CreateAndSeedAgent("agent-1", "Farnsworth");
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.AppendMessage("conv-1", new ChatMessage("User", "Hi there", DateTimeOffset.UtcNow));
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var label = cut.Find(".message .message-role");
+        Assert.Equal("User", label.TextContent.Trim());
+    }
+
+    // #2185: the streaming placeholder must also show the agent display name as its author
+    // label while keeping data-message-role="Assistant".
+    [Fact]
+    public void Streaming_placeholder_author_label_shows_agent_display_name()
+    {
+        CreateAndSeedAgent("agent-1", "Farnsworth", isStreaming: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.SetStreaming("conv-1", true);
+        _store.AppendStreamBuffer("conv-1", "streaming text");
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var streaming = cut.Find("[data-testid='streaming-message']");
+        Assert.Equal("Assistant", streaming.GetAttribute("data-message-role"));
+        Assert.Equal("Farnsworth", streaming.GetAttribute("data-author"));
+        var label = streaming.QuerySelector(".message-role");
+        Assert.NotNull(label);
+        Assert.Equal("Farnsworth", label!.TextContent.Trim());
     }
 
     // #1651: the on-behalf-of-user kickoff explicitly stamps MessageRole.User even though
@@ -311,11 +765,11 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         // An agent-authored post the gateway stamped MessageRole.User (on-behalf-of-user kickoff).
         _store.AppendMessage("conv-1", new ChatMessage("User", "Kicking off on behalf of the user", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Single(cut.FindAll(".message.user"));
         Assert.Empty(cut.FindAll(".message.assistant"));
@@ -331,10 +785,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "A human typed this", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Single(cut.FindAll(".message.user"));
         Assert.Empty(cut.FindAll(".message.assistant"));
@@ -345,10 +799,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Hello from assistant", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Single(cut.FindAll(".msg-copy-btn"));
     }
@@ -358,10 +812,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "Hello from user", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Empty(cut.FindAll(".msg-copy-btn"));
     }
@@ -376,14 +830,14 @@ public sealed class ChatPanelTests : IDisposable
         // content is arriving.
         CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
         var conv = _store.GetAgent("agent-1")!.Conversations["conv-1"];
         conv.StreamState.IsRunActive = true;      // RunStarted seen
         conv.StreamState.IsStreaming = false;     // MessageStart NOT yet seen
         conv.StreamState.Buffer = "# residual **markdown**";
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Empty(cut.FindAll("[data-testid='streaming-message']"));
         Assert.DoesNotContain("residual", cut.Markup);
@@ -396,14 +850,14 @@ public sealed class ChatPanelTests : IDisposable
         // the live bubble renders the accumulating buffer as expected.
         CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
         var conv = _store.GetAgent("agent-1")!.Conversations["conv-1"];
         conv.StreamState.IsRunActive = true;
         conv.StreamState.IsStreaming = true;      // MessageStart seen
         conv.StreamState.Buffer = "live tokens";
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find("[data-testid='streaming-message']");
         Assert.Contains("live tokens", cut.Markup);
@@ -414,11 +868,11 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetStreaming("conv-1", true);
         _store.AppendStreamBuffer("conv-1", "streaming text");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var streamingMessage = cut.Find(".message.assistant.streaming");
         Assert.Empty(streamingMessage.QuerySelectorAll(".msg-copy-btn"));
@@ -429,10 +883,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "```csharp\nConsole.WriteLine(42);\n```", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".msg-copy-btn").Click();
 
@@ -448,7 +902,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -456,7 +910,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "found 3 files"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Contains("search_files", cut.Markup);
     }
@@ -466,7 +920,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -475,7 +929,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "found 3 files"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         void AssertExpandedState(bool shouldBeExpanded)
         {
@@ -506,7 +960,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -514,9 +968,9 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = null
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        Assert.Contains("⏳", cut.Markup);
+        Assert.Contains("bn-icon-running", cut.Markup);
     }
 
     [Fact]
@@ -524,7 +978,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -533,9 +987,9 @@ public sealed class ChatPanelTests : IDisposable
             ToolIsError = false
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        Assert.Contains("✅", cut.Markup);
+        Assert.Contains("bn-icon-check", cut.Markup);
     }
 
     [Fact]
@@ -543,7 +997,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -552,9 +1006,9 @@ public sealed class ChatPanelTests : IDisposable
             ToolIsError = true
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        Assert.Contains("❌", cut.Markup);
+        Assert.Contains("bn-icon-error", cut.Markup);
         Assert.Contains("tool-error", cut.Markup);
     }
 
@@ -563,7 +1017,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -572,7 +1026,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "found 3 files"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Not visible before expanding
         Assert.Empty(cut.FindAll(".tool-copy-btn"));
@@ -589,7 +1043,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -598,7 +1052,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = null
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
 
         // Only the Arguments copy button should render
@@ -610,7 +1064,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -619,7 +1073,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "found 1 file"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
 
         // Click the first copy button (Arguments)
@@ -637,7 +1091,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -646,7 +1100,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "found 3 files:\n- a.cs\n- b.cs\n- c.cs"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
 
         // Click the second copy button (Result)
@@ -664,14 +1118,14 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("system", "", DateTimeOffset.UtcNow)
         {
             Kind = "boundary",
             BoundaryLabel = "Session started"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".session-boundary");
         Assert.Contains("Session started", cut.Markup);
@@ -682,9 +1136,9 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1", title: "My Important Conversation")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Contains("My Important Conversation", cut.Markup);
     }
@@ -694,12 +1148,13 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        cut.Find("[data-testid='chat-pin-conversation-btn']");
-        cut.Find("[data-testid='chat-archive-conversation-btn']");
+        cut.Find("[data-testid='conversation-actions-trigger']").Click();
+        cut.Find("[data-action-id='pin']");
+        cut.Find("[data-action-id='archive']");
     }
 
     [Fact]
@@ -707,10 +1162,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        await cut.InvokeAsync(() => cut.Find("[data-testid='chat-pin-conversation-btn']").Click());
+        await cut.InvokeAsync(() => { cut.Find("[data-testid='conversation-actions-trigger']").Click(); cut.Find("[data-action-id='pin']").Click(); });
 
         await _interaction.Received(1).SetConversationPinnedAsync("agent-1", "conv-1", true);
     }
@@ -720,12 +1175,12 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1", isPinned: true)]);
-        _store.SetActiveConversation("agent-1", "conv-1");
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        var pinButton = cut.Find("[data-testid='chat-pin-conversation-btn']");
-        pinButton.GetAttribute("aria-label").ShouldBe("Unpin conversation");
-        pinButton.GetAttribute("aria-pressed").ShouldBe("true");
+        cut.Find("[data-testid='conversation-actions-trigger']").Click();
+        var pinButton = cut.Find("[data-action-id='pin']");
+        pinButton.TextContent.Trim().ShouldBe("Unpin");
 
         await cut.InvokeAsync(() => pinButton.Click());
 
@@ -740,10 +1195,10 @@ public sealed class ChatPanelTests : IDisposable
         _ctx.JSInterop.Setup<bool>("confirm", _ => true).SetResult(false);
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1", title: "Keep me")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        await cut.InvokeAsync(() => cut.Find("[data-testid='chat-archive-conversation-btn']").Click());
+        await cut.InvokeAsync(() => { cut.Find("[data-testid='conversation-actions-trigger']").Click(); cut.Find("[data-action-id='archive']").Click(); });
 
         var invocation = Assert.Single(_ctx.JSInterop.Invocations, call => call.Identifier == "confirm");
         Assert.Single(invocation.Arguments).ShouldBe("Archive 'Keep me'?");
@@ -755,10 +1210,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        await cut.InvokeAsync(() => cut.Find("[data-testid='chat-archive-conversation-btn']").Click());
+        await cut.InvokeAsync(() => { cut.Find("[data-testid='conversation-actions-trigger']").Click(); cut.Find("[data-action-id='archive']").Click(); });
 
         await _interaction.Received(1).ArchiveConversationAsync("agent-1", "conv-1");
     }
@@ -768,26 +1223,27 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1", isDefault: true)]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        Assert.Empty(cut.FindAll("[data-testid='chat-pin-conversation-btn']"));
-        Assert.Empty(cut.FindAll("[data-testid='chat-archive-conversation-btn']"));
+        cut.Find("[data-testid='conversation-actions-trigger']").Click();
+        Assert.Empty(cut.FindAll("[data-action-id='pin']"));
+        Assert.Empty(cut.FindAll("[data-action-id='archive']"));
     }
 
     [Fact]
     public void Read_only_conversation_hides_pin_and_archive_header_actions()
     {
         CreateAndSeedAgent("agent-1");
-        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
-        _store.GetAgent("agent-1")!.Conversations["conv-1"].IsVirtualSession = true;
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1", source: "Cron")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        // #2305: read-only comes from the immutable server-stamped Source == Cron.
+        Assert.Equal(ConversationSource.Cron, _store.GetAgent("agent-1")!.Conversations["conv-1"].Source);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
-        Assert.Empty(cut.FindAll("[data-testid='chat-pin-conversation-btn']"));
-        Assert.Empty(cut.FindAll("[data-testid='chat-archive-conversation-btn']"));
+        Assert.Empty(cut.FindAll("[data-testid='conversation-actions-trigger']"));
     }
 
     [Fact]
@@ -835,7 +1291,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetPendingAskUser(new AskUserPromptState
         {
             RequestId = "req-1",
@@ -845,7 +1301,7 @@ public sealed class ChatPanelTests : IDisposable
             AllowFreeForm = true
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         cut.Find(".ask-user-prompt");
         Assert.Empty(cut.FindAll(".chat-input"));
@@ -856,7 +1312,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetPendingAskUser(new AskUserPromptState
         {
             RequestId = "req-1",
@@ -870,7 +1326,7 @@ public sealed class ChatPanelTests : IDisposable
             .RespondToAskUserAsync("conv-1", "req-1", "My answer", null, false)
             .Returns(Task.CompletedTask);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".ask-user-free-form").Input("My answer");
 
         await cut.InvokeAsync(() => cut.Find(".ask-user-actions .send-btn").Click());
@@ -886,28 +1342,29 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetStreaming("conv-1", true);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var btn = cut.Find(".interrupt-steer-btn");
         Assert.NotNull(btn);
     }
 
     [Fact]
-    public void InterruptSteerButton_HasAbbreviatedLabel_WhenStreaming()
+    public void InterruptSteerButton_HasIconAndAccessibleLabel_WhenStreaming()
     {
         CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetStreaming("conv-1", true);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var btn = cut.Find(".interrupt-steer-btn");
-        Assert.Contains("Redirect", btn.TextContent);
-        Assert.DoesNotContain("Interrupt + Redirect", btn.TextContent);
+        Assert.Equal("Redirect immediately", btn.GetAttribute("aria-label"));
+        Assert.Equal(string.Empty, btn.TextContent.Trim());
+        Assert.Single(btn.QuerySelectorAll("svg"));
     }
 
     [Fact]
@@ -915,9 +1372,9 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isStreaming: false);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Empty(cut.FindAll(".interrupt-steer-btn"));
     }
@@ -927,13 +1384,13 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "", DateTimeOffset.UtcNow)
         {
             ThinkingContent = "I am reasoning about this..."
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Thinking block should render
         Assert.Single(cut.FindAll(".thinking-block"));
@@ -946,13 +1403,13 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Here is my answer.", DateTimeOffset.UtcNow)
         {
             ThinkingContent = "Let me think about this..."
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Both should render
         Assert.Single(cut.FindAll(".thinking-block"));
@@ -964,13 +1421,13 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Answer", DateTimeOffset.UtcNow)
         {
             ThinkingContent = "Some reasoning..."
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var details = cut.Find(".thinking-block details");
         Assert.True(details.HasAttribute("open"), "Thinking <details> should have the 'open' attribute by default.");
@@ -981,10 +1438,10 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "Hello world", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Empty(cut.FindAll(".thinking-block"));
         Assert.Single(cut.FindAll(".message.assistant"));
@@ -996,12 +1453,12 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "**bold**", DateTimeOffset.UtcNow));
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<p><strong>bold</strong></p>");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // The user message bubble must render the sanitized HTML (msg-content), not the raw markdown source.
         var userBubble = cut.Find(".message.user");
@@ -1014,12 +1471,12 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "- a\n- b", DateTimeOffset.UtcNow));
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<ul><li>a</li><li>b</li></ul>");
 
-        _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Contains(_ctx.JSInterop.Invocations, i =>
             i.Identifier == "BotNexus.renderMarkdown"
@@ -1035,12 +1492,12 @@ public sealed class ChatPanelTests : IDisposable
         // message-level header copy button (.msg-copy-btn stays assistant-only).
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "```csharp\nx();\n```", DateTimeOffset.UtcNow));
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<pre><code>x();</code></pre>");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // User code renders through markdown (msg-content), and the code-copy hook runs.
         var userBubble = cut.Find(".message.user");
@@ -1056,12 +1513,12 @@ public sealed class ChatPanelTests : IDisposable
         // System/Tool/Error rendering must be unchanged (not routed through the markdown cache).
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("System", "**not rendered**", DateTimeOffset.UtcNow));
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<p><strong>not rendered</strong></p>");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Contains("**not rendered**", cut.Markup);
     }
@@ -1071,7 +1528,7 @@ public sealed class ChatPanelTests : IDisposable
     private ConversationState SeedActiveConversationWithMore(string agentId, string convId)
     {
         _store.SeedConversations(agentId, [MakeConvDto(convId, agentId)]);
-        _store.SetActiveConversation(agentId, convId);
+        _store.SelectView(agentId, convId, SelectionSource.RouteNavigation);
         var conv = _store.GetConversation(convId)!;
         conv.HistoryLoaded = true;
         conv.HasMoreHistory = true;
@@ -1087,7 +1544,7 @@ public sealed class ChatPanelTests : IDisposable
         CreateAndSeedAgent("agent-1", isConnected: true);
         SeedActiveConversationWithMore("agent-1", "conv-1");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.NotNull(cut.Find("[data-testid='chat-load-more']"));
     }
@@ -1097,12 +1554,12 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         var conv = _store.GetConversation("conv-1")!;
         conv.HistoryLoaded = true;
         conv.HasMoreHistory = false;
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.Empty(cut.FindAll("[data-testid='chat-load-more']"));
     }
@@ -1123,7 +1580,7 @@ public sealed class ChatPanelTests : IDisposable
             return 20;
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         await cut.InvokeAsync(() => cut.Instance.OnScrolledToTop());
 
@@ -1139,7 +1596,7 @@ public sealed class ChatPanelTests : IDisposable
         SeedActiveConversationWithMore("agent-1", "conv-1");
         _interaction.LoadMoreHistoryAsync("agent-1", "conv-1").Returns(0);
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         await cut.InvokeAsync(() => cut.Find("[data-testid='chat-load-more-btn']").Click());
 
@@ -1152,12 +1609,12 @@ public sealed class ChatPanelTests : IDisposable
         // Guard: once exhausted, the scroll observer firing again must not call the service.
         CreateAndSeedAgent("agent-1", isConnected: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         var conv = _store.GetConversation("conv-1")!;
         conv.HistoryLoaded = true;
         conv.HasMoreHistory = false;
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         await cut.InvokeAsync(() => cut.Instance.OnScrolledToTop());
 
@@ -1175,16 +1632,69 @@ public sealed class ChatPanelTests : IDisposable
     // wraps each loop item in a @key="msg.Id" element and gives the streaming bubble
     // a stable sentinel key so it is never diff-matched against a committed message.
 
+    // ── #2936: pre-compaction (folded) history rendering ──────────────────────
+
+    [Fact]
+    public void Folded_history_rows_are_hidden_until_the_toggle_is_used()
+    {
+        // #2936 AC3: folded rows are now delivered to the client (they are transcript, not context)
+        // but must render collapsed rather than as ordinary turns.
+        CreateAndSeedAgent("agent-1");
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.AppendMessage("conv-1", new ChatMessage("User", "pre-compaction", DateTimeOffset.UtcNow) { IsFolded = true });
+        _store.AppendMessage("conv-1", new ChatMessage("User", "live turn", DateTimeOffset.UtcNow));
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var folded = cut.Find("div[data-folded='true']");
+        Assert.Contains("display:none", folded.GetAttribute("style"));
+        // The live row is unaffected and still uses the keyed display:contents wrapper.
+        Assert.Single(cut.FindAll("div[data-folded='true']"));
+        Assert.NotNull(cut.Find("[data-testid='folded-history-toggle-btn']"));
+    }
+
+    [Fact]
+    public void Folded_history_toggle_reveals_pre_compaction_rows()
+    {
+        CreateAndSeedAgent("agent-1");
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.AppendMessage("conv-1", new ChatMessage("User", "pre-compaction", DateTimeOffset.UtcNow) { IsFolded = true });
+        _store.AppendMessage("conv-1", new ChatMessage("User", "live turn", DateTimeOffset.UtcNow));
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+        cut.Find("[data-testid='folded-history-toggle-btn']").Click();
+
+        var folded = cut.Find("div[data-folded='true']");
+        Assert.DoesNotContain("display:none", folded.GetAttribute("style"));
+        Assert.Contains("pre-compaction", cut.Markup);
+    }
+
+    [Fact]
+    public void Folded_history_toggle_is_absent_when_no_folded_rows_exist()
+    {
+        CreateAndSeedAgent("agent-1");
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.AppendMessage("conv-1", new ChatMessage("User", "live turn", DateTimeOffset.UtcNow));
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        Assert.Empty(cut.FindAll("[data-testid='folded-history-toggle']"));
+        Assert.Empty(cut.FindAll("div[data-folded='true']"));
+    }
+
     [Fact]
     public void Each_message_row_is_keyed_by_message_id()
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("User", "first", DateTimeOffset.UtcNow));
         _store.AppendMessage("conv-1", new ChatMessage("Assistant", "second", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Each loop item is emitted inside a display:contents keyed wrapper. Two
         // messages -> at least two such wrappers (keying is structural, so the
@@ -1199,14 +1709,14 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1", isStreaming: true);
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.SetStreaming("conv-1", true);
         // The committed assistant message renders through the Markdown pipeline
         // (#1475), so the JS renderer must be mocked or the message body renders empty.
         _ctx.JSInterop.SetupVoid("BotNexus.attachCodeCopyButtons", _ => true);
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<p>Hello world</p>");
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Stream two deltas, then commit the buffer as a final assistant message and
         // clear the streaming flag -- exactly the length-changing terminal-flush
@@ -1363,7 +1873,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -1372,7 +1882,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "found 3 files"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         // Not visible before expanding
         Assert.Empty(cut.FindAll(".tool-popout-btn"));
@@ -1388,7 +1898,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -1397,7 +1907,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "line1\\nline2 \\u2705"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
 
         // No modal yet
@@ -1418,7 +1928,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -1426,7 +1936,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolArgs = "{\"query\":\"test\"}"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
         cut.FindAll(".tool-popout-btn")[0].Click();
 
@@ -1441,7 +1951,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -1449,7 +1959,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolArgs = "{\"query\":\"test\"}"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
         cut.FindAll(".tool-popout-btn")[0].Click();
 
@@ -1464,7 +1974,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -1472,7 +1982,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolArgs = "{\"query\":\"test\"}"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
         cut.FindAll(".tool-popout-btn")[0].Click();
 
@@ -1488,7 +1998,7 @@ public sealed class ChatPanelTests : IDisposable
     {
         CreateAndSeedAgent("agent-1");
         _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
-        _store.SetActiveConversation("agent-1", "conv-1");
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
         _store.AppendMessage("conv-1", new ChatMessage("Tool", "", DateTimeOffset.UtcNow)
         {
             IsToolCall = true,
@@ -1496,7 +2006,7 @@ public sealed class ChatPanelTests : IDisposable
             ToolResult = "line1\\nline2 \\u2705"
         });
 
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         cut.Find(".tool-header").Click();
 
         // Copy button copies the ORIGINAL raw payload (lossless — escapes intact).
@@ -1513,7 +2023,7 @@ public sealed class ChatPanelTests : IDisposable
     public void Command_palette_renders_full_shared_registry_surface()
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var input = cut.Find(".chat-input");
         input.Input("/");
@@ -1529,13 +2039,239 @@ public sealed class ChatPanelTests : IDisposable
     public async Task Executing_new_command_from_palette_resets_session_via_dispatcher()
     {
         CreateAndSeedAgent("agent-1", isConnected: true);
-        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1"));
+        // #3063: the dispatcher requires a conversation, so the panel must be rendered against a real
+        // one. A ChatPanel with no conversation was never a state a citizen could open the palette
+        // from - it renders no transcript and no input affordances.
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1")]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var input = cut.Find(".chat-input");
         input.Input("/new");
 
         await cut.Find(".command-palette .command-item").ClickAsync(new Microsoft.AspNetCore.Components.Web.MouseEventArgs());
 
-        await _interaction.Received(1).ResetSessionAsync("agent-1");
+        await _interaction.Received(1).ResetSessionAsync("agent-1", Arg.Any<string>());
+    }
+
+    // --- #2141: long conversation title must not overlap header actions -------
+
+    private const string LongTitle =
+        "This is an extremely long conversation title that would otherwise overflow the chat header and paint on top of the thinking, tools, pin, archive, config and new-session action controls";
+
+    [Fact]
+    public void Long_readonly_conversation_title_is_fully_preserved_in_dom_for_accessibility()
+    {
+        // Read-only conversations render a non-editable <h3>. Even when the
+        // visible text is clipped with an ellipsis, the full title must remain
+        // available to assistive tech and on hover.
+        CreateAndSeedAgent("sub-1");
+        _store.SelectView("sub-1", "subagent-session:sub-1", SelectionSource.RouteNavigation);
+        _store.SeedConversations("sub-1",
+            [MakeConvDto("subagent-session:sub-1", "sub-1", title: LongTitle)]);
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "sub-1").Add(c => c.ConversationId, "subagent-session:sub-1"));
+
+        var title = cut.Find("h3.conversation-title");
+        Assert.Equal(LongTitle, title.TextContent.Trim());
+        // Full identifier/title exposed via the title attribute (hover + a11y).
+        Assert.False(string.IsNullOrEmpty(title.GetAttribute("title")));
+    }
+
+    [Fact]
+    public void Long_editable_conversation_title_is_fully_preserved_in_dom_for_accessibility()
+    {
+        CreateAndSeedAgent("agent-1");
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1", title: LongTitle)]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var title = cut.Find("h3.conversation-title.editable");
+        Assert.Equal(LongTitle, title.TextContent.Trim());
+        var titleAttr = title.GetAttribute("title") ?? "";
+        Assert.Contains("click to rename", titleAttr);
+    }
+
+    [Fact]
+    public void SubAgentSpawned_event_does_not_desync_active_view_composer_stays_visible()
+    {
+        // Regression guard for #2243: with an active user-agent conversation, a SubAgentSpawned
+        // event landing around send time must NOT promote the sub-agent's read-only virtual
+        // session to the active view. The composer + new-session button stay visible and the
+        // read-only sub-agent banner is never shown (IsReadOnly stays false).
+        CreateAndSeedAgent("agent-1", "Farnsworth", isConnected: true);
+        _store.SeedConversations("agent-1", [MakeConvDto("conv-1", "agent-1", isDefault: true)]);
+        _store.SelectView("agent-1", "conv-1", SelectionSource.RouteNavigation);
+        _store.RegisterSession("agent-1", "sess-1", conversationId: "conv-1");
+        _store.GetConversation("conv-1")!.ActiveSessionId = "sess-1";
+
+        var cut = _ctx.Render<ChatPanel>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        // A sub-agent spawns while the user is viewing their own conversation.
+        var handler = new GatewayEventHandler(
+            _store,
+            new GatewayHubConnection(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<GatewayEventHandler>.Instance,
+            _store);
+        handler.HandleSubAgentSpawned(new SubAgentEventPayload(
+            SessionId: "sess-1",
+            SubAgentId: "sub-1",
+            Name: "Flare",
+            Task: "background work",
+            Model: "test-model",
+            Archetype: "coder",
+            Status: "Running",
+            StartedAt: DateTimeOffset.UtcNow,
+            CompletedAt: null,
+            TurnsUsed: 0,
+            ResultSummary: null,
+            TimedOut: false,
+            ChildSessionId: "child-sess-1"));
+
+        cut.Render();
+
+        // Active view is unchanged: still the user's own agent + conversation.
+        _store.ActiveAgentId.ShouldBe("agent-1");
+        (_store as IDisplayedConversation)?.DisplayedConversationIdFor("agent-1").ShouldBe("conv-1");
+
+        // Composer, send button, and new-session button remain visible; read-only banner absent.
+        Assert.NotNull(cut.Find("[data-testid=chat-input]"));
+        Assert.NotNull(cut.Find("[data-testid=chat-send]"));
+        Assert.NotNull(cut.Find(".new-chat-btn"));
+        Assert.DoesNotContain("read-only-banner", cut.Markup);
+    }
+
+    [Fact]
+    public void Icon_only_send_action_keeps_shared_square_centering_geometry()
+    {
+        var css = ReadAppCss();
+
+        AssertRuleHasDeclaration(css, ".composer-action-btn", "display: grid");
+        AssertRuleHasDeclaration(css, ".composer-action-btn", "place-items: center");
+        AssertRuleHasDeclaration(css, ".composer-action-btn", "width: 2.25rem");
+        AssertRuleHasDeclaration(css, ".composer-action-btn", "height: 2.25rem");
+        AssertRuleHasDeclaration(css, ".composer-action-btn", "padding: 0");
+        AssertRuleHasDeclaration(css, ".send-btn:not(.composer-action-btn)", "padding: 0.6rem 1.25rem");
+        AssertRuleHasDeclaration(css, ".composer-action-btn > .bn-icon", "display: block");
+    }
+
+    [Fact]
+    public void Title_region_containers_are_shrinkable_so_header_actions_stay_visible()
+    {
+        // Regression guard for #2141: the intermediate flex containers between
+        // the shrinkable .chat-header-left and the ellipsis-clipped title must
+        // themselves establish a shrinkable width (min-width: 0). Without this
+        // the title keeps its intrinsic content width and paints beneath the
+        // fixed-width .chat-header-actions group instead of showing an ellipsis.
+        var css = ReadAppCss();
+
+        AssertRuleHasDeclaration(css, ".chat-title-stack", "min-width: 0");
+        AssertRuleHasDeclaration(css, ".chat-title-heading-row", "min-width: 0");
+        AssertRuleHasDeclaration(css, "h3.conversation-title", "min-width: 0");
+        AssertRuleHasDeclaration(css, "h3.conversation-title", "text-overflow: ellipsis");
+        // The action group stays a fixed-width, non-shrinking column.
+        AssertRuleHasDeclaration(css, ".chat-header-actions", "flex-shrink: 0");
+    }
+
+    private static string ReadAppCss()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir.FullName,
+                "src", "extensions",
+                "BotNexus.Extensions.Channels.SignalR.BlazorClient",
+                "wwwroot", "css", "app.css");
+            if (File.Exists(candidate))
+            {
+                return File.ReadAllText(candidate);
+            }
+            dir = dir.Parent;
+        }
+        throw new FileNotFoundException("Could not locate app.css from test output directory.");
+    }
+
+    private static void AssertRuleHasDeclaration(string css, string selector, string declaration)
+    {
+        // A selector may appear more than once (e.g. a base rule plus responsive
+        // @media overrides). The contract is satisfied if ANY matching block
+        // declares the required property, so scan every occurrence.
+        var found = false;
+        var seenAnyBlock = false;
+        var searchFrom = 0;
+        while (true)
+        {
+            var start = css.IndexOf(selector, searchFrom, StringComparison.Ordinal);
+            if (start < 0)
+            {
+                break;
+            }
+            // Only accept an exact selector match immediately followed by
+            // optional whitespace and an opening brace (avoids partial matches).
+            var cursor = start + selector.Length;
+            while (cursor < css.Length && (css[cursor] == ' ' || css[cursor] == '\n' || css[cursor] == '\r' || css[cursor] == '\t'))
+            {
+                cursor++;
+            }
+            if (cursor < css.Length && css[cursor] == '{')
+            {
+                seenAnyBlock = true;
+                var close = css.IndexOf('}', cursor);
+                if (close > cursor)
+                {
+                    var body = css.Substring(cursor + 1, close - cursor - 1);
+                    if (body.Contains(declaration, StringComparison.Ordinal))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            searchFrom = start + selector.Length;
+        }
+
+        Assert.True(seenAnyBlock, $"CSS rule for selector '{selector}' was not found.");
+        Assert.True(found, $"No '{selector}' rule declares '{declaration}'.");
+    }
+}
+
+public sealed class ChatPanelAttachmentTests : IDisposable
+{
+    private readonly BunitContext _context = new();
+    private readonly ClientStateStore _store = new();
+
+    public ChatPanelAttachmentTests()
+    {
+        _context.Services.AddSingleton<IClientStateStore>(_store);
+        var interaction = Substitute.For<IAgentInteractionService>();
+        _context.Services.AddSingleton(interaction);
+        _context.Services.AddSingleton<ISlashCommandDispatcher>(new SlashCommandDispatcher(interaction));
+        _context.Services.AddSingleton(Substitute.For<IGatewayRestClient>());
+        _context.Services.AddSingleton(new HttpClient());
+        var preferences = Substitute.For<IPortalPreferencesService>();
+        preferences.Current.Returns(new PortalPreferences());
+        _context.Services.AddSingleton(preferences);
+        _context.JSInterop.Mode = JSRuntimeMode.Loose;
+    }
+
+    public void Dispose() => _context.Dispose();
+
+    [Fact]
+    public void User_and_assistant_rows_use_the_same_attachment_component_path()
+    {
+        _store.UpsertAgent(new AgentState { AgentId = "agent", DisplayName = "Agent", IsConnected = true });
+        _store.SeedConversations("agent", [new ConversationSummaryDto("conversation", "agent", "Conversation", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)]);
+        _store.SelectView("agent", "conversation", SelectionSource.RouteNavigation);
+        var conversation = _store.GetAgent("agent")?.Conversations["conversation"];
+        conversation.ShouldNotBeNull();
+        var attachment = new ChatAttachment("file.txt", "text/plain", 4, "dGVzdA==");
+        conversation.AppendMessage(new ChatMessage("User", "user", DateTimeOffset.UtcNow) { Attachments = [attachment] });
+        conversation.AppendMessage(new ChatMessage("Assistant", "assistant", DateTimeOffset.UtcNow) { Attachments = [attachment] });
+
+        var cut = _context.Render<ChatPanel>(parameters => parameters.Add(component => component.AgentId, "agent").Add(component => component.ConversationId, "conversation"));
+
+        cut.FindAll("[data-testid='attachment-list']").Count.ShouldBe(2);
+        cut.FindAll("[data-testid='message-attachment']").Count.ShouldBe(2);
     }
 }

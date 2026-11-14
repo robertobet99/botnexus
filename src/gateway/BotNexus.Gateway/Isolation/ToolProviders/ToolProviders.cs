@@ -1,0 +1,714 @@
+using System.Linq;
+using BotNexus.Agent.Core.Tools;
+using BotNexus.Agent.Core.Types;
+using BotNexus.Agent.Providers.Core;
+using BotNexus.Agent.Providers.Core.Registry;
+using BotNexus.Cron;
+using BotNexus.Cron.Tools;
+using BotNexus.Domain.Primitives;
+using BotNexus.Domain.World;
+using BotNexus.Gateway.Abstractions.Agents;
+using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Models;
+using BotNexus.Gateway.Abstractions.Security;
+using BotNexus.Gateway.Abstractions.Services;
+using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Configuration;
+using BotNexus.Gateway.Dispatching;
+using BotNexus.Gateway.Tools;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+namespace BotNexus.Gateway.Isolation.ToolProviders;
+
+/// <summary>
+/// Immutable per-<c>CreateAsync</c> inputs shared by every <see cref="IToolProvider"/>. Groups
+/// the values a provider needs to decide inclusion and construct its tools without re-reading the
+/// service provider (#1382 Finding 1). The <see cref="ResolveConversationId"/> delegate is the
+/// memoised resolver from the isolation strategy, so conversation-aware providers reuse the single
+/// bound-conversation lookup (#1382 Finding 2) instead of issuing their own store round-trips.
+/// </summary>
+/// <param name="Descriptor">The agent descriptor being materialised.</param>
+/// <param name="ExecutionContext">The execution context (carries the session id, parameters, history).</param>
+/// <param name="EffectiveToolIds">The normalised tool-id allowlist (empty = all tools).</param>
+/// <param name="ExistingToolNames">Names of tools already selected (workspace + extension), used by
+/// gates that must not double-register a tool already contributed elsewhere.</param>
+/// <param name="IsSubAgentSession">Whether this session is a sub-agent session (spawn tools are
+/// gated closed for sub-agents). Computed once by the strategy including its diagnostics.</param>
+/// <param name="PathValidator">The resolved path validator for filesystem-scoped tools.</param>
+/// <param name="ResolveConversationId">Memoised bound-conversation resolver keyed on a conversation store.</param>
+/// <param name="Logger">The isolation-strategy logger, for provider-level diagnostics.</param>
+/// <param name="WorkspacePath">The resolved agent workspace directory, for tools that scan it.</param>
+/// <param name="ResolvedModelId">The model id this run actually uses, after override resolution (#2796).</param>
+/// <param name="Capabilities">The capabilities declared by the provider serving this run (#2432).</param>
+/// <param name="CancellationToken">Cancellation for async provider work.</param>
+internal sealed record ToolProviderContext(
+    AgentDescriptor Descriptor,
+    AgentExecutionContext ExecutionContext,
+    IReadOnlyList<string> EffectiveToolIds,
+    IReadOnlySet<string> ExistingToolNames,
+    bool IsSubAgentSession,
+    IPathValidator PathValidator,
+    Func<IConversationStore, Task<ConversationId?>> ResolveConversationId,
+    ILogger Logger,
+    string WorkspacePath,
+    string ResolvedModelId,
+    BotNexus.Agent.Providers.Core.Registry.ProviderCapabilities Capabilities,
+    CancellationToken CancellationToken)
+{
+    /// <summary>Session id for this materialisation (shortcut over <see cref="ExecutionContext"/>).</summary>
+    public SessionId SessionId => ExecutionContext.SessionId;
+
+    /// <summary>Agent id for this materialisation (shortcut over <see cref="Descriptor"/>).</summary>
+    public AgentId AgentId => Descriptor.AgentId;
+
+    /// <summary>
+    /// True when the named tool passes the effective allowlist: either no allowlist is configured
+    /// (all tools) or the allowlist explicitly names the tool (case-insensitive). Mirrors the
+    /// per-tool <c>effectiveToolIds.Count == 0 || effectiveToolIds.Contains(name)</c> gate that the
+    /// service-locator body used inline.
+    /// </summary>
+    public bool ToolAllowed(string toolName)
+        => EffectiveToolIds.Count == 0
+           || EffectiveToolIds.Contains(toolName, StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// A cohesive unit of agent-tool construction with explicit constructor dependencies (#1382
+/// Finding 1). Replaces the Service Locator anti-pattern in <c>InProcessIsolationStrategy.CreateAsync</c>
+/// where 23 <c>_serviceProvider.GetService&lt;…&gt;()</c> calls were interleaved with per-tool inclusion
+/// gates. Each provider now declares the collaborators it needs (so the DI graph is visible and the
+/// provider is independently unit-testable), exposes a <see cref="ShouldInclude"/> gate, and yields
+/// its tools from <see cref="CreateToolsAsync"/>. The strategy composes them with
+/// <c>providers.Where(p =&gt; p.ShouldInclude(ctx)).SelectMany(p =&gt; p.CreateToolsAsync(ctx))</c>.
+/// </summary>
+internal interface IToolProvider
+{
+    /// <summary>
+    /// Returns true when this provider should contribute tools for the given context. Encapsulates
+    /// the per-tool availability + allowlist gate that previously lived inline in the strategy.
+    /// </summary>
+    bool ShouldInclude(ToolProviderContext context);
+
+    /// <summary>
+    /// Builds this provider's tools. Only called when <see cref="ShouldInclude"/> returned true.
+    /// Async because some providers resolve the bound conversation or read the live session.
+    /// </summary>
+    Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context);
+}
+
+/// <summary>
+/// Cron scheduling tool (<c>cron</c>). Included when the cron allowlist gate passes and no cron tool
+/// was already contributed by the extension registry.
+/// </summary>
+internal sealed class CronToolProvider(
+    ICronStore? cronStore,
+    CronScheduler? cronScheduler,
+    BotNexus.Agent.Providers.Core.Registry.ModelRegistry? modelRegistry = null,
+    BotNexus.Cron.Actions.ICommandCronAuthorizer? commandAuthorizer = null,
+    BotNexus.Cron.ICronAlertTargetResolver? alertTargetResolver = null,
+    IConversationStore? conversationStore = null,
+    BotNexus.Cron.CronOptions? cronOptions = null) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context)
+    {
+        var cronEnabled = context.ToolAllowed("cron");
+        var hasCronTool = context.ExistingToolNames.Contains("cron");
+        return cronEnabled && !hasCronTool && cronStore is not null && cronScheduler is not null;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var allowCrossAgentCron = ResolveAllowCrossAgentCron(context.Descriptor);
+
+        // #2412: resolve the DURABLE conversation this agent is speaking in, through the same
+        // memoised bound-conversation resolver every other conversation-aware provider uses
+        // (session store first, then the conversation whose ActiveSessionId matches). It is a
+        // persisted store key, NOT a transient or policy-scoped routing token - a policy-scoped key
+        // can be empty and cleanup-retired, which would leave created jobs pointing at a
+        // conversation that no longer exists. A null conversation store, or a session with no
+        // bound conversation (CLI / REST / headless exec), yields null and the tool then keeps the
+        // pre-#2412 isolated default.
+        ConversationId? creatingConversationId = conversationStore is not null
+            ? await context.ResolveConversationId(conversationStore).ConfigureAwait(false)
+            : null;
+
+        // #3521: the binding decision needs the conversation's PROVENANCE, not just its id. The id
+        // alone cannot distinguish an agent-owned or cron-owned conversation (bind, #2412) from a
+        // human's own long-running thread (never adopt - adopting one relocates it into the portal's
+        // Cron bucket and makes it an archive target when the job is deleted). Read the row once,
+        // here, at the same seam that already resolved the id. A row that cannot be read leaves the
+        // provenance null, which preserves the pre-#3521 behaviour rather than silently disabling
+        // the #2412 binding.
+        ConversationKind? creatingConversationKind = null;
+        var creatingConversationIsDefault = false;
+        if (conversationStore is not null && creatingConversationId is { } bound)
+        {
+            var conversation = await conversationStore.GetAsync(bound).ConfigureAwait(false);
+            if (conversation is not null)
+            {
+                creatingConversationKind = conversation.Kind;
+                creatingConversationIsDefault = conversation.IsDefault;
+            }
+        }
+
+        IReadOnlyList<IAgentTool> tools =
+            // #2462: the command-authoring gate is threaded in here so the model-facing cron tool
+            // refuses to persist a shellCommand the exec-tool policy would deny. A null authorizer
+            // fails closed inside CronTool.
+            // #2838: the alert-target resolver is threaded in so the tool can validate a
+            // failureAlertConversationId through the SAME CronAlertTarget seam the REST API uses.
+            // A null resolver fails closed inside CronTool for any supplied target.
+            // #3338: the configured self-pacing bound is threaded in so the `next_check` clamp uses
+            // the operator's floor/ceiling. A null options object falls back to the built-in default
+            // bound inside CronSelfPacingBound - never to an unbounded self-pacing surface.
+            [new CronTool(cronStore!, cronScheduler!, context.AgentId, allowCrossAgentCron, modelRegistry, commandAuthorizer, alertTargetResolver, creatingConversationId, cronOptions, creatingConversationKind, creatingConversationIsDefault)];
+        return tools;
+    }
+
+    private static bool ResolveAllowCrossAgentCron(AgentDescriptor descriptor)
+    {
+        if (!descriptor.Metadata.TryGetValue("allowCrossAgentCron", out var raw) || raw is null)
+            return false;
+
+        return raw switch
+        {
+            bool value => value,
+            string value when bool.TryParse(value, out var parsed) => parsed,
+            _ => false
+        };
+    }
+}
+
+/// <summary>
+/// Session-management tool (<c>session</c>). Always included when a session store is available; the
+/// access level and allowlist come from the descriptor. Intentionally not gated by the tool
+/// allowlist — this matches the pre-refactor behaviour.
+/// </summary>
+internal sealed class SessionToolProvider(ISessionStore? sessionStore) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => sessionStore is not null;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var (level, allowed) = ResolveSessionAccess(context.Descriptor);
+        IReadOnlyList<IAgentTool> tools =
+            [new SessionTool(sessionStore!, context.AgentId, level, allowed)];
+        return Task.FromResult(tools);
+    }
+
+    private static (SessionAccessLevel level, IReadOnlyList<string>? allowedAgents) ResolveSessionAccess(AgentDescriptor descriptor)
+    {
+        var level = (descriptor.SessionAccessLevel ?? "own").ToLowerInvariant() switch
+        {
+            "all" => SessionAccessLevel.All,
+            "allowlist" => SessionAccessLevel.Allowlist,
+            _ => SessionAccessLevel.Own
+        };
+
+        var allowed = descriptor.SessionAllowedAgents is { Count: > 0 }
+            ? descriptor.SessionAllowedAgents
+            : null;
+
+        if (descriptor.SubAgentIds is { Count: > 0 } && level != SessionAccessLevel.All)
+        {
+            var combined = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (allowed is not null)
+                foreach (var a in allowed) combined.Add(a);
+            foreach (var s in descriptor.SubAgentIds) combined.Add(s);
+
+            if (combined.Count > 0)
+            {
+                level = SessionAccessLevel.Allowlist;
+                allowed = combined.ToList();
+            }
+        }
+
+        return (level, allowed);
+    }
+}
+
+/// <summary>
+/// Conversation-management tool (<c>conversation</c>). Included when a conversation store is
+/// available; resolves the bound conversation via the memoised resolver. Not gated by the tool
+/// allowlist — matches the pre-refactor behaviour.
+/// </summary>
+internal sealed class ConversationToolProvider(
+    IConversationStore? conversationStore,
+    ISessionStore? sessionStore,
+    IConversationChangeNotifier? conversationChangeNotifier,
+    IInboundMessageOrchestrator? messageOrchestrator,
+    IConversationRouter? conversationRouter) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => conversationStore is not null;
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var conversationId = await context.ResolveConversationId(conversationStore!).ConfigureAwait(false);
+        var (level, allowed) = ResolveConversationAccess(context.Descriptor);
+        return
+        [
+            new ConversationTool(
+                conversationStore!,
+                context.AgentId,
+                conversationId,
+                level,
+                allowed,
+                sessionStore,
+                messageOrchestrator,
+                conversationChangeNotifier,
+                conversationRouter)
+        ];
+    }
+
+    internal static (ConversationAccessLevel level, IReadOnlyList<string>? allowedAgents) ResolveConversationAccess(AgentDescriptor descriptor)
+    {
+        var level = (descriptor.ConversationAccessLevel ?? "own").ToLowerInvariant() switch
+        {
+            "all" => ConversationAccessLevel.All,
+            "allowlist" => ConversationAccessLevel.Allowlist,
+            _ => ConversationAccessLevel.Own
+        };
+
+        var allowed = descriptor.ConversationAllowedAgents is { Count: > 0 }
+            ? descriptor.ConversationAllowedAgents
+            : null;
+
+        if (descriptor.SubAgentIds is { Count: > 0 } && level != ConversationAccessLevel.All)
+        {
+            var combined = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (allowed is not null)
+                foreach (var agent in allowed) combined.Add(agent);
+            foreach (var subAgentId in descriptor.SubAgentIds) combined.Add(subAgentId);
+
+            if (combined.Count > 0)
+            {
+                level = ConversationAccessLevel.Allowlist;
+                allowed = combined.ToList();
+            }
+        }
+
+        return (level, allowed);
+    }
+}
+
+/// <summary>
+/// Ask-user tool (<c>ask_user</c>). Included when the allowlist permits it and an ask-user response
+/// registry is available.
+/// </summary>
+internal sealed class AskUserToolProvider(
+    IAskUserResponseRegistry? askUserRegistry,
+    IConversationStore? conversationStore,
+    ISessionStore? sessionStore) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context)
+        => context.ToolAllowed("ask_user") && askUserRegistry is not null;
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var askUserConversationId = conversationStore is not null
+            ? await context.ResolveConversationId(conversationStore).ConfigureAwait(false)
+            : null;
+        return
+        [
+            new AskUserTool(
+                askUserRegistry!,
+                context.AgentId,
+                context.SessionId,
+                askUserConversationId,
+                conversationStore)
+        ];
+    }
+
+    // sessionStore is retained as an explicit dependency for parity with the pre-refactor wiring
+    // (the ask-user block resolved the conversation id via the session store); the memoised resolver
+    // already closes over it, so it is not passed to the tool directly.
+    private ISessionStore? SessionStore => sessionStore;
+}
+
+/// <summary>
+/// Always-on delay tool (<c>delay</c>). Never gated — mirrors the unconditional registration in the
+/// pre-refactor body.
+/// </summary>
+internal sealed class DelayToolProvider(IOptions<DelayToolOptions>? delayToolOptions) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => true;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var options = delayToolOptions ?? Options.Create(new DelayToolOptions());
+        IReadOnlyList<IAgentTool> tools = [new DelayTool(options)];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// Always-on date/time tool (<c>datetime</c>). Never gated. Timezone falls back from the agent soul
+/// to the gateway default timezone.
+/// </summary>
+internal sealed class DateTimeToolProvider(IOptions<PlatformConfig>? platformConfig) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => true;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var serverTimezone = platformConfig?.Value.Gateway?.DefaultTimezone;
+        IReadOnlyList<IAgentTool> tools = [new DateTimeTool(context.Descriptor.Soul?.Timezone ?? serverTimezone)];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// Always-on file-watcher tool (<c>watch_file</c>). Never gated; scoped by the resolved path validator.
+/// </summary>
+internal sealed class FileWatcherToolProvider(IOptions<FileWatcherToolOptions>? fileWatcherToolOptions) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => true;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var options = fileWatcherToolOptions ?? Options.Create(new FileWatcherToolOptions());
+        IReadOnlyList<IAgentTool> tools = [new FileWatcherTool(options, context.PathValidator)];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// Always-on model-profile discovery tool (<c>model_profile</c>). Never gated: an agent that cannot
+/// ask what model it is has no way to honour the <c>model-awareness</c> instruction that tells it to
+/// classify a base-instruction-file edit (#2436).
+/// </summary>
+internal sealed class ModelProfileToolProvider : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => true;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        IReadOnlyList<IAgentTool> tools =
+        [
+            new ModelProfileTool(
+                context.ResolvedModelId,
+                context.Descriptor.ApiProvider,
+                context.Capabilities,
+                context.WorkspacePath)
+        ];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// Always-on AGENTS.md discovery tool (<c>get_agent_files</c>). Pull-based convention loading; never
+/// gated. Scoped by the path validator.
+/// </summary>
+internal sealed class AgentFilesToolProvider(System.IO.Abstractions.IFileSystem? fileSystem) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => true;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        IReadOnlyList<IAgentTool> tools = [new AgentFilesTool(context.PathValidator, fileSystem)];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// Sub-agent orchestration tools (<c>spawn_subagent</c>, <c>list_subagents</c>, <c>manage_subagent</c>).
+/// Gated closed for sub-agent sessions and when the sub-agent manager is unavailable or max depth is
+/// zero. The spawn tool additionally requires a bound conversation so spawned sessions stay visible
+/// in the portal thread. The typed/substring sub-agent diagnostics remain in the strategy.
+/// </summary>
+internal sealed class SubAgentToolProvider(
+    ISubAgentManager? subAgentManager,
+    IOptions<GatewayOptions>? gatewayOptions,
+    IConversationStore? conversationStore,
+    ISessionStore? sessionStore) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context)
+        => subAgentManager is not null
+           && gatewayOptions?.Value.SubAgents is { MaxDepth: > 0 }
+           && !context.IsSubAgentSession;
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var tools = new List<IAgentTool>();
+
+        var includeSpawn = context.ToolAllowed("spawn_subagent");
+        var includeList = context.ToolAllowed("list_subagents");
+        var includeManage = context.ToolAllowed("manage_subagent");
+
+        if (includeSpawn)
+        {
+            var spawnConversationId = conversationStore is not null
+                ? await context.ResolveConversationId(conversationStore).ConfigureAwait(false)
+                : null;
+            if (spawnConversationId is { } resolvedSpawnConversationId)
+            {
+                tools.Add(new SubAgentSpawnTool(subAgentManager!, context.AgentId, context.SessionId, resolvedSpawnConversationId));
+            }
+            else
+            {
+                context.Logger.LogInformation(
+                    "Skipping spawn_subagent tool for session '{SessionId}' (agent '{AgentId}'): no conversation is bound to this session. " +
+                    "Sub-agent sessions must inherit a parent conversation to remain visible in the portal thread.",
+                    context.SessionId,
+                    context.AgentId);
+            }
+        }
+        if (includeList)
+            tools.Add(new SubAgentListTool(subAgentManager!, context.SessionId));
+        if (includeManage)
+            tools.Add(new SubAgentManageTool(subAgentManager!, context.SessionId));
+
+        return tools;
+    }
+
+    private ISessionStore? SessionStore => sessionStore;
+}
+
+/// <summary>
+/// Agent-to-agent converse tool (<c>agent_converse</c>). Requires an exchange service and a session
+/// store, plus the allowlist gate.
+/// </summary>
+internal sealed class AgentConverseToolProvider(
+    IAgentExchangeService? conversationService,
+    ISessionStore? sessionStore,
+    IOptions<AgentExchangeOptions>? exchangeOptions,
+    IAgentRegistry? agentRegistry = null,
+    IAgentSupervisor? agentSupervisor = null) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context)
+        => conversationService is not null && sessionStore is not null && context.ToolAllowed("agent_converse");
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        IReadOnlyList<IAgentTool> tools =
+        [
+            // #3577: the registry and supervisor are what let a cancellation name the target's state
+            // rather than returning a bare "A task was canceled.". Both are optional so the tool
+            // still constructs in hosts that do not expose them - it degrades to "unknown" state.
+            new AgentConverseTool(
+                conversationService!,
+                sessionStore!,
+                context.AgentId,
+                context.SessionId,
+                exchangeOptions?.Value,
+                agentRegistry,
+                agentSupervisor,
+                context.Logger)
+        ];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// Finish-agent-exchange system control tool (<c>finish_agent_exchange</c>). Registered only for
+/// agent-to-agent sessions and intentionally bypasses the tool allowlist (it is a system control
+/// tool, not an agent-configured capability).
+/// </summary>
+internal sealed class FinishAgentExchangeToolProvider(ISessionStore? sessionStore) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => sessionStore is not null;
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var session = await sessionStore!.GetAsync(context.SessionId, context.CancellationToken).ConfigureAwait(false);
+        if (session is not null && session.SessionType == SessionType.AgentAgent)
+        {
+            return [new FinishAgentExchangeTool(sessionStore!, context.SessionId)];
+        }
+        return [];
+    }
+}
+
+/// <summary>
+/// List-agents tool (<c>list_agents</c>). Requires an agent registry and the allowlist gate.
+/// </summary>
+internal sealed class ListAgentsToolProvider(
+    IAgentRegistry? agentRegistry,
+    IOptions<AgentExchangeOptions>? exchangeOptions) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context)
+        => agentRegistry is not null && context.ToolAllowed("list_agents");
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        IReadOnlyList<IAgentTool> tools =
+            [new ListAgentsTool(agentRegistry!, context.AgentId, exchangeOptions?.Value)];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// List-locations tool (<c>list_locations</c>). Gated by the standard allowlist, like every other
+/// provider here: available unless the agent's <c>toolIds</c> restricts it away.
+/// </summary>
+/// <remarks>
+/// <para>
+/// This was built opt-in first - included only when <c>toolIds</c> named it - on the reasoning that
+/// an agent with no business touching infrastructure should not be able to enumerate it. Two things
+/// made that the wrong call.
+/// </para>
+/// <para>
+/// <b>The grant is not additive.</b> A non-empty <c>toolIds</c> restricts to <em>exactly</em> that
+/// list, and <c>InProcessIsolationStrategy</c> applies it to the workspace tools too. So the only
+/// way to grant this tool would also have stripped <c>read</c>, <c>write</c>, <c>edit</c>,
+/// <c>shell</c>, <c>ls</c>, <c>grep</c> and <c>glob</c> from that agent unless every one of them
+/// was re-listed by hand. That produces mysteriously crippled agents, which is a worse outcome
+/// than the one being defended against.
+/// </para>
+/// <para>
+/// <b>The marginal exposure is small.</b> <c>ShellTool</c> - arbitrary command execution - is in
+/// the default toolset, alongside <c>write</c> and <c>edit</c>. Anyone who can inject into an
+/// agent's context already has a shell on its workspace; a read-only list of names and endpoints
+/// adds little to that. The protection that carries the weight here is not who may call the tool
+/// but what the tool can say: no credential reaches the payload, which
+/// <c>LocationsToolExposureFenceArchitectureTests</c> enforces and which holds however the gate is
+/// set.
+/// </para>
+/// <para>
+/// For an agent genuinely exposed to untrusted input, the control is <c>toolIds</c> on that agent -
+/// which is what the mechanism is for.
+/// </para>
+/// </remarks>
+internal sealed class ListLocationsToolProvider(
+    IOptionsMonitor<PlatformConfig>? platformConfig) : IToolProvider
+{
+    internal const string ToolName = "list_locations";
+
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context)
+        => platformConfig is not null && context.ToolAllowed(ToolName);
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        IReadOnlyList<IAgentTool> tools = [new ListLocationsTool(platformConfig!)];
+        return Task.FromResult(tools);
+    }
+}
+
+/// <summary>
+/// Agent lifecycle tools (<c>create_agent</c>, <c>update_agent</c>). Requires the registry,
+/// configuration writer, and BotNexus home; each tool has its own allowlist sub-gate.
+/// </summary>
+internal sealed class AgentManagementToolProvider(
+    IAgentRegistry? agentRegistry,
+    IAgentConfigurationWriter? configurationWriter,
+    BotNexusHome? botNexusHome,
+    IEnumerable<IAgentChangeNotifier> changeNotifiers,
+    IOptions<PlatformConfig>? platformConfigOptions,
+    LlmClient llmClient,
+    IOptions<AgentSummaryOptions>? agentSummaryOptions = null) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context)
+        => agentRegistry is not null && configurationWriter is not null && botNexusHome is not null;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        var tools = new List<IAgentTool>();
+
+        if (context.ToolAllowed("create_agent"))
+        {
+            tools.Add(new CreateAgentTool(
+                agentRegistry!, configurationWriter!, changeNotifiers, botNexusHome!,
+                platformConfigOptions, llmClient.Models));
+        }
+
+        if (context.ToolAllowed("update_agent"))
+        {
+            // #3596: the caller id is what makes the summary write self-only; without it the tool
+            // refuses every summary write rather than defaulting to permitting them.
+            tools.Add(new UpdateAgentTool(
+                agentRegistry!, configurationWriter!, changeNotifiers, llmClient.Models,
+                context.AgentId, agentSummaryOptions?.Value));
+        }
+
+        return Task.FromResult<IReadOnlyList<IAgentTool>>(tools);
+    }
+}
+
+/// <summary>
+/// Canvas tool (<c>canvas</c>). Allowlist-gated. Resolves the bound conversation so the canvas is
+/// anchored to it; no-ops safely when there is no conversation context.
+/// </summary>
+internal sealed class CanvasToolProvider(
+    IConversationStore? conversationStore,
+    IEnumerable<IAgentCanvasNotifier> canvasNotifiers,
+    IOptions<PlatformConfig>? platformConfigOptions = null) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => context.ToolAllowed("canvas");
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        ConversationId? canvasConversationId = null;
+        if (conversationStore is not null)
+        {
+            canvasConversationId = await context.ResolveConversationId(conversationStore).ConfigureAwait(false);
+        }
+
+        // #2975: the deep link needs the portal's external origin, which lives in gateway config, not
+        // in the tool's own options block. Both candidates are carried onto CanvasToolOptions so the
+        // tool stays a pure function of its options and remains constructible in tests without DI.
+        var gateway = platformConfigOptions?.Value?.Gateway;
+        var options = new CanvasToolOptions
+        {
+            PublicBaseUrl = gateway?.PublicBaseUrl,
+            ListenUrl = gateway?.ListenUrl,
+        };
+
+        return [new CanvasTool(context.AgentId, canvasConversationId, conversationStore, canvasNotifiers.ToArray(), options)];
+    }
+}
+
+/// <summary>
+/// Per-conversation todo tool (<c>todo</c>). Allowlist-gated (#1464). Resolved per conversation
+/// exactly like the canvas tool so the plan state is anchored to the bound conversation.
+/// </summary>
+internal sealed class TodoToolProvider(
+    IConversationStore? conversationStore,
+    IEnumerable<IAgentTodoNotifier> todoNotifiers) : IToolProvider
+{
+    /// <inheritdoc />
+    public bool ShouldInclude(ToolProviderContext context) => context.ToolAllowed("todo");
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<IAgentTool>> CreateToolsAsync(ToolProviderContext context)
+    {
+        ConversationId? todoConversationId = null;
+        if (conversationStore is not null)
+        {
+            todoConversationId = await context.ResolveConversationId(conversationStore).ConfigureAwait(false);
+        }
+        return [new TodoTool(todoConversationId, conversationStore, context.AgentId, todoNotifiers.ToArray())];
+    }
+}

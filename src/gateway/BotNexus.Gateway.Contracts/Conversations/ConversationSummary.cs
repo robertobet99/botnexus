@@ -18,9 +18,29 @@ namespace BotNexus.Gateway.Abstractions.Conversations;
 /// like the portal can hide internal agent-to-agent transcripts from the user-facing conversation
 /// list. Defaults to <c>HumanAgent</c> for back-compat with pre-Phase-4 stores.
 /// </param>
+/// <param name="Source">
+/// Origination trigger (<c>Channel</c>, <c>Cron</c>, <c>Webhook</c>, or <c>Agent</c>) - why the
+/// conversation exists, orthogonal to <paramref name="Kind"/> which says who is paired with whom.
+/// Defaults to <c>Channel</c> for back-compat with rows persisted before the field existed (#2300).
+/// </param>
+/// <param name="Visibility">
+/// Who may see the conversation (<c>UserFacing</c>, <c>InspectableReadOnly</c>, or
+/// <c>InternalHidden</c>) - orthogonal to every other axis here. Lets a client filter runtime
+/// bookkeeping threads out of the user's list from a typed field instead of probing the
+/// conversation id for an <c>internal:</c> prefix. Defaults to <c>UserFacing</c> for back-compat
+/// with rows persisted before the field existed (#2340).
+/// </param>
 /// <param name="Participants">
 /// Citizen participants in this conversation — enables the portal to render a participant
 /// roster (avatar chips) in the conversation header for multi-agent sessions.
+/// </param>
+/// <param name="SourceId">
+/// Stable identity of the thing that minted the conversation (#2121): the webhook registration id
+/// when <paramref name="Source"/> is <c>Webhook</c>, the cron job id when it is <c>Cron</c>, and
+/// <see langword="null"/> otherwise. Meaningful only paired with <paramref name="Source"/>.
+/// Carrying it on the summary is what lets a client attribute a listed conversation to a specific
+/// registration or job without issuing an extra per-feature list call. Defaults to
+/// <see langword="null"/> for back-compat with rows and payloads that predate the field.
 /// </param>
 public sealed record ConversationSummary(
     string ConversationId,
@@ -34,9 +54,12 @@ public sealed record ConversationSummary(
     DateTimeOffset UpdatedAt,
     string? Purpose = null,
     string Kind = "HumanAgent",
+    string Source = "Channel",
+    string Visibility = "UserFacing",
     bool IsPinned = false,
     DateTimeOffset? PinnedAt = null,
-    IReadOnlyList<ParticipantSummary>? Participants = null);
+    IReadOnlyList<ParticipantSummary>? Participants = null,
+    string? SourceId = null);
 
 /// <summary>
 /// Lightweight participant identity for conversation summary rendering.

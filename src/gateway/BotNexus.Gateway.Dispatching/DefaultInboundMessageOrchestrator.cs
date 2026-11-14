@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
+using BotNexus.Gateway.Abstractions.Activity;
 using BotNexus.Gateway.Abstractions.Channels;
 using BotNexus.Gateway.Abstractions.Models;
 using Microsoft.Extensions.Logging;
@@ -7,16 +8,75 @@ using Microsoft.Extensions.Logging;
 namespace BotNexus.Gateway.Dispatching;
 
 /// <summary>
-/// Default <see cref="IInboundMessageOrchestrator"/> that owns the per-session
+/// Default <see cref="IInboundMessageOrchestrator"/> that owns the per-isolation-unit
 /// FIFO queue, applies bounded backpressure, and delegates per-message processing
 /// to an <see cref="IInboundMessageProcessor"/>. Migrated from the queue plumbing
 /// formerly embedded in <c>GatewayHost</c> so every transport — channel adapters,
 /// SignalR hubs, REST controllers — can share the same serialisation guarantee.
 /// </summary>
-public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestrator, IChannelDispatcher, IAsyncDisposable
+/// <remarks>
+/// The unit of isolation is defined by <see cref="InboundIsolationKey"/>: the canonical
+/// conversation when the delivery names one, otherwise the session, otherwise the
+/// channel composite (#2123). Everything mapping to one key runs strictly FIFO; distinct
+/// keys run in parallel.
+/// </para>
+/// <para>
+/// <b>Queue capacity, and its relationship to the agent's steering queue (#3028 AC7).</b> Two bounded
+/// queues sit on an inbound message's path and they bound different things:
+/// </para>
+/// <list type="bullet">
+/// <item>
+/// <description>
+/// <see cref="DefaultQueueCapacity"/> (64) bounds the <em>gateway</em> per-isolation-unit FIFO of
+/// messages waiting for their own turn. Overflow is reported as
+/// <see cref="InboundDispatchStatus.Busy"/> with user-visible <see cref="BusyMessage"/> feedback.
+/// It is configurable per host via the constructor's <c>queueCapacity</c> parameter.
+/// </description>
+/// </item>
+/// <item>
+/// <description>
+/// <c>PendingMessageQueue.Capacity</c> in <c>BotNexus.Agent.Core</c> bounds the <em>agent's</em>
+/// steering/follow-up queue: messages injected into a turn ALREADY running, drained at the loop's
+/// steering drain points according to <c>QueueMode</c>. Zero (the default) means unbounded; overflow
+/// throws <c>PendingMessageQueueFullException</c> so the accepting boundary can report the refusal.
+/// </description>
+/// </item>
+/// </list>
+/// <para>
+/// They are independent by design and neither is a fallback for the other: a message counts against
+/// exactly one of them, decided by <see cref="IInboundDeliveryResolver"/>. Queue-bound messages never
+/// consume steering capacity, and steered messages never consume gateway queue capacity — so a busy
+/// gateway queue cannot block a steer, and a saturated steering queue cannot block normal traffic.
+/// </para>
+/// </remarks>
+public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestrator, IInboundAdmissionControl, IChannelDispatcher, IAsyncDisposable
 {
     /// <summary>Default bounded-channel capacity for per-session queues.</summary>
     public const int DefaultQueueCapacity = 64;
+
+    /// <summary>
+    /// Default upper bound on how long <see cref="AcceptAsync"/> will wait for a queued message to
+    /// reach the <em>front</em> of its per-isolation-unit queue before returning
+    /// <see cref="InboundDispatchStatus.Stalled"/> and logging a warning (#3600).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This bounds the <b>pre-processing</b> wait only. Once the worker has handed a message to
+    /// <see cref="IInboundMessageProcessor.ProcessAsync"/> the await becomes unbounded again, so an
+    /// ordinary long agent turn - minutes of tool calls - is never truncated. The clock applies
+    /// solely to messages sitting <em>behind</em> a head that is not moving, which is exactly the
+    /// #3600 failure: a wedged head stranded every successor forever, with no exception, no status
+    /// and no log line.
+    /// </para>
+    /// <para>
+    /// The value is deliberately short. A successor that has not even started after this long is
+    /// information the caller needs - "your message is queued behind something that is not
+    /// progressing" - and reporting it is strictly better than the pre-#3600 behaviour of reporting
+    /// nothing at all. <see cref="InboundDispatchStatus.Stalled"/> is not a drop: the message stays
+    /// on the channel and is still processed when the head clears.
+    /// </para>
+    /// </remarks>
+    public static readonly TimeSpan DefaultQueueWaitTimeout = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// Message text returned to the originating channel when its per-session
@@ -25,12 +85,40 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
     /// </summary>
     public const string BusyMessage = "Session is busy processing messages. Please retry shortly.";
 
+    /// <summary>
+    /// Message text returned to the originating channel when a queued message has not started
+    /// processing within the bounded window (#3600). Distinct from <see cref="BusyMessage"/> because
+    /// the situations differ: busy means the message was refused, stalled means it was kept.
+    /// </summary>
+    public const string StalledMessage =
+        "Your message is queued behind a turn that has not finished. It has not been lost and will " +
+        "be processed when that turn completes.";
+
+    // A broken adapter must not hold the FIFO worker or shutdown drain indefinitely.
+    private static readonly TimeSpan FailureFeedbackTimeout = TimeSpan.FromSeconds(3);
+    private const string ProcessingFailureMessage =
+        "Your message could not be processed because an internal error occurred.";
+
+    private readonly Func<TimeSpan, CancellationToken, Task> _failureFeedbackDelay;
     private readonly IInboundMessageProcessor _processor;
     private readonly ILogger<DefaultInboundMessageOrchestrator> _logger;
     private readonly IChannelManager? _channelManager;
+    private readonly IInboundDeliveryResolver? _deliveryResolver;
+    private readonly IInboundSteerDeliverer? _steerDeliverer;
+    private readonly IActivityBroadcaster? _activityBroadcaster;
     private readonly int _queueCapacity;
+    private readonly TimeSpan _queueWaitTimeout;
+    private readonly Func<TimeSpan, CancellationToken, Task> _queueDelay;
+    private readonly Func<Task<InboundDispatchResult>, CancellationToken, Task<InboundDispatchResult>> _waitForRunningCompletion;
     private readonly ConcurrentDictionary<string, SessionQueueState> _sessionQueues =
         new(StringComparer.OrdinalIgnoreCase);
+    private int _isQuiescing;
+
+    /// <inheritdoc />
+    public bool IsQuiescing => Volatile.Read(ref _isQuiescing) != 0;
+
+    /// <inheritdoc />
+    public bool TryBeginQuiesce() => Interlocked.Exchange(ref _isQuiescing, 1) == 0;
 
     /// <summary>
     /// Creates an orchestrator that uses the supplied processor to handle each
@@ -40,11 +128,30 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
     /// <see cref="DefaultQueueCapacity"/>; pass a smaller value in tests to
     /// assert backpressure behaviour.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="deliveryResolver"/> and <paramref name="steerDeliverer"/> are the #3028 seam:
+    /// when BOTH are supplied the orchestrator can route a message to a running turn instead of the
+    /// FIFO queue. When either is absent the orchestrator queues unconditionally, which is exactly
+    /// its pre-#3028 behaviour — so the many direct-construction call sites in tests and hosts keep
+    /// working unchanged, and the steering path is opt-in at composition time rather than implicit.
+    /// <para>
+    /// <paramref name="failureFeedbackDelay"/> supplies the hard failure-feedback wait deadline;
+    /// the default is a three-second delay. Tests may supply an explicit deadline signal. This
+    /// bounds waiting for the adapter's returned task, not synchronous adapter code or delivery.
+    /// </para>
+    /// </remarks>
     public DefaultInboundMessageOrchestrator(
         IInboundMessageProcessor processor,
         ILogger<DefaultInboundMessageOrchestrator> logger,
         IChannelManager? channelManager = null,
-        int queueCapacity = DefaultQueueCapacity)
+        int queueCapacity = DefaultQueueCapacity,
+        IInboundDeliveryResolver? deliveryResolver = null,
+        IInboundSteerDeliverer? steerDeliverer = null,
+        TimeSpan? queueWaitTimeout = null,
+        Func<TimeSpan, CancellationToken, Task>? queueDelay = null,
+        Func<Task<InboundDispatchResult>, CancellationToken, Task<InboundDispatchResult>>? waitForRunningCompletion = null,
+        IActivityBroadcaster? activityBroadcaster = null,
+        Func<TimeSpan, CancellationToken, Task>? failureFeedbackDelay = null)
     {
         ArgumentNullException.ThrowIfNull(processor);
         ArgumentNullException.ThrowIfNull(logger);
@@ -53,10 +160,23 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
             throw new ArgumentOutOfRangeException(nameof(queueCapacity), queueCapacity,
                 "Queue capacity must be positive.");
         }
+        _failureFeedbackDelay = failureFeedbackDelay ?? Task.Delay;
         _processor = processor;
         _logger = logger;
         _channelManager = channelManager;
         _queueCapacity = queueCapacity;
+        _deliveryResolver = deliveryResolver;
+        _steerDeliverer = steerDeliverer;
+        _activityBroadcaster = activityBroadcaster;
+        if (queueWaitTimeout is { } supplied && supplied <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(queueWaitTimeout), supplied,
+                "Queue wait timeout must be positive.");
+        }
+        _queueWaitTimeout = queueWaitTimeout ?? DefaultQueueWaitTimeout;
+        _queueDelay = queueDelay ?? Task.Delay;
+        _waitForRunningCompletion = waitForRunningCompletion ??
+            ((completion, cancellationToken) => completion.WaitAsync(cancellationToken));
     }
 
     /// <summary>
@@ -80,16 +200,199 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
                 nameof(message));
         }
 
+        if (IsQuiescing)
+            return false;
+
+        _ = PublishInboundActivityBestEffortAsync(message);
+
         var queueKey = GetQueueKey(message);
-        var queueState = _sessionQueues.GetOrAdd(queueKey, CreateSessionQueueState);
         var queueItem = new QueuedInboundMessage(message);
-        return queueState.Queue.Writer.TryWrite(queueItem);
+        if (!TryWriteToLiveQueue(queueKey, queueItem))
+            return false;
+
+        ObserveAbandonedCompletion(queueItem);
+        return true;
     }
 
     /// <inheritdoc />
-    public async Task<InboundDispatchResult> AcceptAsync(
+    public async Task<InboundDispatchStatus> PostAsync(
         InboundMessage message,
         CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        if (!message.Sender.IsValid)
+        {
+            throw new ArgumentException(
+                $"InboundMessage.Sender must be a valid CitizenId; got default(CitizenId). " +
+                $"Channel '{message.ChannelType}' producer must populate it (see #526).",
+                nameof(message));
+        }
+
+        if (IsQuiescing)
+            return InboundDispatchStatus.Busy;
+
+        await PublishInboundActivityBestEffortAsync(message).ConfigureAwait(false);
+
+        if (await TrySteerAsync(message, cancellationToken).ConfigureAwait(false))
+        {
+            return InboundDispatchStatus.Steered;
+        }
+
+        var queueKey = GetQueueKey(message);
+        var queueItem = new QueuedInboundMessage(message);
+        if (TryWriteToLiveQueue(queueKey, queueItem))
+        {
+            ObserveAbandonedCompletion(queueItem);
+            return InboundDispatchStatus.Accepted;
+        }
+
+        await SendBusyFeedbackAsync(message, cancellationToken).ConfigureAwait(false);
+        return InboundDispatchStatus.Busy;
+    }
+
+    /// <summary>
+    /// Writes an item onto the isolation unit's queue, replacing the queue first if the one in the
+    /// dictionary is no longer being read (#3600).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The queue worker removes its own dictionary entry when the session seals and again in the
+    /// <c>finally</c> of its read loop. A caller that resolved the entry just before either removal,
+    /// or a <c>GetOrAdd</c> that re-added a state whose writer had already been completed, would then
+    /// write into a channel that nobody reads. <c>TryWrite</c> succeeds, the caller awaits a
+    /// completion that can never be set, and the message is lost with no exception and no log - the
+    /// orphaned-queue half of #3600.
+    /// </para>
+    /// <para>
+    /// Guarding on the worker task closes it: a completed worker means the state is dead, so it is
+    /// evicted and rebuilt rather than written to. The rebuild is logged at Warning because a healthy
+    /// gateway should hit it rarely, and a rising rate is itself the signal that something upstream
+    /// is tearing queues down unexpectedly.
+    /// </para>
+    /// </remarks>
+    private bool TryWriteToLiveQueue(string queueKey, QueuedInboundMessage queueItem)
+    {
+        // Two attempts: the first may lose the race against a worker that is exiting right now, the
+        // second is written to a state this call created or observed as live.
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var state = _sessionQueues.GetOrAdd(queueKey, CreateSessionQueueState);
+            if (!state.WorkerTask.IsCompleted && state.Queue.Writer.TryWrite(queueItem))
+            {
+                return true;
+            }
+
+            if (!state.WorkerTask.IsCompleted)
+            {
+                // A live worker that refused the write means the bounded queue is genuinely full.
+                return false;
+            }
+
+            _logger.LogWarning(
+                "Inbound queue for isolation unit '{QueueKey}' was resolved but its worker had already " +
+                "completed; recreating the queue rather than writing into a channel nobody reads " +
+                "(#3600). attempt={Attempt}",
+                queueKey, attempt + 1);
+
+            // Evict only the exact dead instance, so a queue another thread has already rebuilt is
+            // never torn down underneath it.
+            _ = ((ICollection<KeyValuePair<string, SessionQueueState>>)_sessionQueues)
+                .Remove(new KeyValuePair<string, SessionQueueState>(queueKey, state));
+            state.Queue.Writer.TryComplete();
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Consults the #3028 delivery seam and, when it resolves to a live-turn mechanism, injects the
+    /// message into the running turn instead of queueing it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns <see langword="false"/> — meaning "carry on and queue" — in every case the steer did
+    /// not happen: no seam wired, intent was <c>Auto</c>/<c>Queue</c>, no turn running, or the
+    /// deliverer reported it could not inject. That last case matters: the turn can end between the
+    /// resolver's check and the injection, and a message must never be dropped because it lost that
+    /// race. Falling through to the queue is the safe direction to be wrong in.
+    /// </para>
+    /// <para>
+    /// A deliverer that THROWS is also treated as a non-delivery rather than propagated. Steering is
+    /// an optimisation over queueing; a broken steer path must degrade to the historical behaviour,
+    /// not fail an inbound message that would otherwise have been delivered fine.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> TrySteerAsync(InboundMessage message, CancellationToken cancellationToken)
+    {
+        if (_deliveryResolver is null || _steerDeliverer is null)
+        {
+            return false;
+        }
+
+        InboundDeliveryDecision decision;
+        try
+        {
+            decision = await _deliveryResolver.ResolveAsync(message, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "Inbound delivery resolution failed for channel '{ChannelType}'; falling back to queue.",
+                message.ChannelType);
+            return false;
+        }
+
+        if (decision.Resolved is not (InboundDeliveryMode.Steer or InboundDeliveryMode.Interrupt))
+        {
+            if (decision.FellBackToQueue)
+            {
+                _logger.LogInformation(
+                    "Inbound message requested {Requested} but no turn was running; queued instead.",
+                    decision.Requested);
+            }
+            return false;
+        }
+
+        try
+        {
+            var delivered = await _steerDeliverer.TryDeliverAsync(message, decision, cancellationToken);
+            if (!delivered)
+            {
+                _logger.LogInformation(
+                    "Inbound {Requested} could not be injected into a running turn; queued instead.",
+                    decision.Requested);
+            }
+            return delivered;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "Inbound {Requested} injection failed for channel '{ChannelType}'; falling back to queue.",
+                decision.Requested, message.ChannelType);
+            return false;
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<InboundDispatchResult> AcceptAsync(
+        InboundMessage message,
+        CancellationToken cancellationToken = default)
+        => AcceptCoreAsync(message, executionControl: null, cancellationToken);
+
+    /// <inheritdoc />
+    public Task<InboundDispatchResult> AcceptAsync(
+        InboundMessage message,
+        InboundExecutionControl executionControl,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(executionControl);
+        return AcceptCoreAsync(message, executionControl, cancellationToken);
+    }
+
+    private async Task<InboundDispatchResult> AcceptCoreAsync(
+        InboundMessage message,
+        InboundExecutionControl? executionControl,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(message);
         // CitizenId is a struct, so `required` can't catch `default`. Every channel
@@ -103,19 +406,51 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
                 nameof(message));
         }
 
-        var queueKey = GetQueueKey(message);
-        var queueState = _sessionQueues.GetOrAdd(queueKey, CreateSessionQueueState);
-        var queueItem = new QueuedInboundMessage(message);
+        if (IsQuiescing)
+            return InboundDispatchResult.Busy();
 
-        if (!queueState.Queue.Writer.TryWrite(queueItem))
+        await PublishInboundActivityBestEffortAsync(message).ConfigureAwait(false);
+
+        // #3028: the steer/queue decision is made HERE, server-side, before anything touches the
+        // FIFO queue. The resolver reads the caller's stated intent and the server-owned evidence
+        // (is a turn actually running?) and collapses them to one mechanism. Absent the seam this
+        // is a no-op and the message queues exactly as it always did.
+        var steered = await TrySteerAsync(message, cancellationToken);
+        if (steered)
+        {
+            return InboundDispatchResult.Steered();
+        }
+
+        var queueKey = GetQueueKey(message);
+        var queueItem = new QueuedInboundMessage(message, executionControl);
+
+        if (!TryWriteToLiveQueue(queueKey, queueItem))
         {
             await SendBusyFeedbackAsync(message, cancellationToken);
             return InboundDispatchResult.Busy();
         }
 
+        // #3600: bound the wait for the message to reach the FRONT of the queue, and ONLY that wait.
+        // Pre-fix, AcceptAsync awaited Completion with no upper bound at all, so a head-of-queue turn
+        // that never returned stranded every later message on the same isolation unit: TryWrite kept
+        // succeeding (capacity 64), nothing threw, nothing was logged, and the caller's await simply
+        // never resolved. The message was unobservable between accept and processing.
+        //
+        // Once the worker has picked this item up (Started) the await deliberately becomes unbounded
+        // again, so a legitimately long agent turn is never truncated. The clock therefore measures
+        // exactly one thing: "is the queue ahead of me moving?".
+        if (!await WaitForProcessingStartAsync(queueItem, queueKey, message, cancellationToken))
+        {
+            // Not a drop. The item is still on the channel and will be processed when the head
+            // clears; we are only releasing the caller's await with an observable outcome.
+            ObserveAbandonedCompletion(queueItem);
+            await SendStallFeedbackAsync(message, cancellationToken);
+            return InboundDispatchResult.Stalled();
+        }
+
         try
         {
-            return await queueItem.Completion.Task.WaitAsync(cancellationToken);
+            return await _waitForRunningCompletion(queueItem.Completion.Task, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -126,20 +461,160 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
         }
     }
 
-    /// <summary>
-    /// Derives the per-session queue key. When the inbound message carries a
-    /// <see cref="InboundMessageRoutingHints.RequestedSessionId"/> we use that
-    /// directly so the same logical session always lands on the same queue
-    /// regardless of channel address. Otherwise we fall back to channel-type
-    /// + channel-address — matching the legacy <c>GatewayHost.GetQueueKey</c>.
-    /// </summary>
-    private static string GetQueueKey(InboundMessage message)
+    private async Task PublishInboundActivityBestEffortAsync(InboundMessage message)
     {
+        if (_activityBroadcaster is null)
+        {
+            return;
+        }
+
         var hints = InboundMessageRoutingHints.FromMessage(message);
-        return hints.RequestedSessionId is { } sid
-            ? sid.Value
-            : $"{message.ChannelType}:{message.ChannelAddress}";
+        try
+        {
+            // Activity is observability, not an admission receipt. It deliberately uses an
+            // independent token and cannot turn an otherwise accepted, refused, or cancelled
+            // submission into a different delivery outcome.
+            await _activityBroadcaster.PublishAsync(new GatewayActivity
+            {
+                Type = GatewayActivityType.MessageReceived,
+                AgentId = hints.RequestedAgentId?.Value,
+                SessionId = hints.RequestedSessionId?.Value,
+                ConversationId = hints.RequestedConversationId?.Value,
+                ChannelType = message.ChannelType,
+                Message = message.Content,
+                Data = new Dictionary<string, object?>
+                {
+                    ["requestedDeliveryIntent"] = hints.DeliveryMode.ToString()
+                }
+            }, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to publish inbound activity for channel '{ChannelType}'; delivery continues.",
+                message.ChannelType);
+        }
     }
+
+    /// <summary>
+    /// Waits, up to the configured bound, for the queue worker to actually pick this item up.
+    /// Returns <see langword="true"/> when processing started (or already finished), and
+    /// <see langword="false"/> when the bound elapsed first — in which case a warning naming the
+    /// isolation key and the routing identifiers has been logged (#3600).
+    /// </summary>
+    /// <remarks>
+    /// The <see cref="QueuedInboundMessage.Completion"/> task is included in the race because a very
+    /// fast worker can complete an item before the caller ever observes <c>Started</c>; treating that
+    /// as "not started" would report a stall for a message that was in fact fully processed.
+    /// </remarks>
+    private async Task<bool> WaitForProcessingStartAsync(
+        QueuedInboundMessage queueItem,
+        string queueKey,
+        InboundMessage message,
+        CancellationToken cancellationToken)
+    {
+        var started = queueItem.Started.Task;
+        var completed = queueItem.Completion.Task;
+        if (started.IsCompleted || completed.IsCompleted)
+        {
+            return true;
+        }
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var delay = _queueDelay(_queueWaitTimeout, timeoutCts.Token);
+        var winner = await Task.WhenAny(started, completed, delay);
+        if (winner != delay)
+        {
+            // Cancel the timer so a long-running turn does not hold a pending delay for its duration.
+            timeoutCts.Cancel();
+            return true;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var hints = InboundMessageRoutingHints.FromMessage(message);
+        _logger.LogWarning(
+            "Inbound message for isolation unit '{QueueKey}' has not started processing after " +
+            "{TimeoutSeconds}s and is queued behind a turn that is not progressing; returning " +
+            "{Status} (#3600). channel='{ChannelType}' address='{ChannelAddress}' " +
+            "conversation='{ConversationId}' session='{SessionId}' agent='{AgentId}'. " +
+            "The message remains queued and will be processed when the head of the queue clears.",
+            queueKey,
+            _queueWaitTimeout.TotalSeconds,
+            InboundDispatchStatus.Stalled,
+            message.ChannelType,
+            message.ChannelAddress,
+            hints.RequestedConversationId?.Value ?? "(none)",
+            hints.RequestedSessionId?.Value ?? "(none)",
+            hints.RequestedAgentId?.Value ?? "(none)");
+
+        return false;
+    }
+
+    /// <summary>
+    /// Attaches a no-op observer to a completion the caller has stopped awaiting, so a later
+    /// <c>TrySetException</c> on it cannot surface as an <c>UnobservedTaskException</c> and crash an
+    /// unrelated part of the process. Abandoning the await is the point of the #3600 bound; leaking
+    /// an unobserved fault while doing it would trade one silent failure for another.
+    /// </summary>
+    private static void ObserveAbandonedCompletion(QueuedInboundMessage queueItem)
+        => _ = queueItem.Completion.Task.ContinueWith(
+            static t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+    /// <summary>
+    /// Best-effort user-visible feedback for a stalled queue (#3600), reusing the busy-feedback seam.
+    /// The production defect was not only that the message hung — it was that the user got no signal
+    /// whatsoever and re-sent three times into a conversation that was already dead.
+    /// </summary>
+    private async Task SendStallFeedbackAsync(InboundMessage message, CancellationToken cancellationToken)
+    {
+        if (_channelManager is null)
+        {
+            return;
+        }
+
+        var channel = _channelManager.Get(message.ChannelType);
+        if (channel is null)
+        {
+            return;
+        }
+
+        var hints = InboundMessageRoutingHints.FromMessage(message);
+        try
+        {
+            await channel.SendAsync(new OutboundMessage
+            {
+                ChannelType = message.ChannelType,
+                ChannelAddress = message.ChannelAddress,
+                Content = StalledMessage,
+                SessionId = hints.RequestedSessionId?.Value
+            }, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "Failed to send stall-feedback for channel '{ChannelType}'", message.ChannelType);
+        }
+    }
+
+    /// <summary>
+    /// Derives the queue key by delegating to <see cref="InboundIsolationKey"/>, the
+    /// single explicit definition of the inbound unit of isolation.
+    /// </summary>
+    /// <remarks>
+    /// This method deliberately holds no policy of its own. Before #2123 the rule was
+    /// inlined here as <c>RequestedSessionId ?? channelType:channelAddress</c>, which
+    /// left the isolation unit implicit and, for webhooks, wrong: it keyed on the
+    /// registration id, so two registrations pinned to one conversation ran on separate
+    /// queues and raced that conversation's <c>active_session_id</c>. The rule and its
+    /// rationale now live in one documented, directly-tested place.
+    /// </remarks>
+    private static string GetQueueKey(InboundMessage message)
+        => InboundIsolationKey.ForMessage(message).Value;
 
     /// <summary>
     /// Sends a busy-feedback message back through the originating channel
@@ -178,6 +653,95 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
         }
     }
 
+    private async Task SendProcessingFailureFeedbackAsync(InboundMessage message)
+    {
+        if (_channelManager is null)
+            return;
+
+        CancellationTokenSource? feedbackCancellation = null;
+        try
+        {
+            // Resolution belongs inside the best-effort boundary too. No persistence lookup:
+            // retain the failed submission's identity, including transport request correlation.
+            var channel = _channelManager.Get(message.ChannelType);
+            if (channel is null)
+                return;
+
+            var hints = InboundMessageRoutingHints.FromMessage(message);
+            // Only the independent hard deadline requests cancellation, through observed
+            // CancelAsync. A CTS timer could run throwing adapter callbacks on its timer thread.
+            feedbackCancellation = new CancellationTokenSource();
+            using var delayCancellation = new CancellationTokenSource();
+            var deadline = _failureFeedbackDelay(FailureFeedbackTimeout, delayCancellation.Token);
+            var send = channel.SendAsync(new OutboundMessage
+            {
+                ChannelType = message.ChannelType,
+                ChannelAddress = message.ChannelAddress,
+                ConversationId = hints.RequestedConversationId?.Value,
+                SessionId = hints.RequestedSessionId?.Value,
+                ChannelRequestId = message.ChannelRequestId,
+                Content = ProcessingFailureMessage
+            }, feedbackCancellation.Token);
+
+            // Observe the ACTUAL send even if the hard wait expires. Cancellation is only a
+            // request: an adapter may ignore it and later deliver or fault. Never replay it.
+            var observedSend = ObserveFailureFeedbackAsync(send, message);
+            if (await Task.WhenAny(observedSend, deadline).ConfigureAwait(false) == deadline)
+            {
+                _logger.LogWarning(
+                    "Processing-failure feedback wait expired for channel '{ChannelType}'; " +
+                    "the send may still complete. No retry will be attempted.", message.ChannelType);
+                // Transfer ownership before detaching cleanup. Adapter callbacks must neither
+                // hold this FIFO worker nor lose registrations when this method returns.
+                var cleanupOwner = feedbackCancellation;
+                feedbackCancellation = null;
+                _ = CancelAndDisposeFailureFeedbackAsync(cleanupOwner, message);
+            }
+            else
+            {
+                await observedSend.ConfigureAwait(false);
+            }
+            await delayCancellation.CancelAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "Failed to send processing-failure feedback for channel '{ChannelType}'", message.ChannelType);
+        }
+        finally
+        {
+            feedbackCancellation?.Dispose();
+        }
+    }
+
+    private async Task CancelAndDisposeFailureFeedbackAsync(
+        CancellationTokenSource cancellation, InboundMessage message)
+    {
+        try
+        {
+            await ObserveFailureFeedbackAsync(cancellation.CancelAsync(), message).ConfigureAwait(false);
+        }
+        finally
+        {
+            // If a callback never returns, cleanup retains the source. Never dispose it
+            // while callbacks are running or registrations are still waiting to execute.
+            cancellation.Dispose();
+        }
+    }
+
+    private async Task ObserveFailureFeedbackAsync(Task send, InboundMessage message)
+    {
+        try
+        {
+            await send.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "Failed to send processing-failure feedback for channel '{ChannelType}'", message.ChannelType);
+        }
+    }
+
     private SessionQueueState CreateSessionQueueState(string queueKey)
     {
         var queue = Channel.CreateBounded<QueuedInboundMessage>(new BoundedChannelOptions(_queueCapacity)
@@ -202,10 +766,26 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
                 bool shouldCloseQueue = false;
                 try
                 {
-                    // Use a detached token for processor work so client disconnect
-                    // doesn't kill in-progress agent execution. The processor itself
-                    // owns whether to honour its own cooperative-cancellation hooks.
-                    var outcome = await _processor.ProcessAsync(item.Message, CancellationToken.None);
+                    // A producer-owned deadline can expire while this item is still behind another
+                    // turn. Its completion is cancelled at that instant so the producer can persist
+                    // the terminal state without waiting for the head item to finish. When the queue
+                    // eventually reaches it, discard it before reporting start or invoking the processor.
+                    if (item.Completion.Task.IsCompleted)
+                    {
+                        continue;
+                    }
+
+                    // #3600: signal that this item has left the queue and is now in the processor's
+                    // hands. AcceptAsync bounds only the wait for THIS signal; everything after it is
+                    // a real turn and is awaited without a time limit.
+                    item.Started.TrySetResult(true);
+
+                    // Ordinary transport calls remain detached so a client disconnect cannot kill
+                    // in-progress work. Durable producers carry a distinct execution contract into
+                    // the processor, which owns the precise point at which execution has started.
+                    var outcome = item.ExecutionControl is { } executionControl
+                        ? await _processor.ProcessAsync(item.Message, executionControl)
+                        : await _processor.ProcessAsync(item.Message, CancellationToken.None);
                     shouldCloseQueue = outcome.ShouldClosePerSessionQueue;
 
                     var status = outcome.Dispatches.Count == 0
@@ -222,10 +802,12 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
                     _logger.LogError(ex,
                         "Error processing queued inbound message for queue '{QueueKey}'",
                         queueKey);
+                    await SendProcessingFailureFeedbackAsync(item.Message).ConfigureAwait(false);
                     item.Completion.TrySetException(ex);
                 }
                 finally
                 {
+                    item.Dispose();
                     if (shouldCloseQueue && _sessionQueues.TryRemove(queueKey, out var state))
                     {
                         state.Queue.Writer.TryComplete();
@@ -275,11 +857,44 @@ public sealed class DefaultInboundMessageOrchestrator : IInboundMessageOrchestra
         public Task WorkerTask { get; } = workerTask;
     }
 
-    private sealed class QueuedInboundMessage(InboundMessage message)
+    private sealed class QueuedInboundMessage : IDisposable
     {
-        public InboundMessage Message { get; } = message;
+        private readonly CancellationTokenRegistration _executionCancellation;
+
+        public QueuedInboundMessage(
+            InboundMessage message,
+            InboundExecutionControl? executionControl = null)
+        {
+            Message = message;
+            ExecutionControl = executionControl;
+            if (executionControl is { } control)
+            {
+                _executionCancellation = control.CancellationToken.Register(
+                    static state =>
+                    {
+                        var item = (QueuedInboundMessage)state!;
+                        item.Completion.TrySetCanceled(item.ExecutionControl!.CancellationToken);
+                    },
+                    this);
+            }
+        }
+
+        public InboundMessage Message { get; }
+
+        public InboundExecutionControl? ExecutionControl { get; }
+
+        /// <summary>
+        /// Signalled by the queue worker at the instant this item is handed to the processor (#3600).
+        /// It is the boundary between "waiting behind someone else" (bounded, and reported as
+        /// <see cref="InboundDispatchStatus.Stalled"/> if it takes too long) and "my own turn is
+        /// running" (unbounded, because agent turns legitimately take minutes).
+        /// </summary>
+        public TaskCompletionSource<bool> Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource<InboundDispatchResult> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Dispose() => _executionCancellation.Dispose();
     }
 }

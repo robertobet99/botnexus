@@ -29,10 +29,22 @@ public sealed class MobileChatPageTests : IDisposable
         _portalLoad.InitializeAsync(Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
         _store.Agents.Returns(new Dictionary<string, AgentState>().AsReadOnly());
         _store.ActiveAgentId.Returns((string?)null);
+        // The real store derives ActiveAgentId from the single ViewSelection SelectView writes.
+        // Mirror that on the substitute so route/bootstrap assertions observe the selected agent.
+        _store.When(s => s.SelectView(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<SelectionSource>()))
+            .Do(ci =>
+            {
+                var agentId = ci.ArgAt<string>(0);
+                _store.ActiveAgentId.Returns(string.IsNullOrEmpty(agentId) ? null : agentId);
+            });
         _store.GetStreamState(Arg.Any<string>()).Returns(new ConversationStreamState());
         _store.GetMessages(Arg.Any<string>()).Returns(new List<ChatMessage>().AsReadOnly());
 
         _ctx.Services.AddSingleton(_store);
+        var displayedConversation = Substitute.For<IDisplayedConversation>();
+        displayedConversation.DisplayedConversationIdFor(Arg.Any<string?>())
+            .Returns(call => call.Arg<string?>() is { } agentId ? (_store as IDisplayedConversation)?.DisplayedConversationIdFor(agentId) : null);
+        _ctx.Services.AddSingleton(displayedConversation);
         _ctx.Services.AddSingleton(_portalLoad);
         _ctx.Services.AddSingleton(new BotNexus.Extensions.Channels.SignalR.BlazorClient.Mobile.Services.MobileHubTuningOptions());
         _ctx.Services.AddSingleton(_interaction);
@@ -92,7 +104,6 @@ public sealed class MobileChatPageTests : IDisposable
         {
             AgentId = "agent-2",
             DisplayName = "Beta",
-            ActiveConversationId = "c-1"
         };
         targetAgent.Conversations["c-1"] = new ConversationState { ConversationId = "c-1", Title = "First" };
         targetAgent.Conversations["c-2"] = new ConversationState { ConversationId = "c-2", Title = "Second" };
@@ -144,7 +155,6 @@ public sealed class MobileChatPageTests : IDisposable
         {
             AgentId = decodedAgentId,
             DisplayName = "Encoded Agent",
-            ActiveConversationId = "fallback"
         };
         targetAgent.Conversations[decodedConversationId] = new ConversationState
         {
@@ -280,7 +290,6 @@ public sealed class MobileChatPageTests : IDisposable
         {
             AgentId = "agent-1",
             DisplayName = "Alpha",
-            ActiveConversationId = "conv-1",
             IsConnected = true
         };
         agent.Conversations["conv-1"] = new ConversationState { ConversationId = "conv-1", Title = "C" };
@@ -291,7 +300,7 @@ public sealed class MobileChatPageTests : IDisposable
         _store.GetMessages("conv-1").Returns(messages.AsReadOnly());
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<p><strong>bold</strong></p>");
 
-        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         // Markdown caching runs in response to store changes (streaming/load), so fire one.
         _store.OnChanged += Raise.Event<Action>();
 
@@ -313,7 +322,6 @@ public sealed class MobileChatPageTests : IDisposable
         {
             AgentId = "agent-1",
             DisplayName = "Alpha",
-            ActiveConversationId = "conv-1",
             IsConnected = true
         };
         agent.Conversations["conv-1"] = new ConversationState { ConversationId = "conv-1", Title = "C" };
@@ -324,7 +332,7 @@ public sealed class MobileChatPageTests : IDisposable
         _store.GetMessages("conv-1").Returns(messages.AsReadOnly());
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true).SetResult("<p><strong>not rendered</strong></p>");
 
-        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         _store.OnChanged += Raise.Event<Action>();
 
         // System messages stay on raw text rendering.
@@ -340,7 +348,7 @@ public sealed class MobileChatPageTests : IDisposable
         _ctx.JSInterop.Setup<string>("BotNexus.renderMarkdown", _ => true)
             .SetResult("<p>line one<br>line two</p>`n<p>next paragraph</p>`n");
 
-        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
         _store.OnChanged += Raise.Event<Action>();
 
         cut.WaitForAssertion(() =>
@@ -356,7 +364,7 @@ public sealed class MobileChatPageTests : IDisposable
     {
         ConfigureReadyConversation(new ChatMessage("system", "line one`n  indented", DateTimeOffset.UtcNow));
 
-        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var content = cut.Find(".message-content.plain-text-content");
         content.TextContent.ShouldBe("line one`n  indented");
@@ -373,11 +381,43 @@ public sealed class MobileChatPageTests : IDisposable
             Buffer = "line one`n  indented"
         });
 
-        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         var content = cut.Find(".message.streaming .message-content.plain-text-content");
         content.TextContent.ShouldContain("line one`n  indented");
         content.ClassList.ShouldNotContain("markdown-content");
+    }
+
+    [Fact]
+    public void Active_turn_marks_mobile_composer_and_exposes_working_status()
+    {
+        ConfigureReadyConversation();
+        _store.GetStreamState("conv-1").Returns(new ConversationStreamState { IsRunActive = true });
+
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        var composer = cut.Find("[data-testid='mobile-composer']");
+        composer.ClassList.ShouldContain("composer-active");
+        composer.GetAttribute("aria-busy").ShouldBe("true");
+        cut.Find("[data-testid='mobile-composer-status']").TextContent.ShouldContain("Agent is working");
+        cut.Find("[data-testid='chat-steer-btn']");
+        cut.Find("[data-testid='chat-redirect-btn']");
+    }
+
+    [Fact]
+    public void Authoritative_idle_state_removes_mobile_composer_treatment()
+    {
+        ConfigureReadyConversation();
+        var streamState = new ConversationStreamState { IsRunActive = true };
+        _store.GetStreamState("conv-1").Returns(streamState);
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
+
+        streamState.IsRunActive = false;
+        _store.OnChanged += Raise.Event<Action>();
+
+        cut.Find("[data-testid='mobile-composer']").ClassList.ShouldNotContain("composer-active");
+        cut.Find("[data-testid='mobile-composer']").GetAttribute("aria-busy").ShouldBe("false");
+        cut.FindAll("[data-testid='mobile-composer-status']").ShouldBeEmpty();
     }
 
     private void ConfigureReadyConversation(params ChatMessage[] messages)
@@ -387,7 +427,6 @@ public sealed class MobileChatPageTests : IDisposable
         {
             AgentId = "agent-1",
             DisplayName = "Alpha",
-            ActiveConversationId = "conv-1",
             IsConnected = true
         };
         agent.Conversations["conv-1"] = new ConversationState { ConversationId = "conv-1", Title = "C" };
@@ -407,7 +446,6 @@ public sealed class MobileChatPageTests : IDisposable
         {
             AgentId = "agent-1",
             DisplayName = "Alpha",
-            ActiveConversationId = "conv-1",
             IsConnected = true
         };
         agent.Conversations["conv-1"] = new ConversationState
@@ -423,7 +461,7 @@ public sealed class MobileChatPageTests : IDisposable
         _store.GetAgent("agent-1").Returns(agent);
         _store.GetMessages("conv-1").Returns(new List<ChatMessage>().AsReadOnly());
 
-        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         Assert.NotNull(cut.Find("[data-testid='mobile-load-more']"));
     }
@@ -438,7 +476,6 @@ public sealed class MobileChatPageTests : IDisposable
         {
             AgentId = "agent-1",
             DisplayName = "Alpha",
-            ActiveConversationId = "conv-1",
             IsConnected = true
         };
         agent.Conversations["conv-1"] = new ConversationState
@@ -455,11 +492,32 @@ public sealed class MobileChatPageTests : IDisposable
         _store.GetMessages("conv-1").Returns(new List<ChatMessage>().AsReadOnly());
         _interaction.LoadMoreHistoryAsync("agent-1", "conv-1").Returns(20);
 
-        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1"));
+        var cut = _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "agent-1").Add(c => c.ConversationId, "conv-1"));
 
         await cut.InvokeAsync(() => cut.Instance.OnScrolledToTop());
 
         await _interaction.Received(1).LoadMoreHistoryAsync("agent-1", "conv-1");
+    }
+
+    // -- #2247: mobile route-owned view uses the RouteNavigation source ------
+
+    [Fact]
+    public void Canonical_route_restore_uses_RouteNavigation_source_only()
+    {
+        // #2247: the mobile Chat page mirrors the desktop route-owned contract. A deep-link / refresh
+        // restore must tag its selection RouteNavigation and never impersonate a UserClick or
+        // SubAgentView, so an inbound event can never move the view without a navigation call.
+        _portalLoad.IsReady.Returns(true);
+
+        var agent = new AgentState { AgentId = "farnsworth", DisplayName = "Farnsworth" };
+        _store.Agents.Returns(new Dictionary<string, AgentState> { ["farnsworth"] = agent }.AsReadOnly());
+        _store.GetAgent("farnsworth").Returns(agent);
+
+        _ctx.Render<Chat>(p => p.Add(c => c.AgentId, "farnsworth"));
+
+        _store.Received().SelectView("farnsworth", string.Empty, SelectionSource.RouteNavigation);
+        _store.DidNotReceive().SelectView("farnsworth", Arg.Any<string>(), SelectionSource.UserClick);
+        _store.DidNotReceive().SelectView("farnsworth", Arg.Any<string>(), SelectionSource.SubAgentView);
     }
 
 }

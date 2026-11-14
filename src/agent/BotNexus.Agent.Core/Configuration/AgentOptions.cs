@@ -1,3 +1,8 @@
+using BotNexus.Agent.Core.ExtensionPoints.Messages;
+using BotNexus.Agent.Core.ExtensionPoints.ProviderExecution;
+using BotNexus.Agent.Core.ExtensionPoints.RunCompletion;
+using BotNexus.Agent.Core.ExtensionPoints.ToolExecution;
+using BotNexus.Agent.Core.ExtensionPoints.ToolResults;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Models;
@@ -9,34 +14,91 @@ namespace BotNexus.Agent.Core.Configuration;
 /// </summary>
 /// <param name="InitialState">The optional initial mutable state seed (system prompt, model, tools, messages).</param>
 /// <param name="Model">The model definition used for provider calls (can be overridden in InitialState).</param>
-/// <param name="ConvertToLlm">Optional converter for agent messages to provider chat messages before each LLM call.</param>
-/// <param name="TransformContext">Optional context transformer before provider invocation (defaults to identity passthrough).</param>
-/// <param name="GetApiKey">Resolves provider API keys on demand.</param>
-/// <param name="GetSteeringMessages">Provides steering messages when configured (combined with Agent.Steer queues).</param>
-/// <param name="GetFollowUpMessages">Provides follow-up messages when configured (combined with Agent.FollowUp queues).</param>
+/// <param name="LlmClient">The provider client used to stream model responses during runs.</param>
+/// <param name="ProviderMessageTransformer">Optional converter for agent messages to provider chat messages before each LLM call.</param>
+/// <param name="AgentContextTransformer">Optional context transformer before provider invocation (defaults to identity passthrough).</param>
+/// <param name="ProviderExecutionOptionsProvider">Resolves provider execution policy, including credentials, on demand.</param>
+/// <param name="SteeringMessageProvider">Provides steering messages when configured (combined with Agent.Steer queues).</param>
+/// <param name="FollowUpMessageProvider">Provides follow-up messages when configured (combined with Agent.FollowUp queues).</param>
 /// <param name="ToolExecutionMode">Controls tool execution ordering (Sequential or Parallel).</param>
-/// <param name="BeforeToolCall">Optional pre-tool-call hook for validation and blocking.</param>
-/// <param name="AfterToolCall">Optional post-tool-call hook for result transformation.</param>
+/// <param name="ToolAuditGate">Optional durable audit gate with blocking authority, invoked before tool-execution policy.</param>
+/// <param name="ToolExecutionPolicy">Optional tool-execution policy for validation and blocking.</param>
+/// <param name="ToolExecutionPolicyTimeout">
+/// Cooperative tool-execution policy budget; null selects 15 seconds. Timeout fails closed,
+/// subject to host-suspend adjustment, but cannot forcibly interrupt an uncooperative callback.
+/// Set to <see cref="Timeout.InfiniteTimeSpan"/> or a non-positive value to disable.
+/// </param>
+/// <param name="ToolResultTransformer">Optional tool-result transformer applied after execution.</param>
 /// <param name="GenerationSettings">The generation settings for model calls (temperature, maxTokens, sessionId, etc.).</param>
 /// <param name="SteeringMode">Controls steering message queue consumption (All or OneAtATime).</param>
 /// <param name="FollowUpMode">Controls follow-up message queue consumption (All or OneAtATime).</param>
 /// <param name="SessionId">Optional caller-provided session identifier (overrides GenerationSettings.SessionId if set).</param>
-/// <param name="OnDiagnostic">Optional callback for non-fatal runtime diagnostics.</param>
+/// <param name="DiagnosticObserver">
+/// Optional synchronous callback for non-fatal runtime diagnostics. Multicast subscribers are
+/// invoked independently in registration order. Subscriber exceptions, including cancellation
+/// exceptions, are ignored and cannot replace the runtime outcome or stop later subscribers.
+/// Callbacks should return promptly; delivery does not impose a timeout or prevent side effects.
+/// </param>
 /// <param name="MaxRetryDelayMs">
-/// Optional maximum delay in milliseconds for transient retry backoff.
-/// Must be greater than zero when set; null means uncapped retry delay.
+/// Maximum delay in milliseconds for transient retry backoff, and the ceiling applied to a
+/// server-supplied <c>Retry-After</c>. Must be greater than zero when set.
+/// Defaults to <see cref="AgentLoopConfig.DefaultMaxRetryDelayMs"/> rather than to "uncapped" (#3035);
+/// a null value is normalised to that same ceiling, so the retry delay is bounded on every path.
 /// </param>
 /// <param name="ToolTimeout">
-/// Per-tool execution timeout. Defaults to 120 seconds. Set to null to disable (not recommended).
+/// Loop-level tool-execution timeout; null selects 120 seconds when the runtime config is built.
+/// Tool-declared defaults and supported caller-requested timeouts can extend the effective budget.
 /// </param>
 /// <param name="ClaimAudit">
 /// Optional post-turn claim-auditor configuration (#1600). When null the auditor does not run.
 /// </param>
-/// <param name="MaybeCompactAsync">
-/// Optional best-effort auto-compaction hook (#1710). Flows to the loop config and is awaited at
-/// the top of each outer-loop iteration so a long dispatch re-checks the compaction threshold
-/// between turns. Null means no mid-loop re-check.
+/// <param name="ContextCompactionService">
+/// Optional auto-compaction service awaited before each provider turn to re-check the threshold.
+/// A returned context refreshes the agent state and loop snapshot; null retains the current context.
+/// <see cref="Loop.ProactiveCompactionException"/> blocks provider invocation when required compaction fails;
+/// cancellation propagates and other exceptions are best-effort. Null means no mid-loop re-check.
 /// </param>
+/// <param name="SuspensionRegistry">
+/// Optional provider-exhaustion suspension registry (#3015). Flows to the loop config; when set, a
+/// non-transient exhaustion failure records a time-bounded suspension scoped to provider +
+/// <paramref name="AuthProfile"/> instead of re-burning the retry budget every turn.
+/// </param>
+/// <param name="AuthProfile">
+/// Optional auth-profile identifier scoping suspensions (#3015). Null means the empty profile.
+/// </param>
+/// <param name="MaxToolOutputBytes">
+/// Shared central UTF-8 byte budget applied to every tool result before it reaches the model
+/// (#3162). Flows to the loop config. Null means the platform default; a non-positive value
+/// disables the backstop.
+/// </param>
+/// <param name="ToolResultTextTransformer">
+/// Optional host-owned sanitizer for generic tool text after result transformation and before budgeting and retention.
+/// </param>
+/// <param name="ToolExecutionDecisionObserver">
+/// Optional observer reporting whether a validated, audited tool call will execute after policy evaluation.
+/// Observer exceptions are not swallowed by the executor.
+/// </param>
+/// <param name="RunCompletionPolicy">Optional authoritative host completion evaluator.</param>
+/// <param name="MaxCompletionContinuations">Bound on automatic completion-gate continuation turns.</param>
+/// <param name="CredentialInvalidationService">
+/// Optional host-owned credential invalidation invoked before one bounded authentication retry.
+/// </param>
+/// <param name="RecoveryCoordinator">
+/// Optional shared provider-recovery admission coordinator scoped by provider and auth profile.
+/// Null disables coordinated admission, not the loop's retry handling.
+/// </param>
+/// <param name="RecoveryAdmissionTimeout">
+/// Maximum wait for coordinated provider admission; null uses the effective retry-delay ceiling.
+/// Used only when RecoveryCoordinator is set. Admission failures and cancellation propagate to the run.
+/// </param>
+/// <param name="ToolProgressPolicy">
+/// Optional policy that classifies completed tool results below the absolute budget as progress, non-progress, or unclassified.
+/// Null uses the core default policy. The loop retains ownership of run-local counting, warning
+/// injection, and terminal disposition; policy exceptions and cancellation propagate.
+/// </param>
+/// <param name="MaxToolResults">Executed-result budget per run, default 128. Values outside 1–1000000 are rejected. Checked after entire batches.</param>
+/// <param name="ProviderRequestContextProvider">Optional request-only dynamic context renderer; null uses the core live capacity section. Normal failures and cancellation propagate; finalizer failures preserve its parked outcome.</param>
+/// <param name="ToolCapacityObserver">Optional informational start/75%/90%/exhaustion sink, isolated per subscriber through the diagnostic dispatcher. No control authority.</param>
 /// <remarks>
 /// AgentOptions is passed to the Agent constructor and frozen for the lifetime of the agent.
 /// InitialState is used to seed AgentState - changes to InitialState after construction have no effect.
@@ -45,20 +107,36 @@ public record AgentOptions(
     AgentInitialState? InitialState,
     LlmModel Model,
     LlmClient LlmClient,
-    ConvertToLlmDelegate? ConvertToLlm,
-    TransformContextDelegate? TransformContext,
-    GetApiKeyDelegate GetApiKey,
-    GetMessagesDelegate? GetSteeringMessages,
-    GetMessagesDelegate? GetFollowUpMessages,
+    ProviderMessageTransformer? ProviderMessageTransformer,
+    AgentContextTransformer? AgentContextTransformer,
+    ProviderExecutionOptionsProvider ProviderExecutionOptionsProvider,
+    AgentMessageProvider? SteeringMessageProvider,
+    AgentMessageProvider? FollowUpMessageProvider,
     ToolExecutionMode ToolExecutionMode,
-    BeforeToolCallDelegate? BeforeToolCall,
-    AfterToolCallDelegate? AfterToolCall,
-    SimpleStreamOptions GenerationSettings,
+    ToolExecutionPolicy? ToolExecutionPolicy,
+    ToolResultTransformer? ToolResultTransformer,
+    GenerationOptions GenerationSettings,
     QueueMode SteeringMode,
     QueueMode FollowUpMode,
     string? SessionId = null,
-    Action<string>? OnDiagnostic = null,
-    int? MaxRetryDelayMs = null,
+    Action<string>? DiagnosticObserver = null,
+    int? MaxRetryDelayMs = AgentLoopConfig.DefaultMaxRetryDelayMs,
     TimeSpan? ToolTimeout = null,
     Diagnostics.ClaimAuditOptions? ClaimAudit = null,
-    Func<CancellationToken, Task>? MaybeCompactAsync = null);
+    Func<CancellationToken, Task<AgentContext?>>? ContextCompactionService = null,
+    TimeSpan? ToolExecutionPolicyTimeout = null,
+    Loop.IProviderSuspensionRegistry? SuspensionRegistry = null,
+    string? AuthProfile = null,
+    int? MaxToolOutputBytes = null,
+    ToolAuditGate? ToolAuditGate = null,
+    ToolExecutionDecisionObserver? ToolExecutionDecisionObserver = null,
+    Func<string, string>? ToolResultTextTransformer = null,
+    RunCompletionPolicy? RunCompletionPolicy = null,
+    int MaxCompletionContinuations = 2,
+    CredentialInvalidationService? CredentialInvalidationService = null,
+    Loop.IProviderRecoveryCoordinator? RecoveryCoordinator = null,
+    TimeSpan? RecoveryAdmissionTimeout = null,
+    ToolProgressPolicy? ToolProgressPolicy = null,
+    int MaxToolResults = 128,
+    ProviderRequestContextProvider? ProviderRequestContextProvider = null,
+    ToolCapacityObserver? ToolCapacityObserver = null);

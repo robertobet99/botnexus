@@ -1,5 +1,6 @@
 using BotNexus.Gateway.Channels;
 using BotNexus.Gateway.Abstractions.Channels;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Domain.Primitives;
 using Microsoft.AspNetCore.SignalR;
@@ -13,7 +14,7 @@ namespace BotNexus.Extensions.Channels.SignalR;
 /// SignalR-based channel adapter. Sends agent output to session groups via IHubContext.
 /// </summary>
 public sealed class SignalRChannelAdapter(ILogger<SignalRChannelAdapter> logger, IHubContext<GatewayHub, IGatewayHubClient> hubContext)
-    : ChannelAdapterBase(logger), IStreamEventChannelAdapter
+    : ChannelAdapterBase(logger), IStreamEventChannelAdapter, IConversationEventSink
 {
     /// <summary>Sentinel value agents use to suppress user-visible replies.</summary>
     private const string NoReplySentinel = "NO_REPLY";
@@ -28,6 +29,20 @@ public sealed class SignalRChannelAdapter(ILogger<SignalRChannelAdapter> logger,
     public override bool SupportsThinkingDisplay => true;
     public override bool SupportsToolDisplay => true;
     public override bool SupportsInboundImages => true;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// The Blazor chat panel renders <c>ask_user</c> inline with choice buttons, multi-select,
+    /// and a cancel affordance, so SignalR is fully prompt-capable and never needs the
+    /// text-degraded fallback.
+    /// </remarks>
+    public override bool SupportsInteractivePrompts => true;
+
+    /// <summary>
+    /// The portal is a user-visible surface, so the delimited internal runtime-context envelope is
+    /// redacted from outbound text before it reaches a browser client (#1430).
+    /// </summary>
+    protected override bool StripsRuntimeContext => true;
 
     protected override Task OnStartAsync(CancellationToken cancellationToken)
         => Task.CompletedTask;
@@ -61,7 +76,7 @@ public sealed class SignalRChannelAdapter(ILogger<SignalRChannelAdapter> logger,
             // Carry the stamped role (#1651) so the live fan-out renders an agent-post under the
             // role the gateway recorded it as. Null when unset -- the client keeps its assistant
             // default, so ordinary replies and relays are unchanged.
-            .ContentDelta(new ContentDeltaPayload(normalizedSessionId, message.Content, message.ConversationId, message.SpeakAs?.Value));
+            .ContentDelta(new ContentDeltaPayload(normalizedSessionId, ProjectOutboundText(message.Content), message.ConversationId, message.SpeakAs?.Value));
     }
 
     /// <summary>
@@ -89,10 +104,28 @@ public sealed class SignalRChannelAdapter(ILogger<SignalRChannelAdapter> logger,
     public Task SendStreamEventAsync(ChannelStreamTarget target, AgentStreamEvent streamEvent, CancellationToken cancellationToken = default)
     {
         // Prefer the session and conversation ids stamped on the event (set by GatewayHost)
-        // over the target, so observer fan-out — which addresses each observer by their own
-        // binding — still surfaces the originating ids to the client.
+        // over the target, so observer fan-out - which addresses each observer by their own
+        // binding - still surfaces the originating ids to the client.
         var typedSessionId = streamEvent.SessionId ?? target.SessionId;
         var typedConversationId = streamEvent.ConversationId ?? target.ConversationId;
+
+        // #3065: every stream event is conversation-scoped, so it MUST name its conversation.
+        // The id is resolved server-side long before this point (ConversationSessionResolution ->
+        // session.ConversationId -> the OnEventAsync stamp), so an uninitialized value here means
+        // it was dropped in between, not that none existed. Dropping the event is the honest
+        // outcome: emitting it unattributed is precisely what forces the receiver back onto an
+        // ambient "whatever conversation is active" guess, which renders the event against a
+        // conversation it has nothing to do with - a routing fault that looks like a UI bug.
+        if (!typedConversationId.IsInitialized())
+        {
+            logger.LogError(
+                "Refusing to emit conversation-scoped {Method} for session {SessionId}: no conversation id "
+                + "was resolved. A conversation-scoped event must name its conversation (#3065).",
+                streamEvent.Type,
+                typedSessionId.Value);
+            return Task.CompletedTask;
+        }
+
         var sessionIdStr = typedSessionId.Value;
         var conversationIdStr = typedConversationId.Value;
 
@@ -130,6 +163,15 @@ public sealed class SignalRChannelAdapter(ILogger<SignalRChannelAdapter> logger,
 
     internal static string GetConversationGroup(string conversationId) => $"conversation:{conversationId}";
 
+    /// <summary>
+    /// The per-agent group a connection joins for AGENT-scoped notifications (currently
+    /// <c>ConversationChanged</c>). Distinct from the conversation groups above: a conversation
+    /// group carries the stream for one conversation, whereas this group carries lifecycle events
+    /// for conversations the client does not necessarily have open yet -- a conversation being
+    /// CREATED has no group for the client to already be in (#2541).
+    /// </summary>
+    internal static string GetAgentGroup(string agentId) => $"agent:{agentId}";
+
     // Retained for the back-compat fallback path in SendAsync (until every caller stamps
     // ConversationId) and for tests that pin the legacy group naming.
     internal static string GetSessionGroup(string sessionId) => $"session:{sessionId}";
@@ -141,4 +183,26 @@ public sealed class SignalRChannelAdapter(ILogger<SignalRChannelAdapter> logger,
 
         return SessionId.From(sessionId).Value;
     }
+    /// <inheritdoc />
+    public async Task OnConversationEventAsync(
+        ConversationEvent conversationEvent,
+        CancellationToken cancellationToken = default)
+    {
+        if (conversationEvent is not ConversationAgentEvent agentEvent)
+            return;
+
+        // Every SignalR binding for a conversation resolves to the same conversation group.
+        // Deliver through one representative target so multiple browser bindings do not broadcast
+        // the same source event to that shared group more than once (#2073/#2087).
+        foreach (var target in ConversationEventStreamRouting.GetTargets(
+                     conversationEvent, ChannelType, ((IChannelAdapter)this).AdapterId).Take(1))
+        {
+            if (((IStreamEventChannelAdapter)this).CanSendStreamEvent(target))
+            {
+                await SendStreamEventAsync(target, agentEvent.StreamEvent, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+    }
+
 }

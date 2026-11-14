@@ -1,6 +1,7 @@
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Agents;
-using BotNexus.Gateway.Abstractions.Channels;
+using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using Microsoft.Extensions.Logging;
@@ -14,7 +15,8 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
     private readonly ISessionCompactor _compactor;
     private readonly ISessionStore _sessions;
     private readonly IAgentSupervisor _supervisor;
-    private readonly IChannelManager _channelManager;
+    private readonly IConversationEventPublisher? _eventPublisher;
+    private readonly IConversationStore? _conversations;
     private readonly IOptionsMonitor<CompactionOptions> _options;
     private readonly IPreCompactionMemoryFlusher? _memoryFlusher;
     private readonly ILogger<SessionCompactionCoordinator> _logger;
@@ -23,7 +25,8 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
         ISessionCompactor compactor,
         ISessionStore sessions,
         IAgentSupervisor supervisor,
-        IChannelManager channelManager,
+        IConversationEventPublisher? eventPublisher,
+        IConversationStore? conversations,
         IOptionsMonitor<CompactionOptions> options,
         ILogger<SessionCompactionCoordinator> logger,
         IPreCompactionMemoryFlusher? memoryFlusher = null)
@@ -31,7 +34,8 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
         _compactor = compactor;
         _sessions = sessions;
         _supervisor = supervisor;
-        _channelManager = channelManager;
+        _eventPublisher = eventPublisher;
+        _conversations = conversations;
         _options = options;
         _logger = logger;
         _memoryFlusher = memoryFlusher;
@@ -41,10 +45,20 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
         AgentId agentId,
         GatewaySession session,
         CancellationToken cancellationToken,
-        bool force = false)
+        bool force = false,
+        CompactionHandlePolicy handlePolicy = CompactionHandlePolicy.Evict,
+        CompactionOptions? resolvedOptions = null)
     {
         ArgumentNullException.ThrowIfNull(session);
-        var options = _options.CurrentValue;
+        // Manual current-handle compaction owns admission, but reset can still retain the
+        // cached aggregate while stopping that handle. Never mutate that shared object before
+        // the authoritative fenced save commits. Stores publish/evict the detached candidate;
+        // the endpoint then invalidates only the captured handle, without copying history back.
+        var detached = force && handlePolicy == CompactionHandlePolicy.KeepCurrent;
+        if (detached)
+            session = session.CreateDetachedCopy();
+
+        var options = resolvedOptions ?? _options.CurrentValue;
 
         // When the user explicitly requests compaction, override PreservedTurns
         // to 0 so the compactor always has entries to summarise regardless of
@@ -63,6 +77,8 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
         // against it so a delete/reset that lands while we are summarising cannot be undone by
         // the compaction record write resurrecting or un-sealing the row.
         var fence = SessionWriteFence.Capture(session);
+        if (detached)
+            fence = fence with { ExpectedContentFingerprint = SessionWriteFence.ContentFingerprint(session) };
 
         // 1. Optional pre-compaction memory flush. Best-effort: failures are logged
         //    and swallowed so compaction always proceeds (mirrors auto-compact path).
@@ -85,9 +101,20 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
         {
             result = await _compactor.CompactAsync(session, options, cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Compaction call failed for session {SessionId}; history unchanged.", sessionId);
+            // #3362: attribute the failure instead of collapsing it. A read-shaped fault (I/O,
+            // permissions, deserialization, store unavailable) is NOT a summarization failure, and
+            // the exception type is carried through so the true fault is diagnosable.
+            var thrownSkipReason = ClassifyThrownException(ex);
+            _logger.LogWarning(
+                ex,
+                "Compaction call failed for session {SessionId} ({ExceptionType}, reason={SkipReason}); history unchanged.",
+                sessionId, ex.GetType().Name, thrownSkipReason);
             return new SessionCompactionOutcome(
                 Succeeded: false,
                 Applied: false,
@@ -96,7 +123,29 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
                 EntriesPreserved: 0,
                 TokensBefore: 0,
                 TokensAfter: 0,
-                FailureReason: ex.Message);
+                FailureReason: DescribeFailure(thrownSkipReason, ex),
+                SkipReason: thrownSkipReason,
+                FailureExceptionType: ex.GetType().Name);
+        }
+
+        // Avoid changing shared in-memory history when reset/seal/rebinding already won during
+        // summarization. The fenced save remains the authoritative final persistence boundary.
+        if (force && handlePolicy == CompactionHandlePolicy.KeepCurrent)
+        {
+            var currentSession = await _sessions.GetAsync(sessionId, cancellationToken).ConfigureAwait(false);
+            var bindingMatches = currentSession is not null && currentSession.Status == SessionStatus.Active &&
+                currentSession.AgentId == agentId && currentSession.ConversationId == fence.ExpectedConversationId;
+            if (_conversations is not null)
+            {
+                var conversation = await _conversations.GetAsync(fence.ExpectedConversationId, cancellationToken).ConfigureAwait(false);
+                bindingMatches = bindingMatches && conversation is not null &&
+                    conversation.AgentId == agentId && conversation.ActiveSessionId == sessionId &&
+                    conversation.Status == ConversationStatus.Active;
+            }
+            if (!bindingMatches)
+                return new SessionCompactionOutcome(result.Succeeded, false, HistoryReplaceOutcome.Aborted,
+                    result.EntriesSummarized, result.EntriesPreserved, result.TokensBefore, result.TokensAfter,
+                    "Session binding changed.", CompactionSkipReason.SessionRebound);
         }
 
         // 3. Apply + persist. Track outcome for the caller.
@@ -120,13 +169,21 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
                     break;
                 case HistoryReplaceOutcome.Aborted:
                     _logger.LogWarning(
-                        "Session {SessionId} compaction aborted: history was destructively modified during the summary call. History is unchanged.",
-                        sessionId);
+                        "Session {SessionId} compaction aborted: {Reason} — history was destructively modified during the summary call. History is unchanged.",
+                        sessionId, CompactionSkipReason.ConcurrentHistoryChange);
                     break;
             }
         }
 
-        var saveOutcome = await _sessions.SaveAsync(session, fence, cancellationToken).ConfigureAwait(false);
+        // A skipped/aborted manual attempt has no changes to commit. In particular, never
+        // publish its pre-summary detached snapshot over independently appended messages.
+        var saveOutcome = detached && !applied ? SessionSaveOutcome.Persisted
+            : await _sessions.SaveAsync(session, fence, cancellationToken).ConfigureAwait(false);
+        if (saveOutcome == SessionSaveOutcome.Conflict)
+            return new SessionCompactionOutcome(result.Succeeded, false, HistoryReplaceOutcome.Aborted,
+                result.EntriesSummarized, result.EntriesPreserved, result.TokensBefore, result.TokensAfter,
+                DescribeFailure(CompactionSkipReason.ConcurrentHistoryChange, null),
+                CompactionSkipReason.ConcurrentHistoryChange);
         if (saveOutcome == SessionSaveOutcome.Rebound)
         {
             // #1518: the session was deleted, sealed, or rebound while we summarised. Do NOT
@@ -144,21 +201,52 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
                 EntriesPreserved: result.EntriesPreserved,
                 TokensBefore: result.TokensBefore,
                 TokensAfter: result.TokensAfter,
-                FailureReason: "Compaction was discarded because the session was deleted or reset while it was in progress.");
+                FailureReason: "Compaction was discarded because the session was deleted or reset while it was in progress.",
+                SkipReason: CompactionSkipReason.SessionRebound);
+        }
+
+        // #2460: the Aborted outcome previously logged NO reason, making a repeating no-op abort
+        // loop undiagnosable from logs alone. Resolve the specific branch and log it at Warning
+        // (survives production log settings) whenever nothing was applied.
+        var skipReason = !applied
+            ? result.SkipReason
+              ?? (historyOutcome == HistoryReplaceOutcome.Aborted
+                  ? CompactionSkipReason.ConcurrentHistoryChange
+                  : null)
+            : null;
+
+        if (!applied)
+        {
+            _logger.LogWarning(
+                "Session {SessionId} compaction did not apply: reason={SkipReason}, {Summarized} entries summarized, " +
+                "{Preserved} preserved, tokens {TokensBefore}->{TokensAfter} (outcome={Outcome}). History is unchanged.",
+                sessionId,
+                skipReason ?? "Unspecified",
+                result.EntriesSummarized,
+                result.EntriesPreserved,
+                result.TokensBefore,
+                result.TokensAfter,
+                historyOutcome);
         }
 
         _logger.LogInformation(
-            "Session {SessionId} compacted: {Summarized} entries summarized, {Preserved} preserved (applied={Applied}, outcome={Outcome}).",
-            sessionId, result.EntriesSummarized, result.EntriesPreserved, applied, historyOutcome);
+            "Session {SessionId} compacted: {Summarized} entries summarized, {Preserved} preserved (applied={Applied}, outcome={Outcome}, reason={SkipReason}).",
+            sessionId, result.EntriesSummarized, result.EntriesPreserved, applied, historyOutcome, skipReason ?? "(none)");
 
-        // 4. Evict the cached agent handle on success so the next turn rebuilds
-        //    context from post-compaction history (PR #602 Bug 3 fix — must run
-        //    on every compaction path, not just auto-compact).
-        if (applied)
+        // 4. External/pre-turn compaction evicts the cached handle so the next turn rebuilds
+        //    context from post-compaction history (PR #602 Bug 3). Mid-loop compaction runs
+        //    inside that handle, so synchronously stopping it would make the run await itself
+        //    through DisposeAsync -> Agent.AbortAsync (#4121). That caller keeps the handle and
+        //    replaces its context from the persisted compacted snapshot at the loop boundary.
+        if (applied && handlePolicy == CompactionHandlePolicy.Evict)
         {
             try
             {
                 await _supervisor.StopAsync(agentId, sessionId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -166,9 +254,12 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
             }
         }
 
+        // #3362: the reason is DERIVED from the outcome. It used to be hard-coded to the
+        // summarization-empty-response text for every non-success, which reported an I/O or
+        // deserialization fault as a summarization-model fault that had not occurred.
         string? failureReason = null;
         if (!result.Succeeded)
-            failureReason = "Compaction aborted: the summarization model returned an empty response. Session history was not modified.";
+            failureReason = DescribeFailure(skipReason, exception: null);
         else if (historyOutcome == HistoryReplaceOutcome.Aborted)
             failureReason = "Compaction conflicted with a concurrent change to the session. Session history was not modified — please try again.";
 
@@ -180,7 +271,69 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
             EntriesPreserved: result.EntriesPreserved,
             TokensBefore: result.TokensBefore,
             TokensAfter: result.TokensAfter,
-            FailureReason: failureReason);
+            FailureReason: failureReason,
+            SkipReason: skipReason);
+    }
+
+    /// <summary>
+    /// #3362: maps an exception that escaped the compactor onto the skip reason that names what
+    /// actually broke. Read-shaped faults (I/O, permissions, deserialization, disposed store) are
+    /// <see cref="CompactionSkipReason.HistoryReadFailed"/>; everything else remains
+    /// <see cref="CompactionSkipReason.SummarizationFailed"/>, so the pre-existing discriminator
+    /// is narrowed rather than cannibalised.
+    /// </summary>
+    private static CompactionSkipReason ClassifyThrownException(Exception ex) => ex switch
+    {
+        IOException => CompactionSkipReason.HistoryReadFailed,
+        UnauthorizedAccessException => CompactionSkipReason.HistoryReadFailed,
+        System.Text.Json.JsonException => CompactionSkipReason.HistoryReadFailed,
+        ObjectDisposedException => CompactionSkipReason.HistoryReadFailed,
+        _ => CompactionSkipReason.SummarizationFailed,
+    };
+
+    /// <summary>
+    /// #3362: derives the operator-visible message from the skip reason. The
+    /// "summarization model returned an empty response" text is now reserved for
+    /// <see cref="CompactionSkipReason.EmptySummary"/> — the one branch where that is what
+    /// happened — and every other branch names its own cause.
+    /// </summary>
+    private static string DescribeFailure(CompactionSkipReason? reason, Exception? exception)
+    {
+        var detail = exception is null ? string.Empty : $" ({exception.GetType().Name}: {exception.Message})";
+
+        if (reason is null)
+            return $"Compaction did not complete and session history was not modified.{detail}";
+
+        if (reason == CompactionSkipReason.EmptySummary)
+            return "Compaction aborted: the summarization model returned an empty response. Session history was not modified.";
+
+        if (reason == CompactionSkipReason.HistoryReadFailed)
+            return $"Compaction aborted: the session history could not be read{detail}. Session history was not modified — this is a storage or transcript fault, not a summarization failure.";
+
+        if (reason == CompactionSkipReason.EmptyHistory)
+            return "Compaction skipped: the session history is empty, so there was nothing to summarise.";
+
+        if (reason == CompactionSkipReason.NoSummarizableTurns)
+            return "Compaction skipped: no summarizable turns were found. Session history was not modified.";
+
+        if (reason == CompactionSkipReason.SummarizationTimeout)
+            return "Compaction aborted: the summarization call timed out. Session history was not modified.";
+
+        if (reason == CompactionSkipReason.SummarizationFailed)
+            return $"Compaction aborted: the summarization call failed{detail}. Session history was not modified.";
+
+        if (reason == CompactionSkipReason.CircuitBreakerOpen)
+            return "Compaction skipped: the compaction circuit breaker is open after repeated failures. Session history was not modified.";
+
+        if (reason == CompactionSkipReason.ConcurrentHistoryChange)
+            return "Compaction conflicted with a concurrent change to the session. Session history was not modified — please try again.";
+
+        if (reason == CompactionSkipReason.SessionRebound)
+            return "Compaction was discarded because the session was deleted or reset while it was in progress.";
+
+        // Forward-compatible: an unknown code from a newer build still names itself rather than
+        // inheriting some other branch's story.
+        return $"Compaction did not complete (reason={reason}). Session history was not modified.{detail}";
     }
 
     public string BuildNotificationText(SessionCompactionOutcome outcome)
@@ -195,34 +348,83 @@ public sealed class SessionCompactionCoordinator : ISessionCompactionCoordinator
         return $"_[Session context compacted: {outcome.EntriesSummarized} older messages summarised, {outcome.EntriesPreserved} recent messages preserved{rebased}. Continuing…]_";
     }
 
-    public async Task<bool> TrySendChannelNotificationAsync(
+    public async Task<bool> TryPublishNotificationAsync(
         SessionCompactionOutcome outcome,
-        ChannelKey channelType,
-        ChannelAddress channelAddress,
-        string sessionId,
+        AgentId agentId,
+        GatewaySession session,
         CancellationToken cancellationToken)
     {
-        var adapter = _channelManager.Get(channelType);
-        if (adapter is null)
+        ArgumentNullException.ThrowIfNull(outcome);
+        ArgumentNullException.ThrowIfNull(session);
+
+        var notification = new SessionEntry
         {
-            _logger.LogWarning("No channel adapter found for type '{ChannelType}' — compaction notification dropped for session {SessionId}.", channelType, sessionId);
+            Role = MessageRole.Notification,
+            Content = BuildNotificationText(outcome),
+            Timestamp = DateTimeOffset.UtcNow
+        };
+        session.AddEntry(notification);
+        await _sessions.SaveAsync(session, cancellationToken).ConfigureAwait(false);
+
+        if (!session.ConversationId.IsInitialized())
+        {
+            _logger.LogWarning(
+                "Persisted compaction notification for session {SessionId} has no conversation id; live event publication was skipped.",
+                session.SessionId.Value);
             return false;
+        }
+
+        if (_eventPublisher is null)
+        {
+            _logger.LogWarning(
+                "Persisted compaction notification for session {SessionId} cannot be published because no conversation event publisher is configured.",
+                session.SessionId.Value);
+            return false;
+        }
+
+        var bindings = System.Collections.Immutable.ImmutableArray<ConversationBindingSnapshot>.Empty;
+        try
+        {
+            var conversation = _conversations is null
+                ? null
+                : await _conversations.GetAsync(session.ConversationId, cancellationToken).ConfigureAwait(false);
+            bindings = ConversationBindingSnapshot.FromMany(conversation?.ChannelBindings);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to snapshot bindings for persisted compaction notification in conversation {ConversationId}; publishing with no bindings.",
+                session.ConversationId.Value);
         }
 
         try
         {
-            await adapter.SendAsync(new OutboundMessage
+            var accepted = await _eventPublisher.PublishAsync(new ConversationSessionItemPersistedEvent
             {
-                ChannelType = channelType,
-                ChannelAddress = channelAddress,
-                Content = BuildNotificationText(outcome),
-                SessionId = sessionId
+                AgentId = agentId,
+                ConversationId = session.ConversationId,
+                SessionId = session.SessionId,
+                Bindings = bindings,
+                Item = notification,
+                OccurredAt = notification.Timestamp
             }, cancellationToken).ConfigureAwait(false);
-            return true;
+
+            if (!accepted)
+            {
+                _logger.LogWarning(
+                    "Conversation event publisher rejected persisted compaction notification for session {SessionId}; the committed session item will not be retried.",
+                    session.SessionId.Value);
+            }
+
+            return accepted;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
-            _logger.LogWarning(ex, "Failed to send compaction notification for session {SessionId}.", sessionId);
+            _logger.LogWarning(
+                ex,
+                "Failed to publish persisted compaction notification for session {SessionId}; the committed session item will not be retried.",
+                session.SessionId.Value);
             return false;
         }
     }

@@ -10,8 +10,13 @@ namespace BotNexus.Gateway.Abstractions.Models;
 /// </summary>
 public sealed record Conversation
 {
-    /// <summary>Gets or sets the unique conversation identifier.</summary>
-    public ConversationId ConversationId { get; set; }
+    /// <summary>
+    /// Gets the unique conversation identifier. Write-once on construction — the primary key of
+    /// the row must never be reassignable after the conversation exists, or every cached lookup,
+    /// binding, and session parent-link keyed on it silently goes stale. Pinned by
+    /// <c>ModelImmutabilityArchitectureTests</c> (issue #2316).
+    /// </summary>
+    public ConversationId ConversationId { get; init; }
 
     /// <summary>
     /// Gets or sets the id of the world this conversation belongs to. Stamped by the
@@ -30,7 +35,8 @@ public sealed record Conversation
 
     /// <summary>
     /// Gets the agent that owns this conversation. Write-once on construction — the
-    /// <c>ConversationAgentIdImmutabilityArchitectureTests</c> fence pins this so a
+    /// <c>ConversationAgentIdImmutabilityArchitectureTests</c> fence (and the broader
+    /// <c>ModelImmutabilityArchitectureTests</c> fence, issue #2316) pins this so a
     /// conversation's owning agent cannot drift after the row is persisted. This is the
     /// invariant that lets <see cref="IAgentIdentityResolver"/> cache the resolved
     /// value for the lifetime of the conversation (P9-H, issue #662, directive W-4).
@@ -49,11 +55,39 @@ public sealed record Conversation
     /// <summary>Gets or sets the lifecycle status of this conversation.</summary>
     public ConversationStatus Status { get; set; } = ConversationStatus.Active;
 
-    /// <summary>Gets or sets when this conversation was created.</summary>
-    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    /// <summary>Gets when this conversation was created. Write-once creation-time fact.</summary>
+    public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
 
     /// <summary>Gets or sets when this conversation was last modified.</summary>
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    /// <summary>
+    /// Gets or sets the optimistic-concurrency revision of this conversation (issue #2131).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Monotonically incremented by the store on every mutation that writes conversation columns
+    /// (full save, pin, metadata/override patch, archive, canvas-state write). A hydrated
+    /// conversation therefore carries the revision it was read at, and
+    /// <c>IConversationStore.SaveAsync</c> - which is a full-row upsert of the whole aggregate -
+    /// compares-and-swaps on it so a caller that mutated only <see cref="Title"/> from a stale
+    /// snapshot cannot silently write back the stale value of every <em>other</em> column and
+    /// clobber a pin, canvas, todo or override committed after its read. The mismatch surfaces as
+    /// a <c>ConversationConcurrencyException</c> rather than being lost.
+    /// </para>
+    /// <para>
+    /// <c>0</c> means "not loaded from a store" (a freshly constructed aggregate). The store treats
+    /// that as an unconditional write so bare construct-then-save call sites keep working; every
+    /// persisted row is at <c>1</c> or higher, so any conversation that came out of the store is
+    /// concurrency-checked.
+    /// </para>
+    /// <para>
+    /// <c>TouchAsync</c> deliberately does NOT bump the version: it only stamps
+    /// <see cref="UpdatedAt"/> and runs on the hot message-processing path, so versioning it would
+    /// manufacture conflicts without protecting any field.
+    /// </para>
+    /// </remarks>
+    public long Version { get; set; }
 
     /// <summary>Gets or sets the session currently active within this conversation, if any.</summary>
     public SessionId? ActiveSessionId { get; set; }
@@ -113,7 +147,7 @@ public sealed record Conversation
     /// they are not required to be — e.g. a heartbeat-triggered conversation may be initiated by a
     /// system agent yet owned by the target user-facing agent.
     /// </remarks>
-    public CitizenId? Initiator { get; set; }
+    public CitizenId? Initiator { get; init; }
 
     /// <summary>
     /// Gets or sets the citizen-pairing discriminator for this conversation. Defaults to
@@ -127,7 +161,119 @@ public sealed record Conversation
     /// shape (see F-3). Read by the portal/list/permission layers without having to walk session
     /// ids.
     /// </remarks>
-    public ConversationKind Kind { get; set; } = ConversationKind.HumanAgent;
+    public ConversationKind Kind { get; init; } = ConversationKind.HumanAgent;
+
+    /// <summary>
+    /// Gets the origination trigger for this conversation - what caused it to exist (a schedule, an
+    /// inbound webhook, a human on a channel, or an agent). Stamped once by the origin path that
+    /// mints the conversation and never afterwards: this is <c>init</c>-only by design, mirroring
+    /// <see cref="AgentId"/>, so an inbound event can never poison it the way the mutable
+    /// client-side virtual-session flag could (epic #2300, following #2248; that flag is now deleted).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Defaults to <see cref="ConversationSource.Channel"/> so every row persisted before this
+    /// field existed deserializes unchanged. Callers on a real origin path must stamp explicitly
+    /// rather than lean on the default.
+    /// </para>
+    /// <para>
+    /// Orthogonal to <see cref="Kind"/>: <c>Kind</c> is the pairing topology, <c>Source</c> is the
+    /// trigger. Rendering decisions (read-only? show the composer? group under "cron"?) are meant
+    /// to be a pure projection over <c>(Kind, Source)</c> plus the client's own selection source,
+    /// never a re-derivation from session-id substrings.
+    /// </para>
+    /// </remarks>
+    public ConversationSource Source { get; init; } = ConversationSource.Channel;
+
+    /// <summary>
+    /// Gets the stable identity of the thing that <em>minted</em> this conversation: the webhook
+    /// registration id when <see cref="Source"/> is <see cref="ConversationSource.Webhook"/>, the
+    /// cron job id when it is <see cref="ConversationSource.Cron"/>, and <see langword="null"/>
+    /// otherwise (issue #2121).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Meaningful <em>only</em> in combination with <see cref="Source"/> - the value is an opaque
+    /// identifier drawn from whichever registry owns that origin, and the two fields are a pair.
+    /// A client reading <c>(Source, SourceId)</c> can attribute a conversation to the exact
+    /// registration or job that produced it without a second per-feature list call and without
+    /// parsing the title or the session id.
+    /// </para>
+    /// <para>
+    /// <c>init</c>-only for exactly the reason <see cref="Source"/> is: provenance is a
+    /// creation-time fact, and an inbound event must never be able to re-attribute a persisted
+    /// conversation to a different webhook registration or cron job. Splitting the pair across a
+    /// write-once discriminator and a mutable identifier would leave the poisoning hole open.
+    /// </para>
+    /// <para>
+    /// Defaults to <see langword="null"/>, which is also what every row persisted before this
+    /// column existed hydrates to. <c>null</c> means "originator not recorded", never "no origin":
+    /// <see cref="Source"/> remains authoritative for the origin itself.
+    /// </para>
+    /// </remarks>
+    public string? SourceId { get; init; }
+
+    /// <summary>
+    /// Gets the conversation that spawned this one, when this conversation is a nested run rather
+    /// than a top-level thread. <c>null</c> for every ordinary conversation (and for every row
+    /// persisted before this field existed, which therefore deserializes unchanged).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The missing <em>edge</em> that issue #2338 identifies. A sub-agent run is a full conversation,
+    /// but before this field the only available link to its supervisor was
+    /// <c>SubAgentSpawnRequest.InheritedConversationId</c> - which is why that value got jammed into
+    /// the child session's <see cref="ConversationId"/> identity field, collapsing two distinct
+    /// conversations onto one id and flooding the parent's SignalR group with the child's internals.
+    /// Modelling the relationship explicitly lets the child keep its own identity.
+    /// </para>
+    /// <para>
+    /// Write-once (<c>init</c>-only), like every other domain identity property pinned by
+    /// <c>ModelImmutabilityArchitectureTests</c> (#2319): a conversation's parentage is a
+    /// creation-time fact, and re-parenting a persisted conversation would silently invalidate every
+    /// listing filter and expand-in-place render that keys off it.
+    /// </para>
+    /// <para>
+    /// Presentation contract: conversations with a non-null parent are <em>nested</em> and must not
+    /// appear at top level in conversation listings (see <c>GetSummariesAsync</c> in each
+    /// <c>IConversationStore</c> implementation). This is the correct fix for the listing complaint
+    /// that #468 originally addressed by collapsing the identity.
+    /// </para>
+    /// </remarks>
+    public ConversationId? ParentConversationId { get; init; }
+
+    /// <summary>
+    /// Gets the id of the tool call in the parent conversation that spawned this one (e.g. the
+    /// <c>spawn_subagent</c> call). <c>null</c> when this conversation was not spawned by a tool
+    /// call. Write-once for the same reason as <see cref="ParentConversationId"/>.
+    /// </summary>
+    /// <remarks>
+    /// Binds the nested run back to the <em>exact</em> originating tool call rather than forcing a
+    /// channel to guess by timestamp, which is what lets an adapter render the run as an expandable
+    /// card in place of that call.
+    /// </remarks>
+    public string? SpawningToolCallId { get; init; }
+
+    /// Gets who may see this conversation - whether it is a user-facing row, a read-only inspectable
+    /// view, or runtime bookkeeping that must never be rendered. Stamped once by the origin path
+    /// that mints the conversation and <c>init</c>-only thereafter, exactly like <see cref="Source"/>
+    /// (issue #2340).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Defaults to <see cref="ConversationVisibility.UserFacing"/> so every row persisted before this
+    /// field existed deserializes unchanged and stays visible.
+    /// </para>
+    /// <para>
+    /// Orthogonal to the other four axes. <see cref="Kind"/> is topology, <see cref="Source"/> is the
+    /// trigger, <see cref="Initiator"/> is identity and <see cref="Status"/> is lifecycle; none of
+    /// them answers "should a user ever see this row?". This field replaces the last surviving
+    /// id-prefix probe (a client-side <c>internal:</c> conversation-id test): behaviour keyed on the
+    /// TEXT of an opaque identifier is a hidden coupling between id-minting and rendering code that
+    /// fails silently in both directions.
+    /// </para>
+    /// </remarks>
+    public ConversationVisibility Visibility { get; init; } = ConversationVisibility.UserFacing;
 
     /// <summary>Gets or sets whether this conversation is pinned to the top of the list.</summary>
     public bool IsPinned { get; set; }
@@ -188,4 +334,31 @@ public sealed record Conversation
     /// (issue #1706).
     /// </summary>
     public int? ContextWindowOverride { get; set; }
+
+    /// <summary>Optional positive compaction trigger ceiling in tokens; null inherits the enclosing scope. Not model capacity.</summary>
+    [System.Text.Json.Serialization.JsonNumberHandling(System.Text.Json.Serialization.JsonNumberHandling.Strict)]
+    public int? CompactionTokenCeiling { get; set; }
+
+    /// <summary>
+    /// Gets or sets the per-conversation tool-availability overlay as an opaque JSON string
+    /// (issue #2523). <c>null</c> means no overlay, so every session in this conversation gets the
+    /// agent's configured tool set unchanged - which is what every row persisted before this column
+    /// existed hydrates to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Persisted alongside <see cref="ModelOverride"/> and <see cref="TodoJson"/> so a
+    /// blast-radius restriction survives reconnect, a new session in the same conversation, and a
+    /// gateway restart. The store treats the value as opaque text; the concrete shape (a serialized
+    /// <c>SessionToolOverride</c> carrying <c>enabledTools</c> / <c>disabledTools</c>) is owned by
+    /// the gateway security layer that reads and writes it.
+    /// </para>
+    /// <para>
+    /// The overlay is <b>narrowing-only</b>: it can drop tools the agent has, but it can never grant
+    /// one the agent lacks. Widening through this field is structurally impossible in
+    /// <c>SessionToolOverrideResolver</c>, which is what stops a writable conversation column from
+    /// becoming a privilege-escalation seam.
+    /// </para>
+    /// </remarks>
+    public string? ToolOverrideJson { get; set; }
 }

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using BotNexus.Gateway.Abstractions.Channels;
 using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Events;
 using BotNexus.Gateway.Conversations;
 using BotNexus.Gateway.Dispatching;
 using BotNexus.Persistence.Sqlite;
@@ -29,19 +30,33 @@ using BotNexus.Gateway.Hooks;
 using BotNexus.Gateway.Isolation;
 using BotNexus.Gateway.Media;
 using BotNexus.Gateway.Routing;
+using BotNexus.Gateway.Ralph;
 using BotNexus.Gateway.Services;
 using BotNexus.Gateway.Sessions;
 using BotNexus.Gateway.Security;
+using BotNexus.Gateway.Search;
 using BotNexus.Gateway.Federation;
 using BotNexus.Gateway.Channels;
 using BotNexus.Gateway.Contracts.Memory;
+using BotNexus.Gateway.Providers;
+using BotNexus.Gateway.Abstractions.Providers;
+using BotNexus.Gateway.Contracts.Agents;
+using BotNexus.Gateway.Agents.Proposals;
+using BotNexus.Gateway.Contracts.Events;
+using BotNexus.Gateway.Events;
+using BotNexus.Gateway.Evaluations;
+using BotNexus.Gateway.Abstractions.Evaluations;
+using BotNexus.Agent.Providers.Core.Embeddings;
 using BotNexus.Memory;
+using BotNexus.Memory.Embeddings;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using BotNexus.Gateway.Configuration.Store;
+using BotNexus.Gateway.Telemetry;
 using Microsoft.FeatureManagement;
 using System.Globalization;
 using System.IO.Abstractions;
@@ -71,11 +86,22 @@ public static class GatewayServiceCollectionExtensions
         services.AddOptions<GatewayOptions>();
         services.AddOptions<SessionCleanupOptions>();
         services.AddOptions<ConversationRetentionOptions>();
+        services.AddOptions<SubAgentWorkspaceSweepOptions>();
+        services.AddOptions<SubAgentWorktreeSnapshotOptions>();
         services.AddOptions<SessionWarmupOptions>();
         services.AddOptions<DelayToolOptions>();
+        services.AddOptions<AgentSummaryOptions>();
         services.AddOptions<FileWatcherToolOptions>();
         services.AddOptions<CompactionOptions>();
         services.AddOptions<SqliteWalCheckpointOptions>();
+        services.AddOptions<LivenessWatchdogOptions>();
+        services.AddOptions<SessionConsistencyOptions>();
+        services.AddOptions<SearchAggregationOptions>();
+        services.AddOptions<MemoryReembeddingOptions>()
+            .Validate(options => options.AgentBatchSize is > 0 and <= MemoryReembeddingOptions.MaxAgentBatchSize, $"AgentBatchSize must be between 1 and {MemoryReembeddingOptions.MaxAgentBatchSize}.")
+            .Validate(options => options.ItemBatchSize is > 0 and <= MemoryReembeddingOptions.MaxItemBatchSize, $"ItemBatchSize must be between 1 and {MemoryReembeddingOptions.MaxItemBatchSize}.")
+            .Validate(options => options.PassDelay > TimeSpan.Zero, "PassDelay must be positive.")
+            .Validate(options => options.ItemYieldDelay > TimeSpan.Zero, "ItemYieldDelay must be positive.");
         if (configure is not null)
             services.Configure(configure);
         if (config is not null)
@@ -85,15 +111,22 @@ public static class GatewayServiceCollectionExtensions
             services.Configure<SessionWarmupOptions>(config.GetSection("gateway:sessionWarmup"));
             services.Configure<SubAgentOptions>(config.GetSection("gateway:subAgents"));
             services.Configure<DelayToolOptions>(config.GetSection("gateway:delayTool"));
+            services.Configure<AgentSummaryOptions>(config.GetSection("gateway:agentSummary"));
             services.Configure<FileWatcherToolOptions>(config.GetSection("gateway:fileWatcherTool"));
             services.Configure<AgentExchangeOptions>(config.GetSection("gateway:agentExchange"));
             services.Configure<AgentExchangeBudgetOptions>(config.GetSection("gateway:agentExchange"));
             services.Configure<ConversationRetentionOptions>(config.GetSection("gateway:conversations"));
+            services.Configure<SubAgentWorkspaceSweepOptions>(config.GetSection("gateway:subAgentWorkspace"));
+            services.Configure<SubAgentWorktreeSnapshotOptions>(config.GetSection("gateway:subAgents:worktreeSnapshot"));
+            services.Configure<LivenessWatchdogOptions>(config.GetSection("gateway:livenessWatchdog"));
+            services.Configure<SessionConsistencyOptions>(config.GetSection("gateway:sessionConsistency"));
+            services.Configure<SearchAggregationOptions>(config.GetSection("gateway:search"));
             services.Configure<SqliteWalCheckpointOptions>(o =>
                 o.IntervalMinutes = ParseInt(
                     config["gateway:walCheckpointIntervalMinutes"],
                     SqliteWalCheckpointOptions.DefaultIntervalMinutes));
             services.Configure<TranscriptExportOptions>(config.GetSection("gateway:" + TranscriptExportOptions.SectionName));
+            services.Configure<MemoryEmbeddingsConfig>(config.GetSection("gateway:memoryEmbeddings"));
 
             var compactionSection = config.GetSection("gateway:compaction");
             if (compactionSection.Exists())
@@ -116,27 +149,83 @@ public static class GatewayServiceCollectionExtensions
             }
         }
 
-        // Core services
+        services.TryAddSingleton<SearchAggregator>();
+
+        // Core services. AddPlatformConfiguration replaces this inert default with a verified home
+        // rooted at the already-resolved configuration directory (#3411).
         services.TryAddSingleton<IFileSystem, FileSystem>();
+        services.TryAddSingleton(serviceProvider =>
+            new SqliteWalMaintenance(serviceProvider.GetRequiredService<IFileSystem>()));
         services.TryAddSingleton<BotNexusHome>();
+
+        // Credential resolution. Providers are registered per scheme with TryAddEnumerable so a
+        // second registration of the same one is a no-op rather than a duplicate - SecretResolver
+        // treats two providers claiming one scheme as a fatal configuration error, since silently
+        // letting one win means a credential could resolve from a store nobody expected.
+        // Both registered by implementation type, not by factory: TryAddEnumerable rejects a
+        // factory descriptor outright ("indistinguishable from other services registered for
+        // ISecretProvider"), because it has no type to deduplicate on. FileSecretProvider takes
+        // its IFileSystem through the constructor, so the container supplies it anyway.
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISecretProvider, EnvironmentSecretProvider>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISecretProvider, FileSecretProvider>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISecretProvider, SqliteSecretProvider>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISecretProvider, KeyringSecretProvider>());
+        services.TryAddSingleton<ISecretResolver, SecretResolver>();
+        // #2855: the OPTIONAL embeddings capability registry. Always registered and normally
+        // empty - composition populates it only for providers that opted in, and an empty
+        // registry resolves every key to absent, which is the lexical-only default.
+        services.TryAddSingleton<EmbeddingProviderRegistry>();
+        services.TryAddSingleton<IMemoryEmbeddingService>(serviceProvider =>
+            MemoryEmbeddingComposition.Build(
+                serviceProvider.GetService<IOptions<MemoryEmbeddingsConfig>>()?.Value,
+                serviceProvider.GetService<EmbeddingProviderRegistry>(),
+                serviceProvider.GetService<ILoggerFactory>()));
         services.TryAddSingleton<IMemoryStoreFactory>(serviceProvider =>
         {
-            var home = serviceProvider.GetRequiredService<BotNexusHome>();
-            return new MemoryStoreFactory(agentId =>
+            var workspaceManager = serviceProvider.GetRequiredService<IAgentWorkspaceManager>();
+            var fileSystem = serviceProvider.GetRequiredService<IFileSystem>();
+            return new EmbeddingAwareMemoryStoreFactory(agentId =>
             {
-                var agentDirectory = home.GetAgentDirectory(agentId);
-                return Path.Combine(agentDirectory, "data", "memory.sqlite");
-            });
+                var agentDirectory = workspaceManager is FileAgentWorkspaceManager fileWorkspaces
+                    ? fileWorkspaces.GetAgentRootPath(agentId)
+                    : fileSystem.Path.GetDirectoryName(workspaceManager.GetWorkspacePath(agentId))
+                        ?? throw new InvalidOperationException($"Agent '{agentId}' workspace has no parent directory.");
+                return fileSystem.Path.Combine(agentDirectory, "data", "memory.sqlite");
+            },
+            serviceProvider.GetRequiredService<IMemoryEmbeddingService>(),
+            fileSystem,
+            serviceProvider.GetService<ILoggerFactory>(),
+            serviceProvider.GetRequiredService<IAgentRegistry>());
         });
         services.AddSingleton<IAgentWorkspaceManager, FileAgentWorkspaceManager>();
         services.TryAddSingleton<IAgentMemoryFactory, DefaultAgentMemoryFactory>();
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISearchContributor, MemorySearchContributor>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISearchContributor, FileSearchContributor>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISearchContributor, AgentSearchContributor>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISearchContributor, ConversationSearchContributor>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ISearchContributor, SessionSearchContributor>());
          services.AddSingleton<IContextBuilder, WorkspaceContextBuilder>();
          services.AddSingleton<IAgentRegistry, DefaultAgentRegistry>();
+         // #3569: the backstop workspace sweep must consult a lifecycle authority before deleting.
+         // The registry holds a child agent descriptor for exactly as long as its sub-agent run
+         // lasts, so it is the liveness signal the age-only sweep was missing.
+         services.TryAddSingleton<ISubAgentWorkspaceLivenessProbe, RegistrySubAgentWorkspaceLivenessProbe>();
          services.AddSingleton<IUserRegistry, DefaultUserRegistry>();
          services.AddSingleton<ICitizenRegistry, DefaultCitizenRegistry>();
          services.TryAddSingleton<IAgentConfigurationWriter, NoOpAgentConfigurationWriter>();
         services.AddSingleton<IAgentSupervisor, DefaultAgentSupervisor>();
+        // #2614: the ONE execution-layer tool-audit sink, registered once. Both the streaming
+        // delivery path and every blocking PromptAsync caller render their durable tool history
+        // through this single implementation, so the audit guarantee no longer depends on which
+        // transport the caller picked.
+        services.TryAddSingleton<BotNexus.Gateway.Audit.IToolAuditSink>(
+            sp => new BotNexus.Gateway.Audit.DefaultToolAuditSink(
+                new ToolInvocationRecordPolicy(redactor: sp.GetRequiredService<ISecretRedactor>())));
         services.AddSingleton<AgentExchangeBudgetTracker>();
+        // #3494: per-agent inbound admission control. MUST be a singleton - a per-scope queue would
+        // gate nothing, since two concurrent exchanges targeting one agent would each see their own
+        // empty mailbox and both barge into the same single execution slot.
+        services.TryAddSingleton<AgentExchangeInboundQueue>();
         // #1542: the shared turn loop and cross-world federation routing are their own
         // single-responsibility collaborators, injected into AgentExchangeService.
         services.AddSingleton<AgentExchangeTurnEngine>(serviceProvider =>
@@ -160,32 +249,105 @@ public static class GatewayServiceCollectionExtensions
             new CrossWorldChannelAdapter(
                 serviceProvider.GetRequiredService<ILogger<CrossWorldChannelAdapter>>(),
                 serviceProvider.GetService<HttpClient>() ?? new HttpClient(),
-                serviceProvider.GetService<CrossWorldChannelOptions>()));
+                serviceProvider.GetService<CrossWorldChannelOptions>(),
+                // #3399: without this the relay error path falls back to the null no-op redactor and
+                // a peer world reflecting X-Cross-World-Key into its error page leaks the shared key.
+                serviceProvider.GetService<ISecretRedactor>()));
         services.AddSingleton<IChannelAdapter>(serviceProvider => serviceProvider.GetRequiredService<CrossWorldChannelAdapter>());
+        services.TryAddSingleton<IGitSnapshotProcessRunner, GitSnapshotProcessRunner>();
+        services.TryAddSingleton<ISubAgentWorktreeSnapshotService>(serviceProvider =>
+            new SubAgentWorktreeSnapshotService(
+                serviceProvider.GetRequiredService<IFileSystem>(),
+                serviceProvider.GetRequiredService<IOptions<SubAgentWorktreeSnapshotOptions>>(),
+                serviceProvider.GetRequiredService<IGitSnapshotProcessRunner>(),
+                serviceProvider.GetRequiredService<ISecretRedactor>(),
+                serviceProvider.GetRequiredService<BotNexusHome>(),
+                serviceProvider.GetService<TimeProvider>() ?? TimeProvider.System,
+                serviceProvider.GetRequiredService<ILogger<SubAgentWorktreeSnapshotService>>()));
+        services.AddHostedService<SubAgentWorktreeSnapshotRetentionHostedService>();
         services.AddSingleton<ISubAgentManager, DefaultSubAgentManager>();
+        // Managed task-flow hosts supply the durable ledger-backed IManagedTaskAttemptStore.
+        // Use a factory so the ordinary gateway can validate its service graph without that optional
+        // host capability; resolving the executor still fails explicitly when no ledger is supplied.
+        services.TryAddSingleton<IManagedTaskExecutor>(serviceProvider =>
+        {
+            var attempts = serviceProvider.GetRequiredService<IManagedTaskAttemptStore>();
+            var subAgents = serviceProvider.GetRequiredService<ISubAgentManager>();
+            return new LocalManagedTaskExecutor(subAgents, attempts);
+        });
+        // Optional runtime integration: inert without a host-supplied managed-task ledger; when present,
+        // startup recovers interrupted continuation claims and dispatches pending owner callbacks.
+        services.TryAddSingleton(serviceProvider => new ManagedTaskWaitCoordinator(
+            serviceProvider.GetRequiredService<SqliteManagedTaskFlowLedger>(),
+            serviceProvider.GetServices<IManagedTaskContinuationOwner>(),
+            serviceProvider.GetRequiredService<ILogger<ManagedTaskWaitCoordinator>>()));
+        services.AddHostedService<ManagedTaskWaitRecoveryService>();
         services.TryAddSingleton<SessionLifecycleEvents>();
         services.TryAddSingleton<ISessionLifecycleEvents>(serviceProvider =>
             serviceProvider.GetRequiredService<SessionLifecycleEvents>());
         services.TryAddSingleton<SessionWarmupService>();
+        // #2818: the ralph loop is a plain subscriber to the turn-end lifecycle event the gateway
+        // already publishes, registered as a hosted service so it subscribes at startup.
+        services.TryAddSingleton<IRalphIterationRunner, RalphIterationRunner>();
+        services.TryAddSingleton<RalphLoopTrigger>();
+        services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<RalphLoopTrigger>());
         services.TryAddSingleton<ISessionWarmupService>(serviceProvider =>
             serviceProvider.GetRequiredService<SessionWarmupService>());
         services.AddSingleton<IMessageRouter, DefaultMessageRouter>();
-        services.AddSingleton<IConfigPathResolver, ConfigPathResolver>();
         services.TryAddSingleton<IChannelManager, ChannelManager>();
-        services.TryAddSingleton<ISessionStore, InMemorySessionStore>();
+        // Channel-neutral conversation event seam (#2085). Registered here so gateway code can
+        // publish conversation facts today; sinks are supplied by channel extensions as the
+        // migration slices land. With zero registered sinks publication is a no-op, so this
+        // registration is inert until an extension opts in.
+        services.TryAddSingleton<ConversationEventPublisherOptions>();
+        services.TryAddSingleton<ConversationEventPublisher>();
+        services.TryAddSingleton<IConversationEventPublisher>(serviceProvider =>
+            serviceProvider.GetRequiredService<ConversationEventPublisher>());
+        services.TryAddSingleton<ISessionRunDrain>(serviceProvider =>
+            new SupervisorSessionRunDrain(
+                serviceProvider,
+                serviceProvider.GetService<ILogger<SupervisorSessionRunDrain>>()));
+        services.TryAddSingleton<ISessionStore>(serviceProvider =>
+            AttachArchiveDrain(new InMemorySessionStore(), serviceProvider));
         services.TryAddSingleton<ISessionWriteLock, SessionWriteLock>();
         services.TryAddSingleton<IConversationStore, InMemoryConversationStore>();
+        services.TryAddSingleton<IConversationReadStateStore, InMemoryConversationReadStateStore>();
+        services.TryAddSingleton<IConversationSectionStore, InMemoryConversationSectionStore>();
         services.TryAddSingleton<IAgentIdentityResolver, AgentIdentityResolver>();
         services.AddSingleton<IAgentCanvasNotifier, ConversationCanvasNotifier>();
         services.TryAddSingleton<IConversationRouter, DefaultConversationRouter>();
         services.TryAddSingleton<IConversationDispatcher, DefaultConversationDispatcher>();
         services.TryAddSingleton<IAskUserResponseRegistry, AskUserResponseRegistry>();
+        services.TryAddSingleton<IAskUserPromptResolver, AskUserPromptResolver>();
+        // #2047: durable ask_user checkpoint resolution + restart resume. The resumer dispatches a
+        // continuation turn through the router/orchestrator; the checkpoint service is the single
+        // source of truth for resolving a response against persisted state; the hosted reconciliation
+        // service rehydrates the in-memory interception map from durable checkpoints on startup.
+        services.TryAddSingleton<IAskUserCheckpointResumer, AskUserCheckpointResumer>();
+        services.TryAddSingleton<IAskUserCheckpointService, AskUserCheckpointService>();
+        services.AddHostedService<AskUserCheckpointReconciliationService>();
         services.TryAddSingleton<PendingAskUserInterceptor>();
         services.AddSingleton<InternalChannelAdapter>();
         services.AddSingleton<IChannelAdapter>(serviceProvider => serviceProvider.GetRequiredService<InternalChannelAdapter>());
         services.AddSingleton<ISessionCompactor, LlmSessionCompactor>();
+        // #2896: scope the auto-compaction budget to the agent's / conversation's own context window
+        // instead of the process-global CompactionOptions.ContextWindowTokens.
+        services.TryAddSingleton<ISessionContextWindowResolver, SessionContextWindowResolver>();
+        services.TryAddSingleton<ISessionCompactionCeilingResolver, SessionCompactionCeilingResolver>();
+        services.TryAddSingleton<ISessionCompactionDiagnostics, SessionCompactionDiagnostics>();
+        // #3535: turns a context-exhausted empty completion from a silent blank turn into an
+        // explicit MessageRole.Notification, discriminated against the SAME scope-resolved window.
+        services.TryAddSingleton<IContextExhaustionNotifier, ContextExhaustionNotifier>();
         services.AddSingleton<IPreCompactionMemoryFlusher, PreCompactionMemoryFlusher>();
-        services.AddSingleton<ISessionCompactionCoordinator, SessionCompactionCoordinator>();
+        services.AddSingleton<ISessionCompactionCoordinator>(serviceProvider => new SessionCompactionCoordinator(
+            serviceProvider.GetRequiredService<ISessionCompactor>(),
+            serviceProvider.GetRequiredService<ISessionStore>(),
+            serviceProvider.GetRequiredService<IAgentSupervisor>(),
+            serviceProvider.GetRequiredService<IConversationEventPublisher>(),
+            serviceProvider.GetRequiredService<IConversationStore>(),
+            serviceProvider.GetRequiredService<IOptionsMonitor<CompactionOptions>>(),
+            serviceProvider.GetRequiredService<ILogger<SessionCompactionCoordinator>>(),
+            serviceProvider.GetService<IPreCompactionMemoryFlusher>()));
         services.AddSingleton<ISessionEndMemoryFlusher, SessionEndMemoryFlusher>();
         services.AddSingleton<IConversationResetService, DefaultConversationResetService>();
         services.AddSingleton<IMediaPipeline, MediaPipeline>();
@@ -214,9 +376,39 @@ public static class GatewayServiceCollectionExtensions
         // Tool policy
         services.TryAddSingleton<DefaultToolPolicyProvider>();
         services.TryAddSingleton<IToolPolicyProvider>(sp => sp.GetRequiredService<DefaultToolPolicyProvider>());
-        services.AddSingleton<ToolPolicyHookHandler>();
+        services.AddSingleton<ToolPolicyHookHandler>(sp =>
+            new ToolPolicyHookHandler(
+                sp.GetRequiredService<DefaultToolPolicyProvider>(),
+                sp.GetRequiredService<ILogger<ToolPolicyHookHandler>>(),
+                sp.GetService<ISecurityEventSink>()));
         services.AddSingleton<AgentsMdPromptHookHandler>();
-        services.TryAddSingleton<ISecretRedactor, SecretRedactor>();
+        // #2727: operator-supplied redaction patterns are compiled here, at startup. Compile()
+        // throws on a malformed/all-matching pattern, which surfaces as a startup failure naming the
+        // offending entry rather than an exception on the transcript-writing path later. The
+        // built-in pattern set is unconditional and unaffected by this configuration.
+        services.TryAddSingleton<ISecretRedactor>(sp =>
+        {
+            var redaction = sp.GetService<IOptions<PlatformConfig>>()?.Value?.Gateway?.SecretRedaction;
+            var options = redaction is null
+                ? null
+                : new SecretRedactionOptions(
+                    redaction.Patterns,
+                    redaction.MatchTimeoutMilliseconds is { } ms and > 0
+                        ? TimeSpan.FromMilliseconds(ms)
+                        : null);
+
+            return new SecretRedactor(sp.GetService<ISecurityEventSink>(), options);
+        });
+
+        // #2557: opt-in cron failure alerts delivered into a configured conversation. Registered
+        // here (not in AddBotNexusCron) because the delivery seam lives in the gateway assembly.
+        services.TryAddSingleton<BotNexus.Cron.ICronFailureAlertSink, BotNexus.Gateway.Cron.ConversationCronFailureAlertSink>();
+
+        // #3168: the resolver CronAlertTarget validation needs to verify a failure-alert target.
+        // Without it, validation fails closed on every write, so `failureAlertConversationId`
+        // could never be set and alerting was unreachable. Registered alongside the sink because
+        // both seams are cron-owned interfaces implemented over gateway conversation state.
+        services.TryAddSingleton<BotNexus.Cron.ICronAlertTargetResolver, BotNexus.Gateway.Cron.ConversationCronAlertTargetResolver>();
 
         // Trusted security-event sink (#1532, #1645): captures approval/auth/tool boundary
         // decisions for the future trusted diagnostics surface. Deliberately a separate bounded
@@ -245,11 +437,29 @@ public static class GatewayServiceCollectionExtensions
         services.TryAddSingleton<INetworkPathDetector>(sp =>
             new NetworkPathDetector(sp.GetRequiredService<IFileSystem>()));
 
+        // Governed proposals are runtime state, not configuration. Keep this ledger in the writable
+        // data directory and deliberately give the store no registry or configuration-writer
+        // dependency: approval application belongs to the later lifecycle slice (#4093).
+        services.TryAddSingleton<IAgentProposalStore>(serviceProvider =>
+        {
+            var home = serviceProvider.GetRequiredService<BotNexusHome>();
+            var fileSystem = serviceProvider.GetRequiredService<IFileSystem>();
+            var databasePath = fileSystem.Path.Combine(home.DataPath, "agent-proposals.sqlite");
+            serviceProvider.GetRequiredService<ISqliteDatabaseRegistry>().Register(databasePath);
+            return new SqliteAgentProposalStore(
+                databasePath,
+                fileSystem,
+                serviceProvider.GetRequiredService<INetworkPathDetector>(),
+                serviceProvider.GetService<ILogger<SqliteWalMaintenance>>());
+        });
+
         // Extension state store
         services.TryAddSingleton<IExtensionStateStore>(serviceProvider =>
         {
             var home = serviceProvider.GetRequiredService<BotNexusHome>();
-            var dbPath = Path.Combine(home.RootPath, "data", "extension-state.db");
+            var dbPath = SqliteStorePathPolicy.ResolveOwnedStorePath(
+                Path.Combine(home.RootPath, "data"),
+                "extension-state");
             serviceProvider.GetRequiredService<ISqliteDatabaseRegistry>().Register(dbPath);
             var fs = serviceProvider.GetRequiredService<IFileSystem>();
             var storeLogger = serviceProvider.GetRequiredService<ILogger<SqliteExtensionStateStore>>();
@@ -269,15 +479,35 @@ public static class GatewayServiceCollectionExtensions
         // Outbound fan-out delivery (#1811): focused collaborator extracted from GatewayHost.
         services.TryAddSingleton<IOutboundResponseDeliverer, OutboundResponseDeliverer>();
 
+        // Agent-to-agent handoff progress (#3176): reports exchange milestones back into the
+        // INITIATING conversation over the same outbound fan-out path assistant replies use.
+        services.TryAddSingleton<Abstractions.Agents.IAgentExchangeProgressNotifier, Agents.AgentExchangeProgressNotifier>();
+
         // Live-turn tracker for write-time self-heal of orphaned crash sentinels (#2030).
         // Singleton so GatewayHost shares one view of which sessions have a turn in flight.
         services.TryAddSingleton<Sessions.ISessionTurnTracker, Sessions.SessionTurnTracker>();
+
+        // #2447: startup outcomes are published into a singleton report so the API layer can
+        // answer "which configured adapters actually started" without reaching into the host.
+        services.TryAddSingleton<BotNexus.Gateway.Channels.Startup.ChannelStartupReport>();
+
+        // Best-effort asynchronous post-run evaluation foundation (#4319). The coordinator is a
+        // singleton hosted service so GatewayHost and the background worker share one bounded queue.
+        services.TryAddSingleton(new PostRunEvaluationOptions());
+        services.TryAddSingleton<PostRunEvaluationCoordinator>();
+        services.TryAddSingleton<IPostRunEvaluationCoordinator>(serviceProvider =>
+            serviceProvider.GetRequiredService<PostRunEvaluationCoordinator>());
+        services.TryAddSingleton<PostRunEvaluationDispatcher>();
+        services.AddSingleton<IHostedService>(serviceProvider =>
+            serviceProvider.GetRequiredService<PostRunEvaluationCoordinator>());
 
         // Gateway host
         services.TryAddSingleton<GatewayHost>();
         services.TryAddSingleton<IChannelDispatcher>(serviceProvider => serviceProvider.GetRequiredService<GatewayHost>());
         services.TryAddSingleton<IInboundMessageProcessor>(serviceProvider => serviceProvider.GetRequiredService<GatewayHost>());
         services.TryAddSingleton<IInboundMessageOrchestrator>(serviceProvider => serviceProvider.GetRequiredService<GatewayHost>().Orchestrator);
+        services.TryAddSingleton<IInboundAdmissionControl>(serviceProvider =>
+            (IInboundAdmissionControl)serviceProvider.GetRequiredService<GatewayHost>().Orchestrator);
         services.AddSingleton<IHostedService>(serviceProvider => serviceProvider.GetRequiredService<GatewayHost>());
         services.AddSingleton<IHostedService>(serviceProvider =>
             serviceProvider.GetRequiredService<SessionWarmupService>());
@@ -285,18 +515,37 @@ public static class GatewayServiceCollectionExtensions
             sp.GetRequiredService<ISessionStore>(),
             sp.GetRequiredService<IAgentRegistry>(),
             sp.GetRequiredService<IActivityBroadcaster>(),
-            sp.GetRequiredService<IChannelManager>(),
+            sp.GetRequiredService<IConversationEventPublisher>(),
             sp.GetRequiredService<ILogger<InterruptedTurnNotificationService>>(),
             sp.GetService<IInboundMessageOrchestrator>(),
-            sp.GetService<IOptions<GatewayOptions>>()));
+            sp.GetService<IOptions<GatewayOptions>>(),
+            sp.GetService<IConversationStore>(),
+            sp.GetService<SessionLifecycleEvents>(),
+            sp.GetService<Diagnostics.CleanShutdownMarker>()));
         services.AddHostedService<SessionCleanupService>();
+        // Session/conversation consistency monitor + safe auto-heal path (#2046).
+        services.TryAddSingleton<Sessions.SessionConsistencyChecker>();
+        services.AddHostedService<SessionConsistencyHostedService>();
         services.TryAddSingleton<IConversationChangeNotifier, NullConversationChangeNotifier>();
         services.AddHostedService<ConversationRetentionHostedService>();
+        services.AddHostedService<LegacyToolInvocationBackfillHostedService>();
+        services.AddHostedService<SubAgentWorkspaceSweepHostedService>();
         services.AddHostedService<MemoryIndexer>();
+        services.AddHostedService<MemoryReembeddingWorker>();
+
+        // #2956: converge memory rows left behind by sessions deleted while the gateway was down
+        // (or before the delete path existed). Fails closed on a session-corpus scan error.
+        services.TryAddSingleton<MemorySessionReconciler>();
+        services.AddHostedService<MemorySessionReconciliationService>();
 
         // Liveness watchdog: monitors gateway activity and logs warnings on stalls
         services.AddSingleton<IActivityTracker, ActivityTracker>();
-        services.Configure<LivenessWatchdogOptions>(_ => { });
+        services.AddSingleton<IThreadPoolProbe, ThreadPoolProbe>();
+        // #4689: real dispatch evidence (due-but-unfired cron jobs), not another liveness proxy.
+        services.AddSingleton<IDispatchFreshnessProbe>(sp => new CronDispatchFreshnessProbe(
+            sp,
+            sp.GetService<TimeProvider>() ?? TimeProvider.System,
+            sp.GetService<ILogger<CronDispatchFreshnessProbe>>()));
         services.AddHostedService<LivenessWatchdogService>();
 
         // Satellite registry and stale detection
@@ -330,28 +579,53 @@ public static class GatewayServiceCollectionExtensions
         PlatformConfigLoader.EnsureConfigDirectory(configDirectory, fileSystem);
         var config = LoadConfigForRegistration(configuration, resolvedConfigPath, fileSystem);
 
-        if (configuration is not null)
-        {
-            // Bind PlatformConfig from the host IConfiguration root (config.json is already in the pipeline).
-            // IOptionsMonitor hot-reload comes free from reloadOnChange: true in Program.cs.
-            services.AddOptions<PlatformConfig>().Bind(configuration);
-            services.AddSingleton<IPostConfigureOptions<PlatformConfig>>(sp =>
-                new PlatformConfigPostConfigure(sp.GetRequiredService<IConfiguration>(), resolvedConfigPath));
-            services.AddSingleton<IValidateOptions<PlatformConfig>, PlatformConfigOptionsValidator>();
-        }
-        else
-        {
-            // Fallback when IConfiguration is not threaded in (e.g. tests or CLI-only usage).
-            // Use a manual load + PostConfigure without hot reload.
-            services.AddOptions<PlatformConfig>()
-                .Configure(options =>
-                {
-                    var freshConfig = PlatformConfigLoader.Load(resolvedConfigPath, fileSystem: fileSystem);
-                    ApplyPlatformConfig(options, freshConfig);
-                });
-        }
+        // #3504: ONE registration path. Previously an `IConfiguration`-present branch bound from the
+        // pipeline while an else-branch hand-loaded the file on every options access - two ways to
+        // populate the same type, with only the first getting hot reload, store values, and
+        // last-known-good. When no configuration was threaded in we now build the same pipeline
+        // instead of reading the file, so every host binds identically.
+        configuration ??= new ConfigurationBuilder()
+            .AddPlatformConfiguration(resolvedConfigPath)
+            .Build();
+
+        // Bind PlatformConfig from the IConfiguration root. IOptionsMonitor hot-reload comes free
+        // from reloadOnChange on the file provider and the store's reload token.
+        services.AddOptions<PlatformConfig>().Bind(configuration);
+        services.TryAddSingleton(configuration);
+        services.AddSingleton<IPostConfigureOptions<PlatformConfig>>(sp =>
+            new PlatformConfigPostConfigure(sp.GetRequiredService<IConfiguration>(), resolvedConfigPath));
+        // Explicit factory: the validator has a second, internal constructor used only by
+        // tests, so resolve the logger deliberately rather than relying on constructor
+        // selection. Without the logger the #3037 unknown-property warning would be silent.
+        services.AddSingleton<IValidateOptions<PlatformConfig>>(sp =>
+            new PlatformConfigOptionsValidator(
+                sp.GetService<ILogger<PlatformConfigOptionsValidator>>()));
+
+        // #3281: the world event bus and the provider-health observer are registered together
+        // because neither is useful alone. The bus had no publisher and no registration at all -
+        // WorldEventTypes.HealthDegraded was a declared constant nothing ever emitted - so a
+        // credential outage reached no channel. Registering the observer without the bus, or the
+        // bus without a publisher, would leave that gap exactly where it was.
+        services.TryAddSingleton<IEventDeliveryHandler, LoggingEventDeliveryHandler>();
+        services.TryAddSingleton<IWorldEventBus, InMemoryWorldEventBus>();
+        // Constructed explicitly rather than by convention: the threshold and cooldown are optional
+        // constructor parameters, and DI would otherwise be choosing the debounce policy implicitly.
+        services.TryAddSingleton<IProviderHealthObserver>(serviceProvider =>
+            new WorldEventProviderHealthObserver(
+                serviceProvider.GetRequiredService<IWorldEventBus>(),
+                serviceProvider.GetRequiredService<ILogger<WorldEventProviderHealthObserver>>(),
+                serviceProvider.GetService<TimeProvider>() ?? TimeProvider.System));
 
         services.TryAddSingleton<GatewayAuthManager>();
+
+        // #3015: singleton by design. The whole point of the exhaustion lane is that the condition
+        // is REMEMBERED between turns -- a per-scope registry would forget it immediately and
+        // restore the four-round-trips-per-turn tax the split exists to remove.
+        services.TryAddSingleton<BotNexus.Agent.Core.Loop.IProviderSuspensionRegistry>(
+            _ => new BotNexus.Agent.Core.Loop.ProviderSuspensionRegistry());
+        services.TryAddSingleton<BotNexus.Agent.Core.Loop.IProviderRecoveryCoordinator>(
+            _ => new BotNexus.Agent.Core.Loop.ProviderRecoveryCoordinator());
+
         services.TryAddSingleton<ILocationResolver>(serviceProvider =>
             new DefaultLocationResolver(
                 serviceProvider.GetRequiredService<IOptionsMonitor<PlatformConfig>>(),
@@ -385,16 +659,49 @@ public static class GatewayServiceCollectionExtensions
                 configDirectory,
                 serviceProvider.GetRequiredService<ILogger<PlatformConfigAgentSource>>(),
                 serviceProvider.GetRequiredService<ILocationResolver>(),
-                serviceProvider.GetService<BotNexus.Agent.Providers.Core.Registry.ModelRegistry>()));
+                serviceProvider.GetService<BotNexus.Agent.Providers.Core.Registry.ModelRegistry>(),
+                serviceProvider.GetService<BotNexus.Gateway.Telemetry.IMetrics>()));
         services.Replace(ServiceDescriptor.Singleton(serviceProvider =>
             CreatePlatformConfigWriter(
                 resolvedConfigPath,
                 serviceProvider.GetRequiredService<IFileSystem>())));
+
+        // #2834: the world identity is resolved EXACTLY ONCE, here, against the same resolved config
+        // path the writer uses. Both the injected value and the bootstrap write below consume this
+        // single resolution - nothing re-derives it - so a broken resolver cannot produce two
+        // independently-wrong answers that agree with each other.
+        var worldId = WorldIdResolver.Resolve(resolvedConfigPath, fileSystem, out var worldIdGenerated);
+        services.Replace(ServiceDescriptor.Singleton(worldId));
+        services.Replace(ServiceDescriptor.Singleton(new WorldIdOrigin(worldIdGenerated)));
+        // #3411: bind both the identity and home path to this one composition resolution. Passing the
+        // configuration directory explicitly avoids a second process-global home lookup and hands
+        // every file-backed guard the same WorldId used by the SQLite identity seam below.
+        services.Replace(ServiceDescriptor.Singleton<BotNexusHome>(serviceProvider =>
+            new BotNexusHome(
+                serviceProvider.GetRequiredService<IFileSystem>(),
+                homePath: configDirectory,
+                dataPath: BotNexusHome.ResolveDataPath(),
+                worldId: worldId.Value,
+                logger: serviceProvider.GetService<ILogger<BotNexusHome>>())));
+        services.AddHostedService<WorldIdPersistenceService>();
+
+        // #2833: hand that SAME resolved value to the SQLite connection seam, so every store this
+        // process opens is stamped with - and verified against - this world. Installed here rather
+        // than from a hosted service because stores are opened during registration and early
+        // startup; a guard that arrives after the first open has already missed the failure it
+        // exists to catch. The logger is attached later (see SetLogger) since the logging pipeline
+        // does not exist yet at this point.
+        SqliteStoreIdentityGuard.Configure(
+            new SqliteStoreIdentity(worldId.Value, configDirectory));
         services.Replace(ServiceDescriptor.Singleton<IAgentConfigurationWriter>(serviceProvider =>
         {
             var home = serviceProvider.GetRequiredService<BotNexusHome>();
             var writer = serviceProvider.GetRequiredService<PlatformConfigWriter>();
-            return new PlatformConfigAgentWriter(writer, home);
+            // #3547: the resolver lets the writer recognise an incoming absolute path as the
+            // resolved form of a stored '@location' alias and write the alias back instead.
+            // Optional by design - without it the writer persists the caller's values verbatim.
+            var locationResolver = serviceProvider.GetService<ILocationResolver>();
+            return new PlatformConfigAgentWriter(writer, home, locationResolver);
         }));
         // Config hydration — populate missing keys with defaults on startup
         services.AddSingleton<IConfigSchemaContributor, GatewaySchemaContributor>();
@@ -406,7 +713,43 @@ public static class GatewayServiceCollectionExtensions
         services.AddSingleton<IConfigSchemaContributor, RateLimitSchemaContributor>();
         services.AddHostedService<ConfigHydrationService>();
 
-        services.AddHostedService<BuiltInAgentRegistrationService>();
+        // #3509: the shadow verification harness is gone. It migrated config.json into the store and
+        // diffed the round-trip to prove the copy was faithful - which mattered when the store was
+        // being introduced behind a flag. It writes a report nothing reads, and the store is now an
+        // ordinary configuration provider whose values are simply served, so there is no separate
+        // copy left to verify.
+        services.TryAddSingleton<IConfigStore>(sp =>
+        {
+            // Sits beside config.json rather than in a separate location, so "delete the store to roll
+            // back" is an obvious operation for whoever needs it at 3am.
+            var fs = sp.GetRequiredService<IFileSystem>();
+            var directory = PlatformConfigLoader.GetDefaultConfigDirectory(fs);
+            var storePath = ConfigStoreBootstrap.ResolveStorePath(
+                Path.Combine(directory, "config.json"),
+                fs);
+            return new SqliteConfigStore($"Data Source={storePath}");
+        });
+
+        // #2635: additively reconcile the bundled agent catalog into config.json. Registered
+        // HERE, ahead of AgentConfigurationHostedService below, so an entry inserted on this
+        // startup is visible to the config agent source in the same startup rather than only
+        // after the next restart. Hosted services start in registration order, so this ordering
+        // is the mechanism, not a comment about one.
+        services.AddHostedService(serviceProvider => PlatformAgentReconciliationService.Create(
+            serviceProvider.GetRequiredService<BotNexusHome>(),
+            serviceProvider.GetRequiredService<IFileSystem>(),
+            serviceProvider.GetRequiredService<ILogger<PlatformAgentReconciliationService>>()));
+
+        // Reconcile config-defined model registrations before agent descriptors consume the live
+        // registry. Both services subscribe to the same options monitor; registration order keeps
+        // the catalogue revision ahead of agent validation for each reload.
+        services.TryAddSingleton<ConfigDefinedModelRegistryReconciler>();
+        services.AddSingleton<IHostedService>(serviceProvider =>
+            serviceProvider.GetRequiredService<ConfigDefinedModelRegistryReconciler>());
+
+        // #2136: the six worker archetypes (researcher, coder, planner, reviewer, writer, analyst)
+        // are no longer registered as named conversational agents. They are resolved at spawn time
+        // from BuiltInArchetypes, cloning the parent descriptor and applying the archetype tool set.
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, AgentConfigurationHostedService>());
 
         return services;
@@ -429,8 +772,12 @@ public static class GatewayServiceCollectionExtensions
 
     private static PlatformConfig LoadConfigForRegistration(IConfiguration? configuration, string resolvedConfigPath, IFileSystem fileSystem)
     {
-        if (configuration is null)
-            return PlatformConfigLoader.Load(resolvedConfigPath, fileSystem: fileSystem);
+        // #3504: no hand-rolled load. When no IConfiguration was threaded in (tests, CLI-only
+        // usage) build the same provider pipeline the gateway uses rather than reading the file
+        // directly - so the store is visible and last-known-good applies in every host.
+        configuration ??= new ConfigurationBuilder()
+            .AddPlatformConfiguration(resolvedConfigPath)
+            .Build();
 
         var config = new PlatformConfig();
         configuration.Bind(config);
@@ -469,11 +816,20 @@ public static class GatewayServiceCollectionExtensions
         }
     }
 
+    /// <summary>
+    /// Builds the platform config writer, fanning writes out to every backing store (#3527).
+    /// </summary>
+    /// <remarks>
+    /// Delegates to <see cref="BotNexus.Gateway.Configuration.Writers.ConfigWriterFactory"/> so the DI
+    /// path and the seven direct call sites in the CLI and API assemble the same backend set. Two
+    /// copies of "which writers does this path need" is precisely how the gateway and the CLI would
+    /// drift into disagreeing about where a write lands.
+    /// </remarks>
     private static PlatformConfigWriter CreatePlatformConfigWriter(string configPath, IFileSystem fileSystem)
     {
         var directory = Path.GetDirectoryName(configPath) ?? PlatformConfigLoader.GetDefaultConfigDirectory(fileSystem);
         var backup = new ConfigBackupService(Path.Combine(directory, "backups"), fileSystem);
-        return new PlatformConfigWriter(configPath, fileSystem, backup);
+        return BotNexus.Gateway.Configuration.Writers.ConfigWriterFactory.Create(configPath, fileSystem, backup);
     }
 
     /// <summary>
@@ -539,10 +895,12 @@ public static class GatewayServiceCollectionExtensions
             // Phase 9 / P9-B (#615): thread the conversation store so save-time legacy
             // backfill applies in InMemory test/dev deployments too.
             services.Replace(ServiceDescriptor.Singleton<ISessionStore>(serviceProvider =>
-                new InMemorySessionStore(
-                    redactor: serviceProvider.GetService<ISecretRedactor>(),
-                    conversationStore: serviceProvider.GetService<IConversationStore>(),
-                    logger: serviceProvider.GetService<ILogger<InMemorySessionStore>>())));
+                AttachArchiveDrain(
+                    new InMemorySessionStore(
+                        redactor: serviceProvider.GetService<ISecretRedactor>(),
+                        conversationStore: serviceProvider.GetService<IConversationStore>(),
+                        logger: serviceProvider.GetService<ILogger<InMemorySessionStore>>()),
+                    serviceProvider)));
             return;
         }
 
@@ -558,13 +916,15 @@ public static class GatewayServiceCollectionExtensions
             services.Replace(ServiceDescriptor.Singleton<ISessionStore>(serviceProvider =>
             {
                 var fs = serviceProvider.GetRequiredService<IFileSystem>();
-                fs.Directory.CreateDirectory(sessionsPath);
-                return new FileSessionStore(
-                    sessionsPath,
-                    serviceProvider.GetRequiredService<ILogger<FileSessionStore>>(),
-                    fs,
-                    conversationStore: serviceProvider.GetRequiredService<IConversationStore>(),
-                    redactor: serviceProvider.GetService<ISecretRedactor>());
+                return AttachArchiveDrain(
+                    new FileSessionStore(
+                        sessionsPath,
+                        serviceProvider.GetRequiredService<ILogger<FileSessionStore>>(),
+                        fs,
+                        conversationStore: serviceProvider.GetRequiredService<IConversationStore>(),
+                        redactor: serviceProvider.GetService<ISecretRedactor>(),
+                        home: serviceProvider.GetRequiredService<BotNexusHome>()),
+                    serviceProvider);
             }));
             return;
         }
@@ -580,15 +940,33 @@ public static class GatewayServiceCollectionExtensions
             services.Replace(ServiceDescriptor.Singleton<ISessionStore>(serviceProvider =>
             {
                 RegisterSqliteDatabasePath(serviceProvider, connectionString);
-                return new SqliteSessionStore(
-                    connectionString,
-                    serviceProvider.GetRequiredService<ILogger<SqliteSessionStore>>(),
-                    serviceProvider.GetRequiredService<IConversationStore>());
+                return AttachArchiveDrain(
+                    new SqliteSessionStore(
+                        connectionString,
+                        serviceProvider.GetRequiredService<ILogger<SqliteSessionStore>>(),
+                        serviceProvider.GetRequiredService<IConversationStore>(),
+                        storeMetrics: serviceProvider.GetService<StoreMetrics>(),
+                        journalModeMaintenance: serviceProvider.GetRequiredService<SqliteWalMaintenance>()),
+                    serviceProvider);
             }));
             return;
         }
 
         throw new OptionsValidationException(nameof(PlatformConfig), typeof(PlatformConfig), ["gateway.sessionStore.type must be either 'InMemory', 'File', or 'Sqlite'."]);
+    }
+
+    /// <summary>
+    /// Wires the archive run-fence (#2903) onto a freshly constructed store. Done here, at the
+    /// composition root, rather than through the store constructors: the fence needs
+    /// <c>IAgentSupervisor</c>, which needs <c>ISessionStore</c>, so a constructor parameter would
+    /// be an unresolvable cycle. <see cref="SupervisorSessionRunDrain"/> resolves the supervisor
+    /// lazily at drain time, so attaching it here costs nothing until an archive actually runs.
+    /// </summary>
+    private static TStore AttachArchiveDrain<TStore>(TStore store, IServiceProvider serviceProvider)
+        where TStore : SessionStoreBase
+    {
+        store.ConfigureArchiveDrain(serviceProvider.GetService<ISessionRunDrain>());
+        return store;
     }
 
     private static void ConfigureConversationStore(IServiceCollection services, PlatformConfig config, string configDirectory)
@@ -609,6 +987,8 @@ public static class GatewayServiceCollectionExtensions
         if (resolvedType.Equals("InMemory", StringComparison.OrdinalIgnoreCase))
         {
             services.Replace(ServiceDescriptor.Singleton<IConversationStore, InMemoryConversationStore>());
+            services.Replace(ServiceDescriptor.Singleton<IConversationReadStateStore, InMemoryConversationReadStateStore>());
+            services.Replace(ServiceDescriptor.Singleton<IConversationSectionStore, InMemoryConversationSectionStore>());
             return;
         }
 
@@ -629,6 +1009,15 @@ public static class GatewayServiceCollectionExtensions
                     fs,
                     serviceProvider.GetService<IWorldContext>());
             }));
+            services.Replace(ServiceDescriptor.Singleton<IConversationReadStateStore>(serviceProvider =>
+                new FileConversationReadStateStore(
+                    Path.Combine(conversationsPath, "read-state"),
+                    serviceProvider.GetRequiredService<IFileSystem>())));
+            services.Replace(ServiceDescriptor.Singleton<IConversationSectionStore>(serviceProvider =>
+                new SqliteConversationSectionStore(
+                    $"Data Source={Path.Combine(dataDirectory, "sections.sqlite")}",
+                    serviceProvider.GetRequiredService<ILogger<SqliteConversationSectionStore>>(),
+                    serviceProvider.GetService<IWorldContext>())));
             return;
         }
 
@@ -644,11 +1033,20 @@ public static class GatewayServiceCollectionExtensions
                 return new SqliteConversationStore(
                     connectionString,
                     serviceProvider.GetRequiredService<ILogger<SqliteConversationStore>>(),
-                    serviceProvider.GetService<IWorldContext>());
+                    serviceProvider.GetService<IWorldContext>(),
+                    storeMetrics: serviceProvider.GetService<StoreMetrics>(),
+                    journalModeMaintenance: serviceProvider.GetRequiredService<SqliteWalMaintenance>());
             }));
 
             services.AddSingleton<IConversationAuditLog>(
                 new SqliteConversationAuditLog(connectionString));
+            services.Replace(ServiceDescriptor.Singleton<IConversationReadStateStore>(
+                new SqliteConversationReadStateStore(connectionString)));
+            services.Replace(ServiceDescriptor.Singleton<IConversationSectionStore>(serviceProvider =>
+                new SqliteConversationSectionStore(
+                    connectionString,
+                    serviceProvider.GetRequiredService<ILogger<SqliteConversationSectionStore>>(),
+                    serviceProvider.GetService<IWorldContext>())));
             return;
         }
 
@@ -681,3 +1079,4 @@ public static class GatewayServiceCollectionExtensions
     }
 
 }
+

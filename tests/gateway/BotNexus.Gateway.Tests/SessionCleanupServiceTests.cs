@@ -3,9 +3,12 @@ using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Configuration;
 using BotNexus.Gateway.Sessions;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Moq;
 
 // Resolve ambiguity: the Gateway enum is what SessionCleanupService uses
 using SessionStatus = BotNexus.Gateway.Abstractions.Models.SessionStatus;
@@ -17,13 +20,15 @@ public class SessionCleanupServiceTests
     private static SessionCleanupService CreateService(
         ISessionStore store,
         SessionCleanupOptions options,
-        SessionLifecycleEvents? lifecycle = null)
+        SessionLifecycleEvents? lifecycle = null,
+        ISessionTurnTracker? turnTracker = null)
     {
         return new SessionCleanupService(
             store,
             Options.Create(options),
             NullLogger<SessionCleanupService>.Instance,
-            lifecycle);
+            lifecycle,
+            turnTracker);
     }
 
     private static GatewaySession CreateSession(
@@ -39,6 +44,267 @@ public class SessionCleanupServiceTests
             Status = status,
             UpdatedAt = updatedAt,
         };
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_UsesPagedProjectionOnceAndNeverListsFullSessions()
+    {
+        var store = new Mock<ISessionStore>(MockBehavior.Strict);
+        var row = new SessionCleanupPlanRow(
+            SessionId.From("projection-only"), AgentId.From("agent-1"), ConversationId.From("conv-1"),
+            SessionStatus.Active, DateTimeOffset.UtcNow, 0, 0);
+        store.Setup(sessionStore => sessionStore.ListCleanupPlanAsync(
+                512, includeBytes: false, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SessionCleanupPlanPage([row], "projection-only"));
+        store.Setup(sessionStore => sessionStore.ListCleanupPlanAsync(
+                512, includeBytes: false, "projection-only", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SessionCleanupPlanPage([], null));
+
+        await CreateService(store.Object, new SessionCleanupOptions()).RunCleanupOnceAsync();
+
+        store.Verify(sessionStore => sessionStore.ListCleanupPlanAsync(
+            512, includeBytes: false, null, It.IsAny<CancellationToken>()), Times.Once);
+        store.Verify(sessionStore => sessionStore.ListCleanupPlanAsync(
+            512, includeBytes: false, "projection-only", It.IsAny<CancellationToken>()), Times.Once);
+        store.Verify(sessionStore => sessionStore.ListAsync(
+            It.IsAny<AgentId?>(), It.IsAny<CancellationToken>()), Times.Never);
+        store.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_WhenDiskBudgetEnabled_RequestsByteAccounting()
+    {
+        var store = new Mock<ISessionStore>(MockBehavior.Strict);
+        store.Setup(sessionStore => sessionStore.ListCleanupPlanAsync(
+                512, includeBytes: true, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SessionCleanupPlanPage([], null));
+
+        await CreateService(store.Object, new SessionCleanupOptions
+        {
+            MaxDiskBytes = 1
+        }).RunCleanupOnceAsync();
+
+        store.Verify(sessionStore => sessionStore.ListCleanupPlanAsync(
+            512, includeBytes: true, null, It.IsAny<CancellationToken>()), Times.Once);
+        store.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_WhenExpiryFenceConflicts_DoesNotPublishLifecycleEvent()
+    {
+        var store = new Mock<ISessionStore>();
+        var row = new SessionCleanupPlanRow(
+            SessionId.From("stale-expiry"), AgentId.From("agent-1"), ConversationId.From("conv-1"),
+            SessionStatus.Active, DateTimeOffset.UtcNow.AddDays(-2), 0, 0);
+        store.Setup(sessionStore => sessionStore.ListCleanupPlanAsync(
+                512, includeBytes: false, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SessionCleanupPlanPage([row], null));
+        store.Setup(sessionStore => sessionStore.ExpireIfMatchesAsync(
+                SessionCleanupFence.Capture(row), It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SessionMutationOutcome.Conflict);
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var events = new List<SessionLifecycleEvent>();
+        lifecycle.SessionChanged += (evt, _) =>
+        {
+            events.Add(evt);
+            return Task.CompletedTask;
+        };
+
+        await CreateService(store.Object, new SessionCleanupOptions
+        {
+            SessionTtl = TimeSpan.FromHours(24)
+        }, lifecycle).RunCleanupOnceAsync();
+
+        events.ShouldBeEmpty();
+        store.Verify(sessionStore => sessionStore.ExpireIfMatchesAsync(
+            SessionCleanupFence.Capture(row), It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()), Times.Once);
+        store.Verify(sessionStore => sessionStore.DeleteAsync(
+            It.IsAny<SessionId>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_WhenDeleteFenceConflicts_PublishesNothing()
+    {
+        var store = new Mock<ISessionStore>();
+        var row = new SessionCleanupPlanRow(
+            SessionId.From("stale-delete"), AgentId.From("agent-1"), ConversationId.From("conv-1"),
+            SessionStatus.Sealed, DateTimeOffset.UtcNow.AddDays(-10), 0, 100);
+        store.Setup(sessionStore => sessionStore.ListCleanupPlanAsync(
+                512, includeBytes: false, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SessionCleanupPlanPage([row], null));
+        store.Setup(sessionStore => sessionStore.DeleteIfMatchesAsync(
+                SessionCleanupFence.Capture(row), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SessionMutationOutcome.Conflict);
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var events = new List<SessionLifecycleEvent>();
+        lifecycle.SessionChanged += (evt, _) =>
+        {
+            events.Add(evt);
+            return Task.CompletedTask;
+        };
+
+        await CreateService(store.Object, new SessionCleanupOptions
+        {
+            SessionTtl = TimeSpan.FromDays(999),
+            ClosedSessionRetention = TimeSpan.FromDays(7)
+        }, lifecycle).RunCleanupOnceAsync();
+
+        events.ShouldBeEmpty();
+        store.Verify(sessionStore => sessionStore.DeleteIfMatchesAsync(
+            SessionCleanupFence.Capture(row), It.IsAny<CancellationToken>()), Times.Once);
+        store.Verify(sessionStore => sessionStore.DeleteAsync(
+            It.IsAny<SessionId>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WaitsForApplicationStartedBeforeScanningSessions()
+    {
+        using var applicationStarted = new CancellationTokenSource();
+        using var stopping = new CancellationTokenSource();
+        var projectionRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = CreateSignallingStore(projectionRequested);
+        using var service = CreateServiceWithLifetime(store.Object, applicationStarted.Token);
+
+        // Invoke the loop directly: it runs synchronously to its first incomplete await,
+        // unlike BackgroundService.StartAsync, which schedules ExecuteAsync on .NET 10.
+        var execution = ExecuteCleanupLoop(service, stopping.Token);
+        try
+        {
+            store.VerifyNoOtherCalls();
+            execution.IsCompleted.ShouldBeFalse();
+            applicationStarted.Cancel();
+            await projectionRequested.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            store.Verify(candidate => candidate.ListCleanupPlanAsync(
+                512, false, null, It.IsAny<CancellationToken>()), Times.Once);
+        }
+        finally
+        {
+            await CancelAndDrainAsync(stopping, execution);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_CancelledWhileWaiting_CompletesCleanlyWithoutStoreWork()
+    {
+        using var applicationStarted = new CancellationTokenSource();
+        using var stopping = new CancellationTokenSource();
+        var store = new Mock<ISessionStore>(MockBehavior.Strict);
+        using var service = CreateServiceWithLifetime(store.Object, applicationStarted.Token);
+        var execution = ExecuteCleanupLoop(service, stopping.Token);
+
+        stopping.Cancel();
+        try
+        {
+            await execution.WaitAsync(TimeSpan.FromSeconds(5));
+            execution.IsCompletedSuccessfully.ShouldBeTrue();
+        }
+        finally
+        {
+            // A later startup notification must not resurrect a cancelled cleanup loop.
+            applicationStarted.Cancel();
+            store.VerifyNoOtherCalls();
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_AlreadyStarted_ScansWithoutAnotherNotification()
+    {
+        using var applicationStarted = new CancellationTokenSource();
+        applicationStarted.Cancel();
+        using var stopping = new CancellationTokenSource();
+        var projectionRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = CreateSignallingStore(projectionRequested);
+        using var service = CreateServiceWithLifetime(store.Object, applicationStarted.Token);
+        var execution = ExecuteCleanupLoop(service, stopping.Token);
+        try
+        {
+            await projectionRequested.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            store.Verify(candidate => candidate.ListCleanupPlanAsync(
+                512, false, null, It.IsAny<CancellationToken>()), Times.Once);
+        }
+        finally
+        {
+            await CancelAndDrainAsync(stopping, execution);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WithoutLifetime_PreservesImmediateCleanup()
+    {
+        using var stopping = new CancellationTokenSource();
+        var projectionRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = CreateSignallingStore(projectionRequested);
+        using var service = CreateService(store.Object, new SessionCleanupOptions());
+        var execution = ExecuteCleanupLoop(service, stopping.Token);
+        try
+        {
+            await projectionRequested.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            store.Verify(candidate => candidate.ListCleanupPlanAsync(
+                512, false, null, It.IsAny<CancellationToken>()), Times.Once);
+        }
+        finally
+        {
+            await CancelAndDrainAsync(stopping, execution);
+        }
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_BeforeApplicationStarted_RemainsUsable()
+    {
+        using var applicationStarted = new CancellationTokenSource();
+        var projectionRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = CreateSignallingStore(projectionRequested);
+        using var service = CreateServiceWithLifetime(store.Object, applicationStarted.Token);
+
+        await service.RunCleanupOnceAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        applicationStarted.IsCancellationRequested.ShouldBeFalse();
+        store.Verify(candidate => candidate.ListCleanupPlanAsync(
+            512, false, null, It.IsAny<CancellationToken>()), Times.Once);
+        store.VerifyNoOtherCalls();
+    }
+
+    private static Mock<ISessionStore> CreateSignallingStore(TaskCompletionSource projectionRequested)
+    {
+        var store = new Mock<ISessionStore>(MockBehavior.Strict);
+        store.Setup(candidate => candidate.ListCleanupPlanAsync(
+                512, false, null, It.IsAny<CancellationToken>()))
+            .Callback(() => projectionRequested.TrySetResult())
+            .ReturnsAsync(new SessionCleanupPlanPage([], null));
+        return store;
+    }
+
+    private static SessionCleanupService CreateServiceWithLifetime(ISessionStore store, CancellationToken started)
+    {
+        var lifetime = new Mock<IHostApplicationLifetime>();
+        lifetime.SetupGet(candidate => candidate.ApplicationStarted).Returns(started);
+        var services = new ServiceCollection();
+        services.AddSingleton(lifetime.Object);
+        using var provider = services.BuildServiceProvider();
+        return ActivatorUtilities.CreateInstance<SessionCleanupService>(provider,
+            store, Options.Create(new SessionCleanupOptions { CheckInterval = TimeSpan.FromHours(1) }),
+            NullLogger<SessionCleanupService>.Instance);
+    }
+
+    private static Task ExecuteCleanupLoop(SessionCleanupService service, CancellationToken stoppingToken)
+    {
+        var method = typeof(SessionCleanupService).GetMethod("ExecuteAsync",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Session cleanup execution loop was not found.");
+        return method.CreateDelegate<Func<CancellationToken, Task>>(service)(stoppingToken);
+    }
+
+    private static async Task CancelAndDrainAsync(CancellationTokenSource stopping, Task execution)
+    {
+        stopping.Cancel();
+        try
+        {
+            await execution.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch (OperationCanceledException) when (stopping.IsCancellationRequested)
+        {
+            // Existing periodic-delay cancellation is outside the startup-wait contract.
+        }
     }
 
     [Fact]
@@ -396,5 +662,146 @@ public class SessionCleanupServiceTests
 
         var kept = await store.GetAsync(SessionId.From("cron:job-4:20260101:abc"));
         kept.ShouldNotBeNull("cron noop pruning must be disabled when retention is null");
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_DoesNotExpireActiveSession_WithInFlightRun()
+    {
+        var store = new InMemorySessionStore();
+        var session = CreateSession("s-inflight", "agent-1", SessionStatus.Active,
+            DateTimeOffset.UtcNow.AddHours(-25));
+        await store.SaveAsync(session);
+
+        var tracker = new SessionTurnTracker();
+        using var scope = tracker.BeginTurn("s-inflight");
+
+        var options = new SessionCleanupOptions { SessionTtl = TimeSpan.FromHours(24) };
+        var service = CreateService(store, options, lifecycle: null, turnTracker: tracker);
+
+        await service.RunCleanupOnceAsync();
+
+        var kept = await store.GetAsync(SessionId.From("s-inflight"));
+        kept.ShouldNotBeNull();
+        kept!.Status.ShouldBe(SessionStatus.Active, "a session with an in-flight run must not be expired");
+        kept.ExpiresAt.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_PublishesNoLifecycleEvent_ForInFlightSession()
+    {
+        var store = new InMemorySessionStore();
+        var session = CreateSession("s-inflight-evt", "agent-1", SessionStatus.Active,
+            DateTimeOffset.UtcNow.AddHours(-25));
+        await store.SaveAsync(session);
+
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var events = new List<SessionLifecycleEvent>();
+        lifecycle.SessionChanged += (evt, ct) =>
+        {
+            events.Add(evt);
+            return Task.CompletedTask;
+        };
+
+        var tracker = new SessionTurnTracker();
+        using var scope = tracker.BeginTurn("s-inflight-evt");
+
+        var options = new SessionCleanupOptions { SessionTtl = TimeSpan.FromHours(24) };
+        var service = CreateService(store, options, lifecycle, tracker);
+
+        await service.RunCleanupOnceAsync();
+
+        events.ShouldBeEmpty("no lifecycle event may be published for a live session");
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_ExpiresStaleSession_OnceItsRunCompletes()
+    {
+        var store = new InMemorySessionStore();
+        var session = CreateSession("s-run-done", "agent-1", SessionStatus.Active,
+            DateTimeOffset.UtcNow.AddHours(-25));
+        await store.SaveAsync(session);
+
+        var tracker = new SessionTurnTracker();
+        var scope = tracker.BeginTurn("s-run-done");
+
+        var options = new SessionCleanupOptions { SessionTtl = TimeSpan.FromHours(24) };
+        var service = CreateService(store, options, lifecycle: null, turnTracker: tracker);
+
+        await service.RunCleanupOnceAsync();
+        (await store.GetAsync(SessionId.From("s-run-done")))!.Status.ShouldBe(SessionStatus.Active);
+
+        scope.Dispose();
+        await service.RunCleanupOnceAsync();
+
+        var expired = await store.GetAsync(SessionId.From("s-run-done"));
+        expired.ShouldNotBeNull();
+        expired!.Status.ShouldBe(SessionStatus.Expired, "once the run completes the TTL sweep applies again");
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_ExpiresOtherStaleSessions_WhileOneRunIsInFlight()
+    {
+        var store = new InMemorySessionStore();
+        await store.SaveAsync(CreateSession("s-live", "agent-1", SessionStatus.Active,
+            DateTimeOffset.UtcNow.AddHours(-25)));
+        await store.SaveAsync(CreateSession("s-idle", "agent-1", SessionStatus.Active,
+            DateTimeOffset.UtcNow.AddHours(-25)));
+
+        var tracker = new SessionTurnTracker();
+        using var scope = tracker.BeginTurn("s-live");
+
+        var options = new SessionCleanupOptions { SessionTtl = TimeSpan.FromHours(24) };
+        var service = CreateService(store, options, lifecycle: null, turnTracker: tracker);
+
+        await service.RunCleanupOnceAsync();
+
+        (await store.GetAsync(SessionId.From("s-live")))!.Status.ShouldBe(SessionStatus.Active);
+        (await store.GetAsync(SessionId.From("s-idle")))!.Status.ShouldBe(SessionStatus.Expired);
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_DoesNotDeleteSealedSession_WithInFlightRun()
+    {
+        var store = new InMemorySessionStore();
+        await store.SaveAsync(CreateSession("s-sealed-live", "agent-1", SessionStatus.Sealed,
+            DateTimeOffset.UtcNow.AddDays(-8)));
+
+        var tracker = new SessionTurnTracker();
+        using var scope = tracker.BeginTurn("s-sealed-live");
+
+        var options = new SessionCleanupOptions
+        {
+            SessionTtl = TimeSpan.FromHours(24),
+            ClosedSessionRetention = TimeSpan.FromDays(7)
+        };
+        var service = CreateService(store, options, lifecycle: null, turnTracker: tracker);
+
+        await service.RunCleanupOnceAsync();
+
+        (await store.GetAsync(SessionId.From("s-sealed-live"))).ShouldNotBeNull(
+            "a sealed session with a live run must not be deleted out from under it");
+    }
+
+    [Fact]
+    public async Task RunCleanupOnce_DoesNotDeleteCronNoopSession_WithInFlightRun()
+    {
+        var store = new InMemorySessionStore();
+        await store.SaveAsync(CreateSession("cron:job-live:20260101:abc", "agent-1", SessionStatus.Active,
+            DateTimeOffset.UtcNow.AddDays(-8)));
+
+        var tracker = new SessionTurnTracker();
+        using var scope = tracker.BeginTurn("cron:job-live:20260101:abc");
+
+        var options = new SessionCleanupOptions
+        {
+            SessionTtl = TimeSpan.FromDays(999),
+            CronNoopRetention = TimeSpan.FromDays(7)
+        };
+        var service = CreateService(store, options, lifecycle: null, turnTracker: tracker);
+
+        await service.RunCleanupOnceAsync();
+
+        (await store.GetAsync(SessionId.From("cron:job-live:20260101:abc"))).ShouldNotBeNull(
+            "a cron session with a live run must not be pruned mid-run");
     }
 }

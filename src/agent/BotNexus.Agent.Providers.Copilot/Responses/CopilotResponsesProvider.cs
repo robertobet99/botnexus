@@ -10,6 +10,7 @@ using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Providers.Core.Streaming;
 using BotNexus.Agent.Providers.Core.Utilities;
+using BotNexus.Gateway.Abstractions.Security;
 using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Agent.Providers.Copilot.Responses;
@@ -21,62 +22,92 @@ namespace BotNexus.Agent.Providers.Copilot.Responses;
 public sealed class CopilotResponsesProvider : IApiProvider
 {
     private readonly HttpClient _httpClient;
+    private readonly ICopilotHeaderSink? _headerSink;
     private readonly ILogger<CopilotResponsesProvider> _logger;
     private readonly Func<ICopilotResponsesWebSocketTransport> _webSocketFactory;
 
+    /// <summary>
+    /// Optional secret redactor applied to a non-2xx error body before it is interpolated into an
+    /// exception message that the agent loop persists as the session-visible <c>ErrorMessage</c>
+    /// (#2881). Null is a deliberate no-op so no existing construction site breaks.
+    /// </summary>
+    private readonly ISecretRedactor? _secretRedactor;
+
     /// <summary>Creates the Copilot Responses provider with the production WebSocket adapter.</summary>
-    public CopilotResponsesProvider(HttpClient httpClient, ILogger<CopilotResponsesProvider> logger)
-        : this(httpClient, logger, static () => new CopilotResponsesWebSocketTransport())
+    public CopilotResponsesProvider(
+        HttpClient httpClient,
+        ILogger<CopilotResponsesProvider> logger,
+        ISecretRedactor? secretRedactor = null,
+        ICopilotHeaderSink? headerSink = null)
+        : this(httpClient, logger, static () => new CopilotResponsesWebSocketTransport(), secretRedactor, headerSink)
     {
     }
 
     internal CopilotResponsesProvider(
         HttpClient httpClient,
         ILogger<CopilotResponsesProvider> logger,
-        ICopilotResponsesWebSocketTransport webSocket)
-        : this(httpClient, logger, () => webSocket)
+        ICopilotResponsesWebSocketTransport webSocket,
+        ISecretRedactor? secretRedactor = null,
+        ICopilotHeaderSink? headerSink = null)
+        : this(httpClient, logger, () => webSocket, secretRedactor, headerSink)
     {
     }
 
     private CopilotResponsesProvider(
         HttpClient httpClient,
         ILogger<CopilotResponsesProvider> logger,
-        Func<ICopilotResponsesWebSocketTransport> webSocketFactory)
+        Func<ICopilotResponsesWebSocketTransport> webSocketFactory,
+        ISecretRedactor? secretRedactor, ICopilotHeaderSink? headerSink)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _webSocketFactory = webSocketFactory;
+        _secretRedactor = secretRedactor;
+        _headerSink = headerSink;
     }
 
     /// <inheritdoc />
     public string Api => "github-copilot-responses";
 
+    /// <summary>
+    /// OpenAI-shaped responses over the Copilot transport: system prompt as the first message.
+    /// Leaked-tool-call recovery is DECLARED for the same reason as the Completions transport --
+    /// Copilot discovery may route the #1709 model here, and #2170 is what happens when a Copilot
+    /// fix covers only the transport that happened to be selected on the day (#2432).
+    /// </summary>
+    public ProviderCapabilities Capabilities { get; } = new(
+        RecoversLeakedToolCallMarkup: true,
+        SystemPromptPlacement: SystemPromptPlacement.FirstMessage);
+
     /// <inheritdoc />
     public LlmStream Stream(LlmModel model, Context context, StreamOptions? options = null)
     {
+        var capture = CopilotHeaderCapture.Begin(_headerSink, model, options);
         var preference = options is CopilotResponsesOptions copilotOptions
             ? copilotOptions.TransportPreference
             : CopilotResponsesTransportPreference.Auto;
         var selected = CopilotResponsesTransportPolicy.Select(model, preference);
         if (selected == CopilotResponsesWireTransport.Sse)
-            return StreamSse(model, context, options);
+            return StreamSse(model, context, options, capture);
 
         var output = new LlmStream();
         // Do not pass the request token to Task.Run: an already-cancelled token would prevent the
         // producer from starting and leave consumers waiting forever for a terminal event.
-        _ = Task.Run(() => StreamWebSocketWithSafeFallbackAsync(output, model, context, options));
+        _ = Task.Run(() => StreamWebSocketWithSafeFallbackAsync(output, model, context, options, capture));
         return output;
     }
 
     /// <inheritdoc />
     public LlmStream StreamSimple(LlmModel model, Context context, SimpleStreamOptions? options = null)
     {
-        var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+        var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, _logger);
+        var apiKey = credential.Value;
         var reasoning = ModelRegistry.SupportsExtraHigh(model) ? options?.Reasoning : SimpleOptionsHelper.ClampReasoning(options?.Reasoning);
         var responsesOptions = new CopilotResponsesOptions
         {
             ApiKey = apiKey,
             Temperature = options?.Temperature,
+            ToolChoiceMode = options?.ToolChoiceMode,
             MaxTokens = options?.MaxTokens,
             CancellationToken = options?.CancellationToken ?? CancellationToken.None,
             Transport = options?.Transport ?? Transport.Sse,
@@ -88,7 +119,7 @@ public sealed class CopilotResponsesProvider : IApiProvider
             Metadata = options?.Metadata
         };
         if (reasoning is not null && model.Reasoning)
-            responsesOptions.ReasoningEffort = MapThinkingLevel(reasoning.Value);
+            responsesOptions.ReasoningEffort = MapThinkingLevel(model, reasoning.Value);
         return Stream(model, context, responsesOptions);
     }
 
@@ -96,7 +127,7 @@ public sealed class CopilotResponsesProvider : IApiProvider
         LlmStream output,
         LlmModel model,
         Context context,
-        StreamOptions? options)
+        StreamOptions? options, CopilotHeaderCapture capture)
     {
         using var activity = ProviderDiagnostics.Source.StartActivity("provider.copilot-responses.stream", ActivityKind.Client);
         var descriptor = CopilotResolvedModelDescriptors.Get(model);
@@ -111,7 +142,8 @@ public sealed class CopilotResponsesProvider : IApiProvider
         try
         {
             await using var socket = _webSocketFactory();
-            var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+            var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, _logger);
+        var apiKey = credential.Value;
             if (string.IsNullOrWhiteSpace(apiKey))
                 throw new InvalidOperationException($"No API key for {model.Provider}. Set credentials before using model '{model.Id}'.");
 
@@ -129,7 +161,15 @@ public sealed class CopilotResponsesProvider : IApiProvider
             {
                 Scheme = model.BaseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ? "wss" : "ws"
             }.Uri;
-            await socket.ConnectAsync(uri, headers, options?.CancellationToken ?? CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                await socket.ConnectAsync(uri, headers, options?.CancellationToken ?? CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                capture.Observe(() => socket.ResponseHeaders);
+            }
+            payload.EnforceToolFree(options?.ToolChoiceMode);
             await socket.SendAsync(payload.ToJsonString(), options?.CancellationToken ?? CancellationToken.None).ConfigureAwait(false);
 
             var normalized = new LlmStream();
@@ -147,7 +187,16 @@ public sealed class CopilotResponsesProvider : IApiProvider
                             if (json is null)
                             {
                                 if (!receivedTerminalEvent)
-                                    throw new WebSocketException("Copilot Responses WebSocket closed before a terminal response event.");
+                                {
+                                    // #3366: attribute the close instead of emitting one fixed message for
+                                    // every cause. A 1009 and a 1011 must not read identically in the log.
+                                    var close = socket.LastClose;
+                                    var detail = close is null ? "no close frame was observed" : close.Describe();
+                                    throw new CopilotResponsesWebSocketClosedException(
+                                        close,
+                                        $"Copilot Responses WebSocket closed before a terminal response event ({detail}).");
+                                }
+
                                 return null;
                             }
 
@@ -162,13 +211,25 @@ public sealed class CopilotResponsesProvider : IApiProvider
                         static (stream, failedModel, message, content) => ResponsesStreamEngine.EmitError(stream, "github-copilot-responses", failedModel, message, content),
                         static root => Telemetry.CopilotUsageActivity.TryParseAndEmit(root, Activity.Current),
                         static value => value is CopilotResponsesOptions responseOptions ? responseOptions.ServiceTier : null,
-                        NormalizeTextDelta,
-                        options?.CancellationToken ?? CancellationToken.None).ConfigureAwait(false);
+                        options?.CancellationToken ?? CancellationToken.None,
+                        _secretRedactor).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     parseFailure = ex;
-                    normalized.End();
+                    // The parse died before any terminal event, so there is no final message to
+                    // report. Say that explicitly (#3293) rather than completing the channel with a
+                    // pending result task, which would strand any awaiter of GetResultAsync.
+                    //
+                    // #3382: the overload keys off TOKEN STATE, not exception type. A cancelled turn
+                    // ends the result task as cancelled - nothing is left unobserved for the
+                    // finalizer thread to escalate into an [FTL] breadcrumb on a healthy gateway. A
+                    // parse fault with no cancellation requested still fails the stream exactly as
+                    // before, so this is a guard rather than a blanket swallow.
+                    var parseDiagnostic = ProviderHttpErrorHelper.RedactDiagnosticText(ex.Message, _secretRedactor);
+                    normalized.EndWithoutResult(
+                        $"Copilot Responses stream parse failed: {parseDiagnostic}",
+                        options?.CancellationToken ?? CancellationToken.None);
                 }
             });
 
@@ -183,13 +244,35 @@ public sealed class CopilotResponsesProvider : IApiProvider
                 throw parseFailure;
             activity?.SetStatus(ActivityStatusCode.Ok);
         }
+        catch (Exception ex) when (TryClassifyAuthFailure(ex) is int authStatus && !semanticOutput)
+        {
+            // #3674: an auth failure is TERMINAL, not transport degradation. SSE would present the
+            // same rejected credential to the same provider, so the fallback is guaranteed to fail -
+            // it only buys a second round trip, a misleading transport-health WRN as the first signal
+            // of a credential problem, and a delayed terminal error. Short-circuit instead.
+            var failure = new ProviderAuthenticationException(
+                ProviderAuthenticationException.BuildMessage("Copilot Responses", authStatus, string.Empty, _secretRedactor),
+                authStatus,
+                "Copilot Responses");
+            activity?.SetTag("botnexus.provider.transport.fallback", "none");
+            activity?.SetTag("botnexus.provider.transport.auth_failure_status", authStatus);
+            var authDiagnostic = ProviderHttpErrorHelper.RedactDiagnosticText(ex.Message, _secretRedactor);
+            _logger.LogError(
+                "Copilot Responses WebSocket handshake was rejected with HTTP {StatusCode} for {Model}; "
+                + "this is an authentication failure, so the SSE fallback is suppressed. Failure: {Failure}",
+                authStatus, model.Id, authDiagnostic);
+            ResponsesStreamEngine.EmitError(output, Api, model, failure.Message, partial?.Content);
+            activity?.SetStatus(ActivityStatusCode.Error, failure.Message);
+        }
         catch (Exception ex) when (ex is not OperationCanceledException && !semanticOutput)
         {
             activity?.SetTag("botnexus.provider.transport.fallback", "sse");
-            activity?.SetTag("botnexus.provider.transport.fallback_reason", ex.GetType().Name);
-            _logger.LogWarning(ex,
-                "Copilot Responses WebSocket failed before semantic output for {Model}; falling back to SSE", model.Id);
-            await ForwardAsync(StreamSse(model, context, options), output, options?.CancellationToken ?? CancellationToken.None).ConfigureAwait(false);
+            activity?.SetTag("botnexus.provider.transport.fallback_reason", DescribeFallbackReason(ex));
+            var fallbackDiagnostic = ProviderHttpErrorHelper.RedactDiagnosticText(ex.Message, _secretRedactor);
+            _logger.LogWarning(
+                "Copilot Responses WebSocket failed before semantic output for {Model}; falling back to SSE. Failure: {Failure}",
+                model.Id, fallbackDiagnostic);
+            await ForwardAsync(StreamSse(model, context, options, capture), output, options?.CancellationToken ?? CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -197,12 +280,53 @@ public sealed class CopilotResponsesProvider : IApiProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex,
-                "Copilot Responses WebSocket failed after semantic output for {Model}; SSE replay is suppressed", model.Id);
-            ResponsesStreamEngine.EmitError(output, Api, model, ex.Message, partial?.Content);
-            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            var diagnostic = ProviderHttpErrorHelper.RedactDiagnosticText(ex.Message, _secretRedactor);
+            _logger.LogError(
+                "Copilot Responses WebSocket failed after semantic output for {Model}; SSE replay is suppressed. Failure: {Failure}",
+                model.Id, diagnostic);
+            ResponsesStreamEngine.EmitError(output, Api, model, diagnostic, partial?.Content);
+            activity?.SetStatus(ActivityStatusCode.Error, diagnostic);
         }
     }
+
+    /// <summary>
+    /// Returns the HTTP status when <paramref name="ex"/> is a WebSocket handshake rejection that means
+    /// the credential was refused (401/403), or <see langword="null"/> for every other failure.
+    /// </summary>
+    /// <remarks>
+    /// #3674. This is the control-flow counterpart to <see cref="DescribeFallbackReason"/>: #3366 added
+    /// classification but attached it only as a telemetry tag, so nothing ever <em>decided</em> on it.
+    /// The check keys off the typed status carried by
+    /// <see cref="CopilotResponsesWebSocketHandshakeException"/>, not off the exception's message, so a
+    /// runtime wording change cannot silently re-route auth failures back into the SSE fallback.
+    /// <see cref="OperationCanceledException"/> is excluded explicitly: a cancelled turn must keep
+    /// reaching its own handler and must never be reported as an auth failure.
+    /// </remarks>
+    private static int? TryClassifyAuthFailure(Exception ex)
+    {
+        if (ex is OperationCanceledException)
+            return null;
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is CopilotResponsesWebSocketHandshakeException handshake
+                && CopilotResponsesHandshakeStatus.IsAuthFailure(handshake.StatusCode))
+            {
+                return handshake.StatusCode;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Describes why the WebSocket transport gave up. A server close carries its numeric close code so
+    /// telemetry can distinguish a payload-size close from a capacity or policy close (#3366); any other
+    /// failure falls back to the CLR exception type name as before.
+    /// </summary>
+    private static string DescribeFallbackReason(Exception ex)
+        => ex is CopilotResponsesWebSocketClosedException closed
+            ? $"{nameof(CopilotResponsesWebSocketClosedException)}:{closed.Close?.Code?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown"}"
+            : ex.GetType().Name;
 
     private static bool IsSemantic(AssistantMessageEvent evt) => evt is
         TextStartEvent or TextDeltaEvent or ThinkingStartEvent or ThinkingDeltaEvent or
@@ -251,10 +375,10 @@ public sealed class CopilotResponsesProvider : IApiProvider
         return headers;
     }
 
-    private LlmStream StreamSse(LlmModel model, Context context, StreamOptions? options)
-        => ResponsesStreamEngine.StreamAsync(BuildProfile(_logger), _httpClient, _logger, model, context, options);
+    private LlmStream StreamSse(LlmModel model, Context context, StreamOptions? options, CopilotHeaderCapture capture)
+        => ResponsesStreamEngine.StreamAsync(BuildProfile(_logger, _secretRedactor, capture), _httpClient, _logger, model, context, options);
 
-    private static ResponsesTransportProfile BuildProfile(ILogger logger) => new(
+    private static ResponsesTransportProfile BuildProfile(ILogger logger, ISecretRedactor? secretRedactor, CopilotHeaderCapture capture) => new(
         Api: "github-copilot-responses",
         ActivityName: "provider.copilot-responses.stream",
         BuildPayload: static (model, systemPrompt, messages, tools, options) =>
@@ -264,7 +388,7 @@ public sealed class CopilotResponsesProvider : IApiProvider
             ResponsesStreamParser.ParseAsync(stream, reader, model, options, api, logger, emitError,
                 static root => Telemetry.CopilotUsageActivity.TryParseAndEmit(root, Activity.Current),
                 static value => value is CopilotResponsesOptions responseOptions ? responseOptions.ServiceTier : null,
-                NormalizeTextDelta, ct),
+                ct, secretRedactor),
         DecorateHeaders: static (request, _, messages, options) =>
         {
             var hasImages = CopilotHeaders.HasVisionInput(messages);
@@ -272,26 +396,26 @@ public sealed class CopilotResponsesProvider : IApiProvider
             foreach (var (key, value) in CopilotHeaders.BuildDynamicHeaders(messages, hasImages, headerOptions))
                 request.Headers.TryAddWithoutValidation(key, value);
         },
-        ThrowForError: static (response, errorBody) =>
-            ProviderHttpErrorHelper.ThrowForFailedResponse(response, errorBody, "Copilot Responses"),
-        OnResponseHeaders: static response => CopilotResponseHeaders.EmitToActivity(response, Activity.Current));
+        ThrowForError: static (response, errorBody, redactor) =>
+            ProviderHttpErrorHelper.ThrowForFailedResponse(response, errorBody, "Copilot Responses", redactor),
+        OnResponseHeaders: response => { capture.Observe(response); CopilotResponseHeaders.EmitToActivity(response, Activity.Current); },
+        SecretRedactor: secretRedactor);
 
-    private static string NormalizeTextDelta(LlmModel model, string delta)
+    internal static string MapThinkingLevel(LlmModel model, ThinkingLevel level)
     {
-        if (model.Id.StartsWith("gpt-5.6", StringComparison.OrdinalIgnoreCase) &&
-            delta.StartsWith("\r\n", StringComparison.Ordinal))
-            return delta[2..];
-        return delta;
+        if (level == ThinkingLevel.Minimal &&
+            ModelFamilyVersion.IsAtLeast(model.Id, "gpt", major: 6))
+            return "none";
+
+        return level switch
+        {
+            ThinkingLevel.Minimal => "minimal",
+            ThinkingLevel.Low => "low",
+            ThinkingLevel.Medium => "medium",
+            ThinkingLevel.High => "high",
+            ThinkingLevel.ExtraHigh => "xhigh",
+            ThinkingLevel.Max => "max",
+            _ => "medium"
+        };
     }
-
-    private static string MapThinkingLevel(ThinkingLevel level) => level switch
-    {
-        ThinkingLevel.Minimal => "minimal",
-        ThinkingLevel.Low => "low",
-        ThinkingLevel.Medium => "medium",
-        ThinkingLevel.High => "high",
-        ThinkingLevel.ExtraHigh => "xhigh",
-        ThinkingLevel.Max => "xhigh",
-        _ => "medium"
-    };
 }
