@@ -8,6 +8,7 @@ using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Providers.Core.Streaming;
 using BotNexus.Agent.Providers.Core.Utilities;
+using BotNexus.Gateway.Abstractions.Security;
 
 namespace BotNexus.Agent.Providers.Anthropic;
 
@@ -18,7 +19,13 @@ namespace BotNexus.Agent.Providers.Anthropic;
 /// message conversion to <see cref="AnthropicMessageConverter"/>,
 /// and stream parsing to <see cref="AnthropicStreamParser"/>.
 /// </summary>
-public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvider
+/// <param name="httpClient">The shared provider HTTP client.</param>
+/// <param name="secretRedactor">
+/// Optional secret redactor applied to a non-2xx error body before it is interpolated into an
+/// exception message that the agent loop persists as the session-visible <c>ErrorMessage</c> (#2881).
+/// Optional so no existing construction site breaks; the gateway wires the shared redactor.
+/// </param>
+public sealed partial class AnthropicProvider(HttpClient httpClient, ISecretRedactor? secretRedactor = null) : IApiProvider
 {
     private const string ApiVersion = "2023-06-01";
     private const string ClaudeCodeVersion = "2.1.75";
@@ -39,6 +46,17 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
 
     public string Api => "anthropic-messages";
 
+    /// <summary>
+    /// Anthropic Messages declares its system prompt as a dedicated top-level <c>system</c> field
+    /// (see <c>AnthropicRequestBuilder</c>, which writes <c>body["system"]</c>), and does NOT need
+    /// leaked-tool-call recovery: the #1709 leak was observed on the Copilot transports, never on
+    /// the Anthropic-direct API, which returns tool calls as real <c>tool_use</c> content blocks
+    /// with a <c>tool_use</c> stop reason (#2432).
+    /// </summary>
+    public ProviderCapabilities Capabilities { get; } = new(
+        RecoversLeakedToolCallMarkup: false,
+        SystemPromptPlacement: SystemPromptPlacement.DedicatedField);
+
     public LlmStream Stream(LlmModel model, Context context, StreamOptions? options = null)
     {
         var stream = new LlmStream();
@@ -57,6 +75,7 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
 
             try
             {
+                ct.ThrowIfCancellationRequested();
                 await StreamCoreAsync(model, context, options, stream,
                     contentBlocks, usage,
                     updatedUsage => usage = updatedUsage,
@@ -70,6 +89,10 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
+                // Cancellation is normalized as ErrorEvent(StopReason.Aborted) across every producer
+                // (#3292), asserted by StreamingProviderConformanceTests. DoneEvent is the
+                // normal-completion arm of the union and a cancelled turn did not complete, so this
+                // shape - already correct here - is the one the shared engines converged onto.
                 var msg = BuildMessage(model, contentBlocks, usage, StopReason.Aborted, null, responseId);
                 stream.Push(new ErrorEvent(StopReason.Aborted, msg));
                 stream.End(msg);
@@ -82,19 +105,21 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
                 stream.End(msg);
                 activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             }
-        }, ct);
+        }); // The producer must run even when cancelled so it can emit and complete the aborted stream.
 
         return stream;
     }
 
     public LlmStream StreamSimple(LlmModel model, Context context, SimpleStreamOptions? options = null)
     {
-        var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+        var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, null);
+        var apiKey = credential.Value;
         var baseOptions = SimpleOptionsHelper.BuildBaseOptions(model, options, apiKey);
 
         var anthropicOpts = new AnthropicOptions
         {
             Temperature = baseOptions.Temperature,
+            ToolChoiceMode = baseOptions.ToolChoiceMode,
             MaxTokens = baseOptions.MaxTokens,
             CancellationToken = baseOptions.CancellationToken,
             ApiKey = baseOptions.ApiKey,
@@ -106,6 +131,7 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
             MaxRetryDelayMs = baseOptions.MaxRetryDelayMs,
             Metadata = baseOptions.Metadata,
             StreamSetupTimeoutMs = baseOptions.StreamSetupTimeoutMs,
+            StreamIdleTimeoutMs = baseOptions.StreamIdleTimeoutMs,
         };
 
         if (options?.Reasoning is { } reasoning)
@@ -161,7 +187,8 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
         CancellationToken ct)
     {
         var anthropicOpts = options as AnthropicOptions;
-        var apiKey = options?.ApiKey ?? EnvironmentApiKeys.GetApiKey(model.Provider) ?? "";
+        var credential = ProviderCredentialResolver.Resolve(model.Provider, options?.ApiKey, null);
+        var apiKey = credential.Value;
         if (string.IsNullOrWhiteSpace(apiKey))
         {
             throw new InvalidOperationException(
@@ -186,6 +213,8 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
             if (modified is JsonObject modifiedObject)
                 requestBody = modifiedObject;
         }
+
+        requestBody.EnforceToolFree(options?.ToolChoiceMode, messagesChoice: true);
 
         var json = requestBody.ToJsonString();
 
@@ -225,14 +254,19 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
             {
                 errorBody = $"<error body exceeded {ErrorBodyLimitBytes} bytes and was discarded>";
             }
-            ProviderHttpErrorHelper.ThrowForFailedResponse(response, errorBody, "Anthropic");
+            ProviderHttpErrorHelper.ThrowForFailedResponse(response, errorBody, "Anthropic", secretRedactor);
         }
 
         using var responseStream = await response.Content.ReadAsStreamAsync(effectiveCt);
         // Bound the untrusted SSE body before a byte reaches the parser: every byte the StreamReader
         // consumes flows through the ByteCountingStream, so an unbounded body or a never-terminating
         // data: line trips the cap regardless of buffering (#1685). Caller owns the inner stream.
-        using var boundedStream = new ByteCountingStream(responseStream, MaxResponseBytes, MaxFrameBytes, leaveOpen: true);
+        using var boundedStream = new ByteCountingStream(
+            responseStream,
+            MaxResponseBytes,
+            MaxFrameBytes,
+            leaveOpen: true,
+            idleTimeout: StreamIdleTimeout.Resolve(options));
         using var reader = new StreamReader(boundedStream, Encoding.UTF8);
 
         // Cancel the setup-phase timeout once the first token arrives.
@@ -355,25 +389,16 @@ public sealed partial class AnthropicProvider(HttpClient httpClient) : IApiProvi
             Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
-    private static StopReason MapStopReason(string? reason) => reason switch
-    {
-        "end_turn" => StopReason.Stop,
-        "max_tokens" => StopReason.Length,
-        "tool_use" => StopReason.ToolUse,
-        "refusal" => StopReason.Refusal,
-        "pause_turn" => StopReason.Stop,
-        "stop_sequence" => StopReason.Stop,
-        "content_policy" => StopReason.Sensitive,
-        "safety" => StopReason.Sensitive,
-        "sensitive" => StopReason.Sensitive,
-        _ => throw new InvalidOperationException($"Unhandled Anthropic stop reason: {reason}")
-    };
+    /// <summary>
+    /// Maps an Anthropic <c>stop_reason</c> to the core <see cref="StopReason"/>. Delegates to the
+    /// shared total mapper (#3564) rather than carrying a private switch whose default arm threw:
+    /// an unrecognised or absent stop reason now degrades the turn instead of destroying it.
+    /// </summary>
+    internal static StopReason MapStopReason(string? reason) =>
+        MessagesStopReasonMap.MapStopReason(reason, "Anthropic");
 
+    // #2374: delegates to the shared parsed family+version gate rather than carrying a private copy
+    // of the literal substring list. A new Opus/Sonnet generation now needs no edit here at all.
     internal static bool IsAdaptiveThinkingModel(string modelId) =>
-        modelId.Contains("opus-4-6", StringComparison.OrdinalIgnoreCase) ||
-        modelId.Contains("opus-4.6", StringComparison.OrdinalIgnoreCase) ||
-        modelId.Contains("opus-4-8", StringComparison.OrdinalIgnoreCase) ||
-        modelId.Contains("opus-4.8", StringComparison.OrdinalIgnoreCase) ||
-        modelId.Contains("sonnet-4-6", StringComparison.OrdinalIgnoreCase) ||
-        modelId.Contains("sonnet-4.6", StringComparison.OrdinalIgnoreCase);
+        ModelCapabilityHeuristics.IsAdaptiveThinkingModel(modelId);
 }

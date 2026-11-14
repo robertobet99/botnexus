@@ -4,7 +4,9 @@ using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Abstractions.Triggers;
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Domain.World;
+using BotNexus.Gateway.Streaming;
 using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Gateway.Api.Triggers;
@@ -55,12 +57,15 @@ public sealed class CronTrigger(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(prompt);
 
+        // #3543: validate the job id BEFORE any conversation is created, so a jobless caller is
+        // rejected cleanly rather than leaving an orphan conversation behind.
+        var sessionId = BuildCronSessionId(request?.CronJobId);
+
         var (conversation, createdFreshConversation) = await ResolveOrCreateConversationAsync(agentId, request, ct).ConfigureAwait(false);
 
         if (request is not null && request.ResolvedConversationId is null)
             request.ResolvedConversationId = conversation.ConversationId;
 
-        var sessionId = BuildCronSessionId(request?.CronJobId);
         var session = await sessions.GetOrCreateAsync(sessionId, agentId, ct).ConfigureAwait(false);
         session.ChannelType ??= ChannelKey.From(Type.Value);
         session.CallerId ??= $"{Type.Value}:{agentId.Value}";
@@ -76,6 +81,7 @@ public sealed class CronTrigger(
             session.Metadata.Remove("modelOverride");
         else
             session.Metadata["modelOverride"] = request!.ModelOverride;
+        request?.ApplyCronModelMetadata(session);
 
         if (request?.CronJobId is null)
             session.Metadata.Remove("cronJobId");
@@ -104,12 +110,66 @@ public sealed class CronTrigger(
         // and then receive the same prompt again via PromptAsync, giving the model a
         // duplicate user message and suppressing tool call execution. (#656)
         await sessions.SaveAsync(session, ct).ConfigureAwait(false);
+        if (request?.SessionCreatedAsync is not null)
+            await request.SessionCreatedAsync(sessionId, ct).ConfigureAwait(false);
 
         var retainSession = true;
         try
         {
             var handle = await supervisor.GetOrCreateAsync(agentId, sessionId, ct).ConfigureAwait(false);
-            var response = await handle.PromptAsync(prompt, ct).ConfigureAwait(false);
+
+            AgentResponse response;
+            try
+            {
+                response = await handle.PromptAsync(prompt, ct).ConfigureAwait(false);
+
+                // #2985: report the turn's tool-invocation count back to the caller (the cron
+                // scheduler, via AgentPromptAction) BEFORE any early-return path below, so the
+                // no-op-turn branch - the very shape that produced the fabricated maintenance
+                // runs - still reports its zero. The count is taken from the same
+                // response.ToolCalls collection the transcript projection uses, so the recorded
+                // outcome and the persisted tool rows can never disagree.
+                // #2641: the same write-back now also carries turn count and aggregated token
+                // usage, through one helper shared with SoulTrigger.
+                TriggerRunCostRecorder.Record(request, response);
+
+                // #2522 residual: the blocking path must stamp the provider's reported prompt-token
+                // count exactly as the streaming path does at MessageEnd. Without it, long-lived
+                // cron sessions - the ones that compact most often - present a null provider count
+                // to LlmSessionCompactor, so the unit normalisation shipped by #2717 silently falls
+                // back to the unscaled keep-recent budget and the fix is inert where it matters most.
+                ProviderTokenUsageRecorder.Record(session, response.Usage);
+            }
+            catch (AgentPromptInterruptedException interrupted)
+            {
+                // #2118: the run was cancelled or timed out mid-flight, but tools may have executed
+                // before the interruption. Persist the user entry plus the captured tool timeline
+                // (completed tools + an interrupted-tool row for any in-flight call) so the transcript
+                // reflects the work that actually happened, then re-surface the cancellation. The
+                // assistant text row is intentionally omitted - the turn never produced a final answer.
+                session.AddEntry(new SessionEntry
+                {
+                    Role = MessageRole.User,
+                    Content = prompt,
+                    Trigger = TriggerType.Cron
+                });
+                foreach (var toolEntry in ProjectToolEntries(interrupted.PartialResponse))
+                    session.AddEntry(toolEntry);
+
+                // #2641 AC1: an interrupted run still cost what it cost before it was interrupted,
+                // and cron's timeout path routes through here. Without this write-back the runs
+                // most worth measuring - the ones expensive enough to hit their timeout - would be
+                // the only ones recorded as unmeasured. The partial response carries the same
+                // aggregate the completed path uses.
+                TriggerRunCostRecorder.Record(request, interrupted.PartialResponse);
+
+                // Re-surface as a normal cancellation so upstream cancellation/timeout handling is
+                // unchanged; the interrupted exception is chained as the inner exception for diagnostics.
+                throw new OperationCanceledException(
+                    "Cron run was interrupted (cancelled or timed out) mid-flight.",
+                    interrupted,
+                    interrupted.CancellationToken);
+            }
 
             // #1722 Part A: a wake whose turn produced nothing - the response is NO_REPLY or
             // whitespace AND no tool calls fired - is a pure no-op. Persisting it would leave a
@@ -130,7 +190,7 @@ public sealed class CronTrigger(
                 {
                     await sessions.DeleteAsync(sessionId, CancellationToken.None).ConfigureAwait(false);
                     retainSession = false;
-                    await conversations.ArchiveAsync(conversation.ConversationId, CancellationToken.None).ConfigureAwait(false);
+                    await conversations.ArchiveAsync(conversation.ConversationId, "cron-transient-cleanup", sessionId.Value, "system", CancellationToken.None).ConfigureAwait(false);
                 }
 
                 return sessionId;
@@ -147,7 +207,15 @@ public sealed class CronTrigger(
                 Content = prompt,
                 Trigger = TriggerType.Cron
             });
-            session.AddEntry(new SessionEntry { Role = MessageRole.Assistant, Content = response.Content });
+
+            // #2118: project each tool call the turn executed into ordered tool rows (id, name,
+            // arguments, result content, error) so a completed cron session shows the same tool
+            // timeline the interactive streaming path persists. Placed between the user and
+            // assistant entries to preserve execution order.
+            foreach (var toolEntry in ProjectToolEntries(response))
+                session.AddEntry(toolEntry);
+
+            session.AddEntry(new SessionEntry { AgentRunId = response.AgentRunId, Role = MessageRole.Assistant, Content = response.Content });
         }
         finally
         {
@@ -180,7 +248,9 @@ public sealed class CronTrigger(
     /// </summary>
     private static bool IsNoOpTurn(AgentResponse response)
     {
-        if (response.ToolCalls.Count > 0)
+        // An explicit non-completed disposition is evidence, not a disposable silent wake.
+        // Legacy strategies without completion metadata retain their existing no-op behavior.
+        if (response.Completion is { Status: not "Completed" } || response.ToolCalls.Count > 0)
             return false;
 
         var content = response.Content;
@@ -189,6 +259,18 @@ public sealed class CronTrigger(
 
         return content.Trim().Equals("NO_REPLY", StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// Projects the tool calls carried on an <see cref="AgentResponse"/> into ordered
+    /// <see cref="MessageRole.Tool"/> history entries, mirroring the tool rows the interactive
+    /// streaming path persists (issue #2118). Each call yields a single row carrying the tool call
+    /// id, name, serialized arguments, result content, and error state. A call that never completed
+    /// (cancelled/timed-out mid-flight, <see cref="AgentToolCallInfo.IsIncomplete"/>) is rendered
+    /// with a synthesized "did not complete" body and an error flag so the transcript stays
+    /// consistent with the streaming orphan-synthesis behaviour.
+    /// </summary>
+    private static IEnumerable<SessionEntry> ProjectToolEntries(AgentResponse response)
+        => TriggerToolAuditProjector.ProjectToolEntries(response);
 
     /// <summary>
     /// True only for a throwaway per-run conversation the trigger created this run: a transient
@@ -253,23 +335,46 @@ public sealed class CronTrigger(
                 "CronTrigger: pinned conversation '{ConversationId}' for job '{JobId}' was missing; creating a fresh one. The scheduler's CAS will reconcile.",
                 pinnedId,
                 request.CronJobId);
+
+            // #3161: this is the silent-loss path the issue names. The job's destination - the
+            // conversation the operator is actually reading - is gone, so this run's output lands
+            // in a brand-new throwaway conversation nobody has open. That is a DELIVERY FAILURE:
+            // pre-#3161 it produced one warning log line and a run recorded 'ok', so a job whose
+            // destination had been deleted looked healthy forever. Reporting it back lets the
+            // scheduler record a non-success status and alert on it. The run still proceeds - the
+            // work is worth doing and the CAS reconciliation is still correct - it just no longer
+            // claims to have succeeded.
+            if (request is not null)
+            {
+                request.DeliveryError =
+                    $"The job's destination conversation '{pinnedId.Value}' no longer exists; "
+                    + "this run's output was written to a newly created conversation instead.";
+            }
         }
 
         // No pin (first run) or pinned conversation was hard-deleted out from under us.
         // Create a fresh per-run conversation; the scheduler's CAS decides whether ours wins.
         var initiator = ResolveInitiator(request?.CreatedBy, agentId);
-        var title = !string.IsNullOrWhiteSpace(request?.JobName)
-            ? request!.JobName!
+        // #2553: the job name is operator/agent-supplied. Normalise it at the render seam too,
+        // not just at the four producers, so any future caller of InternalTriggerRequest cannot
+        // put a multi-line or control-character-bearing title on a conversation.
+        var sanitizedJobName = ExternalText.Sanitize(request?.JobName, ExternalText.DefaultDisplayLength);
+        var title = !string.IsNullOrWhiteSpace(sanitizedJobName)
+            ? sanitizedJobName
             : "Cron";
 
-        var conversation = new Conversation
-        {
-            ConversationId = ConversationId.From($"conv:{Guid.NewGuid():N}"),
-            AgentId = agentId,
-            Title = title,
-            IsDefault = false,
-            Initiator = initiator
-        };
+        // Schedule-driven origination (#2302). Minted through the single creation seam (#2310)
+        // so clients never need to sniff a `cron:` prefix out of a session id to know this run
+        // was unattended, and provenance cannot be silently omitted.
+        var conversation = ConversationFactory.CreateForCron(
+            ConversationId.From($"conv:{Guid.NewGuid():N}"),
+            agentId,
+            title: title,
+            initiator: initiator,
+            // #2121: the cron job that owns this run. Null only when the trigger request carried no
+            // job id (an internal trigger that is not a scheduled job), which is an honest gap
+            // rather than a fabricated identifier.
+            sourceId: request?.CronJobId?.Value);
 
         await conversations.CreateAsync(conversation, ct).ConfigureAwait(false);
         logger.LogInformation(
@@ -296,14 +401,34 @@ public sealed class CronTrigger(
         return CitizenId.Of(agentId);
     }
 
+    /// <summary>
+    /// Mints the canonical cron session id <c>cron:&lt;jobId&gt;:&lt;timestamp&gt;:&lt;suffix&gt;</c>.
+    /// </summary>
+    /// <remarks>
+    /// #3543: an absent job id is now REJECTED rather than silently degraded to a three-segment
+    /// <c>cron:&lt;timestamp&gt;:&lt;suffix&gt;</c>. That jobless shape matched cron's broad
+    /// <c>cron:</c> prefix check but belonged to no job, so <c>CronScheduler</c>'s job-scoped
+    /// <c>cron:&lt;jobIdSlug&gt;:</c> scans could never claim it and the rows became permanently
+    /// invisible to per-job cleanup. Every legitimate caller (the cron actions and stubs) always
+    /// supplies <c>CronJobId</c>; the only producer that did not was the session-end memory flush,
+    /// which now has its own <c>MemoryTrigger</c>. Failing loudly here is what stops a future
+    /// jobless caller from quietly re-accumulating unclaimable sessions.
+    /// </remarks>
     private static SessionId BuildCronSessionId(JobId? jobId)
     {
+        var safeJobId = SanitizeSessionIdPart(jobId?.Value);
+        if (string.IsNullOrWhiteSpace(safeJobId))
+        {
+            throw new InvalidOperationException(
+                "CronTrigger requires InternalTriggerRequest.CronJobId: a cron session id must carry "
+                + "its job id (cron:<jobId>:<timestamp>:<suffix>) or cron's job-scoped session scans "
+                + "can never claim it (#3543). A non-cron internal flow must use its own trigger "
+                + "rather than borrowing CronTrigger.");
+        }
+
         var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmss");
         var suffix = Guid.NewGuid().ToString("N");
-        var safeJobId = SanitizeSessionIdPart(jobId?.Value);
-        return string.IsNullOrWhiteSpace(safeJobId)
-            ? SessionId.From($"cron:{timestamp}:{suffix}")
-            : SessionId.From($"cron:{safeJobId}:{timestamp}:{suffix}");
+        return SessionId.From($"cron:{safeJobId}:{timestamp}:{suffix}");
     }
 
     private static string? SanitizeSessionIdPart(string? value)

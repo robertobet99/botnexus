@@ -21,7 +21,10 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
     private readonly ISessionStore _sessionStore;
     private readonly Dictionary<AgentSessionKey, (AgentInstance Instance, IAgentHandle Handle, AgentDescriptor Descriptor)> _instances = [];
     private readonly Dictionary<AgentSessionKey, Task<(AgentInstance Instance, IAgentHandle Handle, AgentDescriptor Descriptor)>> _pendingCreates = [];
+    // A cron pin changes isolation precedence even when the descriptor model is identical.
+    private readonly Dictionary<AgentSessionKey, string?> _cronModelPins = [];
     private readonly Lock _sync = new();
+    private readonly HashSet<AgentSessionKey> _maintenance = [];
     private readonly ILogger<DefaultAgentSupervisor> _logger;
 
     public DefaultAgentSupervisor(
@@ -49,21 +52,27 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
         var existingSession = await _sessionStore.GetAsync(sessionId, cancellationToken);
         var descriptor = ResolveDescriptorForSession(baseDescriptor, existingSession);
         var key = AgentSessionKey.From(agentId, sessionId);
+        var cronPin = existingSession is not null && TryGetMetadataString(existingSession, "cronModelOverride", out var pin)
+            ? pin.Trim() : null;
         Task<(AgentInstance Instance, IAgentHandle Handle, AgentDescriptor Descriptor)> creationTask;
         TaskCompletionSource<(AgentInstance Instance, IAgentHandle Handle, AgentDescriptor Descriptor)>? creationCompletion = null;
 
         lock (_sync)
         {
+            if (_maintenance.Contains(key))
+                throw new InvalidOperationException("Session is reserved for maintenance.");
             if (_instances.TryGetValue(key, out var existing) && existing.Instance.Status is AgentInstanceStatus.Idle or AgentInstanceStatus.Running)
             {
                 // Invalidate if the agent descriptor changed (e.g., provider, model, tools)
-                if (existing.Descriptor == descriptor)
+                if (existing.Descriptor == descriptor
+                    && string.Equals(_cronModelPins.GetValueOrDefault(key), cronPin, StringComparison.Ordinal))
                     return existing.Handle;
 
                 _logger.LogInformation(
                     "Agent descriptor changed for '{AgentId}' session '{SessionId}' — recreating instance",
                     agentId, sessionId);
                 _instances.Remove(key);
+                _cronModelPins.Remove(key);
                 _ = DisposeHandleAsync(existing.Handle);
             }
 
@@ -96,6 +105,7 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
             {
                 _pendingCreates.Remove(key);
                 _instances[key] = created;
+                _cronModelPins[key] = cronPin;
             }
             creationCompletion.SetResult(created);
 
@@ -108,6 +118,15 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
         {
             lock (_sync) _pendingCreates.Remove(key);
             creationCompletion.SetException(ex);
+
+            // #2633: when no concurrent caller was waiting on this pending create, the faulted
+            // TaskCompletionSource task is never awaited by anyone. Reading Task.Exception marks
+            // it observed so it cannot resurface on the finalizer thread as an
+            // UnobservedTaskException long after the real failure was already thrown to the
+            // caller below - which is what made a simple unregistered-model spawn look like a
+            // process-level fault.
+            _ = creationCompletion.Task.Exception;
+
             throw;
         }
     }
@@ -122,6 +141,7 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
         {
             if (!_instances.Remove(key, out entry))
                 return;
+            _cronModelPins.Remove(key);
         }
 
         entry.Instance.Status = AgentInstanceStatus.Stopping;
@@ -129,6 +149,58 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
         entry.Instance.Status = AgentInstanceStatus.Stopped;
 
         _logger.LogInformation("Stopped agent instance '{AgentId}' for session '{SessionId}'", agentId, sessionId);
+    }
+
+    /// <inheritdoc />
+    public IDisposable? TryReserveMaintenance(IAgentHandle expectedHandle)
+    {
+        var key = AgentSessionKey.From(expectedHandle.AgentId, expectedHandle.SessionId);
+        lock (_sync)
+        {
+            if (_maintenance.Contains(key) || _pendingCreates.ContainsKey(key) ||
+                !_instances.TryGetValue(key, out var entry) || !ReferenceEquals(entry.Handle, expectedHandle))
+                return null;
+            var admission = expectedHandle.TryReserveMaintenance();
+            if (admission is null) return null;
+            _maintenance.Add(key);
+            return new MaintenanceReservation(this, key, admission);
+        }
+    }
+
+    private sealed class MaintenanceReservation(DefaultAgentSupervisor owner, AgentSessionKey key,
+        IDisposable admission) : IDisposable
+    {
+        private bool _disposed;
+        public void Dispose()
+        {
+            lock (owner._sync)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                admission.Dispose();
+                owner._maintenance.Remove(key);
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> StopIfCurrentAsync(IAgentHandle expectedHandle,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = AgentSessionKey.From(expectedHandle.AgentId, expectedHandle.SessionId);
+        (AgentInstance Instance, IAgentHandle Handle, AgentDescriptor Descriptor) entry;
+        lock (_sync)
+        {
+            if (!_instances.TryGetValue(key, out entry) || !ReferenceEquals(entry.Handle, expectedHandle))
+                return false;
+            _instances.Remove(key);
+            _cronModelPins.Remove(key);
+        }
+        entry.Instance.Status = AgentInstanceStatus.Stopping;
+        await entry.Handle.DisposeAsync().ConfigureAwait(false);
+        entry.Instance.Status = AgentInstanceStatus.Stopped;
+        return true;
     }
 
     /// <inheritdoc />
@@ -172,6 +244,7 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
         {
             entries = [.. _instances.Values];
             _instances.Clear();
+            _cronModelPins.Clear();
             _pendingCreates.Clear();
         }
 
@@ -278,11 +351,11 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
             model = trimmed[(separator + 1)..];
         }
 
-        if (descriptor.AllowedModelIds.Count > 0
-            && !descriptor.AllowedModelIds.Contains(model, StringComparer.OrdinalIgnoreCase))
+        if (!AgentModelPermission.IsPermitted(descriptor, model))
         {
             throw new InvalidOperationException(
-                $"Session '{session.SessionId}' requested model '{model}', but it is not allowed for agent '{descriptor.AgentId}'.");
+                $"Session '{session.SessionId}' requested a forbidden model. " +
+                AgentModelPermission.FormatRejection(descriptor, model));
         }
 
         if (string.Equals(provider, descriptor.ApiProvider, StringComparison.OrdinalIgnoreCase)
@@ -338,6 +411,19 @@ public sealed class DefaultAgentSupervisor : IAgentSupervisor, IAgentHandleInspe
         {
             parameters["channel"] = channelType.Value;
         }
+
+        // #2396: a per-run thinking selection recorded on the session (headless `agent exec
+        // --thinking`) travels to the isolation strategy through the same parameter bag, so the
+        // strategy can overlay it on the conversation layer of the existing override resolver.
+        // Carried as the raw wire token; the strategy owns parsing and rejects an unknown token by
+        // ignoring it, so a typo degrades to the agent default rather than failing the run.
+        if (session is not null && TryGetMetadataString(session, "thinkingOverride", out var thinkingOverride))
+        {
+            parameters["thinkingOverride"] = thinkingOverride;
+        }
+
+        if (session is not null && TryGetMetadataString(session, "cronModelOverride", out var cronModelOverride))
+            parameters["cronModelOverride"] = cronModelOverride;
 
         return parameters;
     }

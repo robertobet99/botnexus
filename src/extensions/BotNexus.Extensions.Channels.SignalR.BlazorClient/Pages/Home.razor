@@ -1,9 +1,18 @@
+@* #2247: the active agent+conversation is route-owned - navigation is the single source of truth.
+   /agent/{AgentId}/conversation/{ConversationId} is the canonical shape (the default conversation
+   resolves when the segment is omitted). The legacy /chat/... routes stay registered so old
+   deep-links and any still-open browser-history entries continue to restore the correct view on
+   refresh and back/forward. Both shapes flow through the same ApplyRouteSelectionAsync seam, which
+   drives SelectView(..., SelectionSource.RouteNavigation) - no inbound event can move the view. *@
+@page "/agent/{AgentId}"
+@page "/agent/{AgentId}/conversation/{ConversationId}"
 @page "/chat"
 @page "/chat/{AgentId}"
 @page "/chat/{AgentId}/{ConversationId}"
 @inject IClientStateStore Store
 @inject IPortalLoadService PortalLoad
 @inject IAgentInteractionService Interaction
+@inject IConversationMruService Mru
 @inject NavigationManager Nav
 @implements IDisposable
 
@@ -14,7 +23,7 @@
     <div class="portal-loading">
         @if (PortalLoad.LoadError is not null)
         {
-            <div class="portal-load-error">⚠ @PortalLoad.LoadError</div>
+            <div class="portal-load-error"><Icon Name="warning" Size="15" /> @PortalLoad.LoadError</div>
         }
         else
         {
@@ -32,7 +41,7 @@ else
     @foreach (var (agentId, _) in Store.Agents)
     {
         <div class="chat-panel-wrapper @(agentId == Store.ActiveAgentId ? "active" : "hidden")">
-            <AgentPanel AgentId="@agentId" />
+            <AgentPanel AgentId="@agentId" RoutedConversationId="@RoutedConversationIdFor(agentId)" />
         </div>
     }
 }
@@ -42,13 +51,39 @@ else
     [Parameter] public string? ConversationId { get; set; }
     private string? _appliedRouteKey;
 
+    /// <summary>
+    /// #2976: hands the route's conversation segment down to the panel for the agent the route
+    /// actually names, and to no other. This page renders one AgentPanel per agent in Store.Agents,
+    /// so an unconditional pass-through would give every agent's panel a conversation id that
+    /// belongs to a different agent. Escaping is undone the same way ApplyRouteSelectionAsync does
+    /// it, so both paths agree on the identity of the routed conversation.
+    /// </summary>
+    private string? RoutedConversationIdFor(string agentId)
+    {
+        if (string.IsNullOrWhiteSpace(AgentId) || string.IsNullOrWhiteSpace(ConversationId))
+            return null;
+
+        return string.Equals(Uri.UnescapeDataString(AgentId), agentId, StringComparison.Ordinal)
+            ? Uri.UnescapeDataString(ConversationId)
+            : null;
+    }
+
+    // #2293: re-entrancy guard. ApplyRouteSelectionAsync calls Store.NotifyChanged(), which raises
+    // Store.OnChanged, which is wired to HandleStateChanged -> ApplyRouteSelectionAsync again. Without
+    // a guard, the "agent not in Store.Agents" fallback branch (which used to return WITHOUT latching
+    // _appliedRouteKey) re-entered itself unboundedly on a deep-link/refresh before agent state
+    // populated. This flag suppresses self-triggered re-entry so a NotifyChanged() raised while a
+    // route selection is being applied cannot recursively re-enter route application.
+    private bool _applyingRoute;
+
     private string PageTitle
     {
         get
         {
-            if (Store.ActiveAgentId is not { Length: > 0 } activeAgentId)
+            if (string.IsNullOrWhiteSpace(AgentId))
                 return "BotNexus";
 
+            var activeAgentId = Uri.UnescapeDataString(AgentId);
             var agent = Store.GetAgent(activeAgentId);
             if (agent is null)
                 return "BotNexus";
@@ -57,8 +92,8 @@ else
                 ? System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(activeAgentId.Replace("-", " "))
                 : agent.DisplayName;
 
-            if (agent.ActiveConversationId is not { Length: > 0 } convId ||
-                !agent.Conversations.TryGetValue(convId, out var conv) ||
+            if (string.IsNullOrWhiteSpace(ConversationId) ||
+                !agent.Conversations.TryGetValue(Uri.UnescapeDataString(ConversationId), out var conv) ||
                 string.IsNullOrWhiteSpace(conv.Title))
             {
                 return $"{agentLabel} - BotNexus";
@@ -113,50 +148,134 @@ else
             StateHasChanged();
         });
 
+    /// <summary>
+    /// #3064 + #3218: resolve which conversation an agent-only route should land on, or <c>null</c>
+    /// when it must stay put. Warm circuits answer from this circuit's per-agent MRU; a COLD circuit
+    /// (hard refresh, empty MRU) falls back to server state via
+    /// <see cref="PortalListOrdering.ResolveColdStartConversation"/> instead of leaving every
+    /// component below to consult the ambient <c>deleted per-agent conversation state</c> that #3064 exists
+    /// to stop consulting.
+    /// </summary>
+    /// <remarks>
+    /// A stale MRU entry (archived/deleted conversation) is not a dead end: rather than sending the
+    /// user to a route the agent no longer holds, it falls through to cold-start resolution, which
+    /// only ever proposes a conversation the agent currently has. When the agent has no eligible
+    /// conversation at all the answer is <c>null</c> and the caller performs NO navigation - the
+    /// agent-only route stays a valid, benign, non-looping state (#3218 AC5).
+    /// </remarks>
+    private string? ResolveAgentOnlyRouteTarget(string routeAgentId)
+    {
+        if (Store.GetAgent(routeAgentId) is not { } agent)
+            return null;
+
+        if (Mru.GetMostRecent(routeAgentId) is { Length: > 0 } mruConversationId &&
+            agent.Conversations.ContainsKey(mruConversationId))
+        {
+            return mruConversationId;
+        }
+
+        return PortalListOrdering.ResolveColdStartConversation(agent.Conversations.Values)?.ConversationId;
+    }
+
     private async Task ApplyRouteSelectionAsync()
     {
         if (!PortalLoad.IsReady || string.IsNullOrWhiteSpace(AgentId))
             return;
 
-        var routeAgentId = Uri.UnescapeDataString(AgentId);
-        var routeConversationId = string.IsNullOrWhiteSpace(ConversationId)
-            ? null
-            : Uri.UnescapeDataString(ConversationId);
-        var routeKey = $"{routeAgentId}|{routeConversationId ?? ""}";
-        if (string.Equals(_appliedRouteKey, routeKey, StringComparison.Ordinal))
+        // #2293: suppress self-triggered re-entry. Store.NotifyChanged() below synchronously raises
+        // Store.OnChanged, which HandleStateChanged routes straight back into this method. Guarding
+        // here means the re-raised OnChanged short-circuits instead of recursively re-applying the
+        // same route selection (which previously looped forever on the un-latched fallback branch).
+        if (_applyingRoute)
             return;
 
-        if (!Store.Agents.ContainsKey(routeAgentId))
+        _applyingRoute = true;
+        try
         {
-            if (Store.ActiveAgentId is null && Store.Agents.Keys.FirstOrDefault() is { } fallback)
+            var routeAgentId = Uri.UnescapeDataString(AgentId);
+            var routeConversationId = string.IsNullOrWhiteSpace(ConversationId)
+                ? null
+                : Uri.UnescapeDataString(ConversationId);
+            var routeKey = $"{routeAgentId}|{routeConversationId ?? ""}";
+            if (string.Equals(_appliedRouteKey, routeKey, StringComparison.Ordinal))
+                return;
+
+            if (!Store.Agents.ContainsKey(routeAgentId))
             {
-                Store.ActiveAgentId = fallback;
+                if (Store.ActiveAgentId is null && Store.Agents.Keys.FirstOrDefault() is { } fallback)
+                {
+                    Store.SelectView(fallback, string.Empty, SelectionSource.RouteNavigation);
+                    // #2293: LATCH the guard on the fallback path. Previously this branch returned
+                    // without setting _appliedRouteKey, so every re-raised OnChanged re-entered the
+                    // same un-guarded fallback - an infinite recursion whenever the route AgentId was
+                    // not (yet) in Store.Agents (deep-link/refresh before agent state populates). We
+                    // have resolved a concrete view for this route (the fallback agent is now active),
+                    // so record the key: a subsequent OnChanged short-circuits at the routeKey check.
+                    _appliedRouteKey = routeKey;
+                    Store.NotifyChanged();
+                }
+
+                return;
+            }
+
+            if (!string.Equals(Store.ActiveAgentId, routeAgentId, StringComparison.Ordinal))
+            {
+                Store.SelectView(routeAgentId, string.Empty, SelectionSource.RouteNavigation);
                 Store.NotifyChanged();
             }
 
-            return;
-        }
+            if (routeConversationId is null)
+            {
+                // #3064 AC2/AC3: an agent-only route names no conversation, so every component below
+                // would have to resolve identity ambiently from deleted per-agent conversation state.
+                // Resolve it ONCE here instead, from this circuit's per-agent MRU, and redirect to the
+                // canonical explicit shape so the URL is the single source of rendered identity.
+                // replace:true is load-bearing: a pushed entry would leave the redirecting route in
+                // history, and Back onto it would immediately redirect forward again - the user could
+                // never navigate back past it. Latch the guard FIRST so the re-render triggered by the
+                // navigation short-circuits at the routeKey check instead of redirecting again (AC6:
+                // does not loop).
+                _appliedRouteKey = routeKey;
 
-        if (!string.Equals(Store.ActiveAgentId, routeAgentId, StringComparison.Ordinal))
-        {
-            Store.ActiveAgentId = routeAgentId;
-            Store.NotifyChanged();
-        }
+                var resolvedConversationId = ResolveAgentOnlyRouteTarget(routeAgentId);
+                if (resolvedConversationId is not null)
+                {
+                    // #3218: ONE redirect, ONE history policy, ONE loop guard, whether the id came
+                    // from the warm MRU or from cold-start resolution. The client kind is a declared
+                    // input rather than an ambient viewport probe, so each shell resolves its own
+                    // path shape from the same seam.
+                    Nav.NavigateTo(
+                        PortalListOrdering.BuildConversationRoute(
+                            PortalLoad.ClientKind, routeAgentId, resolvedConversationId),
+                        replace: true);
+                }
 
-        if (routeConversationId is null)
-        {
+                return;
+            }
+
+            var agent = Store.GetAgent(routeAgentId);
+            if (agent is null || !agent.Conversations.ContainsKey(routeConversationId))
+                return;
+
+            // #3064 AC1/AC4: the route seam is the single MRU writer. Under #2247 every user-driven
+            // conversation selection navigates to this canonical shape, so recording here captures
+            // exactly the conversations this circuit navigated to - and it happens AFTER the route's
+            // own conversation has already been honoured, so a deep link is never overridden by a
+            // warm MRU entry (the MRU is not consulted at all on this branch).
+            Mru.Record(routeAgentId, routeConversationId);
+
+            if (Store is not IDisplayedConversation displayed
+                || !displayed.IsConversationDisplayed(routeAgentId, routeConversationId))
+            {
+                await Interaction.SelectConversationAsync(routeAgentId, routeConversationId);
+            }
+
             _appliedRouteKey = routeKey;
-            return;
         }
-
-        var agent = Store.GetAgent(routeAgentId);
-        if (agent is null || !agent.Conversations.ContainsKey(routeConversationId))
-            return;
-
-        if (!string.Equals(agent.ActiveConversationId, routeConversationId, StringComparison.Ordinal))
-            await Interaction.SelectConversationAsync(routeAgentId, routeConversationId);
-
-        _appliedRouteKey = routeKey;
+        finally
+        {
+            _applyingRoute = false;
+        }
     }
 
     public void Dispose()

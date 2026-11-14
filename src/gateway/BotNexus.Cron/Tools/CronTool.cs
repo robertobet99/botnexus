@@ -1,8 +1,11 @@
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
+using BotNexus.Cron.Actions;
+using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Domain.Primitives;
+using BotNexus.Gateway.Abstractions.Models;
 
 namespace BotNexus.Cron.Tools;
 
@@ -10,30 +13,97 @@ public sealed class CronTool(
     ICronStore cronStore,
     CronScheduler scheduler,
     AgentId agentId,
-    bool allowCrossAgentCron = false) : IAgentTool
+    bool allowCrossAgentCron = false,
+    ModelRegistry? modelRegistry = null,
+    ICommandCronAuthorizer? commandAuthorizer = null,
+    ICronAlertTargetResolver? alertTargetResolver = null,
+    ConversationId? creatingConversationId = null,
+    CronOptions? cronOptions = null,
+    ConversationKind? creatingConversationKind = null,
+    bool creatingConversationIsDefault = false) : IAgentTool
 {
     private readonly AgentId _agentId = agentId;
+
+    /// <summary>
+    /// #3338 clause 6: the configured self-pacing bound. Null means "take the defaults", so a caller
+    /// that never configured cron still gets a bounded <c>next_check</c> rather than an unbounded one.
+    /// </summary>
+    private readonly CronOptions? _cronOptions = cronOptions;
+
+    /// <summary>
+    /// #2412: the DURABLE conversation the creating agent is speaking in, threaded in by the tool
+    /// provider from the memoised bound-conversation resolver (conversation store / session store),
+    /// never from a transient or policy-scoped routing key. <c>null</c> for a CLI or REST caller
+    /// with no conversation context, which is what preserves the <c>isolated</c> default for them.
+    /// </summary>
+    private readonly ConversationId? _creatingConversationId = creatingConversationId;
+
+    /// <summary>
+    /// #3521: the creating conversation's PROVENANCE, read from the same conversation row that
+    /// yielded <see cref="_creatingConversationId"/>. Without it the binding default cannot tell an
+    /// agent- or cron-owned conversation (bind, #2412) from a human's own thread (never adopt).
+    /// <c>null</c> means the row could not be read, which deliberately preserves the pre-#3521
+    /// behaviour rather than disabling the binding for every caller that does not supply it.
+    /// </summary>
+    private readonly ConversationKind? _creatingConversationKind = creatingConversationKind;
+
+    /// <summary>#3521: whether the creating conversation is the agent's default home thread.</summary>
+    private readonly bool _creatingConversationIsDefault = creatingConversationIsDefault;
+
+    /// <summary>
+    /// #2462 (AUTHORING half): every create/update that would persist a <c>shellCommand</c> is
+    /// checked here, using the same <see cref="ICommandCronAuthorizer"/> seam - and therefore the
+    /// same exec-tool policy vocabulary - that gates FIRING in <c>CommandCronAction</c>. Firing is
+    /// still gated independently: policy can tighten after a job is stored, and jobs can be created
+    /// through paths other than this tool.
+    ///
+    /// Fails CLOSED: when no authorizer was supplied the gate cannot be evaluated, so the write is
+    /// refused rather than silently allowed.
+    /// </summary>
+    private void EnsureCommandAuthorized(CronJob job, string command)
+    {
+        var decision = commandAuthorizer is null
+            ? CommandAuthorizationDecision.Deny(
+                $"no {nameof(ICommandCronAuthorizer)} is available, so the command cannot be classified; failing closed")
+            : commandAuthorizer.AuthorizeAuthoring(job, command);
+
+        if (!decision.Allowed)
+        {
+            throw new UnauthorizedAccessException(
+                $"Cron command job '{job.Name}' was denied by the command authorization policy: {decision.Reason}");
+        }
+    }
 
     public string Name => "cron";
     public string Label => "Cron Job Manager";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Gateway-owned cron store.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     public Tool Definition => new(
         Name,
-        "Manage scheduled cron jobs. Create, list, update, delete, and run cron jobs.",
+        "Manage scheduled cron jobs. Create, list, update, delete, and run cron jobs. The 'run' action accepts execution asynchronously and returns a runId immediately; use 'history' to poll for completion. A job is either an 'agent-prompt' job (the default - costs a model turn unless preconditionCommand returns exit 10, requires 'message' or 'templateName') or a 'command' job (runs 'shellCommand' directly and costs no tokens, requires 'shellCommand').",
         JsonDocument.Parse("""
             {
               "type": "object",
               "properties": {
                 "action": {
                   "type": "string",
-                  "enum": ["list", "create", "update", "delete", "run", "history"]
+                  "enum": ["list", "create", "update", "delete", "run", "history", "costs", "next_check"]
                 },
-                "jobId": { "type": "string", "description": "Optional - for update/delete/run." },
+                "jobId": { "type": "string", "description": "Optional - for update/delete/run. Also optional on 'history': omit it to get recent runs across every job you may manage instead of one job's history." },
                 "includeSystem": { "type": "boolean", "description": "When true, include system-provisioned jobs (e.g., heartbeat) in list output. Default: false." },
                 "name": { "type": "string", "description": "Job name (for create)." },
                 "schedule": { "type": "string", "description": "Standard 5-field cron expression (minute hour day month weekday). The expression is evaluated in the timezone specified by 'timeZone', or UTC if omitted. Example: '30 22 * * *' with timeZone 'America/Los_Angeles' fires at 10:30 PM Pacific daily." },
                 "timeZone": { "type": "string", "description": "IANA timezone name for the schedule (e.g. 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo'). When set, the cron expression is interpreted in this timezone (including DST adjustments). Defaults to UTC if omitted." },
                 "agentId": { "type": "string", "description": "Target agent (for create, defaults to calling agent)." },
+                "actionType": {
+                  "type": "string",
+                  "enum": ["agent-prompt", "command"],
+                  "description": "What the job does when it fires. 'agent-prompt' (default) sends a prompt to the agent and requires 'message' or 'templateName'. 'command' runs 'shellCommand' as a script and requires 'shellCommand'. On update, omitting it keeps the current action type; supplying a different one switches the job and clears the fields belonging to the other action type."
+                },
+                "preconditionCommand": { "type": ["string", "null"], "description": "Optional agent-prompt shell probe, authorized like shellCommand. Exit 0 runs the prompt; exit 10 records non-failure no_work with ZERO model requests. Any other exit, execution failure or timeout fails closed and uses configured failure alerts. Omit on update to preserve; null/empty clears; switching away from agent-prompt clears it. Arbitrary-execution surface." },
+                "shellCommand": { "type": "string", "description": "Shell command or script to run (required for create/update of actionType 'command'). This is an arbitrary-execution surface - treat creating or editing a command job as a dangerous operation." },
                 "message": { "type": "string", "description": "Prompt message (for create/update). Optional when templateName is provided." },
                 "templateName": { "type": "string", "description": "Named prompt template reference (for create/update)." },
                 "templateParameters": {
@@ -41,9 +111,18 @@ public sealed class CronTool(
                   "description": "Template parameter values for templateName (for create/update).",
                   "additionalProperties": { "type": "string" }
                 },
-                "model": { "type": "string", "description": "Optional model override for agent-prompt jobs. Supports model-id or provider/model-id." },
+                "model": { "type": ["string", "null"], "description": "Optional explicit model for model-running jobs. Beats cron.defaultModel, standing conversation, then agent fallback. Supports model-id or provider/model-id. Null or empty on update clears the job override. Ignored by command/webhook. Validated against the model registry; unknown IDs are rejected." },
                 "enabled": { "type": "boolean", "description": "Whether the job is enabled." },
-                "limit": { "type": "integer", "description": "Maximum number of history entries to return (for history action). Default: 20, max: 100." }
+                "deleteJobAfterRun": { "type": "boolean", "description": "One-shot lifecycle. When true, the SCHEDULER deletes this job itself after its first terminal run (success, timeout, error, or abort alike). Use this instead of writing 'delete this cron job after running' into the prompt - a prompt instruction has no enforcement and no retry if the turn ends early. Distinct from 'deleteAfterRun', which only removes the run's SESSION; this removes the JOB. Pair it with 'expiresAt' when a time-boxed job should also be removed after its final run. Default: false." },
+                "expiresAt": { "type": "string", "description": "Optional hard expiry instant (ISO-8601, e.g. '2026-12-31T00:00:00Z'). From that instant on the job stops executing: the scheduler suppresses the fire and never invokes the action. The job is NOT deleted or disabled, so it stays visible for a human to extend - expiry suppresses execution only and never mutates the job. If the job should actually be REMOVED after its final run, set 'deleteJobAfterRun': true alongside it; 'deleteAfterRun' only cleans up run sessions and will leave the expired job in place. Omit for no expiry (the default, identical to today's behaviour); pass an empty string on update to clear an existing expiry." },
+                "failureAlertsEnabled": { "type": "boolean", "description": "When true, a run of this job that terminates as a failure delivers a cron failure alert to 'failureAlertConversationId'. Alerting is opt-in and BOTH this flag and a valid target conversation are required - there is no implicit fallback conversation. Omitting this on update leaves the stored value alone. Default: false." },
+                "failureAlertConversationId": { "type": "string", "description": "Conversation that receives this job's failure alerts. Must resolve to an existing conversation or the write is refused, because an unresolvable target could never deliver. Omitting this on update leaves the stored value alone; pass an empty string to clear it." },
+                "executionClass": { "type": "boolean", "description": "Marks this as an EXECUTION-class job: its contract is to perform work, so a run that finishes having made ZERO tool calls is recorded with status 'no_tool_calls' instead of 'ok' and drives the existing failure-alert path. Leave false for a reporting or classification job that may legitimately answer from context without calling a tool. Default: false." },
+                "deleteAfterRun": { "type": "boolean", "description": "Ephemeral run-SESSION cleanup. When true, the run's cron-scoped session and transcript are deleted after each run. This does NOT delete the job - for that use 'deleteJobAfterRun', and see 'expiresAt' to stop a job from firing after a given instant. Default: false." },
+                "limit": { "type": "integer", "description": "Maximum number of history entries to return (for history action). Default: 20, max: 100." },
+                "failedOnly": { "type": "boolean", "description": "For the history action: return only runs that did not succeed (errors, timeouts, zero-tool execution-class runs, and missed occurrences). Default: false." },
+                "nextCheckSeconds": { "type": "integer", "description": "For the 'next_check' action: how many seconds from now this job proposes to be woken. The value is CLAMPED to the configured self-pacing floor and ceiling (default 60s to 3600s), and the response always reports both the requested and the effective delay - so a loop pinned at the floor is visible as such rather than looking like one pacing itself. Requires 'jobId', which must be a job you may manage." },
+                "windowDays": { "type": "integer", "description": "For the 'costs' action: how many days of run history to roll up. Default: 7. Clamped to the configured run retention; when clamped, each entry reports windowTruncatedByRetention: true so a bounded total is never mistaken for a complete one." }
               },
               "required": ["action"]
             }
@@ -70,15 +149,64 @@ public sealed class CronTool(
         CopyString(arguments, prepared, "agentId");
         CopyString(arguments, prepared, "message");
         CopyString(arguments, prepared, "templateName");
+        CopyString(arguments, prepared, "actionType");
+        CopyString(arguments, prepared, "shellCommand");
+        if (arguments.ContainsKey("preconditionCommand"))
+            prepared["preconditionCommand"] = ReadString(arguments, "preconditionCommand");
         if (TryReadStringMap(arguments, "templateParameters", out var templateParameters))
             prepared["templateParameters"] = templateParameters;
-        CopyString(arguments, prepared, "model");
+        // Omitted preserves the pin; explicit null/empty clears it. CopyString drops blanks.
+        if (arguments.ContainsKey("model"))
+            prepared["model"] = ReadString(arguments, "model");
 
         if (arguments.TryGetValue("enabled", out var enabled) && enabled is not null)
             prepared["enabled"] = ReadBool(enabled, "enabled");
 
+        // #2634: lifecycle fields. Booleans are normalized here like 'enabled'; expiresAt is copied
+        // through ContainsKey (not CopyString) so an explicit empty string -- which means "clear the
+        // expiry" on update -- survives instead of being swallowed as blank.
+        if (arguments.TryGetValue("deleteJobAfterRun", out var deleteJobAfterRun) && deleteJobAfterRun is not null)
+            prepared["deleteJobAfterRun"] = ReadBool(deleteJobAfterRun, "deleteJobAfterRun");
+
+        // #2985: normalise executionClass through the same ReadBool coercion as the other boolean
+        // flags so a string "true" from a model-authored payload is not silently dropped.
+        if (arguments.TryGetValue("executionClass", out var executionClass) && executionClass is not null)
+            prepared["executionClass"] = ReadBool(executionClass, "executionClass");
+
+        if (arguments.TryGetValue("deleteAfterRun", out var deleteAfterRun) && deleteAfterRun is not null)
+            prepared["deleteAfterRun"] = ReadBool(deleteAfterRun, "deleteAfterRun");
+
+        // #2838: the alert flag is normalised like every other boolean. The target id is copied
+        // through ContainsKey (not CopyString) for the same reason as expiresAt - an explicit
+        // empty string means "clear the target" and must survive rather than be swallowed as blank.
+        if (arguments.TryGetValue("failureAlertsEnabled", out var failureAlertsEnabled) && failureAlertsEnabled is not null)
+            prepared["failureAlertsEnabled"] = ReadBool(failureAlertsEnabled, "failureAlertsEnabled");
+
+        if (arguments.ContainsKey("failureAlertConversationId"))
+            prepared["failureAlertConversationId"] = ReadString(arguments, "failureAlertConversationId") ?? string.Empty;
+
+        if (arguments.TryGetValue("failedOnly", out var failedOnly) && failedOnly is not null)
+            prepared["failedOnly"] = ReadBool(failedOnly, "failedOnly");
+
+        if (arguments.ContainsKey("expiresAt"))
+            prepared["expiresAt"] = ReadString(arguments, "expiresAt") ?? string.Empty;
+
         if (arguments.TryGetValue("limit", out var limitVal) && limitVal is not null)
             prepared["limit"] = limitVal;
+
+        // #2641: windowDays must be copied through explicitly. This method is an ALLOW-LIST - an
+        // argument the schema declares but this method forgets is silently dropped and the handler
+        // then reads its default, so `costs` with windowDays=90 quietly answered for 7 days. The
+        // failure mode is invisible (a plausible number for the wrong window), which is exactly why
+        // it is asserted by name in CronToolCostRollupTests.Costs_ReportsRetentionTruncationFlag.
+        if (arguments.TryGetValue("windowDays", out var windowDaysVal) && windowDaysVal is not null)
+            prepared["windowDays"] = windowDaysVal;
+
+        // #3338: same #2641 allow-list trap. If nextCheckSeconds is not copied through here the
+        // handler reads its default and every self-pacing proposal silently collapses to one value -
+        // a loop that looks like it is pacing itself while ignoring everything the agent asked for.
+        if (arguments.TryGetValue("nextCheckSeconds", out var nextCheckVal) && nextCheckVal is not null)
+            prepared["nextCheckSeconds"] = nextCheckVal;
 
         return Task.FromResult<IReadOnlyDictionary<string, object?>>(prepared);
     }
@@ -98,6 +226,8 @@ public sealed class CronTool(
             "delete" => await DeleteAsync(arguments, cancellationToken).ConfigureAwait(false),
             "run" => await RunAsync(arguments, cancellationToken).ConfigureAwait(false),
             "history" => await HistoryAsync(arguments, cancellationToken).ConfigureAwait(false),
+            "costs" => await CostsAsync(arguments, cancellationToken).ConfigureAwait(false),
+            "next_check" => await NextCheckAsync(arguments, cancellationToken).ConfigureAwait(false),
             _ => throw new InvalidOperationException($"Unsupported cron action '{action}'.")
         };
     }
@@ -113,7 +243,7 @@ public sealed class CronTool(
                 string.Equals(job.CreatedBy, _agentId.Value, StringComparison.OrdinalIgnoreCase)
                 || (job.AgentId.HasValue && job.AgentId.Value == _agentId)).ToList();
 
-        return TextResult(JsonSerializer.Serialize(visible, JsonOptions));
+        return TextResult(JsonSerializer.Serialize(visible.Select(job => CronModelRouting.Project(job, _cronOptions?.DefaultModel)), JsonOptions));
     }
 
     private async Task<AgentToolResult> CreateAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken)
@@ -121,40 +251,95 @@ public sealed class CronTool(
         var now = DateTimeOffset.UtcNow;
         var schedule = ReadRequired(arguments, "schedule");
         var timeZone = ReadString(arguments, "timeZone");
-        var message = ReadString(arguments, "message");
-        var templateName = ReadString(arguments, "templateName");
-        EnsurePromptSource(message, templateName);
+        // #2389: the action type decides which fields are required and which are even meaningful.
+        // Defaults to 'agent-prompt' so every pre-existing caller is unaffected.
+        var actionType = NormalizeRequestedActionType(ReadString(arguments, "actionType")) ?? "agent-prompt";
+        var isCommand = string.Equals(actionType, "command", StringComparison.Ordinal);
+
+        // Each action type carries only its own fields, so a command job can never be persisted
+        // holding a stale prompt (or vice versa) that the scheduler would silently ignore.
+        var message = isCommand ? null : ReadString(arguments, "message");
+        var templateName = isCommand ? null : ReadString(arguments, "templateName");
+        var shellCommand = isCommand ? ReadString(arguments, "shellCommand") : null;
+        if (isCommand)
+            EnsureShellCommand(shellCommand);
+        else
+            EnsurePromptSource(message, templateName);
+
         var tz = ResolveTimeZone(timeZone);
 
         DateTimeOffset? nextRunAt = null;
         try
         {
             var expr = Cronos.CronExpression.Parse(schedule, Cronos.CronFormat.Standard);
-            nextRunAt = expr.GetNextOccurrence(now, tz);
+            nextRunAt = expr.NextRun(now, tz);
         }
         catch { /* invalid schedule — will be caught by scheduler */ }
 
+        var model = ReadString(arguments, "model");
+        if (CronModelRouting.UsesModel(actionType)) EnsureModelResolvable(model);
+
         var targetAgentIdString = ReadString(arguments, "agentId");
         var targetAgentId = ResolveTargetAgentId(targetAgentIdString, _agentId);
+
+        // #2838: validated BEFORE the store write, through the SHARED CronAlertTarget validator
+        // the REST seams already use, so an unresolvable target leaves no row behind and the tool
+        // does not introduce a second validation spelling.
+        var alertConversationId = ParseAlertConversationId(arguments);
+        await EnsureAlertTargetValidAsync(alertConversationId, cancellationToken).ConfigureAwait(false);
 
         var job = new CronJob
         {
             Id = JobId.From(Guid.NewGuid().ToString("N")),
             Name = ReadRequired(arguments, "name"),
             Schedule = schedule,
-            ActionType = "agent-prompt",
+            ActionType = actionType,
             AgentId = targetAgentId,
             Message = message,
             TemplateName = templateName,
-            TemplateParameters = ReadStringMap(arguments, "templateParameters"),
-            Model = ReadString(arguments, "model"),
+            TemplateParameters = isCommand ? null : ReadStringMap(arguments, "templateParameters"),
+            ShellCommand = shellCommand,
+            PreconditionCommand = isCommand ? null : ReadPrecondition(arguments),
+            Model = model,
             Enabled = arguments.TryGetValue("enabled", out var enabled) && enabled is bool boolEnabled ? boolEnabled : true,
+            // #2634: both default to the inert state, so a create that omits them is byte-identical
+            // to a create today.
+            DeleteJobAfterRun = arguments.TryGetValue("deleteJobAfterRun", out var djar) && djar is bool b1 && b1,
+            DeleteAfterRun = arguments.TryGetValue("deleteAfterRun", out var dar) && dar is bool b2 && b2,
+            // #2985: off by default, so a create that omits it behaves exactly as before.
+            ExecutionClass = arguments.TryGetValue("executionClass", out var exc) && exc is bool b3 && b3,
+            ExpiresAt = ParseExpiresAt(ReadString(arguments, "expiresAt")),
+            // #2838: alerting stays opt-in, so a create that omits both fields is byte-identical
+            // to a create today.
+            FailureAlertsEnabled = arguments.TryGetValue("failureAlertsEnabled", out var fae) && fae is bool b4 && b4,
+            FailureAlertConversationId = alertConversationId,
+            // #2412 clause 1: an agent-prompt job created by an agent mid-conversation is bound to
+            // that conversation up front, through THE single CronConversationDefault decision, so
+            // its output lands where it was asked for instead of in a fresh cron conversation the
+            // human is not reading. Command jobs, system jobs, and callers with no conversation
+            // context (CLI/API) all resolve to null and keep today's isolated behaviour verbatim.
+            ConversationId = CronConversationDefault.Resolve(
+                actionType,
+                isSystemJob: false,
+                explicitConversationId: null,
+                creatingConversationId: _creatingConversationId,
+                // #3521: a human's own thread is never ADOPTED as a job's output target - the job
+                // stays unbound and the first-run CAS mints a cronconv: conversation instead.
+                creatingConversationKind: _creatingConversationKind,
+                creatingConversationIsDefault: _creatingConversationIsDefault),
             TimeZone = timeZone,
             CreatedBy = _agentId.Value,
             CreatedAt = now,
             NextRunAt = nextRunAt,
             Metadata = new Dictionary<string, object?>()
         };
+
+        // AUTHORING gate (#2462) - before any store write, so a denied command leaves no row behind.
+        if (isCommand)
+            EnsureCommandAuthorized(job, shellCommand!);
+
+        if (!string.IsNullOrWhiteSpace(job.PreconditionCommand))
+            EnsureCommandAuthorized(job, job.PreconditionCommand);
 
         var created = await cronStore.CreateAsync(job, cancellationToken).ConfigureAwait(false);
         return TextResult(JsonSerializer.Serialize(created, JsonOptions));
@@ -170,31 +355,133 @@ public sealed class CronTool(
 
         var newSchedule = ReadString(arguments, "schedule") ?? existing.Schedule;
         var newTimeZone = arguments.ContainsKey("timeZone") ? ReadString(arguments, "timeZone") : existing.TimeZone;
-        var newMessage = arguments.ContainsKey("message") ? ReadString(arguments, "message") : existing.Message;
-        var newTemplateName = arguments.ContainsKey("templateName") ? ReadString(arguments, "templateName") : existing.TemplateName;
+
+        // #2389: an omitted actionType keeps the job's existing one, so a prompt-irrelevant edit
+        // (schedule / enabled / name / timeZone) on a command job is no longer asked for a prompt
+        // it will never use. On an explicit switch the previous action type's fields are dropped
+        // rather than inherited, so the job cannot be left internally inconsistent.
+        var newActionType = NormalizeRequestedActionType(ReadString(arguments, "actionType")) ?? existing.ActionType;
+        var switchingActionType = !string.Equals(newActionType, existing.ActionType, StringComparison.Ordinal);
+
+        var newMessage = arguments.ContainsKey("message")
+            ? ReadString(arguments, "message")
+            : switchingActionType ? null : existing.Message;
+        var newTemplateName = arguments.ContainsKey("templateName")
+            ? ReadString(arguments, "templateName")
+            : switchingActionType ? null : existing.TemplateName;
         var newTemplateParameters = arguments.ContainsKey("templateParameters")
             ? ReadStringMap(arguments, "templateParameters")
-            : existing.TemplateParameters;
-        EnsurePromptSource(newMessage, newTemplateName);
+            : switchingActionType ? null : existing.TemplateParameters;
+        var newShellCommand = arguments.ContainsKey("shellCommand")
+            ? ReadString(arguments, "shellCommand")
+            : switchingActionType ? null : existing.ShellCommand;
+
+        if (string.Equals(newActionType, "command", StringComparison.Ordinal))
+        {
+            EnsureShellCommand(newShellCommand);
+            newMessage = null;
+            newTemplateName = null;
+            newTemplateParameters = null;
+        }
+        else
+        {
+            EnsurePromptSource(newMessage, newTemplateName);
+            newShellCommand = null;
+        }
+
+        // Only a caller-supplied override is preflighted. An update that leaves Model alone must
+        // not be blocked by a pre-existing bad value, or a job whose model was decommissioned
+        // after creation could never be edited (not even to fix the model itself).
+        var requestedModel = ReadString(arguments, "model");
+        if (CronModelRouting.UsesModel(ReadString(arguments, "actionType") ?? existing.ActionType))
+            EnsureModelResolvable(requestedModel);
 
         var newAgentIdString = ReadString(arguments, "agentId");
         var newAgentId = string.IsNullOrWhiteSpace(newAgentIdString)
             ? existing.AgentId
             : ResolveTargetAgentId(newAgentIdString, _agentId);
 
+        // #2838 + #2634: an omitted alert field leaves the stored value alone, so an unrelated edit
+        // can never silently un-alert a job. An explicit empty string clears the target.
+        var newAlertConversationId = arguments.ContainsKey("failureAlertConversationId")
+            ? ParseAlertConversationId(arguments)
+            : existing.FailureAlertConversationId;
+
+        // Only a caller-supplied target is preflighted: re-validating a retained one would make a
+        // job whose alert conversation was later deleted permanently uneditable.
+        if (arguments.ContainsKey("failureAlertConversationId"))
+            await EnsureAlertTargetValidAsync(newAlertConversationId, cancellationToken).ConfigureAwait(false);
+
         var updated = existing with
         {
             Name = ReadString(arguments, "name") ?? existing.Name,
             Schedule = newSchedule,
             TimeZone = newTimeZone,
+            ActionType = newActionType,
+            ShellCommand = newShellCommand,
+            PreconditionCommand = newActionType == "agent-prompt"
+                ? arguments.ContainsKey("preconditionCommand") ? ReadPrecondition(arguments) : switchingActionType ? null : existing.PreconditionCommand
+                : null,
             Message = newMessage,
             TemplateName = newTemplateName,
             TemplateParameters = newTemplateParameters,
-            Model = ReadString(arguments, "model") ?? existing.Model,
+            Model = arguments.ContainsKey("model") ? requestedModel : existing.Model,
             AgentId = newAgentId,
-            Enabled = arguments.TryGetValue("enabled", out var enabled) && enabled is bool boolEnabled ? boolEnabled : existing.Enabled
+            Enabled = arguments.TryGetValue("enabled", out var enabled) && enabled is bool boolEnabled ? boolEnabled : existing.Enabled,
+            // #2634: an omitted lifecycle field leaves the stored value alone, so an unrelated edit
+            // (schedule / name / enabled) can never accidentally clear a one-shot or an expiry.
+            DeleteJobAfterRun = arguments.TryGetValue("deleteJobAfterRun", out var djar) && djar is bool b1
+                ? b1
+                : existing.DeleteJobAfterRun,
+            DeleteAfterRun = arguments.TryGetValue("deleteAfterRun", out var dar) && dar is bool b2
+                ? b2
+                : existing.DeleteAfterRun,
+            ExpiresAt = arguments.ContainsKey("expiresAt")
+                ? ParseExpiresAt(ReadString(arguments, "expiresAt"))
+                : existing.ExpiresAt,
+            // #2985: omitted leaves the stored classification alone, matching the lifecycle-field
+            // rule above - an unrelated edit must never silently un-mark an execution-class job.
+            ExecutionClass = arguments.TryGetValue("executionClass", out var exc) && exc is bool b3
+                ? b3
+                : existing.ExecutionClass,
+            FailureAlertsEnabled = arguments.TryGetValue("failureAlertsEnabled", out var fae) && fae is bool b4
+                ? b4
+                : existing.FailureAlertsEnabled,
+            FailureAlertConversationId = newAlertConversationId
         };
 
+        // #2133: a tool definition update is a narrow write that never touches scheduler-owned
+        // runtime bookkeeping (LastRun*/NextRunAt) or the CAS-pinned conversation, so it cannot
+        // regress a concurrent run's status, timestamps, next run, or conversation pin.
+        // AUTHORING gate (#2462). A retained command is re-checked too, so a policy tightened after
+        // creation takes effect on the next edit instead of being grandfathered in.
+        if (string.Equals(updated.ActionType, "command", StringComparison.Ordinal))
+            EnsureCommandAuthorized(updated, newShellCommand!);
+
+        if (!string.IsNullOrWhiteSpace(updated.PreconditionCommand))
+            EnsureCommandAuthorized(updated, updated.PreconditionCommand);
+
+        // #3573: the authorization decision above was made against `existing`, and ~100 lines of
+        // argument parsing, model preflight and an AWAITED alert-target validation have run since.
+        // Carrying the ownership snapshot into the WHERE clause makes the commit conditional on
+        // that decision still holding; a re-read here would only narrow the window, not close it,
+        // and would leave the REST seam - which reaches the same store method - unguarded.
+        var saved = await cronStore.UpdateDefinitionAsync(
+                updated,
+                CronJobOwnershipExpectation.From(existing),
+                cancellationToken)
+            .ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Cron job '{jobId.Value}' was not found.");
+
+        // #3160: disabling a job must abort the run it has in flight, not merely stop future fires.
+        // Gated on the enabled -> disabled TRANSITION, so a rename or any other routine edit of an
+        // already-running job is not a silent kill switch. Ordered AFTER the persist so an operator
+        // who sees `enabled: false` knows the cancellation has already been issued.
+        if (existing.Enabled && !updated.Enabled)
+            await scheduler.CancelActiveRunAsync(jobId, cancellationToken).ConfigureAwait(false);
+
+        // Reschedule via the separate narrow next_run_at write only when the schedule or timezone
+        // actually changed, so the reschedule cannot clobber a concurrent definition edit either.
         var scheduleChanged = !string.Equals(newSchedule, existing.Schedule, StringComparison.Ordinal);
         var tzChanged = !string.Equals(newTimeZone ?? "", existing.TimeZone ?? "", StringComparison.Ordinal);
         if (scheduleChanged || tzChanged)
@@ -204,14 +491,14 @@ public sealed class CronTool(
             try
             {
                 var expr = Cronos.CronExpression.Parse(newSchedule, Cronos.CronFormat.Standard);
-                nextRunAt = expr.GetNextOccurrence(DateTimeOffset.UtcNow, tz);
+                nextRunAt = expr.NextRun(DateTimeOffset.UtcNow, tz);
             }
             catch { /* invalid schedule — will be caught by scheduler */ }
 
-            updated = updated with { NextRunAt = nextRunAt };
+            await cronStore.SetNextRunAtAsync(jobId, nextRunAt, cancellationToken).ConfigureAwait(false);
+            saved = await cronStore.GetAsync(jobId, cancellationToken).ConfigureAwait(false) ?? saved;
         }
 
-        var saved = await cronStore.UpdateAsync(updated, cancellationToken).ConfigureAwait(false);
         return TextResult(JsonSerializer.Serialize(saved, JsonOptions));
     }
 
@@ -222,7 +509,10 @@ public sealed class CronTool(
             ?? throw new KeyNotFoundException($"Cron job '{jobId.Value}' was not found.");
 
         EnsureCanManage(existing);
-        await cronStore.DeleteAsync(jobId, cancellationToken).ConfigureAwait(false);
+        // #3160: route through the scheduler, not straight at the store. A bare store delete leaves
+        // the in-flight run executing (and skips the conversation archive and run-session
+        // reclamation the scheduler owns) - which is exactly the defect this fixes.
+        await scheduler.DeleteJobAsync(jobId, cancellationToken).ConfigureAwait(false);
         return TextResult($"Deleted cron job '{jobId.Value}'.");
     }
 
@@ -233,11 +523,104 @@ public sealed class CronTool(
             ?? throw new KeyNotFoundException($"Cron job '{jobId.Value}' was not found.");
 
         EnsureCanManage(existing);
-        var run = await scheduler.RunNowAsync(jobId, cancellationToken).ConfigureAwait(false);
-        return TextResult(JsonSerializer.Serialize(run, JsonOptions));
+        var run = await scheduler.AcceptRunNowAsync(jobId, cancellationToken).ConfigureAwait(false);
+        return TextResult(JsonSerializer.Serialize(new
+        {
+            runId = run.Id.Value,
+            jobId = run.JobId.Value,
+            status = "accepted",
+            startedAt = run.StartedAt,
+            pollWith = "cron history"
+        }, JsonOptions));
     }
 
     private async Task<AgentToolResult> HistoryAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken)
+    {
+        var limit = ReadInt(arguments, "limit", defaultValue: 20);
+        if (limit < 1) limit = 1;
+        if (limit > 100) limit = 100;
+
+        var failedOnly = arguments.TryGetValue("failedOnly", out var failedOnlyValue) && failedOnlyValue is bool fo && fo;
+        var statuses = failedOnly ? FailureStatuses : null;
+
+        // #2838: jobId is now OPTIONAL. Omitting it asks 'which of my jobs have failed recently',
+        // which previously required one call per job and was therefore only ever asked after a
+        // human noticed something missing.
+        var jobIdValue = ReadString(arguments, "jobId");
+        if (!string.IsNullOrWhiteSpace(jobIdValue))
+        {
+            var jobId = JobId.From(jobIdValue);
+            var existing = await cronStore.GetAsync(jobId, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException($"Cron job '{jobId.Value}' was not found.");
+
+            EnsureCanManage(existing);
+
+            var runs = statuses is null
+                ? await cronStore.GetRunHistoryAsync(jobId, limit, cancellationToken).ConfigureAwait(false)
+                : await cronStore.GetRecentRunsAsync([jobId], statuses, limit, cancellationToken).ConfigureAwait(false);
+            var projectedRuns = await scheduler.GetRunHealthAsync(runs, cancellationToken).ConfigureAwait(false);
+            return TextResult(JsonSerializer.Serialize(projectedRuns, JsonOptions));
+        }
+
+        // The cross-job scope is derived by applying the SAME CanManage rule the per-job path
+        // applies, rather than by handing the store a second notion of ownership. An agent with no
+        // manageable jobs therefore gets an empty scope - which the store treats as 'no jobs',
+        // never as 'no filter'.
+        var manageable = (await cronStore.ListAsync(ct: cancellationToken).ConfigureAwait(false))
+            .Where(CanManage)
+            .Select(job => job.Id)
+            .ToList();
+
+        var recent = await cronStore.GetRecentRunsAsync(manageable, statuses, limit, cancellationToken).ConfigureAwait(false);
+        var projectedRecent = await scheduler.GetRunHealthAsync(recent, cancellationToken).ConfigureAwait(false);
+        return TextResult(JsonSerializer.Serialize(projectedRecent, JsonOptions));
+    }
+
+    /// <summary>
+    /// #2641: per-job cost rollup over a bounded window, ordered by TOTAL spend descending.
+    /// </summary>
+    /// <remarks>
+    /// Scope is derived by applying the SAME <c>CanManage</c> rule the per-job history path applies,
+    /// so the tool never hands the store a second notion of ownership, and an agent with no
+    /// manageable jobs gets an empty scope rather than a global query.
+    /// </remarks>
+    private async Task<AgentToolResult> CostsAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken)
+    {
+        var windowDays = ReadInt(arguments, "windowDays", defaultValue: 7);
+        if (windowDays < 1) windowDays = 1;
+
+        var manageable = (await cronStore.ListAsync(ct: cancellationToken).ConfigureAwait(false))
+            .Where(CanManage)
+            .Select(job => job.Id)
+            .ToList();
+
+        var rollups = await cronStore.GetJobCostRollupsAsync(manageable, windowDays, cancellationToken).ConfigureAwait(false);
+        return TextResult(JsonSerializer.Serialize(rollups, JsonOptions));
+    }
+
+    /// <summary>
+    /// #3338 clauses 6-8: a self-pacing loop proposes its own next wake, clamped to a configured
+    /// <c>[floor, ceiling]</c> and written through the job-authored backoff column.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The write goes to <see cref="ICronStore.SetBackoffUntilAsync"/>, NOT to <c>SetNextRunAtAsync</c>.
+    /// Per #3350 those are two different facts: <c>NextRunAt</c> is the scheduler's expression cache and
+    /// is corrected freely, whereas the job-authored floor is exactly "the time this job asked to be
+    /// woken". Writing a deliberate deferral into the cache is indistinguishable from a stale cache and
+    /// would be silently corrected away on the next tick.
+    /// </para>
+    /// <para>
+    /// The response reports the requested delay beside the effective one and the bounds in force
+    /// (clause 7). Reporting only the effective value would let a loop pinned at the floor look exactly
+    /// like one pacing itself - #3244's finding that an invisible bound cannot be reasoned about.
+    /// </para>
+    /// <para>
+    /// Scope is the SAME <c>CanManage</c> rule <c>history</c> and <c>costs</c> derive theirs from
+    /// (clause 8), so a job that is not the caller's own is refused rather than re-paced.
+    /// </para>
+    /// </remarks>
+    private async Task<AgentToolResult> NextCheckAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken)
     {
         var jobId = JobId.From(ReadRequired(arguments, "jobId"));
         var existing = await cronStore.GetAsync(jobId, cancellationToken).ConfigureAwait(false)
@@ -245,12 +628,107 @@ public sealed class CronTool(
 
         EnsureCanManage(existing);
 
-        var limit = ReadInt(arguments, "limit", defaultValue: 20);
-        if (limit < 1) limit = 1;
-        if (limit > 100) limit = 100;
+        // Absent rather than zero-defaulted: "the agent proposed 0 seconds" and "the agent proposed
+        // nothing" are different requests, and only the former should be reported as clamped.
+        if (!arguments.TryGetValue("nextCheckSeconds", out var raw) || raw is null)
+            throw new ArgumentException("Argument 'nextCheckSeconds' is required for the 'next_check' action.");
 
-        var runs = await cronStore.GetRunHistoryAsync(jobId, limit, cancellationToken).ConfigureAwait(false);
-        return TextResult(JsonSerializer.Serialize(runs, JsonOptions));
+        var requestedSeconds = ReadInt(arguments, "nextCheckSeconds", defaultValue: int.MinValue);
+        if (requestedSeconds == int.MinValue)
+            throw new ArgumentException("Argument 'nextCheckSeconds' must be an integer number of seconds.");
+
+        var decision = CronSelfPacingBound.Clamp(
+            TimeSpan.FromSeconds(requestedSeconds),
+            floor: SecondsOrNull(_cronOptions?.SelfPacingFloorSeconds),
+            ceiling: SecondsOrNull(_cronOptions?.SelfPacingCeilingSeconds));
+
+        var wakeAt = DateTimeOffset.UtcNow + decision.Effective;
+        await cronStore.SetBackoffUntilAsync(jobId, wakeAt, cancellationToken).ConfigureAwait(false);
+
+        return TextResult(JsonSerializer.Serialize(new
+        {
+            jobId = jobId.Value,
+            requestedSeconds,
+            effectiveSeconds = (int)decision.Effective.TotalSeconds,
+            floorSeconds = (int)decision.Floor.TotalSeconds,
+            ceilingSeconds = (int)decision.Ceiling.TotalSeconds,
+            wasClamped = decision.WasClamped,
+            clampReason = decision.Reason.ToString(),
+            nextCheckAt = wakeAt
+        }, JsonOptions));
+    }
+
+    // A non-positive configured bound is passed through as null so CronSelfPacingBound applies its
+    // own default. Misconfiguration must degrade to the default bound, never to no bound.
+    private static TimeSpan? SecondsOrNull(int? seconds)
+        => seconds is { } value && value > 0 ? TimeSpan.FromSeconds(value) : null;
+
+    /// <summary>
+    /// The run statuses that mean 'this did not succeed' for the failed-only history view (#2838).
+    /// Bound from the CronRunStatus constants so the filter cannot drift from the producers, and
+    /// deliberately broader than Error alone: a timeout, an execution-class run that did nothing
+    /// (#2985), and an occurrence missed while the gateway was down are all things the operator
+    /// asking 'what broke' needs to see.
+    /// </summary>
+    private static readonly string[] FailureStatuses =
+    [
+        CronRunStatus.Error,
+        CronRunStatus.TimedOut,
+        CronRunStatus.NoToolCalls,
+        CronRunStatus.Incomplete,
+        // #3161: a run whose output reached nobody is exactly what the operator asking 'what broke'
+        // needs to see - it is the failure shape that used to be invisible entirely.
+        CronRunStatus.DeliveryFailed,
+        CronRunStatus.Missed
+    ];
+
+    // #2838: the single alert-target parse. Blank means 'no target' (and on update an explicit
+    // empty string clears an existing one), matching the expiresAt spelling.
+    private static ConversationId? ParseAlertConversationId(IReadOnlyDictionary<string, object?> arguments)
+    {
+        var raw = ReadString(arguments, "failureAlertConversationId");
+        return string.IsNullOrWhiteSpace(raw) ? null : ConversationId.From(raw);
+    }
+
+    // #2671: delegates to THE shared validator every other authoring seam uses. Adding a second
+    // spelling here is exactly what that issue exists to prevent, so the tool only translates the
+    // validator's verdict into the tool's error channel.
+    private async Task EnsureAlertTargetValidAsync(ConversationId? conversationId, CancellationToken ct)
+    {
+        var validation = await CronAlertTarget.ValidateAsync(alertTargetResolver, conversationId, ct).ConfigureAwait(false);
+        if (!validation.IsValid)
+            throw new ArgumentException(validation.Error);
+    }
+
+    // #2634: parses the caller-supplied expiry. Null/blank means "no expiry" (and on update, an
+    // explicit empty string clears an existing one). An unparseable value is REJECTED rather than
+    // silently dropped: quietly discarding a bad expiry would leave the agent believing the job
+    // will stop firing when it never will - the exact failure this issue is about.
+    private static DateTimeOffset? ParseExpiresAt(string? expiresAt)
+    {
+        if (string.IsNullOrWhiteSpace(expiresAt))
+            return null;
+
+        if (DateTimeOffset.TryParse(
+                expiresAt,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+                out var parsed))
+        {
+            return parsed;
+        }
+
+        throw new ArgumentException(
+            $"Argument 'expiresAt' must be an ISO-8601 instant (e.g. '2026-12-31T00:00:00Z'); got '{expiresAt}'.");
+    }
+
+    // #2373: reject an unresolvable model override at create/update time rather than letting the
+    // job silently fail on every fire. When no populated registry is available the override is
+    // accepted unchanged - "cannot verify" must never become "reject".
+    private void EnsureModelResolvable(string? model)
+    {
+        if (CronModelPreflight.ClassifyRejection(modelRegistry, model) is { } reason)
+            throw new ArgumentException(reason);
     }
 
     // Scopes the target agent for create/update. When cross-agent cron is disabled (the
@@ -271,32 +749,26 @@ public sealed class CronTool(
 
     private void EnsureCanManage(CronJob job)
     {
-        if (allowCrossAgentCron)
-            return;
-
-        var isCreator = string.Equals(job.CreatedBy, _agentId.Value, StringComparison.OrdinalIgnoreCase);
-        var isTarget = job.AgentId.HasValue && job.AgentId.Value == _agentId;
-        if (!isCreator && !isTarget)
+        if (!CanManage(job))
             throw new UnauthorizedAccessException("You can only manage cron jobs created by or targeting this agent.");
     }
+
+    // The authorisation predicate behind EnsureCanManage. It was extracted from the per-job paths
+    // so the cross-job history scope (#2838) derives from the SAME rule; #3575 hoisted the rule
+    // itself into CronJobOwnership so the REST seam in BotNexus.Gateway.Api can apply it too. This
+    // stays as a one-line delegate rather than being inlined at each call site because
+    // .Where(CanManage) is a method-group reference in the history/costs scopes.
+    private bool CanManage(CronJob job)
+        => CronJobOwnership.CanManage(job, _agentId, allowCrossAgentCron);
 
     private static AgentToolResult TextResult(string text)
         => new([new AgentToolContent(AgentToolContentType.Text, text)]);
 
+    // Delegates to CronTimeZoneResolver - see #2748. The model-facing tool previously
+    // carried a third spelling of resolution, so a timezone the model set was validated
+    // and echoed differently from how the scheduler would interpret it.
     private static TimeZoneInfo ResolveTimeZone(string? timeZone)
-    {
-        if (string.IsNullOrWhiteSpace(timeZone))
-            return TimeZoneInfo.Utc;
-
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(timeZone);
-        }
-        catch (TimeZoneNotFoundException)
-        {
-            return TimeZoneInfo.Utc;
-        }
-    }
+        => CronTimeZoneResolver.Resolve(timeZone);
 
     private static bool IsKnownAction(string action)
         => action.Equals("list", StringComparison.OrdinalIgnoreCase)
@@ -304,7 +776,9 @@ public sealed class CronTool(
            || action.Equals("update", StringComparison.OrdinalIgnoreCase)
            || action.Equals("delete", StringComparison.OrdinalIgnoreCase)
            || action.Equals("run", StringComparison.OrdinalIgnoreCase)
-           || action.Equals("history", StringComparison.OrdinalIgnoreCase);
+           || action.Equals("history", StringComparison.OrdinalIgnoreCase)
+           || action.Equals("costs", StringComparison.OrdinalIgnoreCase)
+           || action.Equals("next_check", StringComparison.OrdinalIgnoreCase);
 
     private static void CopyString(IReadOnlyDictionary<string, object?> source, Dictionary<string, object?> destination, string key)
     {
@@ -337,6 +811,12 @@ public sealed class CronTool(
             throw new ArgumentException($"Argument '{key}' cannot be empty.");
 
         return result;
+    }
+
+    private static string? ReadPrecondition(IReadOnlyDictionary<string, object?> arguments)
+    {
+        var command = ReadString(arguments, "preconditionCommand");
+        return string.IsNullOrWhiteSpace(command) ? null : command;
     }
 
     private static IReadOnlyDictionary<string, string?>? ReadStringMap(IReadOnlyDictionary<string, object?> arguments, string key)
@@ -381,6 +861,36 @@ public sealed class CronTool(
     {
         if (string.IsNullOrWhiteSpace(message) && string.IsNullOrWhiteSpace(templateName))
             throw new ArgumentException("Either 'message' or 'templateName' is required.");
+    }
+
+    // #2389: the command counterpart of EnsurePromptSource. A command job with nothing to run is
+    // just as invalid as an agent-prompt job with nothing to say - relaxing the prompt requirement
+    // per action type must not degrade into "anything goes".
+    private static void EnsureShellCommand(string? shellCommand)
+    {
+        if (string.IsNullOrWhiteSpace(shellCommand))
+            throw new ArgumentException("'shellCommand' is required when actionType is 'command'.");
+    }
+
+    // Returns null when the caller supplied no action type, meaning "default on create / leave
+    // alone on update". Only action types the tool can fully validate are accepted; 'agent-chat'
+    // is the historical alias for 'agent-prompt' and is normalized the same way the REST API
+    // normalizes it. An unknown value is rejected rather than silently persisted as a job the
+    // scheduler has no action for.
+    private static string? NormalizeRequestedActionType(string? actionType)
+    {
+        if (string.IsNullOrWhiteSpace(actionType))
+            return null;
+
+        var trimmed = actionType.Trim();
+        if (trimmed.Equals("agent-prompt", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Equals("agent-chat", StringComparison.OrdinalIgnoreCase))
+            return "agent-prompt";
+        if (trimmed.Equals("command", StringComparison.OrdinalIgnoreCase))
+            return "command";
+
+        throw new ArgumentException(
+            $"Unsupported cron actionType '{actionType}'. Supported values are 'agent-prompt' and 'command'.");
     }
 
     private static bool ReadBool(object value, string argumentName)

@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Streaming;
+using BotNexus.Agent.Providers.Core.Utilities;
 
 namespace BotNexus.Agent.Providers.Core.Tests.Streaming;
 
@@ -55,8 +56,12 @@ public class ResponsesMessageConverterTests
         var result = ResponsesMessageConverter.ConvertMessages(messages, Model("text"));
 
         var contentArray = result[0]!["content"]!.AsArray();
-        contentArray.Count.ShouldBe(1);
+        // #2485 AC4: the image is still filtered out - original intent preserved - but a
+        // user-visible notice is substituted so the drop is not silent.
+        contentArray.Count.ShouldBe(2);
         contentArray[0]!["type"]!.GetValue<string>().ShouldBe("input_text");
+        contentArray.Select(n => n!["type"]!.GetValue<string>()).ShouldNotContain("input_image");
+        contentArray[1]!["text"]!.GetValue<string>().ShouldContain("were not delivered");
     }
 
     [Fact]
@@ -170,6 +175,79 @@ public class ResponsesMessageConverterTests
         output!["output"]!.GetValue<string>().ShouldBe("the result");
     }
 
+    public static TheoryData<IReadOnlyList<ContentBlock>, string> EmptyToolResults => new()
+    {
+        { Array.Empty<ContentBlock>(), string.Empty },
+        { new ContentBlock[] { new TextContent(string.Empty) }, string.Empty },
+        { new ContentBlock[] { new TextContent("   ") }, "   " },
+        { new ContentBlock[] { new TextContent("\n") }, "\n" },
+    };
+
+    [Theory]
+    [MemberData(nameof(EmptyToolResults))]
+    public void ConvertMessages_EmptyTextOnlyToolResult_PreservesOutputAndCallId(
+        IReadOnlyList<ContentBlock> content,
+        string expectedOutput)
+    {
+        var assistant = new AssistantMessage(
+            Content: [new ToolCallContent("call_empty|fc_empty", "do_thing", new Dictionary<string, object?>())],
+            Api: "openai-responses", Provider: "openai", ModelId: "gpt-5",
+            Usage: Usage.Empty(), StopReason: StopReason.ToolUse,
+            ErrorMessage: null, ResponseId: null, Timestamp: Ts);
+        var toolResult = new ToolResultMessage(
+            ToolCallId: "call_empty|fc_empty", ToolName: "do_thing",
+            Content: content, IsError: false, Timestamp: Ts);
+
+        var result = ResponsesMessageConverter.ConvertMessages([assistant, toolResult], Model());
+
+        var output = result.Single(n => n!["type"]!.GetValue<string>() == "function_call_output");
+        output!["call_id"]!.GetValue<string>().ShouldBe("call_empty");
+        output!["output"]!.GetValue<string>().ShouldBe(expectedOutput);
+        output["output"]!.GetValue<string>().ShouldNotContain("image", Case.Insensitive);
+    }
+
+    [Fact]
+    public void ConvertMessages_ToolResultImageOnVisionModel_EmitsImagePart()
+    {
+        var assistant = new AssistantMessage(
+            Content: [new ToolCallContent("call_image|fc_image", "screenshot", new Dictionary<string, object?>())],
+            Api: "openai-responses", Provider: "openai", ModelId: "gpt-5",
+            Usage: Usage.Empty(), StopReason: StopReason.ToolUse,
+            ErrorMessage: null, ResponseId: null, Timestamp: Ts);
+        var toolResult = new ToolResultMessage(
+            ToolCallId: "call_image|fc_image", ToolName: "screenshot",
+            Content: [new ImageContent("AAAA", "image/png")], IsError: false, Timestamp: Ts);
+
+        var result = ResponsesMessageConverter.ConvertMessages([assistant, toolResult], Model("text", "image"));
+
+        var output = result.Single(n => n!["type"]!.GetValue<string>() == "function_call_output");
+        output!["call_id"]!.GetValue<string>().ShouldBe("call_image");
+        var parts = output["output"]!.AsArray();
+        parts.Count.ShouldBe(1);
+        parts[0]!["type"]!.GetValue<string>().ShouldBe("input_image");
+        parts[0]!["image_url"]!.GetValue<string>().ShouldBe("data:image/png;base64,AAAA");
+    }
+
+    [Fact]
+    public void ConvertMessages_ToolResultImageOnTextModel_ProducesNoFalseImageClaim()
+    {
+        var assistant = new AssistantMessage(
+            Content: [new ToolCallContent("call_denied|fc_denied", "screenshot", new Dictionary<string, object?>())],
+            Api: "openai-responses", Provider: "openai", ModelId: "gpt-5",
+            Usage: Usage.Empty(), StopReason: StopReason.ToolUse,
+            ErrorMessage: null, ResponseId: null, Timestamp: Ts);
+        var toolResult = new ToolResultMessage(
+            ToolCallId: "call_denied|fc_denied", ToolName: "screenshot",
+            Content: [new ImageContent("AAAA", "image/png")], IsError: false, Timestamp: Ts);
+
+        var result = ResponsesMessageConverter.ConvertMessages([assistant, toolResult], Model("text"));
+
+        var output = result.Single(n => n!["type"]!.GetValue<string>() == "function_call_output");
+        output!["call_id"]!.GetValue<string>().ShouldBe("call_denied");
+        output!["output"]!.GetValue<string>().ShouldBeEmpty();
+        output["output"]!.GetValue<string>().ShouldNotContain("image", Case.Insensitive);
+    }
+
     [Fact]
     public void ConvertMessages_DanglingFunctionCallInOlderTurn_IsDropped()
     {
@@ -228,6 +306,14 @@ public class ResponsesMessageConverterTests
     {
         // A tool-result with no prior tool-call (orphan) -- symmetric malformation. The Responses
         // API also rejects a function_call_output with no matching function_call.
+        //
+        // #3014 behaviour parity: the drop moved OUT of this converter and into the shared
+        // MessageTransformer seam that every Responses call site (ResponsesStreamEngine and
+        // CopilotResponsesProvider) runs before converting. The assertion is unchanged - no
+        // function_call_output reaches the wire, and only the user message survives - but it is now
+        // exercised through the real pipeline rather than the converter in isolation, which is what
+        // production actually does. Asserting the converter alone would pin a seam production never
+        // uses on its own.
         var messages = new Message[]
         {
             new UserMessage(new UserMessageContent("hi"), Ts),
@@ -236,10 +322,41 @@ public class ResponsesMessageConverterTests
                 Content: [new TextContent("orphan result")], IsError: false, Timestamp: Ts),
         };
 
-        var result = ResponsesMessageConverter.ConvertMessages(messages, Model());
+        var result = ResponsesMessageConverter.ConvertMessages(
+            MessageTransformer.TransformMessages(messages, Model()),
+            Model());
 
         result.Where(n => n!["type"]!.GetValue<string>() == "function_call_output").ShouldBeEmpty();
         result.Count.ShouldBe(1); // only the user message survives
+    }
+
+    [Fact]
+    public void TransformThenConvert_PairedToolCallAndResult_StillReachTheWire()
+    {
+        // Non-vacuity companion to the parity test above: routing through the shared seam must not
+        // drop a WELL-PAIRED call/result. Without this, a seam that discarded every tool result
+        // would keep the orphan test green.
+        var messages = new Message[]
+        {
+            new UserMessage(new UserMessageContent("do it"), Ts),
+            new AssistantMessage(
+                Content: [new ToolCallContent("call_ok|fc_5", "do_thing", new Dictionary<string, object?>())],
+                Api: "openai-responses", Provider: "openai", ModelId: "gpt-5",
+                Usage: Usage.Empty(), StopReason: StopReason.ToolUse,
+                ErrorMessage: null, ResponseId: null, Timestamp: Ts),
+            new ToolResultMessage(
+                ToolCallId: "call_ok|fc_5", ToolName: "do_thing",
+                Content: [new TextContent("done")], IsError: false, Timestamp: Ts),
+        };
+
+        var result = ResponsesMessageConverter.ConvertMessages(
+            MessageTransformer.TransformMessages(messages, Model()),
+            Model());
+
+        result.Single(n => n!["type"]!.GetValue<string>() == "function_call")!["call_id"]!
+            .GetValue<string>().ShouldBe("call_ok");
+        result.Single(n => n!["type"]!.GetValue<string>() == "function_call_output")!["call_id"]!
+            .GetValue<string>().ShouldBe("call_ok");
     }
 
     [Fact]

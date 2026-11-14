@@ -1,3 +1,5 @@
+using BotNexus.Domain.Text;
+using BotNexus.Gateway.Sessions;
 using System.CommandLine;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
@@ -30,7 +32,7 @@ internal sealed class DebugSessionsCommand
         var statusOption = new Option<string?>("--status", "Filter by status: active, sealed, expired, all.");
         var limitOption = new Option<int>("--limit", () => 20, "Maximum sessions to return.");
 
-        var listCommand = new Command("list", "List sessions from sessions.db.")
+        var listCommand = new Command("list", "List sessions from the session store.")
         {
             agentOption, statusOption, limitOption
         };
@@ -71,6 +73,58 @@ internal sealed class DebugSessionsCommand
             return Task.CompletedTask;
         });
 
+        // ── read payload audit ──
+        var fromOption = new Option<DateTimeOffset>("--from", "Inclusive UTC start of the audit window.") { IsRequired = true };
+        var toOption = new Option<DateTimeOffset>("--to", "Exclusive UTC end of the audit window.") { IsRequired = true };
+        var readPayloadAuditCommand = new Command("read-payload-audit", "Measure repeated full read payloads in a complete audit window.")
+        {
+            fromOption, toOption
+        };
+        readPayloadAuditCommand.SetHandler(context =>
+        {
+            var target = context.ParseResult.GetValueForOption(targetOption);
+            var format = context.ParseResult.GetValueForOption(formatOption) ?? "table";
+            var windowStart = context.ParseResult.GetValueForOption(fromOption);
+            var windowEnd = context.ParseResult.GetValueForOption(toOption);
+            var dbPath = ResolveSessionsDb(target);
+            context.ExitCode = ExecuteReadPayloadAudit(dbPath, windowStart, windowEnd, format);
+            return Task.CompletedTask;
+        });
+
+        // ── retention preview ──
+        var olderThanDaysOption = new Option<int>("--older-than-days", () => 30, "Minimum age of successful historical tool invocations.");
+        var retentionCommand = new Command("retention-preview", "Report tool payload retention candidates without modifying the store.")
+        {
+            olderThanDaysOption
+        };
+        retentionCommand.SetHandler(context =>
+        {
+            var target = context.ParseResult.GetValueForOption(targetOption);
+            var format = context.ParseResult.GetValueForOption(formatOption) ?? "table";
+            var olderThanDays = context.ParseResult.GetValueForOption(olderThanDaysOption);
+            var dbPath = ResolveSessionsDb(target);
+            context.ExitCode = ExecuteRetentionPreview(dbPath, olderThanDays, format);
+            return Task.CompletedTask;
+        });
+
+        // ── legacy tool invocation backfill ──
+        var batchSizeOption = new Option<int>("--batch-size", () => 1000, "Maximum unlinked legacy tool rows to scan.");
+        var commitOption = new Option<bool>("--commit", "Apply the backfill. Without this flag the command is read-only.");
+        var backfillCommand = new Command("backfill-tool-invocations", "Preview or apply one bounded legacy tool invocation backfill batch.")
+        {
+            batchSizeOption, commitOption
+        };
+        backfillCommand.SetHandler(context =>
+        {
+            var target = context.ParseResult.GetValueForOption(targetOption);
+            var format = context.ParseResult.GetValueForOption(formatOption) ?? "table";
+            var batchSize = context.ParseResult.GetValueForOption(batchSizeOption);
+            var commit = context.ParseResult.GetValueForOption(commitOption);
+            var dbPath = ResolveSessionsDb(target);
+            context.ExitCode = ExecuteToolInvocationBackfill(dbPath, batchSize, commit, format);
+            return Task.CompletedTask;
+        });
+
         // ── stats ──
         var statsCommand = new Command("stats", "Show aggregate session statistics.");
         statsCommand.SetHandler(context =>
@@ -85,21 +139,40 @@ internal sealed class DebugSessionsCommand
         command.AddCommand(listCommand);
         command.AddCommand(getCommand);
         command.AddCommand(compactionCommand);
+        command.AddCommand(readPayloadAuditCommand);
+        command.AddCommand(retentionCommand);
+        command.AddCommand(backfillCommand);
         command.AddCommand(statsCommand);
         return command;
     }
 
+    /// <summary>
+    /// Resolves the session store through the shared tolerant resolver so this reader opens the
+    /// file the gateway actually writes. Historically this hard-coded
+    /// <c>Path.Combine(home, "sessions.db")</c>, which got both the filename and the directory
+    /// wrong on every deployment (issue #3126).
+    /// </summary>
     internal static string ResolveSessionsDb(string? target)
+        => CliStorePaths.ResolvePath(SessionsStoreName, target);
+
+    /// <summary>Bare store name fed to the shared tolerant resolver.</summary>
+    internal const string SessionsStoreName = "sessions";
+
+    /// <summary>
+    /// Renders the shared not-found message, naming every candidate filename and every directory
+    /// searched so a wrong-directory deployment is diagnosable from the message alone (AC4).
+    /// </summary>
+    private static void ReportMissingStore(string dbPath)
     {
-        var home = CliPaths.ResolveTarget(target);
-        return Path.Combine(home, "sessions.db");
+        var message = CliStorePaths.BuildNotFoundMessage(SessionsStoreName, dbPath);
+        AnsiConsole.MarkupLine("[red]" + CliText.SafeDisplay(message) + "[/]");
     }
 
     internal static int ExecuteList(string dbPath, string? agent, string? status, int limit, string format)
     {
         if (!File.Exists(dbPath))
         {
-            AnsiConsole.MarkupLine("[red]sessions.db not found at:[/] " + Markup.Escape(dbPath));
+            ReportMissingStore(dbPath);
             return 1;
         }
 
@@ -150,10 +223,10 @@ internal sealed class DebugSessionsCommand
         foreach (var s in sessions)
         {
             table.AddRow(
-                Markup.Escape(Truncate(s.Id, 24)),
-                Markup.Escape(Truncate(s.ConversationId ?? "(none)", 20)),
+                CliText.SafeDisplay(Truncate(s.Id, 24)),
+                CliText.SafeDisplay(Truncate(s.ConversationId ?? "(none)", 20)),
                 FormatStatus(s.Status),
-                Markup.Escape(FormatDate(s.CreatedAt)),
+                CliText.SafeDisplay(FormatDate(s.CreatedAt)),
                 s.MessageCount.ToString());
         }
 
@@ -166,7 +239,7 @@ internal sealed class DebugSessionsCommand
     {
         if (!File.Exists(dbPath))
         {
-            AnsiConsole.MarkupLine("[red]sessions.db not found at:[/] " + Markup.Escape(dbPath));
+            ReportMissingStore(dbPath);
             return 1;
         }
 
@@ -179,7 +252,7 @@ internal sealed class DebugSessionsCommand
         using var reader = cmd.ExecuteReader();
         if (!reader.Read())
         {
-            AnsiConsole.MarkupLine($"[red]Session not found:[/] {Markup.Escape(sessionId)}");
+            AnsiConsole.MarkupLine($"[red]Session not found:[/] {CliText.SafeDisplay(sessionId)}");
             return 1;
         }
 
@@ -216,14 +289,14 @@ internal sealed class DebugSessionsCommand
 
         var panel = new Panel(
             new Rows(
-                new Markup($"[bold]ID:[/]              {Markup.Escape(detail.Id)}"),
-                new Markup($"[bold]Conversation:[/]    {Markup.Escape(detail.ConversationId ?? "(none)")}"),
-                new Markup($"[bold]Channel:[/]         {Markup.Escape(detail.ChannelType ?? "(none)")}"),
-                new Markup($"[bold]Caller:[/]          {Markup.Escape(detail.CallerId ?? "(none)")}"),
-                new Markup($"[bold]Type:[/]            {Markup.Escape(detail.SessionType ?? "(none)")}"),
+                new Markup($"[bold]ID:[/]              {CliText.SafeDisplay(detail.Id)}"),
+                new Markup($"[bold]Conversation:[/]    {CliText.SafeDisplay(detail.ConversationId ?? "(none)")}"),
+                new Markup($"[bold]Channel:[/]         {CliText.SafeDisplay(detail.ChannelType ?? "(none)")}"),
+                new Markup($"[bold]Caller:[/]          {CliText.SafeDisplay(detail.CallerId ?? "(none)")}"),
+                new Markup($"[bold]Type:[/]            {CliText.SafeDisplay(detail.SessionType ?? "(none)")}"),
                 new Markup($"[bold]Status:[/]          {FormatStatus(detail.Status ?? "unknown")}"),
-                new Markup($"[bold]Created:[/]         {Markup.Escape(FormatDate(detail.CreatedAt))}"),
-                new Markup($"[bold]Updated:[/]         {Markup.Escape(FormatDate(detail.UpdatedAt))}"),
+                new Markup($"[bold]Created:[/]         {CliText.SafeDisplay(FormatDate(detail.CreatedAt))}"),
+                new Markup($"[bold]Updated:[/]         {CliText.SafeDisplay(FormatDate(detail.UpdatedAt))}"),
                 new Markup($"[bold]Messages:[/]        {detail.MessageCount}"),
                 new Markup($"[bold]Has Compaction:[/]  {(detail.HasCompaction ? "[green]yes[/]" : "[dim]no[/]")}")))
         {
@@ -257,7 +330,7 @@ internal sealed class DebugSessionsCommand
     {
         if (!File.Exists(dbPath))
         {
-            AnsiConsole.MarkupLine("[red]sessions.db not found at:[/] " + Markup.Escape(dbPath));
+            ReportMissingStore(dbPath);
             return 1;
         }
 
@@ -296,7 +369,7 @@ internal sealed class DebugSessionsCommand
             {
                 AnsiConsole.MarkupLine("[red][EMPTY — compaction produced no summary][/]");
                 if (timestamp is not null)
-                    AnsiConsole.MarkupLine($"[dim]Compaction timestamp: {Markup.Escape(timestamp)}[/]");
+                    AnsiConsole.MarkupLine($"[dim]Compaction timestamp: {CliText.SafeDisplay(timestamp)}[/]");
             }
             return 0;
         }
@@ -308,7 +381,7 @@ internal sealed class DebugSessionsCommand
         }
         else
         {
-            AnsiConsole.MarkupLine($"[bold]Compaction Summary[/] [dim]({Markup.Escape(timestamp ?? "unknown")})[/]");
+            AnsiConsole.MarkupLine($"[bold]Compaction Summary[/] [dim]({CliText.SafeDisplay(timestamp ?? "unknown")})[/]");
             AnsiConsole.WriteLine();
             AnsiConsole.Write(new Text(content));
             AnsiConsole.WriteLine();
@@ -317,11 +390,132 @@ internal sealed class DebugSessionsCommand
         return 0;
     }
 
+    internal static int ExecuteReadPayloadAudit(
+        string dbPath,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd,
+        string format)
+    {
+        if (!File.Exists(dbPath))
+        {
+            ReportMissingStore(dbPath);
+            return 1;
+        }
+
+        ReadPayloadAuditReport report;
+        try
+        {
+            report = ReadPayloadAudit.CreateReport(dbPath, windowStart, windowEnd);
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]{CliText.SafeDisplay(ex.Message)}[/]");
+            return 1;
+        }
+
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            AnsiConsole.Write(new Text(JsonSerializer.Serialize(report, JsonOpts)));
+            AnsiConsole.WriteLine();
+            return 0;
+        }
+
+        AnsiConsole.MarkupLine("[bold]Read Payload Audit[/]");
+        AnsiConsole.MarkupLine($"  Window:                       [bold]{report.WindowStart:O}[/] to [bold]{report.WindowEnd:O}[/] (end exclusive)");
+        AnsiConsole.MarkupLine($"  Successful read results:      [bold]{report.SuccessfulReadResults:N0}[/]");
+        AnsiConsole.MarkupLine($"  Repeated full payloads:       [bold]{report.RepeatedFullPayloads:N0}[/]");
+        AnsiConsole.MarkupLine($"  Repeated payload bytes:       [bold]{report.RepeatedFullPayloadBytes:N0}[/]");
+        AnsiConsole.MarkupLine($"  Repeated payloads per 1,000:  [bold]{report.RepeatedPayloadsPerThousand:N2}[/]");
+        AnsiConsole.MarkupLine($"  Threshold per 1,000:          [bold]{report.MaximumRepeatedPayloadsPerThousand:N2}[/] ({(report.MeetsThreshold ? "meets" : "exceeds")})");
+        AnsiConsole.MarkupLine($"  Unchanged markers:            [bold]{report.UnchangedMarkers:N0}[/]");
+        AnsiConsole.MarkupLine($"  Changed same-slice results:   [bold]{report.ChangedSameSliceResults:N0}[/]");
+        AnsiConsole.MarkupLine($"  Different-slice results:      [bold]{report.DifferentSliceResults:N0}[/]");
+        AnsiConsole.MarkupLine($"  Unclassifiable results:       [bold]{report.UnclassifiableResults:N0}[/]");
+        AnsiConsole.MarkupLine($"  Excluded error results:       [bold]{report.ExcludedErrorResults:N0}[/]");
+        AnsiConsole.MarkupLine("[dim]Numerator: repeated complete response body for the same normalized path/offset/limit in one session. Denominator: all successful read result rows in the half-open window. Unchanged markers never enter the numerator.[/]");
+        return 0;
+    }
+
+    internal static int ExecuteRetentionPreview(string dbPath, int olderThanDays, string format)
+    {
+        if (!File.Exists(dbPath))
+        {
+            ReportMissingStore(dbPath);
+            return 1;
+        }
+
+        ToolRetentionReport report;
+        try
+        {
+            report = ToolRetentionPreview.CreateReport(dbPath, olderThanDays);
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]{CliText.SafeDisplay(ex.Message)}[/]");
+            return 1;
+        }
+
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            AnsiConsole.Write(new Text(JsonSerializer.Serialize(report, JsonOpts)));
+            AnsiConsole.WriteLine();
+            return 0;
+        }
+
+        AnsiConsole.MarkupLine("[bold]Historical Tool Retention Preview[/]");
+        AnsiConsole.MarkupLine($"  Cutoff:                 [bold]{report.Cutoff:O}[/]");
+        AnsiConsole.MarkupLine($"  Candidate invocations:  [bold]{report.CandidateInvocations:N0}[/]");
+        AnsiConsole.MarkupLine($"  Candidate rows:         [bold]{report.CandidateRows:N0}[/]");
+        AnsiConsole.MarkupLine($"  Content bytes:          [bold]{report.CandidateContentBytes:N0}[/]");
+        AnsiConsole.MarkupLine($"  Stored argument bytes:  [bold]{report.DuplicatedCandidateArgumentBytes:N0}[/]");
+        AnsiConsole.MarkupLine($"  Unique argument bytes:  [bold]{report.CandidateArgumentBytes:N0}[/]");
+        AnsiConsole.MarkupLine($"  Estimated reclaimable:  [bold]{report.EstimatedReclaimableBytes:N0}[/]");
+        AnsiConsole.MarkupLine("[dim]Read-only preview. Physical SQLite reclamation is a separate operator-controlled operation.[/]");
+        return 0;
+    }
+
+    internal static int ExecuteToolInvocationBackfill(string dbPath, int batchSize, bool commit, string format)
+    {
+        if (!File.Exists(dbPath))
+        {
+            ReportMissingStore(dbPath);
+            return 1;
+        }
+
+        LegacyToolInvocationBackfillReport report;
+        try
+        {
+            report = LegacyToolInvocationBackfill.Run(dbPath, batchSize, commit);
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]{CliText.SafeDisplay(ex.Message)}[/]");
+            return 1;
+        }
+
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            AnsiConsole.Write(new Text(JsonSerializer.Serialize(report, JsonOpts)));
+            AnsiConsole.WriteLine();
+            return 0;
+        }
+
+        AnsiConsole.MarkupLine("[bold]Legacy Tool Invocation Backfill[/]");
+        AnsiConsole.MarkupLine($"  Mode:         [bold]{(report.Committed ? "commit" : "preview")}[/]");
+        AnsiConsole.MarkupLine($"  Scanned rows: [bold]{report.ScannedRows:N0}[/]");
+        AnsiConsole.MarkupLine($"  Linked rows:  [bold]{report.LinkedRows:N0}[/]");
+        AnsiConsole.MarkupLine($"  Invocations:  [bold]{report.InvocationCount:N0}[/]");
+        AnsiConsole.MarkupLine($"  More remain:  [bold]{(report.HasMore ? "yes" : "no")}[/]");
+        if (!report.Committed)
+            AnsiConsole.MarkupLine("[dim]Read-only preview. Pass --commit to apply this batch.[/]");
+        return 0;
+    }
+
     internal static int ExecuteStats(string dbPath, string format)
     {
         if (!File.Exists(dbPath))
         {
-            AnsiConsole.MarkupLine("[red]sessions.db not found at:[/] " + Markup.Escape(dbPath));
+            ReportMissingStore(dbPath);
             return 1;
         }
 
@@ -428,7 +622,7 @@ internal sealed class DebugSessionsCommand
     }
 
     private static string Truncate(string value, int maxLength)
-        => value.Length <= maxLength ? value : value[..maxLength] + "…";
+        => TextTruncation.SafeTruncate(value, maxLength, "…")!;
 
     private static string FormatDate(string? isoDate)
     {
@@ -443,7 +637,7 @@ internal sealed class DebugSessionsCommand
         "active" => "[green]active[/]",
         "sealed" => "[blue]sealed[/]",
         "expired" => "[dim]expired[/]",
-        _ => Markup.Escape(status)
+        _ => CliText.SafeDisplay(status)
     };
 
     // ── DTOs ──

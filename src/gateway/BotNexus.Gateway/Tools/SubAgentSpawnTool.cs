@@ -12,20 +12,24 @@ public sealed class SubAgentSpawnTool(
     ISubAgentManager subAgentManager,
     AgentId agentId,
     SessionId sessionId,
-    ConversationId conversationId) : IAgentTool
+    ConversationId conversationId) : BotNexus.Agent.Core.ExtensionPoints.ToolExecution.IContextAwareAgentTool
 {
     public string Name => "spawn_subagent";
     public string Label => "Spawn Sub-Agent";
 
+    public TimeSpan? DefaultTimeout => TimeSpan.FromSeconds(610);
+    public ToolTimeoutArgument? TimeoutArgument => new("subAgentSpawnTimeoutSeconds", ToolTimeoutUnit.Seconds);
+
     public Tool Definition => new(
         Name,
-        "Spawn a background sub-agent to work on a delegated task.",
+        "Spawn a sub-agent and await its terminal result. Set background=true to return admission immediately; use manage_subagent wait to join it.",
         JsonDocument.Parse("""
             {
               "type": "object",
               "properties": {
+                "background": { "type": "boolean", "description": "Return admission immediately only when true. Default false awaits the result." },
                 "task": { "type": "string", "description": "Task prompt for the sub-agent." },
-                "name": { "type": "string", "description": "Optional friendly name for this sub-agent run." },
+                "name": { "type": "string", "description": "Optional friendly label for this sub-agent RUN. Accepted in every mode, including alongside targetAgentId - it titles the run, it does not customise the agent's descriptor." },
                 "model": { "type": "string", "description": "Optional model override for the sub-agent run." },
                 "apiProvider": { "type": "string", "description": "Optional API provider override for the sub-agent run." },
                 "tools": {
@@ -35,19 +39,24 @@ public sealed class SubAgentSpawnTool(
                 },
                 "systemPrompt": { "type": "string", "description": "Optional system prompt override." },
                 "maxTurns": { "type": "integer", "minimum": 1, "description": "Optional max turn budget." },
-                "timeoutSeconds": { "type": "integer", "minimum": 1, "description": "Optional timeout in seconds. Values above the configured ceiling are clamped down." }
+                "timeoutSeconds": { "type": "integer", "minimum": 1, "description": "Optional timeout in seconds. Omission uses the configured default for the spawning parent. Values above the configured ceiling are clamped down." }
                 ,
                 "archetype": {
                   "type": "string",
                   "enum": ["researcher", "coder", "planner", "reviewer", "writer", "general"],
                   "description": "Optional behavioral archetype for the sub-agent."
                 },
-                "targetAgentId": { "type": "string", "description": "Optional registered agent ID to use as the sub-agent identity. When set, the sub-agent runs as this agent's descriptor instead of cloning the parent." },
-                "shareWorkspace": { "type": "boolean", "description": "When true, grant the sub-agent read/write access to the parent agent's workspace. Default: false (isolated)." },
+                "targetAgentId": { "type": "string", "description": "Optional registered agent ID to use as the sub-agent identity. When set, the sub-agent runs as this agent's descriptor instead of cloning the parent. Descriptor overrides (model, apiProvider, tools, systemPrompt, archetype) are refused alongside it; the run-scoped name, maxTurns and timeoutSeconds are accepted." },
+                "shareWorkspace": { "type": "boolean", "description": "When true, grant the sub-agent read/write access to the parent agent's workspace. Default: false (isolated). The archetype must leave the child a write-capable tool (write, edit or exec) or the spawn is rejected." },
                 "grantedPaths": {
                   "type": "array",
                   "items": { "type": "string" },
-                  "description": "Optional list of absolute paths the sub-agent is granted read access to beyond its own workspace."
+                  "description": "Optional list of absolute paths the sub-agent is granted READ-ONLY access to beyond its own workspace. Writes and edits to these paths are refused. Use grantedWritePaths for a specific writable directory, or shareWorkspace for the whole parent workspace."
+                },
+                "grantedWritePaths": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Optional list of absolute paths the sub-agent is granted READ AND WRITE access to beyond its own workspace. Use this when the sub-agent must produce files in a specific directory (for example a git worktree) without granting the entire parent workspace. NOTE: an archetype may restrict the toolset such that a write grant is unusable - the read-only archetypes (researcher, reviewer) have no write, edit or exec tool, so a write grant combined with one of them is REJECTED at spawn time. Choose a write-capable archetype (coder, writer, planner, analyst) or supply write/edit/exec via the tools override."
                 }
               },
               "required": ["task"]
@@ -63,14 +72,35 @@ public sealed class SubAgentSpawnTool(
         if (string.IsNullOrWhiteSpace(task))
             throw new ArgumentException("Missing required argument: task.");
 
-        return Task.FromResult(arguments);
+        if (arguments.ContainsKey("timeoutSeconds") && ReadInt(arguments, "timeoutSeconds", 0) < 1)
+            throw new ArgumentException("Argument 'timeoutSeconds' must be at least 1 when supplied.");
+
+        // Preparation is read-only: no child admission, tools, or persistence before audit/policy.
+        // Never trust a caller-supplied internal hint or replace the raw request: the latter must
+        // still reach admission unchanged so clamp and advisory disclosures remain truthful.
+        var prepared = new Dictionary<string, object?>(arguments);
+        prepared["subAgentSpawnTimeoutSeconds"] = subAgentManager.ResolveSpawnTimeoutSeconds(
+            agentId, ReadInt(arguments, "timeoutSeconds", 0));
+        return Task.FromResult<IReadOnlyDictionary<string, object?>>(prepared);
     }
 
-    public async Task<AgentToolResult> ExecuteAsync(
+    public Task<AgentToolResult> ExecuteAsync(
         string toolCallId,
         IReadOnlyDictionary<string, object?> arguments,
         CancellationToken cancellationToken = default,
         AgentToolUpdateCallback? onUpdate = null)
+        => ExecuteCoreAsync(toolCallId, arguments, cancellationToken, null);
+
+    /// <inheritdoc />
+    public Task<AgentToolResult> ExecuteAsync(
+        BotNexus.Agent.Core.ExtensionPoints.ToolExecution.ToolExecutionContext context,
+        CancellationToken cancellationToken = default,
+        AgentToolUpdateCallback? onUpdate = null)
+        => ExecuteCoreAsync(context.ToolCallRequest.Id, context.ValidatedArgs, cancellationToken,
+            context.AgentRunId is { } run ? BotNexus.Domain.Primitives.AgentRunId.From(run.Value) : null);
+
+    private async Task<AgentToolResult> ExecuteCoreAsync(string toolCallId,
+        IReadOnlyDictionary<string, object?> arguments, CancellationToken cancellationToken, BotNexus.Domain.Primitives.AgentRunId? agentRunId)
     {
         var task = ReadString(arguments, "task")
             ?? throw new ArgumentException("Missing required argument: task.");
@@ -84,12 +114,16 @@ public sealed class SubAgentSpawnTool(
         var targetAgentId = ReadString(arguments, "targetAgentId");
         var shareWorkspace = ReadBool(arguments, "shareWorkspace");
         var grantedPaths = ReadStringArray(arguments, "grantedPaths");
+        var grantedWritePaths = ReadStringArray(arguments, "grantedWritePaths");
 
         // Phase 5 / F-6 step 3 (#562): Mode rejects mode-mixing.
         // When the caller asks to mirror an existing named agent, none of the
-        // embody-only customisation fields may be supplied — Mirror is strict
+        // embody-only DESCRIPTOR fields may be supplied — Mirror is strict
         // pass-through of the target's full descriptor. Build the Mode union
         // here so DefaultSubAgentManager can prefer it over the legacy bag.
+        // #3570: `name` is deliberately NOT in that set — it labels the run, not
+        // the descriptor, exactly like maxTurns/timeoutSeconds which were always
+        // accepted here.
         var mode = BuildSpawnMode(
             targetAgentId: targetAgentId,
             name: name,
@@ -105,23 +139,97 @@ public sealed class SubAgentSpawnTool(
             ParentSessionId = sessionId,
             Task = task,
             MaxTurns = ReadInt(arguments, "maxTurns", 30),
-            TimeoutSeconds = ReadInt(arguments, "timeoutSeconds", 600),
+            TimeoutSeconds = ReadInt(arguments, "timeoutSeconds", 0),
             InheritedConversationId = conversationId,
+            // #2338: binds the child conversation back to the exact spawn_subagent call so a channel
+            // can render the run as an expandable card in place of it, instead of guessing the
+            // association by timestamp.
+            SpawningToolCallId = toolCallId,
             Mode = mode,
             ShareWorkspace = shareWorkspace,
-            GrantedPaths = grantedPaths
+            GrantedPaths = grantedPaths,
+            GrantedWritePaths = grantedWritePaths
         };
 
-        var spawned = await subAgentManager.SpawnAsync(request, cancellationToken).ConfigureAwait(false);
-        var result = JsonSerializer.Serialize(new
+        SubAgentInfo spawned;
+        try
         {
-            spawned.SubAgentId,
-            SessionId = spawned.ChildSessionId,
-            spawned.Status,
-            spawned.Name
-        }, JsonOptions);
+            spawned = await subAgentManager.SpawnAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // #2633: cancellation is turn control flow, not a tool error. It must keep propagating
+            // so the executor can unwind the turn rather than reporting a spurious failure.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // #2633: a spawn that fails for a configuration reason (e.g. the descriptor names a
+            // model that is not registered for its provider) is the caller's problem to correct,
+            // not a host fault. Return it as a tool error carrying the underlying message - which
+            // names the model and the provider - so the requesting agent can act on it, and so the
+            // exception never escapes to become an unobserved task fault.
+            return TextResult(JsonSerializer.Serialize(new
+            {
+                error = ex.Message,
+                Status = "failed"
+            }, JsonOptions));
+        }
+        // Optional warning fields are added only when actionable. A plain in-range spawn keeps the
+        // compact historical result, while clamp and advisory disclosures can compose independently.
+        var result = new Dictionary<string, object?>
+        {
+            ["subAgentId"] = spawned.SubAgentId,
+            ["sessionId"] = spawned.ChildSessionId,
+            // #2338: the run's own conversation id. This is what a channel expands to load the
+            // child's transcript on demand; it is deliberately NOT the caller's conversation id.
+            ["conversationId"] = spawned.ChildConversationId,
+            ["status"] = spawned.Status,
+            ["name"] = spawned.Name
+        };
 
-        return TextResult(result);
+        if (spawned.BudgetClamp is { } clamp)
+        {
+            result["budgetClamp"] = new
+            {
+                clamp.PolicyTier,
+                clamp.MaxTurnsClamped,
+                clamp.RequestedMaxTurns,
+                clamp.EffectiveMaxTurns,
+                clamp.TimeoutSecondsClamped,
+                clamp.RequestedTimeoutSeconds,
+                clamp.EffectiveTimeoutSeconds,
+                Notice = "Your requested budget exceeded a configured ceiling and was reduced. "
+                    + "Scope the delegated task to the effective values above, not the requested ones."
+            };
+        }
+
+        if (spawned.BudgetAdvisory is { } advisory)
+        {
+            result["budgetAdvisory"] = new
+            {
+                advisory.MaxTurnsAboveThreshold,
+                advisory.MaxTurnsThreshold,
+                advisory.EffectiveMaxTurns,
+                advisory.TimeoutSecondsAboveThreshold,
+                advisory.TimeoutSecondsThreshold,
+                advisory.EffectiveTimeoutSeconds,
+                Warning = "The effective budget exceeds a configured staging advisory. Delegate one coherent stage "
+                    + "and split multi-stage work into separate sub-agent runs. This warning did not change the effective budget."
+            };
+        }
+
+        if (!ReadBool(arguments, "background"))
+        {
+            var terminal = await subAgentManager.WaitAsync(spawned.SubAgentId, sessionId, cancellationToken).ConfigureAwait(false);
+            result["status"] = terminal.Status;
+            result["resultSummary"] = SubAgentRunDetail.FromLive(terminal).ResultSummary;
+            result["result"] = SubAgentRunDetail.FromLive(terminal).Result;
+            var payload = JsonSerializer.Serialize(result, JsonOptions);
+            return TextResult(await subAgentManager.ConsumeResultAsync(terminal, toolCallId, Name,
+                JsonSerializer.Serialize(arguments), payload, cancellationToken, agentRunId).ConfigureAwait(false));
+        }
+        return TextResult(JsonSerializer.Serialize(result, JsonOptions));
     }
 
     private static SubAgentSpawnMode BuildSpawnMode(
@@ -135,8 +243,10 @@ public sealed class SubAgentSpawnTool(
     {
         if (!string.IsNullOrWhiteSpace(targetAgentId))
         {
-            var conflicts = new List<string>(6);
-            if (!string.IsNullOrWhiteSpace(name)) conflicts.Add("name");
+            var conflicts = new List<string>(5);
+            // #3570: `name` is absent by design. It is a run label, not a descriptor
+            // customisation, and rejecting it broke an automated PR-review workflow on
+            // 100% of its invocations. Only genuine descriptor fields belong here.
             if (!string.IsNullOrWhiteSpace(modelOverride)) conflicts.Add("model");
             if (!string.IsNullOrWhiteSpace(apiProviderOverride)) conflicts.Add("apiProvider");
             if (toolIds is { Count: > 0 }) conflicts.Add("tools");
@@ -148,10 +258,11 @@ public sealed class SubAgentSpawnTool(
                 throw new ArgumentException(
                     $"targetAgentId is incompatible with embody-only fields: {string.Join(", ", conflicts)}. "
                     + "Mirror mode runs the target agent's full descriptor verbatim — supply targetAgentId alone, "
-                    + "or omit it and customise via embody fields.");
+                    + "or omit it and customise via embody fields. The run-scoped name, maxTurns and "
+                    + "timeoutSeconds are accepted alongside targetAgentId.");
             }
 
-            return new Mirror(AgentId.From(targetAgentId));
+            return new Mirror(AgentId.From(targetAgentId), string.IsNullOrWhiteSpace(name) ? null : name);
         }
 
         var archetype = ResolveArchetype(archetypeRaw);

@@ -4,6 +4,7 @@
     <RootNamespace>BotNexus.Extensions.Channels.SignalR.BlazorClient</RootNamespace>
     <OverrideHtmlAssetPlaceholders>true</OverrideHtmlAssetPlaceholders>
     <ServiceWorkerAssetsManifest>service-worker-assets.js</ServiceWorkerAssetsManifest>
+    <UserGuideSourceRoot Condition="'$(UserGuideSourceRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\docs</UserGuideSourceRoot>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,5 +20,57 @@
     <ServiceWorker Include="wwwroot\service-worker.js"
                    PublishedContent="wwwroot\service-worker.published.js" />
   </ItemGroup>
+
+  <!--
+    In-app user guide.
+
+    The guide is NOT a second copy of the documentation. docs/user-guide stays the single source
+    and is copied into wwwroot at build time, because a hand-maintained in-app copy is exactly the
+    kind of thing that drifts: this repository has already shipped config examples using the wrong
+    field names and a model catalogue full of ids that no longer resolve, and both cost real
+    debugging time. One source cannot disagree with itself.
+
+    Generated files belong to this configuration/target framework's intermediate output, never
+    shared source wwwroot. Content Link metadata gives the SDK the same wwwroot/guide URLs while
+    keeping a concurrent Release build from deleting files already registered by Debug.
+
+    ResolveProjectStaticWebAssets consumes Content items evaluated before targets run, rather than
+    enumerating wwwroot. Reconcile and refresh the owned Content inventory before that target so
+    clean and incremental builds register the same assets, including removed or renamed sources.
+  -->
+  <Target Name="CopyUserGuide" BeforeTargets="ResolveProjectStaticWebAssets;BeforeBuild">
+    <PropertyGroup>
+      <!-- Resolve here: the SDK finalizes IntermediateOutputPath after project evaluation. -->
+      <UserGuideOutputRoot Condition="'$(UserGuideOutputRoot)' == ''">$(IntermediateOutputPath)user-guide</UserGuideOutputRoot>
+    </PropertyGroup>
+    <ItemGroup>
+      <!-- Ignore legacy generated source-tree output without deleting another build's files. -->
+      <Content Remove="wwwroot\guide\**" />
+      <Content Remove="$(UserGuideOutputRoot)\guide\**" />
+    </ItemGroup>
+    <RemoveDir Directories="$(UserGuideOutputRoot)\guide" />
+    <ItemGroup>
+      <UserGuideDoc Include="$(UserGuideSourceRoot)\user-guide\**\*.md" />
+      <UserGuideExtra Include="$(UserGuideSourceRoot)\skills.md" />
+      <UserGuideIndex Include="$(UserGuideSourceRoot)\user-guide\guide-index.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(UserGuideDoc)"
+          DestinationFiles="@(UserGuideDoc->'$(UserGuideOutputRoot)\guide\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(UserGuideExtra)"
+          DestinationFolder="$(UserGuideOutputRoot)\guide"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(UserGuideIndex)"
+          DestinationFolder="$(UserGuideOutputRoot)\guide"
+          SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <!-- Link is the SDK's logical discovery path; Identity remains configuration-owned. -->
+      <_UserGuideContent Include="$(UserGuideOutputRoot)\guide\**" />
+      <Content Include="@(_UserGuideContent)"
+               Link="wwwroot\guide\%(_UserGuideContent.RecursiveDir)%(_UserGuideContent.Filename)%(_UserGuideContent.Extension)"
+               ContentRoot="$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(UserGuideOutputRoot)'))"
+               CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
 
 </Project>

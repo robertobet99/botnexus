@@ -2,6 +2,7 @@ using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Triggers;
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Text.RegularExpressions;
@@ -14,8 +15,10 @@ namespace BotNexus.Cron.Actions;
 /// Dedicated cron action for system heartbeat jobs (actionType = "heartbeat").
 /// Handles quiet-hours gating, HEARTBEAT.md emptiness pre-check, and heartbeat-specific trigger routing.
 /// </summary>
-public sealed class HeartbeatAction : ICronAction
+public sealed class HeartbeatAction(TimeProvider? timeProvider = null) : ICronAction
 {
+    private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+
     /// <inheritdoc/>
     public string ActionType => "heartbeat";
 
@@ -59,64 +62,43 @@ public sealed class HeartbeatAction : ICronAction
         if (string.IsNullOrWhiteSpace(prompt))
             throw new InvalidOperationException("Heartbeat cron job must define a message prompt.");
 
-        // Pre-flight: defer a SCHEDULED heartbeat while the agent already has a run in flight.
-        // A background heartbeat firing mid-turn injects a redundant wake (or competes with the
-        // active run), so it is deferred until the next schedule when the agent is busy. Manual /
-        // immediate wakes keep their existing semantics and always fire. This is the
-        // "defer-when-active-run" behavior (#1500); the authoritative busy signal is the agent
-        // handle's IsRunning, which reflects the per-turn AgentStatus (not handle liveness).
-        if (context.TriggerType == CronTriggerType.Scheduled && HasActiveRun(context.Services, agentId))
-        {
-            logger?.LogDebug(
-                "Deferring scheduled heartbeat for agent '{AgentId}' \u2014 a run is currently active.",
-                agentId);
-            return;
-        }
+        // Activity in another conversation must not suppress a due ownership check.
+        // Session-level execution safety belongs to the trigger and agent handle.
+
+        // #2373: classify an unresolvable model override before dispatch so the run records the
+        // real reason instead of an opaque provider error raised deep inside the agent turn.
+        if (context.EffectiveModel is null)
+            CronModelPreflight.EnsureResolvable(
+            context.Services.GetService<BotNexus.Agent.Providers.Core.Registry.ModelRegistry>(),
+            context.Job.Model);
 
         var trigger = ResolveHeartbeatTrigger(context.Services, descriptor);
 
-        var sessionId = await trigger
-            .CreateSessionAsync(
-                agentId,
-                prompt,
-                cancellationToken,
-                new InternalTriggerRequest
-                {
-                    CronJobId = context.Job.Id,
-                    JobName = context.Job.Name,
-                    ModelOverride = context.Job.Model,
-                    ConversationId = context.Job.ConversationId,
-                    CreatedBy = context.Job.CreatedBy
-                })
-            .ConfigureAwait(false);
-
-        context.RecordSessionId(sessionId);
-    }
-
-    /// <summary>
-    /// Returns true when the agent has at least one live instance whose handle is currently
-    /// processing a turn. Used to defer scheduled heartbeats while a run is in flight (#1500).
-    /// Returns false when no supervisor is registered (e.g. minimal hosts) so heartbeats still fire.
-    /// </summary>
-    private static bool HasActiveRun(IServiceProvider services, AgentId agentId)
-    {
-        var supervisor = services.GetService<IAgentSupervisor>();
-        if (supervisor is null)
-            return false;
-
-        foreach (var instance in supervisor.GetAllInstances())
+        var request = new InternalTriggerRequest
         {
-            if (!instance.AgentId.Equals(agentId))
-                continue;
-
-            // GetHandle returns the live handle whose IsRunning reflects the agent's per-turn
-            // status; AgentInstance.Status is not transitioned per-turn, so it cannot be used here.
-            var handle = supervisor.GetHandle(instance.AgentId, instance.SessionId);
-            if (handle is { IsRunning: true })
-                return true;
+            CronJobId = context.Job.Id,
+            JobName = ExternalText.Sanitize(context.Job.Name, ExternalText.DefaultDisplayLength),
+            ModelOverride = context.Job.Model,
+            CronRequestedModel = context.EffectiveModel?.RequestedModel,
+            CronModelSource = context.EffectiveModel?.Source,
+            ConversationId = context.Job.ConversationId,
+            CreatedBy = context.Job.CreatedBy,
+            SessionCreatedAsync = context.PersistSessionIdAsync
+        };
+        SessionId sessionId;
+        try
+        {
+            sessionId = await trigger.CreateSessionAsync(agentId, prompt, cancellationToken, request)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            // SoulTrigger records partial activity before rethrowing interruption. Do not lose
+            // that evidence here, including measured usage and explicit completion disposition.
+            AgentPromptAction.RecordCost(context, request);
         }
 
-        return false;
+        context.RecordSessionId(sessionId);
     }
 
     /// <summary>
@@ -203,10 +185,10 @@ public sealed class HeartbeatAction : ICronAction
                 "No suitable internal trigger found for heartbeat action (heartbeat, soul, or cron).");
     }
 
-    private static bool IsInQuietHours(QuietHoursConfig config, string timezoneId)
+    private bool IsInQuietHours(QuietHoursConfig config, string timezoneId)
     {
-        var tz = TimeZoneHelper.Resolve(timezoneId);
-        var localNow = TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, tz);
+        var tz = CronTimeZoneResolver.Resolve(timezoneId);
+        var localNow = TimeZoneInfo.ConvertTime(_timeProvider.GetUtcNow(), tz);
         var currentTime = localNow.TimeOfDay;
 
         if (!TimeSpan.TryParse(config.Start, out var start) ||

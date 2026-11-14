@@ -1,3 +1,4 @@
+using BotNexus.Memory.Embeddings;
 using System.Reflection;
 using BotNexus.Domain.Primitives;
 using BotNexus.Agent.Core;
@@ -173,13 +174,27 @@ public sealed class SubAgentIntegrationTests
         var manager = CreateManager(supervisor.Object, registry.Object, workspaceManager: workspaceManager.Object);
         var spawned = await manager.SpawnAsync(CreateSpawnRequest());
 
-        await WaitUntilAsync(
+        await TestAwait.EventuallyAsync(
             async () => (await manager.GetAsync(spawned.SubAgentId))?.Status == SubAgentStatus.Completed,
-            TimeSpan.FromSeconds(2));
+            "the subagent status to become completed",
+            timeout: TimeSpan.FromSeconds(30));
         var completed = await manager.GetAsync(spawned.SubAgentId);
 
         completed.ShouldNotBeNull();
         completed!.Status.ShouldBe(SubAgentStatus.Completed);
+
+        // The Completed status flip happens strictly BEFORE child cleanup
+        // (CleanupChildAgentAsync -> StopAsync -> TryCleanupWorkspace), so status is not a
+        // happens-before edge for the workspace call. Waiting only on status verified work that was
+        // still in flight, and failed intermittently in CI (#2969) with the tell-tale Moq message
+        // "expected once, but was 0 times" that then printed the invocation as having occurred.
+        // The sibling SpawnFailure_/SpawnTimeout_CleansWorkspace tests already wait on this second
+        // signal; this case was the only one missing it.
+        await TestAwait.EventuallyAsync(
+            () => Task.FromResult(workspaceManager.Invocations.Count > 0),
+            "the completed subagent workspace cleanup invocation",
+            timeout: TimeSpan.FromSeconds(30));
+
         supervisor.Verify(s => s.StopAsync(
                 It.IsAny<BotNexus.Domain.Primitives.AgentId>(),
                 completed.ChildSessionId,
@@ -202,12 +217,14 @@ public sealed class SubAgentIntegrationTests
         var manager = CreateManager(supervisor.Object, registry.Object, workspaceManager: workspaceManager.Object);
         var spawned = await manager.SpawnAsync(CreateSpawnRequest());
 
-        await WaitUntilAsync(
+        await TestAwait.EventuallyAsync(
             async () => (await manager.GetAsync(spawned.SubAgentId))?.Status == SubAgentStatus.Failed,
-            TimeSpan.FromSeconds(2));
-        await WaitUntilAsync(
+            "the subagent status to become failed",
+            timeout: TimeSpan.FromSeconds(30));
+        await TestAwait.EventuallyAsync(
             () => Task.FromResult(workspaceManager.Invocations.Count > 0),
-            TimeSpan.FromSeconds(2));
+            "the failed subagent workspace cleanup invocation",
+            timeout: TimeSpan.FromSeconds(30));
 
         workspaceManager.Verify(w => w.TryCleanupWorkspace(It.IsAny<string>()), Times.Once);
     }
@@ -226,12 +243,14 @@ public sealed class SubAgentIntegrationTests
         var manager = CreateManager(supervisor.Object, registry.Object, workspaceManager: workspaceManager.Object);
         var spawned = await manager.SpawnAsync(CreateSpawnRequest(timeoutSeconds: 1));
 
-        await WaitUntilAsync(
+        await TestAwait.EventuallyAsync(
             async () => (await manager.GetAsync(spawned.SubAgentId))?.Status == SubAgentStatus.TimedOut,
-            TimeSpan.FromSeconds(3));
-        await WaitUntilAsync(
+            "the subagent status to become timed out",
+            timeout: TimeSpan.FromSeconds(30));
+        await TestAwait.EventuallyAsync(
             () => Task.FromResult(workspaceManager.Invocations.Count > 0),
-            TimeSpan.FromSeconds(2));
+            "the timed-out subagent workspace cleanup invocation",
+            timeout: TimeSpan.FromSeconds(30));
 
         workspaceManager.Verify(w => w.TryCleanupWorkspace(It.IsAny<string>()), Times.Once);
     }
@@ -334,20 +353,6 @@ public sealed class SubAgentIntegrationTests
         return handle;
     }
 
-    private static async Task WaitUntilAsync(Func<Task<bool>> condition, TimeSpan timeout)
-    {
-        var deadline = DateTimeOffset.UtcNow.Add(timeout);
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            if (await condition())
-                return;
-
-            await Task.Delay(25);
-        }
-
-        throw new TimeoutException("Condition was not met before timeout.");
-    }
-
     private static InProcessIsolationStrategy CreateStrategy(
         IConversationStore? conversationStore = null,
         ISessionStore? sessionStore = null)
@@ -427,13 +432,14 @@ public sealed class SubAgentIntegrationTests
         public Task<string> BuildSystemPromptAsync(
             AgentDescriptor descriptor,
             AgentExecutionContext? executionContext,
+            EffectiveExecutionSettings? effectiveSettings = null,
             CancellationToken ct = default)
             => Task.FromResult(descriptor.SystemPrompt ?? string.Empty);
     }
 
     private sealed class EmptyToolFactory : IAgentToolFactory
     {
-        public IReadOnlyList<IAgentTool> CreateTools(string workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null) => [];
+        public IReadOnlyList<IAgentTool> CreateTools(WorkingDir workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null) => [];
     }
 
     private sealed class TestWorkspaceManager : IAgentWorkspaceManager
@@ -462,7 +468,7 @@ public sealed class SubAgentIntegrationTests
     private sealed class StubMemoryStoreFactory : IMemoryStoreFactory
     {
         private readonly IMemoryStore _store = new StubMemoryStore();
-        public IMemoryStore Create(string agentId) => _store;
+        public IMemoryStore Create(AgentId agentId) => _store;
     }
 
     private sealed class StubMemoryStore : IMemoryStore
@@ -474,6 +480,19 @@ public sealed class SubAgentIntegrationTests
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
         public Task<IReadOnlyList<MemoryEntry>> SearchAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
+
+        // #2781: explicit pass-through. Required (not default-implemented) on IMemoryStore because
+        // Moq returns null for default interface methods rather than running the default body.
+        public async Task<IReadOnlyList<ScoredMemoryEntry>> SearchScoredAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+        {
+            var entries = await SearchAsync(query, topK, filter, ct);
+            return entries.Select(entry => new ScoredMemoryEntry(entry, 0d)).ToList();
+        }
+
+        // #3244: explicit pass-through with a NotAttempted scan report - this stub runs no bounded
+        // vector scan, so claiming any coverage would be a lie the caller could act on.
+        public async Task<MemorySearchResult> SearchWithReportAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+            => new(await SearchScoredAsync(query, topK, filter, ct), MemoryVectorScanReport.NotAttempted);
         public Task DeleteAsync(string id, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task<MemoryStoreStats> GetStatsAsync(CancellationToken ct = default) => Task.FromResult(new MemoryStoreStats(0, 0, null));

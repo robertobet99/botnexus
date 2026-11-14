@@ -17,16 +17,107 @@ public static class SessionJsonl
         JsonSerializerOptions options,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         var directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrWhiteSpace(directory))
             fileSystem.Directory.CreateDirectory(directory);
 
-        await using var stream = fileSystem.FileStream.New(path, FileMode.Create, FileAccess.Write, FileShare.Read);
-        await using var writer = new StreamWriter(stream, new UTF8Encoding(false));
+        var temporaryPath = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            await using (var stream = fileSystem.FileStream.New(
+                temporaryPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None))
+            {
+                await WriteAllToStreamAsync(stream, entries, options, cancellationToken).ConfigureAwait(false);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            fileSystem.File.Move(temporaryPath, path, overwrite: true);
+        }
+        finally
+        {
+            if (fileSystem.File.Exists(temporaryPath))
+                fileSystem.File.Delete(temporaryPath);
+        }
+    }
+
+    internal static async Task WriteAllToStreamAsync<TEntry>(
+        Stream stream,
+        IEnumerable<TEntry> entries,
+        JsonSerializerOptions options,
+        CancellationToken cancellationToken = default)
+    {
         foreach (var entry in entries)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var json = JsonSerializer.Serialize(entry, options);
-            await writer.WriteLineAsync(json).ConfigureAwait(false);
+            var line = Encoding.UTF8.GetBytes(json + "\n");
+            await stream.WriteAsync(line, cancellationToken).ConfigureAwait(false);
+        }
+
+        await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public static async Task AppendAsync<TEntry>(
+        IFileSystem fileSystem,
+        string path,
+        IEnumerable<TEntry> entries,
+        JsonSerializerOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory))
+            fileSystem.Directory.CreateDirectory(directory);
+
+        await using var stream = fileSystem.FileStream.New(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
+        stream.Position = stream.Length;
+        await AppendToStreamAsync(stream, entries, options, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static async Task AppendToStreamAsync<TEntry>(
+        Stream stream,
+        IEnumerable<TEntry> entries,
+        JsonSerializerOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        var originalLength = stream.Length;
+        stream.Position = originalLength;
+
+        try
+        {
+            foreach (var entry in entries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var json = JsonSerializer.Serialize(entry, options);
+                var line = Encoding.UTF8.GetBytes(json + "\n");
+                await stream.WriteAsync(line, cancellationToken).ConfigureAwait(false);
+            }
+
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception appendException)
+        {
+            try
+            {
+                stream.SetLength(originalLength);
+                stream.Position = originalLength;
+                await stream.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception rollbackException)
+            {
+                throw new IOException(
+                    "Session JSONL append failed and its partial write could not be rolled back.",
+                    new AggregateException(appendException, rollbackException));
+            }
+
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(appendException).Throw();
+            throw;
         }
     }
 

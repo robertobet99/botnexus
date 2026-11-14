@@ -29,7 +29,7 @@ internal static class CopilotResponsesRequestBuilder
             input.Insert(0, new JsonObject
             {
                 ["role"] = model.Reasoning ? "developer" : "system",
-                ["content"] = UnicodeSanitizer.SanitizeSurrogates(systemPrompt)
+                ["content"] = systemPrompt.SanitizeSurrogates()
             });
         }
         var payload = new JsonObject
@@ -69,6 +69,12 @@ internal static class CopilotResponsesRequestBuilder
             // does not request reasoning for a reasoning-capable model. Copilot has
             // never emitted that fallback, so the carve-out drops it.
         }
+        if (options?.ToolChoiceMode == BotNexus.Agent.Providers.Core.ToolChoice.None)
+        {
+            payload.Remove("tools");
+            payload["tool_choice"] = "none";
+        }
+
         return payload;
     }
 

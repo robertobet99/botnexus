@@ -1,5 +1,7 @@
 @using System.Text.Json.Nodes
 @using System.Globalization
+@using System.Text
+@using System.Text.RegularExpressions
 @using BotNexus.Extensions.Channels.SignalR.BlazorClient.Services
 @inject IModelOptionsProvider ModelOptions
 
@@ -24,7 +26,7 @@ else
             <div class="schema-group" data-group="@group.Key">
                 @if (!string.IsNullOrEmpty(group.Key))
                 {
-                    <h4 class="schema-group-title">@group.Key</h4>
+                    <h4 class="schema-group-title">@GroupLabel(group.Key)</h4>
                 }
                 @foreach (var (name, node) in group.Value)
                 {
@@ -48,6 +50,25 @@ else
     public EventCallback<JsonObject> ValueChanged { get; set; }
 
     /// <summary>
+    /// Raised with the JSON path of every node the user actually edits (issue #2059).
+    /// </summary>
+    /// <remarks>
+    /// The page needs to know <em>what changed</em>, not merely <em>that something changed</em>.
+    /// Without this the only honest save was "write back every section I loaded", which reverted
+    /// concurrent edits to sections the operator never touched. Collection lifecycle operations
+    /// report the collection's own path, because an add/remove/rename/reorder is a change to the
+    /// container rather than to one member.
+    /// </remarks>
+    [Parameter]
+    public EventCallback<string> PathChanged { get; set; }
+
+    private void MarkDirty(string path)
+    {
+        if (PathChanged.HasDelegate)
+            PathChanged.InvokeAsync(path);
+    }
+
+    /// <summary>
     /// When set, renders only the single root section with this property key (e.g. <c>"providers"</c>)
     /// instead of the whole config tree. Drives the sidebar-sectioned layout (#1892): the page keys
     /// a nav off the root schema properties and feeds the selected section here. Null/empty or an
@@ -57,6 +78,14 @@ else
     [Parameter]
     public string? SectionKey { get; set; }
 
+    /// <summary>
+    /// Optional schema-derived group within <see cref="SectionKey"/>. Ungrouped fields belong to
+    /// the deterministic <c>general</c> subsection. Unknown keys fall back to the first descriptor.
+    /// </summary>
+    [Parameter]
+    public string? SubsectionKey { get; set; }
+
+    private const string GeneralSubsectionKey = "general";
     private const string SecretSentinel = "***";
 
     private JsonObject? RootProperties
@@ -66,13 +95,70 @@ else
             var props = Schema?["schema"]?["properties"]?.AsObject();
             if (props is null || string.IsNullOrEmpty(SectionKey))
                 return props;
-            // Section view: narrow the root to just the selected property so the renderer draws a
-            // single section. Unknown key -> fall back to the full tree rather than a blank form.
+            // Section view: narrow the root to just the selected property so canonical paths still
+            // start at the real root. A subsection narrows only that cloned node's direct fields.
             if (props.TryGetPropertyValue(SectionKey, out var node) && node is JsonObject obj)
-                return new JsonObject { [SectionKey] = obj.DeepClone() };
+            {
+                var section = obj.DeepClone().AsObject();
+                var subsections = Subsections(SectionKey);
+                if (subsections.Count > 1 && section["properties"] is JsonObject sectionProperties)
+                {
+                    var selected = subsections.FirstOrDefault(item =>
+                        string.Equals(item.Key, SubsectionKey, StringComparison.OrdinalIgnoreCase));
+                    if (string.IsNullOrEmpty(selected.Key))
+                        selected = subsections[0];
+                    section["properties"] = FilterProperties(sectionProperties, selected.Key);
+                }
+                return new JsonObject { [SectionKey] = section };
+            }
             return props;
         }
     }
+
+    private static JsonObject FilterProperties(JsonObject properties, string subsectionKey)
+    {
+        var filtered = new JsonObject();
+        foreach (var (key, value) in properties)
+        {
+            if (value is not JsonObject node || !string.Equals(SubsectionKeyFor(node), subsectionKey, StringComparison.OrdinalIgnoreCase))
+                continue;
+            filtered[key] = node.DeepClone();
+        }
+        return filtered;
+    }
+
+    /// <summary>
+    /// Ordered subsection descriptors for a root section. They are derived from direct child
+    /// <c>x-ui-group</c> values, so generated/synthetic groups appear without page hardcoding.
+    /// </summary>
+    public IReadOnlyList<(string Key, string Label)> Subsections(string sectionKey) =>
+        DescribeSubsections(Schema, sectionKey);
+
+    public static IReadOnlyList<(string Key, string Label)> DescribeSubsections(JsonObject? schema, string sectionKey)
+    {
+        var properties = schema?["schema"]?["properties"]?[sectionKey]?["properties"]?.AsObject();
+        if (properties is null)
+            return [];
+
+        // Preserve the schema's declared property order. x-ui-order remains the ordering contract
+        // inside each subsection; using it across groups would make groups with the same local
+        // order drift alphabetically when an unrelated field is added.
+        var result = new List<(string Key, string Label)>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (_, value) in properties)
+        {
+            if (value is not JsonObject node)
+                continue;
+            var key = SubsectionKeyFor(node);
+            if (!seen.Add(key))
+                continue;
+            result.Add((key, key == GeneralSubsectionKey ? "General" : GroupLabel(key)));
+        }
+        return result;
+    }
+
+    private static string SubsectionKeyFor(JsonObject node) =>
+        node["x-ui-group"]?.GetValue<string>() is { Length: > 0 } group ? group : GeneralSubsectionKey;
 
     /// <summary>Ordered root section descriptors (key + label) for a sidebar/nav. Ignores <see cref="SectionKey"/>.</summary>
     public IReadOnlyList<(string Key, string Label)> RootSections()
@@ -195,6 +281,10 @@ else
             .OrderBy(kv => kv.Value["x-ui-order"]?.GetValue<int>() ?? int.MaxValue)
             .ThenBy(kv => kv.Key, StringComparer.Ordinal)
             .GroupBy(kv => kv.Value["x-ui-group"]?.GetValue<string>() ?? string.Empty)
+            // Fields that declare no group are the section's own; they read as orphans if they
+            // appear below the named buckets, so they are hoisted to the top where the card
+            // title already accounts for them.
+            .OrderBy(g => string.IsNullOrEmpty(g.Key) ? 0 : 1)
             .Select(g => new KeyValuePair<string, List<KeyValuePair<string, JsonObject>>>(g.Key, g.ToList()));
     }
 
@@ -222,6 +312,56 @@ else
 
     private static string Label(string name, JsonObject node) => node["x-ui-label"]?.GetValue<string>() ?? name;
 
+    /// <summary>
+    /// The field's explanatory text. Every generated field carries one - x-ui-description on all
+    /// 31 of the 34 gateway fields, for instance - and the renderer used to discard all of it,
+    /// which is why the forms read as a wall of bare labels.
+    /// </summary>
+    private static string? Description(JsonObject node)
+    {
+        var d = node["x-ui-description"]?.GetValue<string>() ?? node["description"]?.GetValue<string>();
+        return string.IsNullOrWhiteSpace(d) ? null : d;
+    }
+
+    // IDs are document-global, so a path alone cannot identify fields when two forms render the
+    // same schema. Keep one namespace for this component instance; the readonly value survives
+    // ordinary rerenders while a second instance receives a disjoint namespace.
+    private static int s_instances;
+    private readonly int _instance = Interlocked.Increment(ref s_instances);
+
+    /// <summary>
+    /// Stable DOM id for a field, so its label can carry a for= attribute. Hex-encoding the UTF-8
+    /// path is injective: supported names such as <c>a.b</c> and <c>a-b</c> cannot collapse after
+    /// punctuation replacement, and no configuration-path semantics need to change.
+    /// </summary>
+    private string FieldId(string path) => $"cfg-i{_instance.ToString(CultureInfo.InvariantCulture)}-{Convert.ToHexString(Encoding.UTF8.GetBytes(path))}";
+
+    /// <summary>
+    /// x-ui-group values are kebab-case slugs ("tool-result-persistence"). Render them as prose.
+    /// </summary>
+    /// <summary>
+    /// True when a group heading would only restate the title of the card containing it -
+    /// "Session store" > SESSION STORE. Compared on alphanumerics alone so kebab-case slugs
+    /// match their prose labels, and by prefix so "rate-limit" matches "Rate limiting".
+    /// </summary>
+    private static bool GroupRestatesOwner(string slug, string ownerLabel)
+    {
+        static string Normalise(string v) =>
+            new string(v.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+
+        var g = Normalise(slug);
+        var o = Normalise(ownerLabel);
+        if (g.Length == 0 || o.Length == 0)
+            return false;
+        return g.StartsWith(o, StringComparison.Ordinal) || o.StartsWith(g, StringComparison.Ordinal);
+    }
+
+    private static string GroupLabel(string slug)
+    {
+        var words = slug.Replace('-', ' ').Replace('_', ' ').Trim();
+        return words.Length == 0 ? words : char.ToUpperInvariant(words[0]) + words[1..];
+    }
+
     // Recursive node dispatcher: object -> children; dict -> entries; array -> items; else widget.
     private RenderFragment RenderNode(string name, JsonObject node, string path) => __builder =>
     {
@@ -229,26 +369,69 @@ else
         {
             <fieldset class="schema-object" data-testid="@($"object-{path}")">
                 <legend>@Label(name, node)</legend>
+                @if (Description(node) is { } objectDescription)
+                {
+                    <p class="schema-object-description">@objectDescription</p>
+                }
+                @* OrderAndGroup already buckets these by x-ui-group. The grouping was computed
+                   here and then thrown away - only group.Value was read - so every field inside
+                   a section rendered as one flat run regardless of the group it declared. The
+                   schema has carried the buckets all along; this just draws them. *@
                 @foreach (var group in OrderAndGroup(node["properties"]?.AsObject()))
                 {
-                    @foreach (var (childName, childNode) in group.Value)
-                    {
-                        @RenderNode(childName, childNode, $"{path}.{childName}")
-                    }
+                    <div class="schema-subgroup" data-group="@group.Key">
+                        @if (!string.IsNullOrEmpty(group.Key) && !GroupRestatesOwner(group.Key, Label(name, node)))
+                        {
+                            <h5 class="schema-subgroup-title">@GroupLabel(group.Key)</h5>
+                        }
+                        @foreach (var (childName, childNode) in group.Value)
+                        {
+                            @RenderNode(childName, childNode, $"{path}.{childName}")
+                        }
+                    </div>
                 }
             </fieldset>
         }
         else if (IsDictionary(node))
         {
             var valueSchema = node["additionalProperties"]!.AsObject();
+            var immutableKeys = node["x-ui-immutable-keys"]?.GetValue<bool>() == true;
+            var dict = Resolve(path) as JsonObject;
             <fieldset class="schema-dict" data-testid="@($"dict-{path}")">
                 <legend>@Label(name, node)</legend>
-                @foreach (var entry in (Resolve(path) as JsonObject)?.ToList() ?? [])
+                @if (Description(node) is { } dictionaryDescription)
                 {
-                    <div class="schema-dict-entry" data-key="@entry.Key">
-                        <span class="schema-dict-key">@entry.Key</span>
-                        @RenderNode(entry.Key, valueSchema, $"{path}.{entry.Key}")
+                    <p class="schema-collection-description">@dictionaryDescription</p>
+                }
+                @foreach (var entry in dict?.ToList() ?? [])
+                {
+                    var key = entry.Key;
+                    var renameStateKey = $"{path}::{key}";
+                    <div class="schema-dict-entry" data-key="@key">
+                        <span class="schema-dict-key">@key</span>
+                        @if (!immutableKeys)
+                        {
+                            <input class="dict-rename-input" data-testid="@($"dict-rename-input-{path}-{key}")"
+                                   value="@(_renameKeys.TryGetValue(renameStateKey, out var rn) ? rn : key)"
+                                   @onchange="e => _renameKeys[renameStateKey] = e.Value?.ToString() ?? string.Empty" />
+                            <button type="button" class="dict-rename" data-testid="@($"dict-rename-{path}-{key}")"
+                                    @onclick="() => RenameDictEntry(path, node, key)">Rename</button>
+                        }
+                        @RenderNode(key, valueSchema, $"{path}.{key}")
+                        <button type="button" class="dict-entry-delete" data-testid="@($"dict-delete-{path}-{key}")"
+                                @onclick="() => RemoveDictEntry(path, key)">Delete</button>
                     </div>
+                }
+                <div class="schema-dict-add">
+                    <input class="dict-newkey" data-testid="@($"dict-newkey-{path}")"
+                           value="@(_newKeys.TryGetValue(path, out var nk) ? nk : string.Empty)"
+                           @onchange="e => _newKeys[path] = e.Value?.ToString() ?? string.Empty" />
+                    <button type="button" class="dict-add" data-testid="@($"dict-add-{path}")"
+                            @onclick="() => AddDictEntry(path, node, valueSchema)">Add</button>
+                </div>
+                @if (_collectionErrors.TryGetValue(path, out var derr) && derr is not null)
+                {
+                    <span class="schema-dict-error" data-testid="@($"dict-error-{path}")">@derr</span>
                 }
             </fieldset>
         }
@@ -258,9 +441,28 @@ else
             var arr = Resolve(path) as JsonArray ?? [];
             <fieldset class="schema-array" data-testid="@($"array-{path}")">
                 <legend>@Label(name, node)</legend>
+                @if (Description(node) is { } arrayDescription)
+                {
+                    <p class="schema-collection-description">@arrayDescription</p>
+                }
                 @for (var i = 0; i < arr.Count; i++)
                 {
-                    @RenderNode($"[{i}]", itemSchema, $"{path}[{i}]")
+                    var index = i;
+                    <div class="schema-array-item" data-index="@index">
+                        @RenderNode($"[{index}]", itemSchema, $"{path}[{index}]")
+                        <button type="button" class="array-item-up" data-testid="@($"array-up-{path}-{index}")"
+                                disabled="@(index == 0)" @onclick="() => MoveListItem(path, index, -1)">Up</button>
+                        <button type="button" class="array-item-down" data-testid="@($"array-down-{path}-{index}")"
+                                disabled="@(index == arr.Count - 1)" @onclick="() => MoveListItem(path, index, 1)">Down</button>
+                        <button type="button" class="array-item-remove" data-testid="@($"array-remove-{path}-{index}")"
+                                @onclick="() => RemoveListItem(path, index)">Remove</button>
+                    </div>
+                }
+                <button type="button" class="array-add" data-testid="@($"array-add-{path}")"
+                        @onclick="() => AddListItem(path, itemSchema)">Add</button>
+                @if (_collectionErrors.TryGetValue(path, out var aerr) && aerr is not null)
+                {
+                    <span class="schema-array-error" data-testid="@($"array-error-{path}")">@aerr</span>
                 }
             </fieldset>
         }
@@ -281,22 +483,26 @@ else
         var textValue = AsString(current) ?? "";
         var numberValue = current?.ToString() ?? "";
         var selectValue = AsString(current) ?? "";
-        <div class="schema-field" data-testid="@($"field-{path}")">
-            <label class="schema-field-label">@Label(name, node)</label>
+        var fieldId = FieldId(path);
+        var description = Description(node);
+        var describedBy = description is null ? null : $"{fieldId}-desc";
+        <div class="schema-field schema-field-@widget" data-testid="@($"field-{path}")">
+            <label class="schema-field-label" for="@fieldId">@Label(name, node)</label>
+            <div class="schema-field-control">
             @if (widget == "toggle")
             {
-                <input type="checkbox" checked="@(AsBool(Resolve(path)))"
+                <input type="checkbox" id="@fieldId" aria-describedby="@describedBy" checked="@(AsBool(Resolve(path)))"
                        @onchange="e => Set(path, JsonValue.Create((bool)e.Value!))" />
             }
             else if (widget == "number")
             {
-                <input type="number" value="@numberValue"
+                <input type="number" id="@fieldId" aria-describedby="@describedBy" value="@numberValue"
                        @onchange="e => SetNumber(path, e.Value?.ToString())" />
             }
             else if (widget == "select")
             {
                 var options = SelectOptions(node, path);
-                <select value="@selectValue"
+                <select value="@selectValue" id="@fieldId" aria-describedby="@describedBy"
                         @onchange="e => Set(path, JsonValue.Create(e.Value?.ToString()))">
                     @* Blank sentinel so an unset/optional select can stay empty and a dynamic list
                        that has not loaded yet still shows the current value. *@
@@ -309,19 +515,24 @@ else
             }
             else if (IsSecret(node))
             {
-                <input type="password" placeholder="@secretPlaceholder"
+                <input type="password" id="@fieldId" aria-describedby="@describedBy" placeholder="@secretPlaceholder"
                        value="@secretValue"
                        @onchange="e => Set(path, JsonValue.Create(e.Value?.ToString()))" />
             }
             else
             {
-                <input type="text" value="@textValue"
+                <input type="text" id="@fieldId" aria-describedby="@describedBy" value="@textValue"
                        @onchange="e => Set(path, JsonValue.Create(e.Value?.ToString()))" />
+            }
+            @if (description is not null)
+            {
+                <p class="schema-field-description" id="@describedBy">@description</p>
             }
             @if (error is not null)
             {
                 <span class="schema-field-error">@error</span>
             }
+            </div>
         </div>
     };
 
@@ -348,17 +559,232 @@ else
         return cur;
     }
 
+    // Collection-lifecycle UI state. Keyed by the collection's JSON path so multiple
+    // dictionaries/arrays on one form keep independent draft keys and error messages.
+    private readonly Dictionary<string, string> _newKeys = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _renameKeys = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string?> _collectionErrors = new(StringComparer.Ordinal);
+
+    // Writes a value at an arbitrary object-or-array path, creating intermediate objects as needed
+    // and traversing existing arrays by index. The previous implementation only walked JsonObject
+    // intermediates, so any path passing through a JsonArray element (e.g. models[0].id or a
+    // dictionary-of-objects entry) silently wrote into a fresh object graph and lost the edit
+    // (#2062). Traversal now mirrors Resolve(): a "[i]" token indexes the current JsonArray, every
+    // other token indexes the current JsonObject.
     private void Set(string path, JsonNode? value)
     {
         var segs = Tokenize(path).ToList();
-        JsonObject obj = Value;
+        JsonNode? cur = Value;
         for (var i = 0; i < segs.Count - 1; i++)
         {
-            if (obj[segs[i]] is not JsonObject next) { next = []; obj[segs[i]] = next; }
-            obj = next;
+            var seg = segs[i];
+            if (seg.StartsWith('['))
+            {
+                var idx = int.Parse(seg.Trim('[', ']'), CultureInfo.InvariantCulture);
+                var array = cur as JsonArray ?? throw new InvalidOperationException($"Path segment '{seg}' expects an array at '{path}'.");
+                cur = array[idx];
+            }
+            else
+            {
+                var obj = cur as JsonObject ?? throw new InvalidOperationException($"Path segment '{seg}' expects an object at '{path}'.");
+                // Look ahead: if the next token indexes an array, the intermediate must be an array,
+                // otherwise create/keep an object.
+                var nextIsIndex = segs[i + 1].StartsWith('[');
+                if (nextIsIndex)
+                {
+                    if (obj[seg] is not JsonArray arr) { arr = []; obj[seg] = arr; }
+                    cur = arr;
+                }
+                else
+                {
+                    if (obj[seg] is not JsonObject next) { next = []; obj[seg] = next; }
+                    cur = next;
+                }
+            }
         }
-        obj[segs[^1]] = value;
+
+        var last = segs[^1];
+        if (last.StartsWith('['))
+        {
+            var idx = int.Parse(last.Trim('[', ']'), CultureInfo.InvariantCulture);
+            var array = cur as JsonArray ?? throw new InvalidOperationException($"Path segment '{last}' expects an array at '{path}'.");
+            array[idx] = value;
+        }
+        else
+        {
+            var obj = cur as JsonObject ?? throw new InvalidOperationException($"Path segment '{last}' expects an object at '{path}'.");
+            obj[last] = value;
+        }
+        MarkDirty(path);
         ValueChanged.InvokeAsync(Value);
+    }
+
+    // ── List lifecycle (#2062) ──────────────────────────────────────────────
+
+    // Ensures the array at path exists (creating it in place without disturbing siblings) and
+    // returns it. Uses Set's exact-path traversal so a nested/array-embedded collection is created
+    // at the right spot rather than replacing an unrelated sibling.
+    private JsonArray EnsureArray(string path)
+    {
+        if (Resolve(path) is JsonArray existing)
+            return existing;
+        var created = new JsonArray();
+        Set(path, created);
+        return (Resolve(path) as JsonArray)!;
+    }
+
+    private JsonObject EnsureObject(string path)
+    {
+        if (Resolve(path) is JsonObject existing)
+            return existing;
+        var created = new JsonObject();
+        Set(path, created);
+        return (Resolve(path) as JsonObject)!;
+    }
+
+    private void AddListItem(string path, JsonObject itemSchema)
+    {
+        var arr = EnsureArray(path);
+        arr.Add(DefaultForSchema(itemSchema));
+        _collectionErrors[path] = null;
+        MarkDirty(path);
+        ValueChanged.InvokeAsync(Value);
+    }
+
+    private void RemoveListItem(string path, int index)
+    {
+        if (Resolve(path) is JsonArray arr && index >= 0 && index < arr.Count)
+        {
+            arr.RemoveAt(index);
+            MarkDirty(path);
+            ValueChanged.InvokeAsync(Value);
+        }
+    }
+
+    // Moves an item by a signed delta (-1 up, +1 down). Reorders in place by detaching and
+    // re-inserting the node so unrelated siblings are untouched.
+    private void MoveListItem(string path, int index, int delta)
+    {
+        if (Resolve(path) is not JsonArray arr)
+            return;
+        var target = index + delta;
+        if (index < 0 || index >= arr.Count || target < 0 || target >= arr.Count)
+            return;
+        var node = arr[index];
+        arr.RemoveAt(index);
+        var clone = node?.DeepClone();
+        arr.Insert(target, clone);
+        MarkDirty(path);
+        ValueChanged.InvokeAsync(Value);
+    }
+
+    // ── Dictionary lifecycle (#2062) ────────────────────────────────────────
+
+    private void AddDictEntry(string path, JsonObject dictNode, JsonObject valueSchema)
+    {
+        var key = (_newKeys.TryGetValue(path, out var k) ? k : string.Empty).Trim();
+        var dict = Resolve(path) as JsonObject;
+        var error = ValidateKey(dictNode, key, dict, originalKey: null);
+        if (error is not null) { _collectionErrors[path] = error; return; }
+
+        var target = EnsureObject(path);
+        target[key] = DefaultForSchema(valueSchema);
+        _newKeys[path] = string.Empty;
+        _collectionErrors[path] = null;
+        MarkDirty(path);
+        ValueChanged.InvokeAsync(Value);
+    }
+
+    private void RemoveDictEntry(string path, string key)
+    {
+        if (Resolve(path) is JsonObject dict && dict.ContainsKey(key))
+        {
+            dict.Remove(key);
+            _collectionErrors[path] = null;
+            MarkDirty(path);
+            ValueChanged.InvokeAsync(Value);
+        }
+    }
+
+    // Renames a dictionary key while preserving the entry's value and its position among siblings.
+    // Rebuilds the object in order so a rename does not reorder unrelated entries (JsonObject has no
+    // in-place rename). Immutable-key dictionaries never render a rename control, so this is a no-op
+    // guard for them.
+    private void RenameDictEntry(string path, JsonObject dictNode, string originalKey)
+    {
+        if (dictNode["x-ui-immutable-keys"]?.GetValue<bool>() == true)
+            return;
+        var renameStateKey = $"{path}::{originalKey}";
+        var newKey = (_renameKeys.TryGetValue(renameStateKey, out var nk) ? nk : originalKey).Trim();
+        if (Resolve(path) is not JsonObject dict)
+            return;
+        if (string.Equals(newKey, originalKey, StringComparison.Ordinal))
+        {
+            _collectionErrors[path] = null;
+            return;
+        }
+        var error = ValidateKey(dictNode, newKey, dict, originalKey);
+        if (error is not null) { _collectionErrors[path] = error; return; }
+
+        // Rebuild preserving order: swap the key in place.
+        var entries = dict.ToList();
+        foreach (var e in entries)
+            dict.Remove(e.Key);
+        foreach (var e in entries)
+        {
+            var emitKey = string.Equals(e.Key, originalKey, StringComparison.Ordinal) ? newKey : e.Key;
+            dict[emitKey] = e.Value?.DeepClone();
+        }
+        _renameKeys.Remove(renameStateKey);
+        _collectionErrors[path] = null;
+        MarkDirty(path);
+        ValueChanged.InvokeAsync(Value);
+    }
+
+    // Validates a proposed dictionary key against schema metadata: non-empty, unique (ignoring the
+    // entry being renamed), and matching any x-ui-key-pattern regex the schema supplies.
+    private static string? ValidateKey(JsonObject dictNode, string key, JsonObject? dict, string? originalKey)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            return "Key must not be empty.";
+        if (dict is not null && dict.ContainsKey(key) && !string.Equals(key, originalKey, StringComparison.Ordinal))
+            return $"Key '{key}' already exists.";
+        var pattern = dictNode["x-ui-key-pattern"]?.GetValue<string>();
+        if (!string.IsNullOrEmpty(pattern) && !Regex.IsMatch(key, pattern))
+            return $"Key '{key}' does not match required pattern.";
+        return null;
+    }
+
+    // Builds an empty-but-valid default value for a freshly added collection item/entry from its
+    // schema node: objects get their declared child scalars defaulted, arrays start empty, scalars
+    // use their schema default or a type-appropriate empty value.
+    private static JsonNode? DefaultForSchema(JsonObject schema)
+    {
+        if (IsObject(schema))
+        {
+            var obj = new JsonObject();
+            if (schema["properties"] is JsonObject props)
+            {
+                foreach (var (childName, childNode) in props)
+                {
+                    if (childNode is JsonObject childObj)
+                        obj[childName] = DefaultForSchema(childObj);
+                }
+            }
+            return obj;
+        }
+        if (IsDictionary(schema))
+            return new JsonObject();
+        if (IsArray(schema))
+            return new JsonArray();
+        if (schema["default"] is JsonNode def)
+            return def.DeepClone();
+        return NodeType(schema) switch
+        {
+            "boolean" => JsonValue.Create(false),
+            "integer" or "number" => JsonValue.Create(0),
+            _ => JsonValue.Create(string.Empty),
+        };
     }
 
     private void SetNumber(string path, string? raw)

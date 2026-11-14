@@ -20,17 +20,50 @@ public interface ISessionStore
     Task<GatewaySession?> GetAsync(SessionId sessionId, CancellationToken ct = default);
     Task<GatewaySession> GetOrCreateAsync(SessionId sessionId, AgentId agentId, CancellationToken ct = default);
     Task SaveAsync(GatewaySession session, CancellationToken ct = default);
+    Task<SessionSaveOutcome> SaveAsync(GatewaySession session, SessionWriteFence fence, CancellationToken ct = default);
     Task DeleteAsync(SessionId sessionId, CancellationToken ct = default);
-    
+
+    // Atomic mutations (read-modify-write under the store's own lock)
+    Task<SessionAppendMutationResult> AppendEntriesAsync(...);
+    Task<SessionMetadataMutationResult> PatchMetadataAsync(...);
+    Task<SessionStatusMutationResult> TransitionStatusAsync(...);
+
     // Queries
-    Task<IReadOnlyList<GatewaySession>> ListAsync(AgentId agentId, CancellationToken ct = default);
-    Task<IReadOnlyList<GatewaySession>> QueryAsync(ExistenceQuery query, CancellationToken ct = default);
-    
+    Task<IReadOnlyList<GatewaySession>> ListAsync(AgentId? agentId = null, CancellationToken ct = default);
+    Task<IReadOnlyList<SessionSummary>> ListSummariesAsync(...);
+    Task<SessionSummaryPage> ListSummaryPageAsync(...);
+    Task<IReadOnlyList<GatewaySession>> ListByChannelAsync(...);
+    Task<IReadOnlyList<GatewaySession>> ListByConversationAsync(...);
+    Task<IReadOnlyList<GatewaySession>> GetExistenceAsync(...);
+    Task<SessionStats?> GetStatsAsync(AgentId? agentId = null, CancellationToken ct = default);
+
     // Lifecycle
     Task ArchiveAsync(SessionId sessionId, CancellationToken ct = default);
-    Task<int> CleanupExpiredAsync(TimeSpan retention, CancellationToken ct = default);
+
+    // Sub-agent session records
+    Task SaveSubAgentSessionAsync(SubAgentInfo info, CancellationToken ct = default);
+    Task UpdateSubAgentSessionAsync(...);
+    Task<IReadOnlyList<SubAgentSessionSummary>> ListSubAgentSessionsAsync(...);
+    Task<IReadOnlyList<SubAgentSessionSummary>> ListAllSubAgentSessionsAsync(...);
 }
 ```
+
+See [ISessionStore.cs](../../src/gateway/BotNexus.Gateway.Contracts/Sessions/ISessionStore.cs)
+for the authoritative signatures and per-member contracts.
+
+### The fenced save overload
+
+`SaveAsync(session, fence, ct)` is the write path the gateway's post-run finalizer uses. It
+persists **only if** the on-disk row still matches the run identity captured in the
+`SessionWriteFence` at run start. When the row was deleted, sealed by a competing reset, or
+rebound to a different conversation while the run was in flight, the write is skipped and
+`SessionSaveOutcome.Rebound` is returned rather than resurrecting or clobbering the row
+(issue #1518). The unfenced `SaveAsync` keeps unconditional create-or-update semantics for
+pre-run write-ahead saves that must be able to create the row.
+
+The default implementation re-reads via `GetAsync` and applies the fence before delegating.
+Stores that can do the re-read and the write under a single lock - the SQLite store - override
+it to close the check-then-write window atomically.
 
 ## GatewaySession Model
 
@@ -80,7 +113,18 @@ public record SessionParticipant
 
 ## SessionStoreBase
 
-Abstract base class that implements common logic: `GetOrCreateAsync` (auto-create sessions on demand), `ArchiveAsync` (seal sessions). Defines abstract methods (`GetInternalAsync`, `SaveInternalAsync`, `DeleteInternalAsync`, `ListInternalAsync`) for subclasses to implement storage-specific behavior.
+Abstract base class implementing the query, mutation, and lifecycle logic that is identical
+across every backing store, so a concrete store only implements storage access. Its abstract
+members are `GetAsync`, `GetOrCreateAsync`, `SaveAsync`, `DeleteAsync`, `ArchiveAsync`, and the
+protected `EnumerateSessionsAsync`. Everything else - the fenced `SaveAsync` overload, the three
+atomic mutations (`AppendEntriesAsync`, `PatchMetadataAsync`, `TransitionStatusAsync`), the
+summary/paging/channel/conversation queries, and the sub-agent session records - is `virtual`,
+so a store overrides only what it can do better (the SQLite store overrides the fenced save and
+the mutations to close the check-then-write window under one lock).
+
+It also owns the **archive drain**: `ConfigureArchiveDrain(runDrain, drainTimeout)` lets the
+gateway supply a drain so `ArchiveAsync` waits for an in-flight run to finish before sealing,
+bounded by `DefaultArchiveDrainTimeout` (30 seconds).
 
 See [SessionStoreBase.cs](../../src/gateway/BotNexus.Gateway.Sessions/SessionStoreBase.cs)
 
@@ -96,6 +140,12 @@ See [SessionStoreBase.cs](../../src/gateway/BotNexus.Gateway.Sessions/SessionSto
 Uses `ConcurrentDictionary<string, GatewaySession>` for O(1) lookups. Non-durable — all data lost on restart. Suitable for testing and development.
 
 See [InMemorySessionStore.cs](../../src/gateway/BotNexus.Gateway.Sessions/InMemorySessionStore.cs)
+
+## FileSessionStore
+
+The file-backed implementation stores history as JSONL plus a small metadata sidecar. Ordinary saves append only the unpersisted history tail to the JSONL file, so adding one turn does not serialize and recreate the existing transcript. Explicit destructive history mutations, such as compaction projection or sentinel removal, rewrite the JSONL file from the reconciled in-memory history because a line-oriented file has no stable row-update primitive. Whole-session deletion and archival remain explicit lifecycle operations.
+
+See [FileSessionStore.cs](../../src/gateway/BotNexus.Gateway.Sessions/FileSessionStore.cs)
 
 ## SqliteSessionStore
 
@@ -143,7 +193,7 @@ CREATE INDEX idx_sessions_session_type ON sessions(session_type);
 CREATE INDEX idx_sessions_created_at ON sessions(created_at);
 ```
 
-**Key behaviors:** Parameterized queries throughout, `INSERT OR REPLACE` for upserts, JSON serialization for complex fields (`participants_json`, `metadata`). Session history stored in the separate `session_history` table. Lazy schema initialization via `EnsureSchemaAsync`, and ISO 8601 date formatting.
+**Key behaviors:** Parameterized queries throughout, conflict-targeted upserts for the session row, JSON serialization for complex fields (`participants_json`, `metadata`), lazy schema initialization via `EnsureCreatedAsync`, and ISO 8601 date formatting. Session history lives in the separate `session_history` table and is append-oriented: an ordinary aggregate save inserts only the unpersisted tail. Explicit destructive mutations such as compaction projection or crash-sentinel cleanup reconcile rows by their durable `session_history.id`, preserving unchanged row identities and deleting only rows that were explicitly removed. Whole-session history deletion is reserved for deleting the session itself or repairing a dangling session whose owning conversation no longer exists. The existing `session.save` activity reports bounded `append`/`reconcile` mode plus numeric inserted, updated, and deleted row counts; no session or row identifier is added as a mutation tag.
 
 ### History entry flags
 
@@ -185,44 +235,57 @@ See [SqliteSessionStore.cs](../../src/gateway/BotNexus.Gateway.Sessions/SqliteSe
 **Example Queries:**
 
 ```csharp
-// Find all active UserAgent sessions for an agent
-var query = new ExistenceQuery
+var agentId = AgentId.From("my-agent");
+
+// Find all active UserAgent sessions the agent owns or participates in
+var activeQuery = new ExistenceQuery
 {
-    AgentId = AgentId.From("my-agent"),
     SessionType = SessionType.UserAgent,
     Status = SessionStatus.Active
 };
-var sessions = await _sessionStore.QueryAsync(query, ct);
+var sessions = await _sessionStore.GetExistenceAsync(agentId, activeQuery, ct);
 
-// Find all soul sessions created in the last 7 days
-var query = new ExistenceQuery
+// Find that agent's soul sessions created in the last 7 days
+var soulQuery = new ExistenceQuery
 {
     SessionType = SessionType.Soul,
     CreatedAfter = DateTimeOffset.UtcNow.AddDays(-7),
     Limit = 100
 };
-var recentSoulSessions = await _sessionStore.QueryAsync(query, ct);
+var recentSoulSessions = await _sessionStore.GetExistenceAsync(agentId, soulQuery, ct);
 ```
 
 ## Session Cleanup
 
 **Automatic Cleanup:**
 
-`CleanupExpiredAsync` deletes sessions with expired status and `updated_at` older than the retention cutoff. See [SqliteSessionStore.cs](../../src/gateway/BotNexus.Gateway.Sessions/SqliteSessionStore.cs)
+There is no store-level bulk-expiry method. Cleanup is driven entirely by
+`SessionCleanupService`, which enumerates sessions and calls `DeleteAsync` per session for the
+rows that qualify.
 
 **SessionCleanupService:**
 
-`BackgroundService` that periodically calls `CleanupExpiredAsync` with configurable interval and retention period. Logs results and handles errors with 5-minute retry backoff.
+A `BackgroundService` that wakes on `CheckInterval` and calls `RunCleanupOnceAsync`. Each pass
+**skips any session with an agent run in flight** (logged, retried next pass) and then deletes:
+
+- sessions idle beyond `SessionTtl`;
+- closed sessions older than `ClosedSessionRetention`, when configured;
+- cron sessions whose run did no work, older than `CronNoopRetention`.
+
+Each deletion emits a `SessionLifecycleEventType.Deleted` event. A failed iteration is logged as
+a warning and retried on the next interval rather than terminating the service.
 
 See [SessionCleanupService.cs](../../src/gateway/BotNexus.Gateway/SessionCleanupService.cs)
 
 **SessionCleanupOptions:**
 
 ```csharp
-public record SessionCleanupOptions
+public sealed class SessionCleanupOptions
 {
-    public TimeSpan CleanupInterval { get; init; } = TimeSpan.FromHours(1);
-    public TimeSpan RetentionPeriod { get; init; } = TimeSpan.FromDays(30);
+    public TimeSpan CheckInterval { get; set; } = TimeSpan.FromMinutes(5);
+    public TimeSpan SessionTtl { get; set; } = TimeSpan.FromHours(24);
+    public TimeSpan? ClosedSessionRetention { get; set; }
+    public TimeSpan? CronNoopRetention { get; set; } = TimeSpan.FromDays(7);
 }
 ```
 
@@ -293,3 +356,63 @@ See [SessionWarmupService.cs](../../src/gateway/BotNexus.Gateway/Sessions/Sessio
 3. Index frequently queried fields (agent_id, status, session_type)
 4. Run cleanup service to prevent unbounded growth
 5. Use session warmup to avoid N+1 queries in UI
+
+### Single-copy tool arguments and results
+
+For SQLite contributors, the durable tool execution record is `tool_invocations`.
+`session_history` keeps conversation messages and ordered tool markers linked by
+`tool_invocation_id`. Normal tool arguments and result bodies belong on the invocation,
+not on both history markers. In-memory `SessionEntry` projections can still contain the
+arguments and results needed by providers, history views and exports.
+
+A result marker whose arguments were moved to its invocation records
+`tool_args_from_invocation = 1`. Reads reconstruct those arguments through the link.
+An unmarked historical result with `tool_args = NULL` continues to mean that the result
+projection had no arguments. These cases are different; do not infer argument presence
+from the invocation link alone. Arguments are execution input owned by the invocation; a result carrying different
+arguments is a producer defect, not independent post-execution evidence. The linked
+invocation's arguments are canonical. Unique historical result bodies remain intact
+when they cannot be reconstructed from the authoritative invocation.
+
+Append, retry and explicit history replacement must preserve this storage shape. Before
+changing a shared invocation, the store preserves older distinct result bodies; exact
+copies can then be reduced to references again in the same transaction.
+
+### Bulk historical migration
+
+After the startup delay, the SQLite worker performs a set-based SQL pass rather than
+restarting 100-row discovery batches. In one transaction it populates missing execution
+records, links history rows, clears redundant payloads, and records completion in
+`legacy_tool_bulk_migration`. Errors roll back the data and completion record together.
+Completion is versioned. Version 1 populates and links missing execution records.
+Version 2 also removes exact duplicate fields from already-linked legacy rows whose
+`message_kind` is NULL. A database with version 1 already complete runs only the cleanup
+upgrade: it does not repopulate executions, relink history, or replace the original
+completion record. Data changes and the version 2 record commit together. A failure
+rolls back both, and a later attempt can retry. Once version 2 completes, later
+restarts skip the pass. Manual bounded maintenance APIs remain available for
+compatibility; the automatic worker uses the bulk pass.
+
+Legacy arguments and content are checked independently against the linked invocation
+in the same session. Only exact copies are cleared. Distinct start arguments and
+result bodies remain in history. The `tool_args_from_invocation` and
+`tool_content_from_invocation` flags record which absent fields must be reconstructed.
+They preserve NULL message kinds and distinguish removed copies from historically
+absent fields. History reads, bounded scans, byte accounting, and later writes use
+these flags. The upgrade does not infer a start/result label from payload presence.
+
+SQL joins and byte equality protect unique result bodies. The pass does not hydrate
+payloads into managed objects or reread each row for a second verification. It covers
+successful, failed and interrupted executions, including rows whose result body was
+already moved but arguments remained in history. Run-scoped execution keys keep reused
+provider call IDs separate.
+
+The bulk transaction holds SQLite's writer slot until commit. On a large installation,
+allow time and storage for the write-ahead log and temporary rollup tables; other writers
+may wait. This is a one-time migration, not a periodic full-corpus audit. It does not
+remove messages or run a vacuum.
+
+Logical deduplication makes freed SQLite pages available for reuse. It does not promise
+that the database file shrinks immediately. Physical file reclamation is a separate
+maintenance operation requiring writer coordination, capacity checks and recovery
+protection. Do not run an uncoordinated full vacuum against a live gateway database.

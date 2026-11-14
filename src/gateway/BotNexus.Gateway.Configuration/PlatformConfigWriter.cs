@@ -1,0 +1,1130 @@
+using System.IO.Abstractions;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
+using BotNexus.Gateway.Configuration.Store;
+
+namespace BotNexus.Gateway.Configuration;
+
+/// <summary>
+/// Thread-safe writer for platform config JSON files.
+/// Performs atomic read-modify-write with file locking.
+/// </summary>
+/// <remarks>
+/// <para><b>Explicit-null semantics (#2705).</b> config.json has THREE distinct states per key:
+/// key absent, key present with value <c>null</c>, and key present with a value.
+/// <see cref="BotNexus.Gateway.Configuration.Store.ConfigValueState" /> is the canonical model of
+/// that distinction today: the agent-level merger that originally consumed it was removed with the
+/// configuration reset (#3515), but the states did not go with it - an explicit null still means
+/// <em>suppress the inherited value</em>, whereas absence still means <em>inherit it</em>, and the
+/// store layer (<see cref="BotNexus.Gateway.Configuration.Store.ConfigDocumentFlattener" /> reading,
+/// <see cref="BotNexus.Gateway.Configuration.Store.ConfigDocumentPatcher" /> writing) preserves it.</para>
+/// <para>The writer therefore guarantees that <b>an explicit null present in the document on disk
+/// survives a whole-document write</b>. This is a deliberate contract, not an implementation
+/// accident: the typed <see cref="PlatformConfig" /> graph cannot represent "present and null"
+/// (a null CLR property and an absent one are the same state), and the serializer's
+/// <see cref="JsonIgnoreCondition.WhenWritingNull" /> policy - chosen for output tidiness - would
+/// otherwise silently downgrade every explicit null to an absent key and invert the operator's
+/// intent on a write they did not initiate.</para>
+/// <para>The asymmetry is intentional: an explicit null can only be removed by an explicit
+/// raw-document edit (<see cref="MutateAsync(Action{JsonObject}, string, CancellationToken)" /> or
+/// <see cref="MutateValidatedAsync" />), never as a side effect of a typed whole-document replace.
+/// Any future configuration store (#2646) must reproduce this behaviour deliberately.</para>
+/// <para><b>Destructive-section guard (#2816).</b> Every write - without exception - passes through
+/// the single private pipeline <see cref="MutateCoreAsync" />, which applies
+/// <see cref="ConfigSectionGuard" /> to the candidate document before the file is touched. A
+/// candidate that would drop or empty a populated top-level section the caller did not
+/// <em>name</em> is refused, and the bytes on disk are left exactly as they were. This exists
+/// because a 2026-07-31 production write flattened the whole <c>channels</c> section to a single
+/// defaulted property and destroyed live credentials while reporting success; see
+/// <see cref="ConfigSectionGuard" /> for the full rationale and for why the guard deliberately has
+/// no bypass flag. New write methods must route through <see cref="MutateCoreAsync" /> rather than
+/// re-implementing the read/mutate/validate/write sequence, or they will silently opt out of it.</para>
+/// </remarks>
+public sealed partial class PlatformConfigWriter
+{
+    private static readonly SemaphoreSlim WriteLock = new(1, 1);
+    private static readonly JsonSerializerOptions PlatformReadOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+    private static readonly JsonSerializerOptions PlatformWriteOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+    private static readonly JsonSerializerOptions PlatformPersistOptions = new() { WriteIndented = true };
+
+    /// <summary>
+    /// Per-process key that makes the compare-and-swap revision opaque to its holder (#3469).
+    /// </summary>
+    /// <remarks>
+    /// Generated once per gateway process and never persisted, logged or exposed on any surface.
+    /// See <see cref="ComputeRevision"/> for why the token must not be derivable from document
+    /// content, and for the restart semantics this implies.
+    /// </remarks>
+    private static readonly byte[] RevisionKey = RandomNumberGenerator.GetBytes(32);
+    private readonly string _configPath;
+    private readonly IFileSystem _fileSystem;
+    private readonly ConfigBackupService? _backup;
+
+    /// <summary>
+    /// The backends this writer persists to (#3527).
+    /// </summary>
+    /// <remarks>
+    /// Defaults to JSON-only, which is byte-identical to the behaviour before the writer seam
+    /// existed. A host with a configuration store registers both. Ordinary mutations update an
+    /// existing JSON projection but preserve its absence; SQLite retains the full authoritative
+    /// document. Explicit full-document backend writes still reach every registered backend.
+    /// </remarks>
+    private readonly Writers.IConfigurationWriter _writer;
+
+    private IReadOnlyList<Writers.ConfigurationBackendDescriptor>? _mutationBackends;
+
+    /// <summary>
+    /// Backends selected by the latest locked persistence operation, or registered backends before
+    /// the first operation. An absent store-backed JSON projection is not reported as saved.
+    /// </summary>
+    public IReadOnlyList<Writers.ConfigurationBackendDescriptor> Backends => _mutationBackends ?? _writer.Backends;
+
+    /// <summary>
+    /// Store consulted for the pristine document when no config file exists. Null for file-only
+    /// installations, which is every caller that has not been given a store.
+    /// </summary>
+    private readonly IConfigStore? _pristineStore;
+
+    public PlatformConfigWriter(string configPath, IFileSystem fileSystem, ConfigBackupService? backup = null)
+        : this(configPath, fileSystem, backup, writer: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a writer that persists through <paramref name="writer"/>.
+    /// </summary>
+    /// <param name="writer">
+    /// The persistence backend. <see langword="null"/> builds the JSON-only writer, preserving the
+    /// existing behaviour for every caller that has not been given a store.
+    /// </param>
+    public PlatformConfigWriter(
+        string configPath,
+        IFileSystem fileSystem,
+        ConfigBackupService? backup,
+        Writers.IConfigurationWriter? writer)
+        : this(configPath, fileSystem, backup, writer, pristineStore: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a writer that can recover its pristine document from <paramref name="pristineStore"/>
+    /// when no config file exists.
+    /// </summary>
+    /// <param name="pristineStore">
+    /// Store consulted for the before-document when the config file is absent. <see langword="null"/>
+    /// keeps the file-only behaviour. Supplying it is what makes a store-only installation safe; see
+    /// <see cref="ReadRootAsync"/> for why an empty fallback is actively dangerous rather than merely
+    /// incomplete.
+    /// </param>
+    public PlatformConfigWriter(
+        string configPath,
+        IFileSystem fileSystem,
+        ConfigBackupService? backup,
+        Writers.IConfigurationWriter? writer,
+        IConfigStore? pristineStore)
+    {
+        _configPath = configPath;
+        _fileSystem = fileSystem;
+        _backup = backup;
+        _pristineStore = pristineStore;
+        _writer = writer ?? new Writers.JsonConfigurationWriter(configPath, fileSystem, backup);
+    }
+
+    // Identity bootstrap must detect an unwritable mount before the timed writer lock. File
+    // attributes cannot detect a Linux read-only bind mount. Probe only a unique sibling, never
+    // the existing configuration; the real write still goes through the canonical pipeline.
+    internal void EnsurePersistenceWritable(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var directory = _fileSystem.Path.GetDirectoryName(_configPath);
+        if (!string.IsNullOrWhiteSpace(directory))
+            _fileSystem.Directory.CreateDirectory(directory);
+
+        var probePath = _configPath + "." + Guid.NewGuid().ToString("N") + ".write-probe";
+        var created = false;
+        try
+        {
+            using var probe = _fileSystem.FileStream.New(
+                probePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            created = true;
+        }
+        finally
+        {
+            // Do not delete a pre-existing file if CreateNew failed (including a name collision).
+            if (created)
+                _fileSystem.File.Delete(probePath);
+        }
+        ct.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>
+    /// Reads the config as a canonical-path <see cref="ConfigDocument"/> - the surface consumers
+    /// outside this project use (#2887). Note this read is outside the writer lock and is therefore
+    /// advisory only; the authoritative read happens inside the mutate methods.
+    /// </summary>
+    public async Task<ConfigDocument> ReadDocumentAsync(CancellationToken ct = default)
+        => new(await ReadRootAsync(ct));
+
+    /// <summary>
+    /// Applies a canonical-path mutation and persists it only when the resulting complete candidate
+    /// document validates. The <see cref="ConfigDocument"/> overload of
+    /// <see cref="MutateValidatedAsync(Func{JsonObject, string?}, string, CancellationToken, IReadOnlyCollection{string}?)"/>,
+    /// so a consumer never needs to name a JSON node type.
+    /// </summary>
+    public async Task<IReadOnlyList<string>> MutateDocumentValidatedAsync(
+        Func<ConfigDocument, string?> mutation,
+        string reason,
+        CancellationToken ct = default,
+        IReadOnlyCollection<string>? namedSections = null)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        return await MutateValidatedAsync(root => mutation(new ConfigDocument(root)), reason, ct, namedSections);
+    }
+
+    /// <summary>
+    /// Applies a canonical-path mutation and persists it. The <see cref="ConfigDocument"/> overload
+    /// of <see cref="MutateAsync(Action{JsonObject}, string, CancellationToken, IReadOnlyCollection{string}?)"/>.
+    /// </summary>
+    public async Task MutateDocumentAsync(
+        Action<ConfigDocument> mutation,
+        string reason,
+        CancellationToken ct = default,
+        IReadOnlyCollection<string>? namedSections = null)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        await MutateAsync(root => mutation(new ConfigDocument(root)), reason, ct, namedSections);
+    }
+
+    /// <summary>
+    /// Reads the full config as a JSON object.
+    /// </summary>
+    public async Task<JsonObject> ReadAsync(CancellationToken ct = default)
+    {
+        return await ReadRootAsync(ct);
+    }
+
+    /// <summary>
+    /// Reads the current platform configuration as a strongly-typed object.
+    /// </summary>
+    public async Task<PlatformConfig> ReadPlatformConfigAsync(CancellationToken ct = default)
+    {
+        var root = await ReadRootAsync(ct);
+        var json = root.ToJsonString();
+        return JsonSerializer.Deserialize<PlatformConfig>(json, PlatformReadOptions) ?? new PlatformConfig();
+    }
+
+    /// <summary>
+    /// Atomically updates a section of the config.
+    ///
+    /// The incoming payload comes from the config UI, which was served redacted
+    /// secrets ("***") and channel subtrees it may not fully model. A raw
+    /// <c>root[sectionName] = value</c> replace would (a) clobber real on-disk
+    /// secrets with the "***" placeholder the UI round-tripped (#1955) and
+    /// (b) drop existing keys the payload omits, e.g. telegram bots or
+    /// serviceBus queues (#1954). Instead we restore any placeholder secrets
+    /// from the existing section and deep-merge the incoming payload over the
+    /// existing section so omitted keys survive.
+    /// </summary>
+    /// <param name="merge">
+    /// When <see langword="true"/> (default, used by the config-UI PUT path), the
+    /// incoming payload is treated as potentially partial/redacted: secrets are
+    /// restored and the payload is deep-merged over the existing section so omitted
+    /// keys survive. When <see langword="false"/>, callers that already assemble the
+    /// full authoritative section from disk (e.g. LocationsController, which must be
+    /// able to delete entries by omission) get a straight replace.
+    /// </param>
+    public async Task UpdateSectionAsync(
+        string sectionName,
+        JsonNode value,
+        CancellationToken ct = default,
+        bool merge = true,
+        Func<JsonObject, JsonObject, IReadOnlyList<string>>? additionalValidation = null)
+        => await MutateAsync(
+            root =>
+            {
+                // #2816: sectionName is declared to the guard below, so this path may legitimately
+                // clear the section it was asked to replace - and only that section.
+                if (!merge || value is not JsonObject incoming || root[sectionName] is not JsonObject existing)
+                {
+                    // No existing object section (or non-object payload): nothing to
+                    // merge/preserve, so fall back to a straight assignment.
+                    root[sectionName] = value;
+                    return;
+                }
+
+                // Work on a clone so we never mutate the shared root mid-flight.
+                var merged = existing.DeepClone().AsObject();
+
+                // 1) Restore secrets: wrap both under the real section name so the
+                //    symmetric restore walks the same paths RedactSecrets uses.
+                var existingWrapper = new JsonObject { [sectionName] = existing.DeepClone() };
+                var incomingWrapper = new JsonObject { [sectionName] = incoming.DeepClone() };
+                existingWrapper.RestoreSecrets(incomingWrapper);
+                var restoredIncoming = incomingWrapper[sectionName] as JsonObject ?? incoming;
+
+                // 2) Deep-merge restored payload over existing so omitted subtrees survive.
+                merged.DeepMerge(restoredIncoming);
+
+                root[sectionName] = merged;
+            },
+            $"before-{sectionName}-update",
+            ct,
+            namedSections: [sectionName],
+            additionalValidation: additionalValidation);
+
+    /// <summary>
+    /// Reads the current platform configuration together with the revision token it was read at.
+    /// </summary>
+    /// <remarks>
+    /// Issue #2134. A caller that intends to replace the <em>whole</em> document later must be able
+    /// to prove nothing else committed in between. The revision is a content digest of the exact
+    /// bytes-equivalent document this snapshot was materialised from; pass it back to
+    /// <see cref="UpdatePlatformConfigAsync"/> to get a compare-and-swap instead of a blind
+    /// last-writer-wins overwrite.
+    /// </remarks>
+    public async Task<(PlatformConfig Config, string Revision)> ReadPlatformConfigWithRevisionAsync(CancellationToken ct = default)
+    {
+        var root = await ReadRootAsync(ct);
+        var json = root.ToJsonString();
+        var config = JsonSerializer.Deserialize<PlatformConfig>(json, PlatformReadOptions) ?? new PlatformConfig();
+        return (config, ComputeRevision(root));
+    }
+
+    /// <summary>
+    /// Replaces the entire platform configuration document.
+    /// </summary>
+    /// <param name="config">The complete replacement document.</param>
+    /// <param name="reason">Backup reason label recorded when the write proceeds.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="expectedRevision">
+    /// Optional compare-and-swap guard (#2134). When supplied, the write is rejected with a
+    /// <see cref="PlatformConfigConcurrencyException"/> if the document on disk no longer matches
+    /// the revision the caller's snapshot was read at - i.e. another writer committed in between
+    /// and this whole-document replace would silently discard their changes. When
+    /// <see langword="null"/> the historical last-writer-wins behaviour is preserved, so existing
+    /// callers are unaffected.
+    /// </param>
+    /// <param name="namedSections">
+    /// Top-level sections this replacement is explicitly entitled to empty or remove (#2816).
+    /// Defaults to none: a whole-document replace is exactly the shape of write that destroyed a
+    /// production <c>channels</c> section, so by default it is held to the same guard as every
+    /// other path and is refused if it silently flattens something. Pass the section names only
+    /// from a caller whose declared job is to regenerate those sections wholesale.
+    /// </param>
+    public async Task UpdatePlatformConfigAsync(
+        PlatformConfig config,
+        string reason,
+        CancellationToken ct = default,
+        string? expectedRevision = null,
+        IReadOnlyCollection<string>? namedSections = null)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        await MutateAsync(root =>
+        {
+            // The check runs inside the writer lock, against the root that was read inside the
+            // same lock, so no writer can interleave between the comparison and the replace.
+            if (expectedRevision is not null)
+            {
+                var actual = ComputeRevision(root);
+                if (!string.Equals(actual, expectedRevision, StringComparison.Ordinal))
+                    throw new PlatformConfigConcurrencyException(_configPath, expectedRevision, actual);
+            }
+
+            var serialized = JsonSerializer.Serialize(config, PlatformWriteOptions);
+            var next = JsonNode.Parse(serialized)?.AsObject() ?? new JsonObject();
+
+            // #2705: re-apply the explicit nulls the operator wrote, BEFORE clearing the root.
+            //
+            // PlatformWriteOptions uses WhenWritingNull for output tidiness, and the typed
+            // PlatformConfig graph cannot represent "present and null" at all - a null property
+            // and an absent property are the same CLR state. So a whole-document write through
+            // the typed model erases every explicit null in config.json.
+            //
+            // That is not cosmetic. ConfigValueState models absent / explicit-null / value as
+            // THREE distinct states, and the store layer preserves them end to end
+            // (ConfigDocumentFlattener reading, ConfigDocumentPatcher writing): explicit null means
+            // "suppress the inherited value", absence means "inherit it". Erasing the null therefore
+            // flips the setting to the opposite of what the operator wrote, silently, on a write they
+            // did not initiate. The agent-level merger that first depended on this was removed with
+            // the configuration reset (#3515); the tri-state itself was not.
+            //
+            // Two rejected alternatives, recorded so they are not "simplified" back in:
+            //  - Dropping WhenWritingNull globally would spray nulls for every unset optional
+            //    property across the whole document - a far larger behaviour change than the
+            //    defect warrants, and it would not help the tri-state keys anyway, because the
+            //    typed model cannot tell "operator wrote null" from "never set".
+            //  - Redefining what a JSON null means in config.json is wrong: the reader and the
+            //    store both treat it as an explicit suppression, and both are correct.
+            // Instead the preservation is scoped precisely to keys that were explicitly null in
+            // the SOURCE document, and only where the regenerated document left them absent - a
+            // real value in the new document always wins.
+            RestoreExplicitNulls(root, next);
+
+            root.Clear();
+            foreach (var kvp in next)
+                root[kvp.Key] = kvp.Value?.DeepClone();
+        }, reason, ct, namedSections);
+    }
+
+    /// <summary>
+    /// Mutates a single named section <em>inside</em> the writer lock and persists the result only
+    /// when the resulting complete candidate document validates.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #2134. The pre-existing shape of the config write path was:
+    /// <c>read snapshot -&gt; modify it -&gt; hand the finished snapshot to UpdateSectionAsync</c>.
+    /// Only the last step took the writer lock, so the read-modify-window sat entirely
+    /// <em>outside</em> mutual exclusion and two concurrent callers each replaced the section with
+    /// their own stale-plus-one view; whichever wrote second erased the other's entry.
+    /// </para>
+    /// <para>
+    /// This API closes that window by inverting the control flow: the caller supplies the
+    /// modification, not the finished snapshot, and the writer reads the section, applies the
+    /// modification, validates and writes all under the one lock. Adding more locking around the
+    /// old shape would not have helped - the defect was what the lock <em>spanned</em>.
+    /// </para>
+    /// </remarks>
+    /// <param name="sectionName">The root section to mutate (created when absent).</param>
+    /// <param name="mutation">
+    /// Mutates the live section object in place and returns <see langword="null"/> on success, or a
+    /// caller-presentable message to abort the write (for example a duplicate-name conflict).
+    /// When the mutation aborts, nothing is written and the file is left untouched.
+    /// </param>
+    /// <param name="reason">Backup reason label recorded when the write proceeds.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The rejection messages; empty when the mutation was validated and persisted.</returns>
+    public async Task<IReadOnlyList<string>> MutateSectionAsync(
+        string sectionName,
+        Func<JsonObject, string?> mutation,
+        string reason,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sectionName);
+        ArgumentNullException.ThrowIfNull(mutation);
+
+        // #2816: this call names exactly one section, so the guard permits it to empty that one
+        // and nothing else - a mutation aimed at gateway still cannot flatten channels.
+        return await MutateValidatedAsync(
+            root =>
+            {
+                if (root[sectionName] is not JsonObject section)
+                {
+                    section = new JsonObject();
+                    root[sectionName] = section;
+                }
+
+                return mutation(section);
+            },
+            reason,
+            ct,
+            namedSections: [sectionName]);
+    }
+
+    /// <summary>
+    /// Copies explicit JSON nulls from <paramref name="source" /> (the document as it exists on
+    /// disk) into <paramref name="target" /> (the regenerated document), at the same paths, but
+    /// only where <paramref name="target" /> has no key at all.
+    /// </summary>
+    /// <remarks>
+    /// #2705. Deliberately conservative:
+    /// <list type="bullet">
+    ///   <item>Only keys whose SOURCE value is JSON null are considered, so this never invents a
+    ///   null the operator did not write.</item>
+    ///   <item>A key the regenerated document supplies with a value is left alone, so a caller
+    ///   that genuinely sets a previously-null section still wins.</item>
+    ///   <item>Recursion descends only where BOTH sides still have an object, so a subtree the
+    ///   caller deleted wholesale (for example a removed agent) does not come back.</item>
+    /// </list>
+    /// </remarks>
+    private static void RestoreExplicitNulls(JsonObject source, JsonObject target)
+    {
+        foreach (var kvp in source)
+        {
+            if (kvp.Value is null)
+            {
+                if (!target.ContainsKey(kvp.Key))
+                    target[kvp.Key] = null;
+                continue;
+            }
+
+            if (kvp.Value is JsonObject childSource && target[kvp.Key] is JsonObject childTarget)
+                RestoreExplicitNulls(childSource, childTarget);
+        }
+    }
+
+    /// <summary>
+    /// Reads the raw configuration document together with the revision token it was read at
+    /// (issue #2059).
+    /// </summary>
+    /// <remarks>
+    /// The settings UI needs the revision of the <em>document</em>, not of a typed projection: it
+    /// edits raw JSON paths (including sections and keys <see cref="PlatformConfig"/> does not
+    /// model) and must be able to prove that nothing else committed between the load it rendered
+    /// from and the save it submits. Pair with <see cref="ApplyPatchAsync"/>.
+    /// </remarks>
+    public async Task<(JsonObject Config, string Revision)> ReadWithRevisionAsync(CancellationToken ct = default)
+    {
+        var root = await ReadRootAsync(ct);
+        return (root, ComputeRevision(root));
+    }
+
+    /// <summary>
+    /// Applies a batch of addressed patch operations as one all-or-nothing write, optionally
+    /// guarded by the revision the caller's snapshot was read at (issue #2059).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the write shape the settings UI needs and previously did not have. Its predecessor
+    /// looped over every materialised top-level section issuing an independent
+    /// <c>PUT /api/config/{section}</c>. That loop had three defects, all of which this method
+    /// closes structurally rather than by convention:
+    /// </para>
+    /// <list type="number">
+    ///   <item><b>No dirty tracking.</b> Sections the operator never touched were rewritten from a
+    ///   stale snapshot, so a concurrent edit elsewhere was silently reverted. A patch carries only
+    ///   the paths that changed, so an untouched section is not part of the write at all.</item>
+    ///   <item><b>No concurrency check.</b> Every PUT was last-writer-wins. Supplying
+    ///   <paramref name="expectedRevision"/> turns the save into a compare-and-swap: a save built
+    ///   on a stale read is rejected with <see cref="PlatformConfigConcurrencyException"/> so the
+    ///   UI can reload and re-apply, instead of destroying the other writer's change.</item>
+    ///   <item><b>No atomicity.</b> The loop committed section-by-section and aborted mid-way on
+    ///   the first failure, leaving the document half-saved. Here the whole batch is applied to an
+    ///   in-memory candidate inside the writer lock; if any operation, the guard, or validation
+    ///   rejects it, nothing at all is written.</item>
+    /// </list>
+    /// <para>
+    /// Redacted secrets are restored from the document on disk before the candidate is validated,
+    /// so a field the UI rendered as <c>***</c> and submitted back verbatim cannot overwrite the
+    /// real value (#1955).
+    /// </para>
+    /// <para>
+    /// Scope note: this closes the <em>portal-side</em> hole. Coordination between independent
+    /// writers beyond this process is #2060, and the validate-before-commit contract is #2058 -
+    /// this method reuses the existing candidate validation rather than redefining it.
+    /// </para>
+    /// </remarks>
+    /// <param name="operations">The addressed mutations, applied in order.</param>
+    /// <param name="reason">Backup reason label recorded when the write proceeds.</param>
+    /// <param name="expectedRevision">
+    /// Optional compare-and-swap token from <see cref="ReadWithRevisionAsync"/>. When
+    /// <see langword="null"/> the write proceeds without a concurrency check.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The outcome, carrying the newly committed revision on success.</returns>
+    /// <exception cref="PlatformConfigConcurrencyException">
+    /// The document on disk no longer matches <paramref name="expectedRevision"/>. Nothing was
+    /// written.
+    /// </exception>
+    public async Task<ConfigPatchResult> ApplyPatchAsync(
+        IReadOnlyList<ConfigPatchOperation> operations,
+        string reason,
+        string? expectedRevision = null,
+        CancellationToken ct = default,
+        Func<JsonObject, JsonObject, IReadOnlyList<string>>? additionalValidation = null)
+    {
+        ArgumentNullException.ThrowIfNull(operations);
+
+        if (operations.Count == 0)
+            return new ConfigPatchResult(true, null, []);
+
+        string? committedRevision = null;
+
+        var errors = await MutateCoreAsync(
+            root =>
+            {
+                // The comparison runs inside the writer lock against the root read inside the same
+                // lock, so no writer can interleave between the check and the write.
+                if (expectedRevision is not null)
+                {
+                    var actual = ComputeRevision(root);
+                    if (!string.Equals(actual, expectedRevision, StringComparison.Ordinal))
+                        throw new PlatformConfigConcurrencyException(_configPath, expectedRevision, actual);
+                }
+
+                // Apply to a candidate first: a failure part-way through must not leave the live
+                // root half-mutated, because MutateCoreAsync's guard compares against it.
+                var candidate = root.DeepClone().AsObject();
+                var applyError = candidate.Apply(operations);
+                if (applyError is not null)
+                    return Task.FromResult<string?>(applyError);
+
+                root.RestoreSecrets(candidate);
+
+                root.Clear();
+                foreach (var kvp in candidate)
+                    root[kvp.Key] = kvp.Value?.DeepClone();
+
+                committedRevision = ComputeRevision(root);
+                return Task.FromResult<string?>(null);
+            },
+            reason,
+            validateCandidate: true,
+            ConfigPatchApplier.DeclaredSections(operations),
+            ct,
+            additionalValidation);
+
+        return errors.Count > 0
+            ? new ConfigPatchResult(false, null, errors)
+            : new ConfigPatchResult(true, committedRevision, []);
+    }
+
+    /// <summary>
+    /// Computes the revision token for a configuration document: a keyed digest of its canonical
+    /// serialization, used as the compare-and-swap token for whole-document replaces.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Issue #3469 - why this is keyed rather than a bare content hash.</b> The revision
+    /// crosses the redaction boundary: <c>GET /api/config/snapshot</c> redacts every secret out of
+    /// the returned document but hands the caller this token, and the same value reaches the client
+    /// again on the <c>409 Conflict</c> path via
+    /// <see cref="PlatformConfigConcurrencyException.ActualRevision"/>. A bare
+    /// <c>SHA256(canonical)</c> therefore let anyone authorised only for the <em>redacted</em> view
+    /// verify a guessed secret offline in one hash - unrated-limited and unaudited - because the
+    /// redacted document already reveals the full structure, every non-secret value and the exact
+    /// set of configured providers. HMAC under a key the caller does not have breaks that
+    /// derivation while leaving the token a pure function of document state.</para>
+    /// <para><b>Why not hash a redacted canonicalisation instead.</b> That was the issue's first
+    /// suggestion and it is unsound here: <see cref="ConfigSecretMerge.Redact"/> collapses every
+    /// secret to the single literal <see cref="ConfigSecretMerge.Placeholder"/>, so two documents
+    /// differing <em>only</em> in a secret value produce an identical digest. A concurrent
+    /// secret-only write - rotating an API key is exactly that - would then be undetectable by
+    /// compare-and-swap, trading a confidentiality bug for a silent lost update. Matches upstream
+    /// OpenClaw <c>a4f17833ada0</c>, which bound its token to a startup-phase key for the same
+    /// reason.</para>
+    /// <para><b>Consequence: tokens do not survive a gateway restart.</b> The key is per-process and
+    /// never persisted, so a patch quoting a token minted by a previous process is rejected with
+    /// <c>409</c> and the client reloads. That is the sound direction to fail - a snapshot from a
+    /// previous process lifetime cannot prove what committed across the restart - and the key is
+    /// deliberately not derived from anything on disk, because a disk-derived key is recoverable by
+    /// precisely the reader this defends against.</para>
+    /// </remarks>
+    private static string ComputeRevision(JsonObject root)
+    {
+        var canonical = root.ToJsonString(PlatformPersistOptions);
+        return Convert.ToHexString(
+            HMACSHA256.HashData(RevisionKey, Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    /// <summary>
+    /// Updates a keyed entry within a section (e.g., providers.github-copilot).
+    /// </summary>
+    public async Task UpdateSectionEntryAsync(
+        string sectionName,
+        string key,
+        JsonNode value,
+        CancellationToken ct = default,
+        Func<JsonObject, JsonObject, IReadOnlyList<string>>? additionalValidation = null)
+        => await MutateAsync(root =>
+        {
+            if (root[sectionName] is not JsonObject section)
+            {
+                section = new JsonObject();
+                root[sectionName] = section;
+            }
+
+            // Same secret-restore + deep-merge as UpdateSectionAsync, but scoped to a single keyed
+            // entry. The UI PUTs a redacted entry (e.g. providers.github-copilot) back verbatim, so
+            // a raw replace would clobber the real secret with "***" (#1955) and drop any on-disk
+            // keys the payload omits (#1954). Wrap the entry under its real section name so the
+            // secret restore walks the same paths ConfigSecretMerge.Redact uses.
+            if (value is JsonObject incoming && section[key] is JsonObject existing)
+            {
+                var existingWrapper = new JsonObject { [sectionName] = new JsonObject { [key] = existing.DeepClone() } };
+                var incomingWrapper = new JsonObject { [sectionName] = new JsonObject { [key] = incoming.DeepClone() } };
+                existingWrapper.RestoreSecrets(incomingWrapper);
+                var restoredIncoming = incomingWrapper[sectionName]![key] as JsonObject ?? incoming;
+
+                var merged = existing.DeepClone().AsObject();
+                merged.DeepMerge(restoredIncoming);
+                section[key] = merged;
+            }
+            else
+            {
+                section[key] = value;
+            }
+        }, $"before-{sectionName}-update", ct, namedSections: [sectionName], additionalValidation: additionalValidation);
+
+    /// <summary>
+    /// Atomically mutates the config document and persists the result.
+    /// </summary>
+    /// <param name="namedSections">
+    /// Top-level sections the caller explicitly declares it is operating on, so the
+    /// destructive-section guard (#2816) permits this write to empty or remove them. Leave
+    /// <see langword="null" /> for a targeted edit that is not supposed to destroy anything.
+    /// </param>
+    public async Task MutateAsync(
+        Action<JsonObject> mutation,
+        string reason,
+        CancellationToken ct = default,
+        IReadOnlyCollection<string>? namedSections = null,
+        Func<JsonObject, JsonObject, IReadOnlyList<string>>? additionalValidation = null)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+        await MutateAsync(root =>
+        {
+            mutation(root);
+            return Task.CompletedTask;
+        }, reason, ct, namedSections, additionalValidation);
+    }
+
+    /// <summary>
+    /// Atomically mutates the config document and persists the result.
+    /// </summary>
+    /// <param name="namedSections">
+    /// Top-level sections the caller explicitly declares it is operating on (#2816). See the
+    /// overload above.
+    /// </param>
+    /// <exception cref="PlatformConfigSectionGuardException">
+    /// The candidate document would have destroyed a populated top-level section that
+    /// <paramref name="namedSections" /> does not name. Nothing was written.
+    /// </exception>
+    public async Task MutateAsync(
+        Func<JsonObject, Task> mutation,
+        string reason,
+        CancellationToken ct = default,
+        IReadOnlyCollection<string>? namedSections = null,
+        Func<JsonObject, JsonObject, IReadOnlyList<string>>? additionalValidation = null)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+
+        var errors = await MutateCoreAsync(
+            async root =>
+            {
+                await mutation(root);
+                return null;
+            },
+            reason,
+            validateCandidate: false,
+            namedSections,
+            ct,
+            additionalValidation);
+
+        // This overload has no error channel in its signature, so a guard rejection must throw or
+        // it would be indistinguishable from a successful write - which is precisely the silent
+        // failure mode #2816 is about.
+        if (errors.Count > 0)
+            throw new PlatformConfigSectionGuardException(errors[0]);
+    }
+
+    /// <summary>
+    /// Applies a targeted raw-JSON mutation and persists it only when the resulting
+    /// <em>complete</em> candidate document validates.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the safe replacement for the typed whole-root rewrite
+    /// (<see cref="UpdatePlatformConfigAsync"/>) that targeted CLI operations used to perform
+    /// (#2057). Two properties matter:
+    /// </para>
+    /// <list type="number">
+    ///   <item>The document is read, mutated, validated, and written inside the same writer lock,
+    ///   so a concurrent writer cannot interleave between the read and the replace.</item>
+    ///   <item>Validation runs against the candidate <em>before</em> the live file is touched. When
+    ///   the candidate is rejected nothing is written, no backup is taken, and the original bytes
+    ///   on disk are left byte-for-byte unchanged.</item>
+    /// </list>
+    /// <para>
+    /// Because only the addressed node is rewritten, unknown root/child keys, extension-owned
+    /// JSON, secrets, and the reserved <c>agents.defaults</c> entry all survive untouched.
+    /// </para>
+    /// </remarks>
+    /// <param name="mutation">
+    /// Mutates the raw root in place and returns <see langword="null"/> on success, or a
+    /// caller-presentable message to abort the write (for example an unresolvable key path).
+    /// </param>
+    /// <param name="reason">Backup reason label recorded when the write proceeds.</param>
+    /// <returns>The rejection messages; empty when the mutation was validated and persisted.</returns>
+    /// <param name="namedSections">
+    /// Top-level sections the caller explicitly declares it is operating on, so the
+    /// destructive-section guard (#2816) permits this write to empty or remove them. A guard
+    /// rejection is returned through the same error list as a validation failure, so existing
+    /// callers report it and exit non-zero without any change.
+    /// </param>
+    public async Task<IReadOnlyList<string>> MutateValidatedAsync(
+        Func<JsonObject, string?> mutation,
+        string reason,
+        CancellationToken ct = default,
+        IReadOnlyCollection<string>? namedSections = null)
+    {
+        ArgumentNullException.ThrowIfNull(mutation);
+
+        return await MutateCoreAsync(
+            root => Task.FromResult(mutation(root)),
+            reason,
+            validateCandidate: true,
+            namedSections,
+            ct);
+    }
+
+    /// <summary>
+    /// The single read-modify-guard-validate-write pipeline every public write method funnels
+    /// through.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Issue #2816. The destructive-section guard is applied here, once, rather than in each public
+    /// method. That is the whole design decision: the incident it prevents was never attributed to
+    /// a specific command, so a per-command check would have been re-derived four ways, forgotten
+    /// by the fifth command, and possibly absent from the path that actually caused the damage. A
+    /// method that bypasses this pipeline bypasses the guard, so do not add one.
+    /// </para>
+    /// <para>
+    /// Ordering inside the lock is deliberate: the pristine document is captured BEFORE the
+    /// mutation runs (the mutation edits the live root in place), the guard then compares pristine
+    /// against candidate, and only a candidate that passes both the guard and validation reaches
+    /// <see cref="WriteRootAsync" />. A rejected write therefore leaves the file byte-for-byte
+    /// unchanged and takes no backup.
+    /// </para>
+    /// </remarks>
+    /// <param name="validateCandidate">
+    /// Whether to run full <c>PlatformConfigLoader.ValidateRawJson</c> validation on the candidate.
+    /// Only the validated write paths do; the raw <c>MutateAsync</c> paths historically do not, and
+    /// turning that on here would change behaviour well beyond #2816.
+    /// </param>
+    private async Task<IReadOnlyList<string>> MutateCoreAsync(
+        Func<JsonObject, Task<string?>> mutation,
+        string reason,
+        bool validateCandidate,
+        IReadOnlyCollection<string>? namedSections,
+        CancellationToken ct,
+        Func<JsonObject, JsonObject, IReadOnlyList<string>>? additionalValidation = null,
+        ConfigReconciliationPreview? reconciliation = null)
+    {
+        // Lock order is always semaphore -> cross-process file lock (#2134). See
+        // CrossProcessConfigLock for the ordering/deadlock argument: the semaphore keeps this
+        // process's own threads from queueing on the OS lock, and the file lock extends the same
+        // critical section across the CLI/gateway process boundary.
+        await WriteLock.WaitAsync(ct);
+        try
+        {
+            using var crossProcess = await CrossProcessConfigLock.AcquireAsync(_configPath, _fileSystem, ct);
+            ConfigReconciliationPreview? current = null;
+            if (reconciliation is not null)
+            {
+                // Do not call ReadRootAsync here: it initializes SQL and falls back on empty SQL.
+                // Both independent before-images must be re-read under the canonical lock.
+                current = await PreviewReconciliationAsync(_configPath, ct);
+                if (!current.CanApply)
+                    return [current.Outcome];
+                if (current.SqlRevision != reconciliation.SqlRevision
+                    || current.CompatibilityRevision != reconciliation.CompatibilityRevision)
+                    return ["Reconciliation refused: a backend changed after preview; preview again."];
+            }
+            var root = current?.Sql?.DeepClone().AsObject() ?? await ReadRootAsync(ct);
+
+            // Snapshot the pristine document: mutations edit root in place, so this is the only
+            // moment the pre-mutation state still exists to compare against.
+            var pristine = root.DeepClone().AsObject();
+
+            if (current?.Candidate is { } reconciliationCandidate)
+            {
+                root.Clear();
+                foreach (var pair in reconciliationCandidate)
+                    root[pair.Key] = pair.Value?.DeepClone();
+            }
+            var mutationError = await mutation(root);
+            if (!string.IsNullOrWhiteSpace(mutationError))
+                return [mutationError];
+
+            var validationErrors = ValidateMutation(pristine, root, validateCandidate, namedSections, additionalValidation, _configPath);
+            if (validationErrors.Count > 0)
+                return validationErrors;
+            if (current is not null)
+            {
+                if (current.Compatibility is { } compatibility)
+                {
+                    var compatibilityErrors = ValidateMutation(compatibility, root, true, null, null);
+                    if (compatibilityErrors.Count > 0)
+                        return compatibilityErrors;
+                }
+                // An explicit complete-union operation, not a change to ordinary delta semantics.
+                // The established fan-out reports partial backend failure by throwing.
+                if (!JsonNode.DeepEquals(current.Sql, root) || !JsonNode.DeepEquals(current.Compatibility, root))
+                    await _writer.WriteAsync(root, reason, ct);
+            }
+            else
+            {
+                await WriteRootAsync(root, reason, pristine, ct);
+            }
+            return [];
+        }
+        finally
+        {
+            WriteLock.Release();
+        }
+    }
+
+    private static IReadOnlyList<string> ValidateMutation(
+        JsonObject pristine,
+        JsonObject root,
+        bool validateCandidate,
+        IReadOnlyCollection<string>? namedSections,
+        Func<JsonObject, JsonObject, IReadOnlyList<string>>? additionalValidation,
+        string configPath = "configuration")
+    {
+        var destroyed = ConfigSectionGuard.FindDestroyedSections(pristine, root, namedSections);
+        if (destroyed.Count > 0)
+            return [ConfigSectionGuard.FormatRejection(configPath, destroyed)];
+
+        if (additionalValidation is not null)
+        {
+            var additionalErrors = additionalValidation(pristine, root);
+            if (additionalErrors.Count > 0)
+                return additionalErrors;
+        }
+
+        // Ceiling constraints apply even to legacy raw mutation paths. Validate only this
+        // new policy here; unrelated legacy configuration remains load-tolerated.
+        var ceilingErrors = ValidateCompactionCeilings(root);
+        if (ceilingErrors.Count > 0)
+            return ceilingErrors;
+
+        if (validateCandidate)
+        {
+            // Validate the complete candidate document, not just the mutated fragment: a
+            // locally plausible edit can still violate a cross-field rule elsewhere in the graph.
+            var candidateJson = root.ToJsonString(PlatformPersistOptions);
+            var errors = PlatformConfigLoader.ValidateRawJson(candidateJson);
+            if (errors.Count > 0)
+                return errors;
+        }
+
+        return [];
+    }
+
+    private static IReadOnlyList<string> ValidateCompactionCeilings(JsonObject root)
+    {
+        List<string> errors = [];
+        var worlds = Matches(root, "world");
+        var agentSections = Matches(root, "agents");
+        // Reject scope ambiguity only when this policy is present (including explicit null).
+        // Unrelated legacy duplicate casing remains load-tolerated on raw mutation paths.
+        if (worlds.Length > 1 && worlds.Any(entry => HasCeiling(entry.Value)))
+            errors.Add("world has ambiguous case-insensitive duplicate keys for compactionTokenCeiling policy.");
+        if (agentSections.Length > 1 && agentSections.Any(entry =>
+                entry.Value is JsonObject agents && agents.Any(agent => HasCeiling(agent.Value))))
+            errors.Add("agents has ambiguous case-insensitive duplicate keys for compactionTokenCeiling policy.");
+        foreach (var entry in worlds)
+            if (entry.Value is JsonObject world)
+                Check(world, entry.Key);
+        foreach (var section in agentSections)
+            if (section.Value is JsonObject agents)
+                foreach (var entry in agents)
+                    if (entry.Value is JsonObject agent)
+                        Check(agent, section.Key + "." + entry.Key);
+        return errors;
+
+        static KeyValuePair<string, JsonNode?>[] Matches(JsonObject scope, string name)
+            => scope.Where(entry => string.Equals(entry.Key, name, StringComparison.OrdinalIgnoreCase)).ToArray();
+
+        static bool HasCeiling(JsonNode? node)
+            => node is JsonObject scope && Matches(scope, "compactionTokenCeiling").Length > 0;
+
+        void Check(JsonObject scope, string path)
+        {
+            var ceilings = Matches(scope, "compactionTokenCeiling");
+            if (ceilings.Length > 1)
+                errors.Add(path + ".compactionTokenCeiling has ambiguous case-insensitive duplicate keys.");
+            // Validate all occurrences: null or a valid first key must not hide an invalid alias.
+            foreach (var entry in ceilings)
+                if (entry.Value is { } value
+                    && (value is not JsonValue scalar || !scalar.TryGetValue<int>(out var tokens) || tokens <= 0))
+                    errors.Add(path + "." + entry.Key + " must be a positive 32-bit integer or null.");
+        }
+    }
+
+    /// <summary>
+    /// Removes a keyed entry from a section.
+    /// </summary>
+    public async Task RemoveSectionEntryAsync(string sectionName, string key, CancellationToken ct = default)
+        => await MutateAsync(root =>
+        {
+            if (root[sectionName] is JsonObject section)
+                section.Remove(key);
+        }, $"before-{sectionName}-remove", ct, namedSections: [sectionName]);
+
+    /// <summary>
+    /// Reads the pristine document every mutation diffs against.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The authoritative store is the source when configured and populated. The file is the fallback
+    /// when no store document exists, matching the runtime configuration pipeline's store-last,
+    /// store-wins precedence. A JSON mirror may exist beside an enabled store; reading that lower-
+    /// precedence mirror first would make a mutation derive from configuration the runtime does not
+    /// actually use.
+    /// </para>
+    /// <para>
+    /// <b>Why this is not merely a tidy-up.</b> This document is the <em>before</em> side of
+    /// <see cref="ConfigDocumentDiffer"/>. Returning an empty object when a populated store exists
+    /// does not fail - it makes the differ compute every stored key as an addition and no key as a
+    /// removal, so a one-field edit produces a change set spanning the entire configuration. That is
+    /// silently wrong output from a successful-looking write, the same detection story as #3547: a
+    /// 200, no error-shaped log line, and a wrong result. Sourcing the pristine document from the
+    /// store is what makes a store-only installation safe (#3823).
+    /// </para>
+    /// </remarks>
+    private async Task<JsonObject> ReadRootAsync(CancellationToken ct)
+    {
+        if (_pristineStore is not null)
+        {
+            var entries = await _pristineStore.ReadEntriesAsync(ct);
+            if (entries.Count > 0)
+                return ConfigDocumentRehydrator.Rehydrate(entries);
+        }
+
+        if (_fileSystem.File.Exists(_configPath))
+        {
+            var json = await _fileSystem.File.ReadAllTextAsync(_configPath, ct);
+            return JsonNode.Parse(json)?.AsObject() ?? new JsonObject();
+        }
+
+        return new JsonObject();
+    }
+
+    /// <summary>
+    /// Persists the complete document through the configured backend(s).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// #3527: all seventeen public mutation methods funnel here, so this is the single point where a
+    /// document becomes durable - and therefore the only place the backend set has to be honoured.
+    /// The file-specific behaviour that used to live inline (no-op detection, backup, atomic replace
+    /// with retry, owner-only permissions applied twice, directory creation) moved verbatim into
+    /// <see cref="Writers.JsonConfigurationWriter"/>.
+    /// </para>
+    /// <para>
+    /// Nothing is lost by delegating: with only the JSON backend registered this is the same code
+    /// reached through one interface call. With a store also registered, mutations update SQLite
+    /// and any existing JSON projection; an absent projection is not recreated.
+    /// </para>
+    /// </remarks>
+    /// <param name="pristine">
+    /// The document as it was before the mutation, when available. Supplying it lets the write be
+    /// expressed as the keys that actually changed (#3532) rather than as a whole-document replace.
+    /// </param>
+    private Task WriteRootAsync(JsonObject root, string reason, JsonObject? pristine, CancellationToken ct)
+    {
+        // Evaluate while MutateCoreAsync holds both locks, not when the factory is constructed:
+        // a projection removed before this mutation must stay absent. Explicit full-document
+        // writes and JSON-only first writes retain intentional file creation. Store ownership,
+        // not a caller option or a filename-shaped identity, determines this policy.
+        var projectionFreeFanOut = pristine is not null && _pristineStore is not null
+            && !_fileSystem.File.Exists(_configPath)
+                ? _writer as Writers.FanOutConfigurationWriter
+                : null;
+        _mutationBackends = projectionFreeFanOut?.BackendsWithoutJsonProjection ?? _writer.Backends;
+
+        if (pristine is null)
+        {
+            // No before-image: the caller cannot say what changed, so a full replace is the only
+            // honest write. This is the import path, where replacing everything is the intent.
+            return _writer.WriteAsync(root, reason, ct);
+        }
+
+        // Diff document-against-document. The mutation has already produced the desired JSON in
+        // `root`, so re-projecting a CLR type here would add nothing and would drop every key the
+        // type does not model - the #2816 failure, and the reason the DTO-shaped writer overload was
+        // deleted unused. The DTO's role is the read side: bind through IOptions.
+        var changes = ConfigDocumentDiffer.Diff(pristine, root);
+
+        if (changes.IsEmpty)
+        {
+            // A mutation that changed nothing must not churn the file mtime or the backup history,
+            // or an unchanged save becomes indistinguishable from a real one.
+            return Task.CompletedTask;
+        }
+
+        // Carry the complete before-image as an optional fallback for malformed JSON projections.
+        // Existing projections and row backends keep applying only the diff. An absent
+        // store-backed projection was omitted above; the store keeps the complete sibling state.
+        // The canonical read already succeeded; this is not a source-read fallback.
+        return projectionFreeFanOut is not null
+            ? projectionFreeFanOut.ApplyChangeSetWithoutJsonProjectionAsync(changes, pristine, reason, ct)
+            : _writer.ApplyChangeSetAsync(changes, pristine, reason, ct);
+    }
+
+    // #2357: Windows fails File.Move(..., overwrite: true) with UnauthorizedAccessException when
+    // ANY other handle is open on the destination - even one opened with the maximal
+    // FileShare.ReadWrite | FileShare.Delete that the configuration provider's reload watcher
+    // uses. The gateway registers config.json with AddJsonFile(reloadOnChange: true), so it is
+    // routinely its own competing reader; a measured probe lost 29 of 40 saves.
+    //
+    // Two mitigations, in order:
+    //  1) Prefer File.Replace, which maps to Win32 ReplaceFile semantics and tolerates readers
+    //     that opened the destination with delete sharing. Replace requires the destination to
+    //     exist, so a first-create still uses Move.
+    //  2) Wrap both in a bounded retry with backoff, because a reader that opened WITHOUT delete
+    //     sharing still blocks the swap momentarily and that window is short.
+    //
+    // Atomicity is unchanged: the staged temp file is still swapped in as a single operation, and
+    // the final failure is rethrown rather than swallowed so a lost edit can never be mistaken
+    // for a successful save.
+    private const int ReplaceAttempts = 10;
+
+    private async Task ReplaceWithRetryAsync(string tempPath, CancellationToken ct)
+    {
+        var delayMs = 5;
+        for (var attempt = 1; ; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                if (_fileSystem.File.Exists(_configPath))
+                {
+                    _fileSystem.File.Replace(
+                        tempPath, _configPath, destinationBackupFileName: null, ignoreMetadataErrors: true);
+                }
+                else
+                {
+                    _fileSystem.File.Move(tempPath, _configPath, overwrite: true);
+                }
+
+                return;
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            {
+                if (attempt >= ReplaceAttempts)
+                    throw;
+            }
+
+            await Task.Delay(delayMs, ct);
+            delayMs = Math.Min(delayMs * 2, 100);
+        }
+    }
+
+    /// <summary>
+    /// Compares two JSON documents for structural (effective) equality, tolerating whitespace
+    /// and formatting differences so that a re-serialized identical document is treated as a
+    /// no-op even when the on-disk copy used a different indentation or key formatting.
+    /// </summary>
+    private static bool JsonCanonicalEquals(string existing, string candidate)
+    {
+        if (string.Equals(existing, candidate, StringComparison.Ordinal))
+            return true;
+
+        try
+        {
+            var existingNode = JsonNode.Parse(existing);
+            var candidateNode = JsonNode.Parse(candidate);
+            return JsonNode.DeepEquals(existingNode, candidateNode);
+        }
+        catch (JsonException)
+        {
+            // Existing file is not valid JSON: treat as different so we rewrite it.
+            return false;
+        }
+    }
+}

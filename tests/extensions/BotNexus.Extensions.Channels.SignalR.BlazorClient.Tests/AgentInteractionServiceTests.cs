@@ -21,6 +21,21 @@ public sealed class AgentInteractionServiceTests
     }
 
     [Fact]
+    public async Task RefreshAgentsAsync_copies_summary_on_add_and_update()
+    {
+        _restClient.GetAgentsAsync(Arg.Any<CancellationToken>()).Returns(
+        [
+            new AgentSummary("agent-1", "Agent 1", Summary: "Updated summary"),
+            new AgentSummary("agent-2", "Agent 2", Summary: "Added summary")
+        ]);
+
+        await _service.RefreshAgentsAsync();
+
+        _store.GetAgent("agent-1")?.Summary.ShouldBe("Updated summary");
+        _store.GetAgent("agent-2")?.Summary.ShouldBe("Added summary");
+    }
+
+    [Fact]
     public async Task CreateConversationAsync_adds_conversation_and_selects_it()
     {
         _restClient.CreateConversationAsync(Arg.Any<CreateConversationRequestDto>(), Arg.Any<CancellationToken>())
@@ -39,7 +54,7 @@ public sealed class AgentInteractionServiceTests
 
         var agent = _store.GetAgent("agent-1")!;
         Assert.Equal("conv-1", conversationId);
-        Assert.Equal("conv-1", agent.ActiveConversationId);
+        Assert.Equal("conv-1", (_store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId));
         Assert.True(agent.Conversations.ContainsKey("conv-1"));
     }
 
@@ -62,14 +77,14 @@ public sealed class AgentInteractionServiceTests
 
         await _service.SelectConversationAsync("agent-1", "conv-2");
 
-        Assert.Equal("conv-2", agent.ActiveConversationId);
+        Assert.Equal("conv-2", (_store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId));
     }
 
     [Fact]
     public void ClearLocalMessages_clears_active_conversation_and_adds_system_message()
     {
         var agent = _store.GetAgent("agent-1")!;
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         agent.Conversations["conv-1"] = new ConversationState
         {
             ConversationId = "conv-1",
@@ -78,7 +93,7 @@ public sealed class AgentInteractionServiceTests
         };
         agent.Conversations["conv-1"].AppendMessage(new ChatMessage("User", "hello", DateTimeOffset.UtcNow));
 
-        _service.ClearLocalMessages("agent-1");
+        _service.ClearLocalMessages("agent-1", "conv-1");
 
         var messages = agent.Conversations["conv-1"].Messages;
         Assert.Single(messages);
@@ -232,8 +247,12 @@ public sealed class AgentInteractionServiceTests
                     DateTimeOffset.UtcNow.AddHours(-1),
                     DateTimeOffset.UtcNow.AddMinutes(-1))
             ]);
-        _restClient.GetSessionsAsync("agent-1", Arg.Any<CancellationToken>())
-            .Returns([
+        // #2532 AC2: RefreshConversationsAsync no longer enumerates sessions, so this stub is now
+        // unreached. It is left in place deliberately - the assertion below is about conversation
+        // KEYING (repeated cron runs must collapse onto one stable conversation id), and leaving
+        // the session data available proves the keying does not depend on having dropped it.
+        _restClient.GetSessionsAsync("agent-1", Arg.Any<int?>(), Arg.Any<int>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new SessionPageDto([
                 new SessionSummary(
                     firstRunSessionId,
                     "agent-1",
@@ -254,7 +273,7 @@ public sealed class AgentInteractionServiceTests
                     false,
                     DateTimeOffset.UtcNow.AddMinutes(-3),
                     DateTimeOffset.UtcNow.AddMinutes(-1))
-            ]);
+            ], TotalCount: 2, HasMore: false));
 
         await _service.RefreshConversationsAsync("agent-1");
 
@@ -270,8 +289,11 @@ public sealed class AgentInteractionServiceTests
         {
             ConversationId = "cron-session:cron:job-1:run",
             Title = "Cron session",
-            IsVirtualSession = true,
-            VirtualSessionKind = "cron",
+            // #2305: origin is the immutable typed Source, seeded at construction. The old
+            // virtual-session flag/kind pair is deleted. IsLocallySynthesised marks it as
+            // a client-minted transcript row so it reads SESSION history, not conversation history.
+            Source = ConversationSource.Cron,
+            IsLocallySynthesised = true,
             ActiveSessionId = "cron:job-1:run",
             HistoryLoaded = false
         };
@@ -314,12 +336,12 @@ public sealed class AgentInteractionServiceTests
             ConversationId = "cron-session:cron:job-1:run",
             Title = "Cron session",
             IsDefault = false,
-            IsVirtualSession = true,
-            VirtualSessionKind = "cron",
+            Source = ConversationSource.Cron,
+            IsLocallySynthesised = true,
             ActiveSessionId = "cron:job-1:run",
             HistoryLoaded = true
         };
-        _store.SetActiveConversation("agent-1", "cron-session:cron:job-1:run");
+        _store.SelectView("agent-1", "cron-session:cron:job-1:run", SelectionSource.RouteNavigation);
 
         _restClient.ArchiveConversationAsync("cron-session:cron:job-1:run", Arg.Any<CancellationToken>())
             .Returns(true);
@@ -329,7 +351,11 @@ public sealed class AgentInteractionServiceTests
         // Must route through conversation archive (not session deletion) to preserve session records
         await _restClient.Received(1).ArchiveConversationAsync("cron-session:cron:job-1:run", Arg.Any<CancellationToken>());
         agent.Conversations.ContainsKey("cron-session:cron:job-1:run").ShouldBeFalse();
-        agent.ActiveConversationId.ShouldBe("conv-1");
+        (_store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId).ShouldBe(
+            "cron-session:cron:job-1:run",
+            customMessage: "The route owner retains identity until it chooses a replacement.");
+        _store.PendingSelectionInvalid.ShouldBeTrue(
+            "Archiving the routed conversation must invalidate selection without ambiently choosing a fallback.");
     }
 
     [Fact]
@@ -353,7 +379,8 @@ public sealed class AgentInteractionServiceTests
         {
             SubAgentId = "sub-1",
             Name = "Scout",
-            Task = "Inspect repository"
+            Task = "Inspect repository",
+            Status = "Failed"
         });
 
         await _restClient.Received(1).GetSessionHistoryAsync("sub-1", Arg.Any<int>(), Arg.Any<int>(), Arg.Any<CancellationToken>());
@@ -362,11 +389,16 @@ public sealed class AgentInteractionServiceTests
         var subAgent = _store.GetAgent("sub-1");
         Assert.NotNull(subAgent);
         Assert.Equal("agent-subagent", subAgent.SessionType);
-        Assert.Equal("subagent-session:sub-1", subAgent.ActiveConversationId);
+        Assert.Equal(SubAgentObserverStatus.Failed, subAgent.ObserverStatus);
+        Assert.Equal("subagent-session:sub-1", (_store as IDisplayedConversation)?.DisplayedConversationIdFor(subAgent.AgentId));
 
         var conversation = subAgent.Conversations["subagent-session:sub-1"];
-        Assert.True(conversation.IsVirtualSession);
-        Assert.Equal("subagent", conversation.VirtualSessionKind);
+        // #2305: the locally-synthesised observer row carries the immutable typed origin instead of
+        // the deleted virtual-session flag/kind pair, and renders read-only from it.
+        Assert.True(conversation.IsLocallySynthesised);
+        Assert.Equal(ConversationSource.Agent, conversation.Source);
+        Assert.Equal(ConversationKind.AgentSubAgent, conversation.Kind);
+        Assert.True(conversation.Project(SelectionSource.SubAgentView).IsReadOnly);
         Assert.Single(conversation.Messages);
         Assert.Equal("sub-agent result", conversation.Messages[0].Content);
     }
@@ -382,12 +414,12 @@ public sealed class AgentInteractionServiceTests
         {
             ConversationId = cronKey,
             Title = "Cron · cron:202",
-            IsVirtualSession = true,
-            VirtualSessionKind = "cron",
+            Source = ConversationSource.Cron,
+            IsLocallySynthesised = true,
             ActiveSessionId = sessionId,
             HistoryLoaded = true
         };
-        _store.SetActiveConversation("agent-1", cronKey);
+        _store.SelectView("agent-1", cronKey, SelectionSource.RouteNavigation);
 
         _restClient.ArchiveConversationAsync(cronKey, Arg.Any<CancellationToken>())
             .Returns(true);
@@ -408,9 +440,9 @@ public sealed class AgentInteractionServiceTests
         {
             ConversationId = cronKey,
             Title = "Cron · stale",
-            IsVirtualSession = true,
-            VirtualSessionKind = "cron",
-            ActiveSessionId = null, // stale — no backing session
+            Source = ConversationSource.Cron,
+            IsLocallySynthesised = true,
+            ActiveSessionId = null, // stale - no backing session
             HistoryLoaded = false
         };
 
@@ -463,7 +495,7 @@ public sealed class AgentInteractionServiceTests
             IsDefault = false,
             HistoryLoaded = true
         };
-        _store.SetActiveConversation("agent-1", "conv-normal");
+        _store.SelectView("agent-1", "conv-normal", SelectionSource.RouteNavigation);
 
         _restClient.ArchiveConversationAsync("conv-normal", Arg.Any<CancellationToken>())
             .Returns(true);
@@ -553,12 +585,13 @@ public sealed class AgentInteractionServiceTests
     {
         var agent = _store.GetAgent("agent-1")!;
         // No SessionId, no ActiveConversationSessionId
-        Assert.Null(agent.ActiveConversationSessionId);
+        Assert.Null(agent.SessionId);
 
-        await _service.SteerAsync("agent-1", "redirect me");
+        await _service.SteerAsync("agent-1", "conv-1", "redirect me");
 
         // No local message should be appended because SteerAsync bails early
-        Assert.Null(agent.ActiveConversationId);
+        Assert.Null((_store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId));
+        Assert.Empty(agent.Conversations);
     }
 
     [Fact]
@@ -566,7 +599,7 @@ public sealed class AgentInteractionServiceTests
     {
         var agent = _store.GetAgent("agent-1")!;
         agent.SessionId = "sess-1";
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         agent.Conversations["conv-1"] = new ConversationState
         {
             ConversationId = "conv-1",
@@ -576,7 +609,7 @@ public sealed class AgentInteractionServiceTests
 
         // SteerAsync will fail on the hub call (no connection) and append an error,
         // but the user steering message should be appended first.
-        await _service.SteerAsync("agent-1", "redirect me");
+        await _service.SteerAsync("agent-1", "conv-1", "redirect me");
 
         var conv = agent.Conversations["conv-1"];
         Assert.True(conv.Messages.Count >= 1);
@@ -589,7 +622,7 @@ public sealed class AgentInteractionServiceTests
     {
         var agent = _store.GetAgent("agent-1")!;
         agent.SessionId = "sess-1";
-        agent.ActiveConversationId = "conv-1";
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
         agent.Conversations["conv-1"] = new ConversationState
         {
             ConversationId = "conv-1",
@@ -597,7 +630,7 @@ public sealed class AgentInteractionServiceTests
             ActiveSessionId = "sess-1"
         };
 
-        await _service.SteerAsync("agent-1", "redirect me");
+        await _service.SteerAsync("agent-1", "conv-1", "redirect me");
 
         var conv = agent.Conversations["conv-1"];
         // First message is the user steering, second is the error
@@ -693,7 +726,7 @@ public sealed class AgentInteractionServiceTests
     public async Task LoadHistory_not_called_when_streaming_active()
     {
         var agent = _store.GetAgent("agent-1")!;
-        agent.ActiveConversationId = "conv-active";
+        _store.SelectView(agent.AgentId, "conv-active" ?? string.Empty, SelectionSource.RouteNavigation);
         agent.Conversations["conv-active"] = new ConversationState
         {
             ConversationId = "conv-active",
@@ -718,8 +751,8 @@ public sealed class AgentInteractionServiceTests
             {
                 new("conv-active", "agent-1", "Active", false, "Active", "sess-active", 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
             });
-        _restClient.GetSessionsAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(new List<SessionSummary>() as IReadOnlyList<SessionSummary>);
+        _restClient.GetSessionsAsync(Arg.Any<string>(), Arg.Any<int?>(), Arg.Any<int>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new SessionPageDto([], 0, false));
 
         // This should NOT trigger a history load because conversation is streaming
         await _service.RefreshConversationsAsync("agent-1");
@@ -870,7 +903,7 @@ public sealed class AgentInteractionServiceTests
         conv.CanvasHtml.ShouldBeNull();
         conv.TodoJson.ShouldBeNull();
         _store.GetPendingAskUser("conv-fail").ShouldBeNull();
-        agent.ActiveConversationId.ShouldBe("conv-fail");
+        (_store as IDisplayedConversation)?.DisplayedConversationIdFor(agent.AgentId).ShouldBe("conv-fail");
     }
 
     [Fact]
@@ -924,5 +957,95 @@ public sealed class AgentInteractionServiceTests
         await _restClient.DidNotReceive().GetConversationPendingAskUserAsync("agent-1", "conv-live");
         _store.GetPendingAskUser("conv-live")!.RequestId.ShouldBe("live-req");
     }
+
+    // ---- #2195: Stop force-clears local turn state (escape hatch) ----
+
+    [Fact]
+    public async Task AbortAsync_force_clears_local_turn_state_even_when_hub_call_fails()
+    {
+        // #2195: if a RunEnded is missed/misrouted the conversation is stuck turn-active and the
+        // user cannot reply. Stop must always force-clear the local run bracket so the input
+        // recovers without a page reload -- even though the (disconnected) hub Abort throws.
+        var agent = _store.GetAgent("agent-1")!;
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
+        agent.IsStreaming = true;
+        agent.Conversations["conv-1"] = new ConversationState
+        {
+            ConversationId = "conv-1",
+            Title = "Test conv",
+            ActiveSessionId = "sess-1"
+        };
+        var conv = agent.Conversations["conv-1"];
+        conv.StreamState.IsRunActive = true;
+        conv.StreamState.IsStreaming = true;
+        conv.StreamState.ActiveToolCalls["tool-1"] = new ActiveToolCall
+        {
+            ToolCallId = "tool-1",
+            ToolName = "read",
+            StartedAt = DateTimeOffset.UtcNow,
+            MessageId = "msg-1"
+        };
+        Assert.True(conv.StreamState.IsTurnActive);
+
+        await _service.AbortAsync("agent-1", "conv-1");
+
+        // The turn-active bracket is cleared locally regardless of the hub result, so the portal
+        // swaps back to the normal Send control.
+        Assert.False(conv.StreamState.IsRunActive);
+        Assert.False(conv.StreamState.IsStreaming);
+        Assert.Empty(conv.StreamState.ActiveToolCalls);
+        Assert.False(conv.StreamState.IsTurnActive);
+        Assert.False(agent.IsStreaming);
+    }
+
+    // ---- #2439: Stop also clears the pending Steer/Follow-up chip ----
+
+    [Fact]
+    public async Task AbortAsync_clears_pending_steering_chip()
+    {
+        // #2439 AC2: the chip must not survive an abort. Once the run is torn down nothing will
+        // ever inject the queued follow-up, so a pending indicator that cannot be verified must
+        // not persist.
+        var agent = _store.GetAgent("agent-1")!;
+        _store.SelectView(agent.AgentId, "conv-1" ?? string.Empty, SelectionSource.RouteNavigation);
+        agent.Conversations["conv-1"] = new ConversationState
+        {
+            ConversationId = "conv-1",
+            Title = "Test conv",
+            ActiveSessionId = "sess-1"
+        };
+        _store.AddSteeringEntry("conv-1",
+            new SteeringEntry("f1", "queued follow-up", SteeringEntryKind.FollowUp, SteeringEntryStatus.Pending));
+        Assert.Single(_store.GetSteeringQueue("conv-1"));
+
+        await _service.AbortAsync("agent-1", "conv-1");
+
+        Assert.Empty(_store.GetSteeringQueue("conv-1"));
+    }
+
+    [Fact]
+    public async Task DeliverMessageAsync_AttachmentSnapshot_RemainsOnLocalEcho()
+    {
+        const string agentId = "agent-attachment-echo";
+        const string conversationId = "conversation-attachment-echo";
+        _store.UpsertAgent(new AgentState { AgentId = agentId, DisplayName = "Agent", IsConnected = true });
+        _store.SeedConversations(agentId,
+        [
+            new ConversationSummaryDto(conversationId, agentId, "Conversation", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
+        ]);
+        var attachment = new DraftAttachment("photo.png", "image/png", "AQID", 3);
+
+        await _service.DeliverMessageAsync(agentId, conversationId, "caption", attachments: [attachment]);
+
+        var messages = _store.GetAgent(agentId)?.Conversations[conversationId].Messages;
+        messages.ShouldNotBeNull();
+        var echo = messages.Where(message => message.Role == "User").ShouldHaveSingleItem();
+        var snapshot = echo.Attachments.ShouldHaveSingleItem();
+        snapshot.FileName.ShouldBe("photo.png");
+        snapshot.MimeType.ShouldBe("image/png");
+        snapshot.Size.ShouldBe(3);
+        snapshot.DataUrl.ShouldBe("data:image/png;base64,AQID");
+    }
+
 }
 

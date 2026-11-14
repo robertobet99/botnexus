@@ -1,5 +1,10 @@
 # BotNexus
 
+[![CI: Build & Test](https://github.com/sytone/botnexus/actions/workflows/ci-build-test.yml/badge.svg)](https://github.com/sytone/botnexus/actions/workflows/ci-build-test.yml)
+[![Docs](https://github.com/sytone/botnexus/actions/workflows/deploy-docs.yml/badge.svg)](https://sytone.github.io/botnexus/)
+
+📖 **Documentation site:** <https://sytone.github.io/botnexus/> · 🤝 **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
+
 ```text
 ░░▒▒▓▓█████████████████████████████████████████████████████████████████████▓▓▒▒░░
 ░▒▓                                                                           ▓▒░
@@ -77,6 +82,28 @@ BotNexus gives you a local playground for running and observing agents:
 - **Extension system** - load providers, channels, and tools dynamically instead
   of welding every experiment into the gateway.
 
+## Quick Start
+
+Get BotNexus running from the published CLI tool in three steps (requires the
+.NET 10 SDK — see [Prerequisites](#prerequisites)):
+
+```bash
+# 1. Install the BotNexus CLI (global .NET tool) and build the platform
+dotnet tool install -g BotNexus.Cli
+botnexus install --build
+
+# 2. Initialize config and configure your first provider
+botnexus init
+botnexus provider setup
+
+# 3. Start the gateway
+botnexus gateway start
+```
+
+Open the WebUI at <http://localhost:5005>. Prefer building from source? See
+[Install And Run From Source](#install-and-run-from-source) and
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Prerequisites
 
 | Requirement | Version | Notes |
@@ -109,8 +136,9 @@ dotnet tool install -g BotNexus.Cli
 Once installed, run the setup sequence:
 
 ```bash
-# 1. Clone the BotNexus platform to ~/botnexus and build it
+# 1. Clone the highest stable BotNexus release to ~/botnexus and build it
 botnexus install --build
+# Use --latest for origin/main, or --version 1.2.3 for an exact release tag.
 
 # 2. Initialize ~/.botnexus with a default config and required directories
 botnexus init
@@ -195,7 +223,8 @@ Agents are named configurations with their own workspace, model, and settings.
 BotNexus creates an `assistant` agent by default. Add more:
 
 ```bash
-botnexus agent add          # Interactive wizard
+botnexus agent wizard       # Interactive wizard
+botnexus agent add <id>     # Add an agent non-interactively
 botnexus agent list         # List configured agents
 ```
 
@@ -226,11 +255,15 @@ dotnet tool update -g BotNexus.Cli
 botnexus gateway restart
 ```
 
-**Source build:**
+**Source installation:**
 
 ```bash
-botnexus update   # git pull → build → redeploy extensions → restart gateway
+botnexus update                 # highest stable release
+botnexus update --latest        # configured development tip (origin/main)
+botnexus update --version 1.2.3 # exact v1.2.3 release tag
 ```
+
+`botnexus update check` accepts the same selectors and compares the installed source commit with the resolved target. `--latest` and `--version` are mutually exclusive. These commands update the source checkout; they do not update the packaged CLI tool. Use `dotnet tool update -g BotNexus.Cli` for the tool package.
 
 ## Diagnostics
 
@@ -304,6 +337,15 @@ Start here when you want more than a README can responsibly contain:
 | [Cron And Scheduling](docs/cron-and-scheduling.md) | Schedule background agent tasks. |
 | [Skills Guide](docs/skills.md) | Package reusable agent knowledge. |
 | [Observability](docs/observability.md) | Trace, log, and inspect the weird bits. |
+
+## Contributing
+
+Want to build from source, fix a bug, or add a provider/channel/tool? Start with
+[CONTRIBUTING.md](CONTRIBUTING.md) — it covers prerequisites, dev setup, the
+worktree/branch workflow, Conventional Commits, code style (IFileSystem, Vogen
+value objects, XML docs, warnings-as-errors), running impacted tests, and the
+pre-commit validation gate. Planning is tracked in
+[GitHub Issues](https://github.com/sytone/botnexus/issues).
 
 ## A Small Warning Label
 

@@ -2,7 +2,13 @@ using System.IO.Abstractions;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Contracts.Memory;
+using BotNexus.Memory.Embeddings;
 using BotNexus.Memory.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using BotNexus.Domain.Text;
+
+using BotNexus.Memory.Tools;
 
 namespace BotNexus.Memory;
 
@@ -18,13 +24,15 @@ public sealed class MarkdownAgentMemory : IAgentMemory
     private readonly IMemoryStore _memoryStore;
     private readonly IFileSystem _fileSystem;
     private readonly string? _memoryPathOverride;
+    private readonly ILogger _logger;
 
     public MarkdownAgentMemory(
         string agentId,
         IAgentWorkspaceManager workspaceManager,
         IMemoryStore memoryStore,
         IFileSystem fileSystem,
-        string? memoryPathOverride = null)
+        string? memoryPathOverride = null,
+        ILogger<MarkdownAgentMemory>? logger = null)
     {
         _agentId = string.IsNullOrWhiteSpace(agentId)
             ? throw new ArgumentException("Agent ID is required.", nameof(agentId))
@@ -33,6 +41,7 @@ public sealed class MarkdownAgentMemory : IAgentMemory
         _memoryStore = memoryStore ?? throw new ArgumentNullException(nameof(memoryStore));
         _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
         _memoryPathOverride = memoryPathOverride;
+        _logger = logger ?? NullLogger<MarkdownAgentMemory>.Instance;
     }
 
     /// <inheritdoc />
@@ -40,7 +49,12 @@ public sealed class MarkdownAgentMemory : IAgentMemory
     {
         ct.ThrowIfCancellationRequested();
         var workspacePath = ResolveWorkspaceDirectory(_workspaceManager.GetWorkspacePath(request.AgentId));
-        return LoadDailyMemoryContextAsync(workspacePath, ct);
+        return LoadDailyMemoryContextAsync(
+            workspacePath,
+            request.MaxTokenBudget,
+            request.MemoryToolsAvailable,
+            request.MemorySearchAvailable,
+            ct);
     }
 
     /// <inheritdoc />
@@ -55,6 +69,8 @@ public sealed class MarkdownAgentMemory : IAgentMemory
             request.Content,
             _memoryPathOverride,
             ct).ConfigureAwait(false);
+
+        await IndexNoteAsync(request.AgentId, filePath: null, request.ExpiresAt, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -69,6 +85,41 @@ public sealed class MarkdownAgentMemory : IAgentMemory
             content,
             _memoryPathOverride,
             ct).ConfigureAwait(false);
+
+        await IndexNoteAsync(_agentId, filePath, expiresAt: null, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Mirrors the markdown note that was just appended into the searchable memory store with
+    /// <c>SourceType = "note"</c> (issue #2780). Strictly additive and fail-safe: the workspace
+    /// file is the source of truth, so any indexing failure is logged and swallowed rather than
+    /// propagated back to the caller that already wrote the note successfully.
+    /// </summary>
+    private async Task IndexNoteAsync(
+        string agentId,
+        string? filePath,
+        DateTimeOffset? expiresAt,
+        CancellationToken ct)
+    {
+        try
+        {
+            var workspacePath = ResolveWorkspaceDirectory(_workspaceManager.GetWorkspacePath(agentId));
+            var notePath = MarkdownNoteIndexer.ResolveNotePath(_fileSystem, workspacePath, _memoryPathOverride, filePath);
+            if (string.IsNullOrWhiteSpace(notePath))
+                return;
+
+            await MarkdownNoteIndexer
+                .IndexNoteFileAsync(_memoryStore, _fileSystem, agentId, workspacePath, notePath, expiresAt, ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to index markdown note for agent {AgentId}; the note file was written and remains authoritative.", agentId);
+        }
     }
 
     /// <inheritdoc />
@@ -86,7 +137,7 @@ public sealed class MarkdownAgentMemory : IAgentMemory
             }
             : null;
 
-        var entries = await _memoryStore.SearchAsync(request.Query, request.TopK, filter, ct).ConfigureAwait(false);
+        var entries = await _memoryStore.SearchScoredAsync(request.Query, request.TopK, filter, ct).ConfigureAwait(false);
         return entries.Select(MapToSearchResult).ToList();
     }
 
@@ -140,9 +191,18 @@ public sealed class MarkdownAgentMemory : IAgentMemory
                     SessionId = sessionEvent.SessionId,
                     TurnIndex = pendingUser.Index,
                     SourceType = "conversation",
-                    // Strip LLM control / role-injection markup before persisting raw transcript
-                    // text to the searchable store — defends against memory-poisoning (#1560).
-                    Content = $"User: {MemoryContentSanitizer.Sanitize(pendingUser.Content)}\nAssistant: {MemoryContentSanitizer.Sanitize(turn.Content)}",
+                    // See MemoryIndexer: the pair carries a verbatim user turn, so it is stamped
+                    // with the more conservative of the two halves (#2480).
+                    Provenance = MemoryProvenance.User,
+                    OriginSessionId = sessionEvent.SessionId,
+                    OriginConversationId = sessionEvent.ConversationId,
+                                        // Strip LLM control / role-injection markup before persisting raw transcript
+                    // text to the searchable store - defends against memory-poisoning (#1560).
+                    // Then delimit through the single shared encoder so no user text can forge an
+                    // extra role record in the stored row (#2954).
+                    Content = TranscriptTurnFormat.Encode(
+                        UntrustedContentSanitizer.Sanitize(pendingUser.Content),
+                        UntrustedContentSanitizer.Sanitize(turn.Content)),
                     MetadataJson = null,
                     Embedding = null,
                     CreatedAt = turn.Timestamp,
@@ -167,8 +227,35 @@ public sealed class MarkdownAgentMemory : IAgentMemory
         return Task.CompletedTask;
     }
 
-    private async Task<AgentMemoryContext> LoadDailyMemoryContextAsync(string workspacePath, CancellationToken ct)
+    /// <summary>
+    /// Assembles the daily-note context and applies the caller's token budget (#2871).
+    /// </summary>
+    /// <remarks>
+    /// Budgeting is applied here, at the single point where assembled content becomes the returned
+    /// context, rather than at the caller. Enforcing it at the provider means every consumer of
+    /// <see cref="IAgentMemory"/> gets the bound the contract advertises, and a future second
+    /// caller cannot silently opt out of it by forgetting to trim. The trimming order and the
+    /// disclosure rule are documented on <see cref="MemoryPromptBudget"/>.
+    /// </remarks>
+    private async Task<AgentMemoryContext> LoadDailyMemoryContextAsync(
+        string workspacePath,
+        int maxTokenBudget,
+        bool memoryToolsAvailable,
+        bool memorySearchAvailable,
+        CancellationToken ct)
     {
+        // #3468: the capability decision is made before any file I/O. An agent with no memory
+        // tools should not have its notes read off disk at all, let alone assembled and then
+        // discarded -- "withheld" and "never loaded" must not be distinguishable by a timing or
+        // logging side channel.
+        if (!memoryToolsAvailable)
+        {
+            _logger.LogDebug(
+                "Skipped always-on memory injection for agent {AgentId}: the turn's effective tool policy grants it no memory tools.",
+                _agentId);
+            return AgentMemoryContext.Empty;
+        }
+
         var memoryRoot = ResolveMemoryRoot(workspacePath);
         if (!_fileSystem.Directory.Exists(memoryRoot))
             return AgentMemoryContext.Empty;
@@ -191,7 +278,6 @@ public sealed class MarkdownAgentMemory : IAgentMemory
             .ToList();
 
         var dailyNotes = new List<AgentMemoryDailyNote>();
-        var totalChars = 0;
 
         foreach (var file in files)
         {
@@ -214,15 +300,52 @@ public sealed class MarkdownAgentMemory : IAgentMemory
                 var trimmed = content.Trim();
                 if (DateOnly.TryParse(file.Name, out var date))
                 {
-                    dailyNotes.Add(new AgentMemoryDailyNote(date, trimmed));
-                    totalChars += trimmed.Length;
+                    // Daily notes under the agent's own memory root are written by the agent
+                    // itself through memory_save, so they are first-party `agent` content (#2480)
+                    // -- UNLESS the note was quarantined at write time because the run that
+                    // produced it consumed foreign content (#2519). Markdown notes have no
+                    // provenance column, so the marker embedded in the content IS the provenance
+                    // record; deriving it here is what stops a quarantined note from being handed
+                    // back as first-party knowledge on a later session.
+                    var provenance = MemoryQuarantine.IsQuarantined(trimmed)
+                        ? MemoryProvenance.ExternalUntrusted
+                        : MemoryProvenance.Agent;
+                    dailyNotes.Add(new AgentMemoryDailyNote(date, trimmed, provenance));
                 }
             }
         }
 
-        // Rough token estimate: ~4 chars per token
-        var approxTokens = totalChars / 4;
-        return new AgentMemoryContext(null, dailyNotes, approxTokens);
+        // Trust gate BEFORE budgeting (#3232 AC5). Order matters: budgeting after exclusion means
+        // the surviving first-party notes get the whole budget rather than sharing it with content
+        // that was about to be discarded, and the exclusion disclosure is itself subject to the cap.
+        var (eligible, excludedCount) = MemoryInjectionGate.Apply(
+            dailyNotes,
+            memoryToolsAvailable,
+            memorySearchAvailable);
+
+        if (excludedCount > 0)
+        {
+            _logger.LogWarning(
+                "Withheld {ExcludedCount} non-first-party daily note(s) from always-on context for agent {AgentId}; retrievable via memory_search: {Retrievable}.",
+                excludedCount,
+                _agentId,
+                memorySearchAvailable);
+        }
+
+        // Rough token estimate: ~4 chars per token, computed by the budget helper so the reported
+        // count and the enforced cap are expressed in identical units.
+        var budgeted = MemoryPromptBudget.Apply(eligible, maxTokenBudget);
+
+        if (budgeted.WasTrimmed)
+        {
+            _logger.LogInformation(
+                "Memory prompt context for agent {AgentId} exceeded the {Budget}-token budget and was trimmed to ~{Tokens} tokens.",
+                _agentId,
+                maxTokenBudget,
+                budgeted.ApproximateTokenCount);
+        }
+
+        return new AgentMemoryContext(null, budgeted.Notes, budgeted.ApproximateTokenCount);
     }
 
     private string ResolveWorkspaceDirectory(string workspacePath)
@@ -264,5 +387,22 @@ public sealed class MarkdownAgentMemory : IAgentMemory
             Content: entry.Content,
             SourceType: entry.SourceType,
             SessionId: entry.SessionId,
-            CreatedAt: entry.CreatedAt);
+            CreatedAt: entry.CreatedAt)
+        {
+            // Always the normalized value, never the raw column: recall must not be able to
+            // present a NULL or malformed provenance as anything other than `unknown` (#2480).
+            Provenance = entry.NormalizedProvenance,
+            // Derived from the same row, not defaulted: a caller that renders the tier must see the
+            // tier the ranker actually applied to this row (#3232 AC8).
+            TrustTier = MemoryTrust.ToWireValue(entry.TrustTier),
+            OriginConversationId = entry.OriginConversationId,
+            OriginSessionId = entry.OriginSessionId
+        };
+
+    /// <summary>
+    /// Maps a ranked row, preserving the fused relevance score so the caller can render a magnitude
+    /// and apply a floor instead of inferring relevance from position (#2781).
+    /// </summary>
+    private static AgentMemorySearchResult MapToSearchResult(ScoredMemoryEntry scored)
+        => MapToSearchResult(scored.Entry) with { RelevanceScore = scored.Score };
 }

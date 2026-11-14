@@ -1,10 +1,13 @@
+using System.Globalization;
 using System.Text;
+using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Extensions;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Security;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
@@ -13,16 +16,30 @@ namespace BotNexus.Gateway.Commands;
 /// <summary>
 /// Provides built-in slash commands through the shared command contributor extension contract.
 /// </summary>
-internal sealed class BuiltInCommandContributor(
+internal sealed partial class BuiltInCommandContributor(
     IAgentRegistry agentRegistry,
     IAgentSupervisor agentSupervisor,
     ISessionStore sessionStore,
     IOptionsMonitor<CompactionOptions> compactionOptions,
     IServiceProvider serviceProvider,
-    ISessionCompactionCoordinator? compactionCoordinator = null) : ICommandContributor
+    ISessionCompactionCoordinator? compactionCoordinator = null,
+    ISessionCompactionDiagnostics? compactionDiagnostics = null) : ICommandContributor
 {
+    /// <summary>
+    /// Ceiling for the model-rejection text a slash command returns. Mirrors
+    /// <c>CronModelPreflight.MaxReasonLength</c>: the remedy list is a full model catalogue, which
+    /// must not be pasted unbounded into a chat surface.
+    /// </summary>
+    private const int ModelRejectionReasonMaxLength = 512;
+
     private static readonly IReadOnlyList<CommandDescriptor> BuiltInCommands =
     [
+        new CommandDescriptor
+        {
+            Name = "/loop",
+            Description = "Create (/loop [interval] <prompt>), list (/loop status), or stop (/loop stop [name]) loops in this conversation.",
+            Category = "Session"
+        },
         new CommandDescriptor
         {
             Name = "/help",
@@ -77,6 +94,12 @@ internal sealed class BuiltInCommandContributor(
             Name = "/reasoning",
             Description = "Show, set (/reasoning <minimal|low|medium|high|xhigh|max>), or clear (/reasoning clear) the per-conversation thinking override.",
             Category = "Session"
+        },
+        new CommandDescriptor
+        {
+            Name = "/tools",
+            Description = "Show (/tools), narrow (/tools disable <tool...> | /tools only <tool...>), or clear (/tools clear) the per-conversation tool overlay. Narrowing-only: it cannot grant a tool the agent lacks.",
+            Category = "Session"
         }
     ];
 
@@ -93,10 +116,12 @@ internal sealed class BuiltInCommandContributor(
             "/agents" => Task.FromResult(ExecuteAgents()),
             "/new" => ExecuteNewSessionAsync(context, cancellationToken),
             "/reset" => Task.FromResult(ClientSideOnlyCommandResult()),
-            "/context" => Task.FromResult(ExecuteContext(context)),
+            "/context" => ExecuteContextAsync(context, cancellationToken),
             "/compact" => ExecuteCompactAsync(context, cancellationToken),
             "/model" => ExecuteModelOverrideAsync(context, cancellationToken),
             "/reasoning" => ExecuteReasoningOverrideAsync(context, cancellationToken),
+            "/tools" => ExecuteToolOverrideAsync(context, cancellationToken),
+            "/loop" => ExecuteLoopAsync(context, cancellationToken),
             _ => Task.FromResult(new CommandResult
             {
                 Title = "Command Not Found",
@@ -236,7 +261,7 @@ internal sealed class BuiltInCommandContributor(
         };
     }
 
-    private CommandResult ExecuteContext(CommandExecutionContext context)
+    private async Task<CommandResult> ExecuteContextAsync(CommandExecutionContext context, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(context.AgentId) || string.IsNullOrWhiteSpace(context.SessionId))
         {
@@ -282,23 +307,64 @@ internal sealed class BuiltInCommandContributor(
             };
         }
 
-        var contextWindowTokens = compactionOptions.CurrentValue.ContextWindowTokens;
+        // Resolve only after the existing resident-handle guards. Never create a handle or
+        // replace missing/failed policy with a cached model binding or relaxed global policy.
+        var policy = compactionDiagnostics is null ? null
+            : await compactionDiagnostics.ResolveAsync(agentId, sessionId, cancellationToken).ConfigureAwait(false);
+        var contextWindowTokens = policy?.ScopedContextWindowTokens;
         var totalUsed = diag.TotalEstimatedTokens;
-        var remaining = contextWindowTokens - totalUsed;
-        var usedPct = contextWindowTokens > 0
-            ? Math.Round((double)totalUsed / contextWindowTokens * 100, 1)
-            : 0.0;
 
-        static string Pct(int tokens, int window)
-            => window > 0 ? $"{Math.Round((double)tokens / window * 100, 1),5:F1}%" : "  n/a%";
+        static string Pct(int tokens, int? window)
+            => window is > 0
+                ? ((double)tokens / window.Value * 100).ToString("F1", CultureInfo.InvariantCulture) + "%"
+                : "n/a";
 
-        static string Fmt(int n) => n.ToString("N0");
+        static string Fmt(int n) => n.ToString("N0", CultureInfo.InvariantCulture);
+        static string Ratio(double n) => n.ToString("0.###", CultureInfo.InvariantCulture);
 
         var separator = new string('-', 60);
         var sb = new StringBuilder();
-        sb.AppendLine($"Context Window Usage  ({usedPct}% of {Fmt(contextWindowTokens)} token window)");
+        sb.AppendLine("Context Window Usage");
+        if (policy is not null)
+        {
+            sb.AppendLine(contextWindowTokens is { } scopedWindow
+                ? $"Scoped working window: {Fmt(scopedWindow)} tokens"
+                : "Scoped working window: unavailable");
+            if (contextWindowTokens is null)
+                sb.AppendLine($"Compaction policy fallback window: {Fmt(policy.ContextWindowTokens)} tokens (not known model capacity)");
+            var ceilingSource = policy.CompactionTokenCeilingSource switch
+            {
+                "conversation" => "conversation",
+                "agent" => "agent",
+                "world" => "world",
+                _ => "none"
+            };
+            sb.AppendLine(policy.CompactionTokenCeiling is { } ceiling
+                ? $"Compaction ceiling: {Fmt(ceiling)} tokens (source: {ceilingSource})"
+                : "Compaction ceiling: none (source: none)");
+            sb.AppendLine($"Ratio safety threshold: {Fmt(policy.RatioSafetyThresholdTokens)} tokens (configured ratio: {Ratio(policy.TokenThresholdRatio)})");
+            sb.AppendLine($"Effective token trigger threshold: {Fmt(policy.EffectiveThresholdTokens)} tokens");
+            sb.AppendLine("Token pressure triggers above this threshold, not at equality; this is not a hard cap or a guarantee that compaction will succeed.");
+            sb.AppendLine($"Persisted LLM-visible history estimate: {Fmt(policy.LocalEstimatedTokens)} tokens");
+            sb.AppendLine("The persisted estimate excludes system instructions, tool definitions and injected workspace context.");
+            var measurementSource = policy.ProviderMeasurementSource == "lastProviderPromptTokens"
+                ? "lastProviderPromptTokens" : "unavailable";
+            sb.AppendLine(policy.ProviderPromptTokens is { } providerTokens
+                ? $"Last completed provider prompt: {Fmt(providerTokens)} tokens (source: {measurementSource})"
+                : "Last completed provider prompt: unavailable (source: unavailable)");
+            sb.AppendLine($"Provider / persisted estimate ratio: {(policy.ProviderToEstimateRatio is { } ratio ? Ratio(ratio) : "unavailable")}");
+            sb.AppendLine("Provider counts describe the last completed request, not a new request. Byte triggers and circuit-breaker state are not reported here.");
+        }
+        else
+        {
+            sb.AppendLine("Compaction policy: unavailable");
+            if (compactionDiagnostics is null)
+                sb.AppendLine($"Configured compaction fallback window: {Fmt(compactionOptions.CurrentValue.ContextWindowTokens)} tokens (not known model capacity)");
+        }
         sb.AppendLine();
-        sb.AppendLine($"{"Section",-28} {"~Tokens",9}  {"Chars",9}  {"  %",6}");
+        sb.AppendLine("Handle context breakdown (estimate) - separate from persisted compaction history");
+        sb.AppendLine();
+        sb.AppendLine($"{"Section",-28} {"~Tokens",9}  {"Chars",9}  {(contextWindowTokens is > 0 ? "%" : "n/a"),6}");
         sb.AppendLine(separator);
         sb.AppendLine($"{"System instructions",-28} {Fmt(diag.SystemPromptTokens),9}  {Fmt(diag.SystemPromptChars),9}  {Pct(diag.SystemPromptTokens, contextWindowTokens),6}");
         sb.AppendLine($"{"Tool definitions",-28} {Fmt(diag.ToolDefinitionTokens),9}  {Fmt(diag.ToolDefinitionChars),9}  {Pct(diag.ToolDefinitionTokens, contextWindowTokens),6}");
@@ -306,10 +372,12 @@ internal sealed class BuiltInCommandContributor(
         sb.AppendLine($"{"Tool results",-28} {Fmt(diag.ToolResultTokens),9}  {Fmt(diag.ToolResultChars),9}  {Pct(diag.ToolResultTokens, contextWindowTokens),6}");
         sb.AppendLine(separator);
         sb.AppendLine($"{"Total used",-28} {Fmt(totalUsed),9}  {"",9}  {Pct(totalUsed, contextWindowTokens),6}");
-        sb.AppendLine($"{"Remaining",-28} {Fmt(remaining),9}");
         sb.AppendLine();
         sb.AppendLine($"History: {diag.HistoryEntryCount} message(s)  |  Tools: {diag.ToolCount}");
-        sb.AppendLine("Note: token counts are estimates (chars / 4). Actual provider usage may differ.");
+        sb.AppendLine(
+            "Note: token counts are estimates - CJK characters are weighted at ~1 token each and " +
+            "other characters at ~1/4 (#3655). This is a heuristic, not a tokenizer; actual provider " +
+            "usage may differ.");
 
         return new CommandResult
         {
@@ -396,15 +464,23 @@ internal sealed class BuiltInCommandContributor(
 
         if (IsClearToken(arg))
         {
-            conversation.ModelOverride = null;
-            conversation.UpdatedAt = DateTimeOffset.UtcNow;
-            await store.SaveAsync(conversation, cancellationToken).ConfigureAwait(false);
+            // Clearing must stay reachable even when the STORED override is unresolvable - that is
+            // the only in-product escape from a conversation whose override no longer resolves.
+            // It is therefore deliberately validated-exempt.
+            await PatchOverrideAsync(store, conversation, FieldUpdate<string?>.Set(null), FieldUpdate<string?>.Unset, cancellationToken)
+                .ConfigureAwait(false);
             return new CommandResult { Title = "Model Override", Body = "Cleared model override; reverting to the agent default.", IsError = false };
         }
 
-        conversation.ModelOverride = arg;
-        conversation.UpdatedAt = DateTimeOffset.UtcNow;
-        await store.SaveAsync(conversation, cancellationToken).ConfigureAwait(false);
+        // #3228: validate BEFORE persisting. Without this the command stored any string, and the
+        // resulting unresolvable override threw in InProcessIsolationStrategy during agent
+        // construction on every subsequent turn - before command dispatch - so the conversation
+        // could not be repaired from inside the product.
+        if (ClassifyModelRejection(conversation.AgentId, arg) is { } rejection)
+            return new CommandResult { Title = "Model Override", Body = rejection, IsError = true };
+
+        await PatchOverrideAsync(store, conversation, FieldUpdate<string?>.Set(arg), FieldUpdate<string?>.Unset, cancellationToken)
+            .ConfigureAwait(false);
         return new CommandResult { Title = "Model Override", Body = $"Set model override to '{arg}' for this conversation.", IsError = false };
     }
 
@@ -425,9 +501,8 @@ internal sealed class BuiltInCommandContributor(
 
         if (IsClearToken(arg))
         {
-            conversation.ThinkingOverride = null;
-            conversation.UpdatedAt = DateTimeOffset.UtcNow;
-            await store.SaveAsync(conversation, cancellationToken).ConfigureAwait(false);
+            await PatchOverrideAsync(store, conversation, FieldUpdate<string?>.Unset, FieldUpdate<string?>.Set(null), cancellationToken)
+                .ConfigureAwait(false);
             return new CommandResult { Title = "Reasoning Override", Body = "Cleared thinking override; reverting to the agent default.", IsError = false };
         }
 
@@ -435,10 +510,195 @@ internal sealed class BuiltInCommandContributor(
         if (token is not ("minimal" or "low" or "medium" or "high" or "xhigh" or "max"))
             return new CommandResult { Title = "Reasoning Override", Body = $"Unknown thinking level '{arg}'. Use minimal, low, medium, high, xhigh, or max.", IsError = true };
 
-        conversation.ThinkingOverride = token;
-        conversation.UpdatedAt = DateTimeOffset.UtcNow;
-        await store.SaveAsync(conversation, cancellationToken).ConfigureAwait(false);
+        await PatchOverrideAsync(store, conversation, FieldUpdate<string?>.Unset, FieldUpdate<string?>.Set(token), cancellationToken)
+            .ConfigureAwait(false);
         return new CommandResult { Title = "Reasoning Override", Body = $"Set thinking override to '{token}' for this conversation.", IsError = false };
+    }
+
+    /// <summary>
+    /// Classifies a requested model override for the agent's provider, returning operator-facing
+    /// rejection text when the id positively does not resolve, or <see langword="null"/> when the
+    /// command may proceed.
+    /// <para>
+    /// Routes through the shared <see cref="ModelPreflight"/> seam - the same classifier the cron
+    /// preflight and the create_agent/update_agent tools use - so the slash command and
+    /// <c>PUT /api/conversations/{id}/override</c> cannot develop different notions of a valid
+    /// model (#3228). An absent or empty registry classifies as "cannot know" and is deliberately
+    /// NOT a rejection, so a minimal host does not start refusing valid overrides.
+    /// </para>
+    /// </summary>
+    private string? ClassifyModelRejection(AgentId agentId, string requestedModel)
+    {
+        var registry = serviceProvider.GetService<ModelRegistry>();
+        var descriptor = agentRegistry.Get(agentId);
+        var provider = descriptor?.ApiProvider;
+
+        if (descriptor is not null && !AgentModelPermission.IsPermitted(descriptor, requestedModel))
+            return AgentModelPermission.FormatRejection(descriptor, requestedModel);
+
+        // An unqualified id with no known provider still gets probed across every registered
+        // provider rather than being waved through unchecked.
+        var result = string.IsNullOrWhiteSpace(provider)
+            ? ModelPreflight.ResolveBare(registry, requestedModel)
+            : ModelPreflight.Resolve(registry, provider, requestedModel);
+
+        if (!result.IsRejection)
+            return null;
+
+        return result.Kind == ModelPreflightKind.UnknownProvider
+            ? ModelPreflight.FormatList(
+                $"Model override '{requestedModel}' names a provider that is not registered. Known providers: ",
+                result.AvailableProviders,
+                ".",
+                ModelRejectionReasonMaxLength)
+            : ModelPreflight.FormatList(
+                $"Model '{requestedModel}' is not registered for this agent's provider. Available: ",
+                result.AvailableModels,
+                ".",
+                ModelRejectionReasonMaxLength);
+    }
+
+    /// <summary>
+    /// Writes conversation overrides through the narrow transactional patch rather than a
+    /// whole-record save. #2139 introduced <c>PatchOverrideAsync</c> precisely so a pin or metadata
+    /// mutation committed between the read and the write is preserved; the REST controller was
+    /// converted then, but these command handlers were left on <c>SaveAsync</c> and silently
+    /// retained the clobber (#3228).
+    /// </summary>
+    private static async Task PatchOverrideAsync(
+        IConversationStore store,
+        Conversation conversation,
+        FieldUpdate<string?> model,
+        FieldUpdate<string?> thinking,
+        CancellationToken cancellationToken)
+    {
+        await store.PatchOverrideAsync(
+            conversation.ConversationId,
+            new ConversationOverridePatch { Model = model, Thinking = thinking },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Shows or narrows the per-conversation tool overlay (issue #2523).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Grammar: <c>/tools</c> shows the current overlay; <c>/tools disable exec shell</c> drops
+    /// those tools; <c>/tools only read grep</c> narrows to that subset; <c>/tools clear</c> removes
+    /// the overlay. Writes through <c>PatchOverrideAsync</c> for the same clobber-avoidance reason
+    /// as <c>/model</c> and <c>/reasoning</c> (#3228).
+    /// </para>
+    /// <para>
+    /// There is deliberately NO "enable a tool the agent lacks" verb. The overlay narrows the
+    /// agent's configured set and nothing more; granting a tool requires editing the agent, which
+    /// carries the appropriate authority. <c>SessionToolOverrideResolver</c> enforces this at
+    /// resolution time regardless of what is persisted here, so a hand-written override row cannot
+    /// bypass it either.
+    /// </para>
+    /// </remarks>
+    private async Task<CommandResult> ExecuteToolOverrideAsync(CommandExecutionContext context, CancellationToken cancellationToken)
+    {
+        const string Title = "Tool Override";
+
+        var (conversation, error) = await ResolveActiveConversationAsync(context, cancellationToken).ConfigureAwait(false);
+        if (conversation is null)
+            return new CommandResult { Title = Title, Body = error!, IsError = true };
+
+        var store = serviceProvider.GetService<IConversationStore>()!;
+        var current = SessionToolOverride.FromJson(conversation.ToolOverrideJson);
+
+        if (context.Arguments.Count == 0)
+            return new CommandResult { Title = Title, Body = DescribeToolOverride(current), IsError = false };
+
+        var verb = context.Arguments[0].Trim().ToLowerInvariant();
+        var names = context.Arguments.Skip(1)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name.Trim())
+            .ToList();
+
+        if (IsClearToken(verb))
+        {
+            await PatchToolOverrideAsync(store, conversation, null, cancellationToken).ConfigureAwait(false);
+            return new CommandResult { Title = Title, Body = "Cleared the tool overlay; this conversation gets the agent's full configured tool set.", IsError = false };
+        }
+
+        if (names.Count == 0)
+        {
+            return new CommandResult
+            {
+                Title = Title,
+                Body = $"Usage: /tools | /tools disable <tool...> | /tools only <tool...> | /tools clear\n\n{DescribeToolOverride(current)}",
+                IsError = true
+            };
+        }
+
+        SessionToolOverride updated;
+        string summary;
+        switch (verb)
+        {
+            case "disable":
+            case "drop":
+                updated = new SessionToolOverride
+                {
+                    EnabledTools = current?.EnabledTools,
+                    DisabledTools = [.. (current?.DisabledTools ?? []).Concat(names).Distinct(StringComparer.OrdinalIgnoreCase)]
+                };
+                summary = $"Disabled for this conversation: {string.Join(", ", names)}.";
+                break;
+
+            case "only":
+            case "enable":
+                updated = new SessionToolOverride
+                {
+                    EnabledTools = [.. names.Distinct(StringComparer.OrdinalIgnoreCase)],
+                    DisabledTools = current?.DisabledTools
+                };
+                summary = $"Narrowed this conversation to: {string.Join(", ", names)}. "
+                    + "Any name the agent does not have is refused, not granted.";
+                break;
+
+            default:
+                return new CommandResult
+                {
+                    Title = Title,
+                    Body = $"Unknown option '{verb}'. Use: /tools | /tools disable <tool...> | /tools only <tool...> | /tools clear",
+                    IsError = true
+                };
+        }
+
+        await PatchToolOverrideAsync(store, conversation, updated, cancellationToken).ConfigureAwait(false);
+        return new CommandResult { Title = Title, Body = $"{summary}\nTakes effect on the next turn.", IsError = false };
+    }
+
+    private static string DescribeToolOverride(SessionToolOverride? current)
+    {
+        if (current is null || !current.HasRestrictions)
+            return "No tool overlay set - this conversation uses the agent's full configured tool set.";
+
+        var lines = new List<string>();
+        if (current.EnabledTools is { Count: > 0 } enabled)
+            lines.Add($"Narrowed to: {string.Join(", ", enabled)}");
+        if (current.DisabledTools is { Count: > 0 } disabled)
+            lines.Add($"Disabled: {string.Join(", ", disabled)}");
+
+        lines.Add("The overlay can only narrow the agent's tool set; it never grants a tool the agent lacks.");
+        return string.Join("\n", lines);
+    }
+
+    private static async Task PatchToolOverrideAsync(
+        IConversationStore store,
+        Conversation conversation,
+        SessionToolOverride? overrides,
+        CancellationToken cancellationToken)
+    {
+        await store.PatchOverrideAsync(
+            conversation.ConversationId,
+            new ConversationOverridePatch
+            {
+                ToolOverrideJson = FieldUpdate<string?>.Set(
+                    overrides is { HasRestrictions: true } ? overrides.ToJson() : null)
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static bool IsClearToken(string arg)

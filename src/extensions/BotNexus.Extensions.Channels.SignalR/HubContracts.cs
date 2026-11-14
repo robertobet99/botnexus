@@ -13,9 +13,16 @@ public sealed record SendMessageResult(
     [property: JsonPropertyName("agentId")] string AgentId,
     [property: JsonPropertyName("channelType")] string? ChannelType);
 
+/// <summary>Authoritative server-owned activity for a run in flight at subscribe time.</summary>
+public sealed record RunActivitySnapshot(
+    [property: JsonPropertyName("sessionId")] string SessionId,
+    [property: JsonPropertyName("agentId")] string AgentId,
+    [property: JsonPropertyName("conversationId")] string? ConversationId);
+
 /// <summary>Result returned by <c>SubscribeAll</c>.</summary>
 public sealed record SubscribeAllResult(
-    [property: JsonPropertyName("sessions")] IReadOnlyList<SessionSummary> Sessions);
+    [property: JsonPropertyName("sessions")] IReadOnlyList<SessionSummary> Sessions,
+    [property: JsonPropertyName("activeRuns")] IReadOnlyList<RunActivitySnapshot> ActiveRuns);
 
 /// <summary>Result returned by <c>CompactSession</c>.</summary>
 public sealed record CompactSessionResult(
@@ -36,11 +43,17 @@ public sealed record ConnectedPayload(
     [property: JsonPropertyName("capabilities")] HubCapabilities Capabilities);
 
 /// <summary>Agent identity summary included in <see cref="ConnectedPayload"/>.</summary>
+/// <remarks>
+/// #3596: <c>summary</c> is appended last with a null default so a client built against the
+/// previous shape still deserialises the payload - the field is additive and optional, never
+/// required, and is omitted from the wire entirely when the agent has never written one.
+/// </remarks>
 public sealed record AgentSummary(
     [property: JsonPropertyName("agentId")] string AgentId,
     [property: JsonPropertyName("displayName")] string DisplayName,
     [property: JsonPropertyName("emoji")] string? Emoji = null,
-    [property: JsonPropertyName("description")] string? Description = null);
+    [property: JsonPropertyName("description")] string? Description = null,
+    [property: JsonPropertyName("summary")] string? Summary = null);
 
 /// <summary>Hub capabilities advertised on connect.</summary>
 public sealed record HubCapabilities(
@@ -94,6 +107,12 @@ public sealed record ConversationChangedPayload(
     [property: JsonPropertyName("agentId")] string AgentId,
     [property: JsonPropertyName("conversationId")] string ConversationId,
     [property: JsonPropertyName("updatedAt")] DateTimeOffset? UpdatedAt = null);
+
+/// <summary>Payload sent only to the reader whose durable conversation cursor advanced.</summary>
+public sealed record ConversationReadStateChangedPayload(
+    [property: JsonPropertyName("conversationId")] string ConversationId,
+    [property: JsonPropertyName("position")] long Position,
+    [property: JsonPropertyName("version")] long Version);
 
 /// <summary>Kind of steering feedback event.</summary>
 public enum SteeringFeedbackKind { Injected, Queued }

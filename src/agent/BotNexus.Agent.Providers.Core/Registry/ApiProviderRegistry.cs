@@ -10,10 +10,11 @@ namespace BotNexus.Agent.Providers.Core.Registry;
 /// </summary>
 public sealed class ApiProviderRegistry
 {
-    private sealed record Registration(IApiProvider Provider, string? SourceId);
-    private sealed class GuardedProvider(IApiProvider inner) : IApiProvider
+    private sealed record Registration(IApiProvider Provider, string? SourceId, IReadOnlySet<ProviderCapability> Capabilities);
+    private class GuardedProvider(IApiProvider inner) : IApiProvider
     {
         public string Api => inner.Api;
+        public ProviderCapabilities Capabilities => inner.Capabilities;
 
         /// <summary>
         /// Executes stream.
@@ -48,6 +49,14 @@ public sealed class ApiProviderRegistry
         }
     }
 
+    // Preserve optional health policy without advertising it for providers that do not own one.
+    private sealed class GuardedHealthProvider(IApiProvider inner, IProviderHealthCheck healthCheck)
+        : GuardedProvider(inner), IProviderHealthCheck
+    {
+        public Task<ProviderHealthResult> CheckAsync(string providerId, CancellationToken cancellationToken = default) =>
+            healthCheck.CheckAsync(providerId, cancellationToken);
+    }
+
     private readonly ConcurrentDictionary<string, Registration> _registry = new();
 
     /// <summary>
@@ -55,9 +64,20 @@ public sealed class ApiProviderRegistry
     /// </summary>
     /// <param name="provider">The provider.</param>
     /// <param name="sourceId">The source id.</param>
-    public void Register(IApiProvider provider, string? sourceId = null)
+    /// <param name="capabilities">
+    /// The code-side capability set this registration declares (issue #2853). Omitted means
+    /// <see cref="ProviderCapabilitySets.ChatOnly"/>, which is the pre-#2853 meaning of every
+    /// existing registration -- so no caller changes behaviour by not passing it.
+    /// </param>
+    public void Register(IApiProvider provider, string? sourceId = null, IReadOnlySet<ProviderCapability>? capabilities = null)
     {
-        _registry[provider.Api] = new Registration(new GuardedProvider(provider), sourceId);
+        var declared = capabilities is null || capabilities.Count == 0
+            ? ProviderCapabilitySets.ChatOnly
+            : new HashSet<ProviderCapability>(capabilities);
+        IApiProvider guarded = provider is IProviderHealthCheck healthCheck
+            ? new GuardedHealthProvider(provider, healthCheck)
+            : new GuardedProvider(provider);
+        _registry[provider.Api] = new Registration(guarded, sourceId, declared);
     }
 
     /// <summary>
@@ -77,6 +97,33 @@ public sealed class ApiProviderRegistry
     public IReadOnlyList<IApiProvider> GetAll()
     {
         return _registry.Values.Select(r => r.Provider).ToList();
+    }
+
+    /// <summary>
+    /// Returns the providers whose registration declares <paramref name="capability"/> (issue #2853).
+    /// A provider that does not declare it is absent from the result even though it is registered
+    /// and still resolvable by <see cref="Get"/> -- capability declaration is orthogonal to api
+    /// resolution, not a replacement for it.
+    /// </summary>
+    /// <param name="capability">The declared capability to filter on.</param>
+    /// <returns>The registered providers declaring the capability.</returns>
+    public IReadOnlyList<IApiProvider> GetByCapability(ProviderCapability capability)
+    {
+        return _registry.Values
+            .Where(r => r.Capabilities.Contains(capability))
+            .Select(r => r.Provider)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Returns the capability set declared by the registration for <paramref name="api"/>, or
+    /// <see langword="null"/> when no provider is registered for it.
+    /// </summary>
+    /// <param name="api">The api key.</param>
+    /// <returns>The declared capability set, or null.</returns>
+    public IReadOnlySet<ProviderCapability>? GetCapabilities(string api)
+    {
+        return _registry.TryGetValue(api, out var reg) ? reg.Capabilities : null;
     }
 
     /// <summary>

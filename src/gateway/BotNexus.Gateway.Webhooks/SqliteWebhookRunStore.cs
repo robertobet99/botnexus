@@ -24,6 +24,9 @@ public sealed class SqliteWebhookRunStore(
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private bool _initialized;
 
+    /// <summary>The schema version of the shared webhook database understood by this store.</summary>
+    public const int CurrentSchemaVersion = WebhookSqliteSchema.CurrentVersion;
+
     public async Task InitializeAsync(CancellationToken ct = default)
     {
         if (_initialized) return;
@@ -62,6 +65,8 @@ public sealed class SqliteWebhookRunStore(
                 ON webhook_runs(webhook_id, accepted_at DESC);
                 """;
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+            connection.Apply( CurrentSchemaVersion, WebhookSqliteSchema.Migrations);
 
             _initialized = true;
         }
@@ -192,7 +197,7 @@ public sealed class SqliteWebhookRunStore(
                 DELETE FROM webhook_runs
                 WHERE completed_at IS NOT NULL
                   AND completed_at < $cutoff
-                  AND status IN ('Completed', 'Failed', 'Timeout')
+                  AND status IN ('Completed', 'Failed', 'Timeout', 'Rejected')
                 """;
             cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
             var deleted = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);

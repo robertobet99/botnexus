@@ -1,12 +1,229 @@
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Sessions;
 using BotNexus.Gateway.Streaming;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 
 namespace BotNexus.Gateway.Tests;
 
 public sealed class StreamingSessionHelperTests
 {
+    [Fact]
+    public async Task ProcessAndSaveAsync_MultipleTurnEnds_ReturnsCompleteRunAssistantContent()
+    {
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-multiple-turns"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+
+        var result = await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "first" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, Usage = new AgentResponseUsage(5, 2) },
+                new AgentStreamEvent { Type = AgentStreamEventType.TurnEnd },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "second" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, Usage = new AgentResponseUsage(4, 3) },
+                new AgentStreamEvent { Type = AgentStreamEventType.TurnEnd },
+                new AgentStreamEvent { Type = AgentStreamEventType.RunEnded }
+            ]),
+            session,
+            store.Object);
+
+        result.AssistantContent.ShouldBe($"first{Environment.NewLine}second");
+        result.Usage.ShouldBe(new AgentResponseUsage(9, 5));
+        result.TurnCount.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_RunEndedCompletion_SurvivesInResultWithUsageEvidence()
+    {
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-completion"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+        var completion = new RunCompletionSignal("Parked", ["open"], "UserInput", "detail", "evidence", "user", "reply", 1);
+
+        var result = await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, Usage = new AgentResponseUsage(5, 2) },
+                new AgentStreamEvent { Type = AgentStreamEventType.RunEnded, Completion = completion }
+            ]),
+            session,
+            store.Object);
+
+        result.Completion.ShouldBe(completion);
+        result.Usage.ShouldBe(new AgentResponseUsage(5, 2));
+        result.TurnCount.ShouldBe(1);
+        result.FinalSaveOutcome.ShouldBe(SessionSaveOutcome.Persisted);
+    }
+
+    /// <summary>
+    /// Minimal capturing logger so the #2921 silent-stop warning can be asserted on directly
+    /// rather than inferred. Records level plus the formatted message.
+    /// </summary>
+    private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger
+    {
+        public List<(Microsoft.Extensions.Logging.LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Entries.Add((logLevel, formatter(state, exception)));
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_ThinkingThenTextThenEmptyFinalCompletion_DoesNotPersistGhostRow()
+    {
+        // #2921 regression: hadThinkingContent is a run-wide sticky latch while thinkingBuffer is
+        // cleared at every TurnEnd. A normal thinking+text turn therefore used to fall into the
+        // #1198 thinking-only branch at the final write and append a SECOND, contentless assistant
+        // row carrying no ThinkingContent - the exact shape of the 412 observed ghost rows.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-2921-ghost"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.ThinkingDelta, ThinkingContent = "Reasoning..." },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "Here is the answer." },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd },
+                new AgentStreamEvent { Type = AgentStreamEventType.TurnEnd },
+                // The provider then emits a contentless final completion.
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd }
+            ]),
+            session,
+            store.Object);
+
+        // Exactly one assistant row - the real answer. No trailing ghost.
+        session.History.ShouldHaveSingleItem();
+        session.History[0].Content.ShouldBe("Here is the answer.");
+        session.History[0].ThinkingContent.ShouldBe("Reasoning...");
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_MessageStartEndWithNoDeltas_PersistsNothingAndWarns()
+    {
+        // #2921 AC3 + AC4: a stream with MessageStart/MessageEnd and no ContentDelta/ThinkingDelta
+        // persists zero assistant entries, and the silent stop is surfaced as a warning naming the
+        // session id.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-2921-empty"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+        var logger = new CapturingLogger();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(Logger: logger));
+
+        session.History.ShouldBeEmpty();
+
+        var warning = logger.Entries.ShouldHaveSingleItem();
+        warning.Level.ShouldBe(Microsoft.Extensions.Logging.LogLevel.Warning);
+        warning.Message.ShouldContain("session-2921-empty");
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_ThinkingOnly_StillPersistsEntry_AndDoesNotWarn()
+    {
+        // #2921 AC2 anti-regression pin for the #1198/#656 branch. This fails if that branch is
+        // removed or if the new emptiness guard swallows the legitimate thinking-only case.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-2921-think"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+        var logger = new CapturingLogger();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.ThinkingDelta, ThinkingContent = "Only reasoning." },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(Logger: logger));
+
+        session.History.ShouldHaveSingleItem();
+        session.History[0].Role.ShouldBe(MessageRole.Assistant);
+        session.History[0].Content.ShouldBe(string.Empty);
+        // A thinking-only turn is normal model behaviour, not a silent stop.
+        logger.Entries.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_ContentThenMessageEndThenTurnEnd_DoesNotWarnEmptyCompletion()
+    {
+        // #3129 false-positive repro. streamedContent/streamedHistory are per-TURN buffers: the
+        // TurnEnd case persists the assistant message and then CLEARS both. The final write
+        // therefore sees empty buffers plus hadMessageEnd and used to log the #2921 "terminated on
+        // an empty assistant completion" warning milliseconds AFTER writing the very content it
+        // was denying. 153 of 160 observed warnings had this shape.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-3129-normal"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+        var logger = new CapturingLogger();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.RunStarted },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "Here is the answer." },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd },
+                new AgentStreamEvent { Type = AgentStreamEventType.TurnEnd },
+                new AgentStreamEvent { Type = AgentStreamEventType.RunEnded }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(Logger: logger));
+
+        // The content really was delivered...
+        session.History.ShouldHaveSingleItem();
+        session.History[0].Content.ShouldBe("Here is the answer.");
+        // ...so nothing may claim the run ended on an empty assistant completion.
+        logger.Entries.ShouldNotContain(e => e.Message.Contains("empty assistant completion"));
+        logger.Entries.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_RunWithNoAssistantContentAtAll_StillWarnsEmptyCompletion()
+    {
+        // #3129 true-positive pin. The #2921 signal must SURVIVE the precision fix - this is the
+        // genuine "run ended without answering" failure mode that the #3125 spike depends on.
+        // A change that silences the branch outright fixes the sibling test and breaks this one.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-3129-genuine"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+        var logger = new CapturingLogger();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.RunStarted },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd },
+                new AgentStreamEvent { Type = AgentStreamEventType.TurnEnd },
+                new AgentStreamEvent { Type = AgentStreamEventType.RunEnded }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(Logger: logger));
+
+        session.History.ShouldBeEmpty();
+
+        var warning = logger.Entries.ShouldHaveSingleItem();
+        warning.Level.ShouldBe(Microsoft.Extensions.Logging.LogLevel.Warning);
+        warning.Message.ShouldContain("empty assistant completion");
+        warning.Message.ShouldContain("session-3129-genuine");
+    }
     [Fact]
     public async Task ProcessAndSaveAsync_AccumulatesAssistantContentAndToolHistory()
     {
@@ -148,7 +365,7 @@ public sealed class StreamingSessionHelperTests
     }
 
     [Fact]
-    public async Task ProcessAndSaveAsync_ToolStart_WithNoArgs_ToolArgsIsNull()
+    public async Task ProcessAndSaveAsync_ToolStart_WithNoArgs_ToolArgsIsEmptyObject()
     {
         var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-noargs"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
         var store = new Mock<ISessionStore>();
@@ -169,11 +386,13 @@ public sealed class StreamingSessionHelperTests
 
         result.HistoryEntries.Count.ShouldBe(2); // start + synthesized orphan result
         var entry = result.HistoryEntries[0];
-        entry.ToolArgs.ShouldBeNull();
+        // #2906 AC2: "no args" is recorded as an empty JSON object, never NULL, so it stays
+        // distinguishable from "args lost".
+        entry.ToolArgs.ShouldBe("{}");
     }
 
     [Fact]
-    public async Task ProcessAndSaveAsync_ToolStart_WithEmptyArgs_ToolArgsIsNull()
+    public async Task ProcessAndSaveAsync_ToolStart_WithEmptyArgs_ToolArgsIsEmptyObject()
     {
         var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-emptyargs"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
         var store = new Mock<ISessionStore>();
@@ -194,7 +413,8 @@ public sealed class StreamingSessionHelperTests
 
         result.HistoryEntries.Count.ShouldBe(2); // start + synthesized orphan result
         var entry = result.HistoryEntries[0];
-        entry.ToolArgs.ShouldBeNull();
+        // #2906 AC2: an empty argument dictionary serializes to the empty object, not NULL.
+        entry.ToolArgs.ShouldBe("{}");
     }
 
     // ── ToolIsError tests ─────────────────────────────────────────────────
@@ -382,8 +602,10 @@ public sealed class StreamingSessionHelperTests
             session,
             store.Object);
 
+        // #2906: both rows of the pair carry ToolArgs now, so the de-duplication invariant is
+        // "exactly one START row", expressed via the typed row kind rather than args presence.
         session.GetHistorySnapshot().Count(entry =>
-            entry.ToolCallId == "tc-prepersisted" && entry.ToolArgs is not null).ShouldBe(1);
+            entry.ToolCallId == "tc-prepersisted" && entry.IsToolStartRow()).ShouldBe(1);
     }
 
     // ── Write-ahead persistence tests (#1052) ───────────────────────────────
@@ -670,11 +892,369 @@ public sealed class StreamingSessionHelperTests
         }
     }
 
+    // ── Crash-sentinel lease across multi-turn streams (#2135) ────────────
+
+    private static SessionEntry NewCrashSentinel() => new()
+    {
+        Role = MessageRole.System,
+        Content = "[agent turn in progress - gateway restarted if visible]",
+        IsCrashSentinel = true
+    };
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_MultiTurnStream_RetainsCrashSentinelAfterIntermediateTurnEnd()
+    {
+        // A crash sentinel written before the run must survive an intermediate TurnEnd
+        // snapshot so a process death during a following tool/model turn still leaves a
+        // replayable marker (#2135).
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From("session-sentinel-mid"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        session.AddEntry(NewCrashSentinel());
+
+        var sentinelPresentAtTurnEndSave = (bool?)null;
+        var store = new Mock<ISessionStore>();
+        var saveCount = 0;
+        store
+            .Setup(s => s.SaveAsync(It.IsAny<GatewaySession>(), It.IsAny<CancellationToken>()))
+            .Callback<GatewaySession, CancellationToken>((s, _) =>
+            {
+                saveCount++;
+                // Capture sentinel presence at the FIRST (intermediate TurnEnd) save only.
+                if (saveCount == 1)
+                    sentinelPresentAtTurnEndSave = s.History.Any(e => e.IsCrashSentinel);
+            })
+            .Returns(Task.CompletedTask);
+
+        // Stream: first turn ends (intermediate TurnEnd), then a second model turn starts.
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "first ", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.TurnEnd, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m2" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "second", MessageId = "m2" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m2" }
+            ]),
+            session,
+            store.Object);
+
+        // The intermediate TurnEnd save must have retained the sentinel.
+        sentinelPresentAtTurnEndSave.ShouldBe(true);
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_CleanFinalCompletion_RemovesCrashSentinel()
+    {
+        // The sentinel is removed only when the whole run reaches its authoritative final save.
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From("session-sentinel-final"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        session.AddEntry(NewCrashSentinel());
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "first ", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.TurnEnd, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m2" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "second", MessageId = "m2" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m2" }
+            ]),
+            session,
+            store.Object);
+
+        // After the run completes cleanly, no sentinel may remain.
+        session.History.Any(e => e.IsCrashSentinel).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_FailedFinalCompletion_RetainsSentinelAndPublishesAfterSave()
+    {
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From("session-sentinel-failed"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        session.AddEntry(NewCrashSentinel());
+        var store = new Mock<ISessionStore>();
+        var saveCompleted = false;
+        store.Setup(s => s.SaveAsync(session, It.IsAny<CancellationToken>()))
+            .Callback(() => saveCompleted = true)
+            .Returns(Task.CompletedTask);
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        SessionLifecycleEvent? published = null;
+        lifecycle.SessionChanged += (evt, _) =>
+        {
+            saveCompleted.ShouldBeTrue("live recovery must observe the authoritative failed transcript");
+            published = evt;
+            return Task.CompletedTask;
+        };
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent
+                {
+                    Type = AgentStreamEventType.RunEnded,
+                    Completion = new RunCompletionSignal("Failed", [], null, "provider failed", null, null, null, 0)
+                }
+            ]),
+            session,
+            store.Object,
+            lifecycleEvents: lifecycle);
+
+        session.History.ShouldContain(e => e.IsCrashSentinel);
+        published.ShouldNotBeNull();
+        published.Type.ShouldBe(SessionLifecycleEventType.TerminalFailure);
+        published.Session.ShouldBeSameAs(session);
+    }
+
+    [Theory]
+    [InlineData("Completed")]
+    [InlineData("Cancelled")]
+    public async Task ProcessAndSaveAsync_NonFailedFinalCompletion_RemovesSentinelWithoutFailureSignal(string status)
+    {
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From($"session-sentinel-{status.ToLowerInvariant()}"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        session.AddEntry(NewCrashSentinel());
+        var store = new Mock<ISessionStore>();
+        var lifecycle = new SessionLifecycleEvents(NullLogger<SessionLifecycleEvents>.Instance);
+        var terminalFailures = 0;
+        lifecycle.SessionChanged += (evt, _) =>
+        {
+            if (evt.Type == SessionLifecycleEventType.TerminalFailure)
+                terminalFailures++;
+            return Task.CompletedTask;
+        };
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent
+                {
+                    Type = AgentStreamEventType.RunEnded,
+                    Completion = new RunCompletionSignal(status, [], null, null, null, null, null, 0)
+                }
+            ]),
+            session,
+            store.Object,
+            lifecycleEvents: lifecycle);
+
+        session.History.ShouldNotContain(e => e.IsCrashSentinel);
+        terminalFailures.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_ToolStartWriteAhead_RetainsCrashSentinel()
+    {
+        // A mid-run tool-start write-ahead is a continuation, not a terminal boundary; it must
+        // preserve the sentinel so a crash during tool execution still leaves a replayable marker.
+        var session = new GatewaySession
+        {
+            SessionId = BotNexus.Domain.Primitives.SessionId.From("session-sentinel-tool"),
+            AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1")
+        };
+        session.AddEntry(NewCrashSentinel());
+
+        var sentinelPresentAtToolStartSave = (bool?)null;
+        var store = new Mock<ISessionStore>();
+        var saveCount = 0;
+        store
+            .Setup(s => s.SaveAsync(It.IsAny<GatewaySession>(), It.IsAny<CancellationToken>()))
+            .Callback<GatewaySession, CancellationToken>((s, _) =>
+            {
+                saveCount++;
+                if (saveCount == 1)
+                    sentinelPresentAtToolStartSave = s.History.Any(e => e.IsCrashSentinel);
+            })
+            .Returns(Task.CompletedTask);
+
+        // Simulate a hard death: enumerate only up to the tool-start write-ahead by stopping
+        // the stream after ToolStart. Since there is no ToolEnd/final, the sentinel written at
+        // the tool-start save is the durable replay marker.
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            DeathAfterToolStart(),
+            session,
+            store.Object);
+
+        // The first (tool-start write-ahead) save must have retained the sentinel.
+        sentinelPresentAtToolStartSave.ShouldBe(true);
+    }
+
+    private static async IAsyncEnumerable<AgentStreamEvent> DeathAfterToolStart()
+    {
+        yield return new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" };
+        yield return new AgentStreamEvent { Type = AgentStreamEventType.ToolStart, ToolCallId = "tc1", ToolName = "shell", MessageId = "m1" };
+        await Task.Yield();
+    }
     private static async IAsyncEnumerable<AgentStreamEvent> StallAfterFirst()
     {
         yield return new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "partial" };
         await Task.Delay(TimeSpan.FromSeconds(30)); // Will be cut short by watchdog
         yield return new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd };
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_WhenAssistantMessageKindSet_StampsStreamedAssistantEntry()
+    {
+        // #2149: a streaming parent turn produced while handling a sub-agent completion must stamp
+        // the assistant entry with subagent-response so history replay agrees with live delivery.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-kind"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "parent " },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "reply" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd }
+            ]),
+            session,
+            store.Object,
+            new StreamingSessionOptions(AssistantMessageKind: BotNexus.Domain.Primitives.MessageKind.SubAgentResponse));
+
+        var entry = session.History.ShouldHaveSingleItem();
+        entry.Role.ShouldBe(MessageRole.Assistant);
+        entry.Content.ShouldBe("parent reply");
+        entry.ResolveKind().ShouldBe(BotNexus.Domain.Primitives.MessageKind.SubAgentResponse);
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_WhenNoAssistantMessageKind_DefaultsToUnstampedMessageEntry()
+    {
+        // #2149 sad path: an ordinary streamed turn must NOT stamp a non-default kind - the entry
+        // stays unstamped (null Kind) and resolves to MessageKind.Message.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-kind-2"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "hi" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd }
+            ]),
+            session,
+            store.Object);
+
+        var entry = session.History.ShouldHaveSingleItem();
+        entry.Kind.ShouldBeNull();
+        entry.ResolveKind().ShouldBe(BotNexus.Domain.Primitives.MessageKind.Message);
+    }
+
+    // #3336: persistence-seam reconciliation ------------------------------------------------
+    // The parsers prefer the provider's final block text, but the gateway persists a
+    // CONCATENATION of the ContentDelta events it already emitted. Without the MessageEnd
+    // FinalContent channel the corrected value never reaches session_history, which is why the
+    // CRLF family survived four issues on the relay paths.
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_MessageEndFinalContent_ReplacesCrlfFramedDeltasInHistory()
+    {
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-3336-crlf"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+        const string canonical = "Line one\nLine two with https://example.com/a_b";
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" },
+                // Exactly the reported wire shape: one CRLF per token.
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "\r\nLine", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "\r\n one", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "\r\n\nLine two with https://example.com/a_b", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m1", FinalContent = canonical }
+            ]),
+            session,
+            store.Object);
+
+        var entry = session.History.ShouldHaveSingleItem();
+
+        entry.Content.ShouldBe(canonical);
+        entry.Content.ShouldNotContain("\r");
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_MessageEndWithoutFinalContent_PersistsAssembledDeltasUnchanged()
+    {
+        // Fail-open: NULL means "the provider gave us nothing to check against", never "the
+        // message was empty". Every provider that supplies no final text must be unaffected.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-3336-null"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "alpha", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = " beta", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m1" }
+            ]),
+            session,
+            store.Object);
+
+        session.History.ShouldHaveSingleItem().Content.ShouldBe("alpha beta");
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_EmptyFinalContent_DoesNotDeleteStreamedText()
+    {
+        // Guard against the strictly worse defect: reconciliation removes transport artifacts, it
+        // must never delete a model's answer because a terminal path reported no content (#2921).
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-3336-empty"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "real answer", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m1", FinalContent = "" }
+            ]),
+            session,
+            store.Object);
+
+        session.History.ShouldHaveSingleItem().Content.ShouldBe("real answer");
+    }
+
+    [Fact]
+    public async Task ProcessAndSaveAsync_MultiMessageTurn_ReconcilesOnlyTheCurrentMessage()
+    {
+        // The content buffer is shared across messages within a turn, so a whole-buffer overwrite
+        // would silently discard the FIRST message's text. Two messages, only the second carrying
+        // a divergent final, is the shape that catches it.
+        var session = new GatewaySession { SessionId = BotNexus.Domain.Primitives.SessionId.From("session-3336-multi"), AgentId = BotNexus.Domain.Primitives.AgentId.From("agent-1") };
+        var store = new Mock<ISessionStore>();
+
+        await StreamingSessionHelper.ProcessAndSaveAsync(
+            ToAsyncEnumerable(
+            [
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "first ", MessageId = "m1" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m1", FinalContent = "first " },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageStart, MessageId = "m2" },
+                new AgentStreamEvent { Type = AgentStreamEventType.ContentDelta, ContentDelta = "\r\nsecond", MessageId = "m2" },
+                new AgentStreamEvent { Type = AgentStreamEventType.MessageEnd, MessageId = "m2", FinalContent = "second" }
+            ]),
+            session,
+            store.Object);
+
+        var entry = session.History.ShouldHaveSingleItem();
+
+        // The first message's text survives; only the second message's slice was reconciled.
+        entry.Content.ShouldBe("first second");
     }
 
     private static async IAsyncEnumerable<AgentStreamEvent> ToAsyncEnumerable(IEnumerable<AgentStreamEvent> events)

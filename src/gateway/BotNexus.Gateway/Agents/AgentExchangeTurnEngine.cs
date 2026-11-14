@@ -1,6 +1,7 @@
 using BotNexus.Domain.AgentExchange;
 using BotNexus.Domain.Primitives;
 using BotNexus.Domain.World;
+using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
@@ -36,28 +37,44 @@ public sealed class AgentExchangeTurnEngine
     private readonly IConversationStore _conversationStore;
     private readonly ILogger _logger;
     private readonly AgentExchangeBudgetTracker? _budgetTracker;
+    private readonly TimeProvider _timeProvider;
 
     public AgentExchangeTurnEngine(
         ISessionStore sessionStore,
         IConversationStore conversationStore,
         ILogger logger,
-        AgentExchangeBudgetTracker? budgetTracker)
+        AgentExchangeBudgetTracker? budgetTracker,
+        TimeProvider? timeProvider = null)
     {
         _sessionStore = sessionStore;
         _conversationStore = conversationStore;
         _logger = logger;
         _budgetTracker = budgetTracker;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
     /// Outcome of a single exchange turn: the assistant response text and whether the target
     /// signalled completion (via the local completion gate or a cross-world relay flag).
     /// </summary>
+    /// <param name="Response">The assistant response text for this turn.</param>
+    /// <param name="Finished">Whether the target signalled completion.</param>
+    /// <param name="FinishReason">The reason supplied with completion, when finished.</param>
+    /// <param name="FinishSummary">The optional summary supplied with completion.</param>
+    /// <param name="ToolEntries">
+    /// The sink-produced tool-audit rows for this turn (#2614 AC4), persisted immediately before
+    /// the assistant row so the exchange transcript orders as user -> tools -> assistant, exactly
+    /// like every other blocking call site. Empty for a turn whose tools are audited elsewhere:
+    /// the cross-world SENDER leaves this empty because the target agent runs in the remote
+    /// process and its tool rows are recorded by the receiver's own session, so populating it here
+    /// would duplicate an audit record rather than add one.
+    /// </param>
     public readonly record struct ExchangeTurnOutcome(
         string Response,
         bool Finished,
         string? FinishReason,
-        string? FinishSummary);
+        string? FinishSummary,
+        IReadOnlyList<SessionEntry>? ToolEntries = null);
 
     /// <summary>
     /// Drives the shared agent-exchange turn loop and end-of-exchange lifecycle for both the
@@ -88,6 +105,20 @@ public sealed class AgentExchangeTurnEngine
         Action<GatewaySession> onSealSuccess,
         CancellationToken cancellationToken)
     {
+        // #3515: the engine arms its OWN deadline source, deliberately NOT linked from the caller's
+        // token. That asymmetry is the entire point - a source the caller cannot cancel is the only
+        // evidence available at the catch arms below that distinguishes "the budget expired" from
+        // "a human pressed stop". Every pre-existing deadline on this path was a linked DESCENDANT of
+        // the caller's token, so both causes set the same bit and the seal decision had nothing to
+        // discriminate with. Null Deadline keeps the pre-#3515 shape exactly.
+        using var deadlineCts = CreateDeadlineSource(request.Deadline);
+
+        // The work below observes caller-cancel OR deadline; the two catch arms then attribute it.
+        using var effectiveCts = deadlineCts is null
+            ? null
+            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadlineCts.Token);
+        var effectiveToken = effectiveCts?.Token ?? cancellationToken;
+
         var transcript = new List<AgentExchangeTranscriptEntry>();
         var message = request.Message;
         var finalResponse = string.Empty;
@@ -101,8 +132,13 @@ public sealed class AgentExchangeTurnEngine
             {
                 AddTurn(MessageRole.User, message, transcript, session);
 
-                var outcome = await sendTurnAsync(turn, message, cancellationToken).ConfigureAwait(false);
+                var outcome = await sendTurnAsync(turn, message, effectiveToken).ConfigureAwait(false);
                 finalResponse = outcome.Response;
+                // #2614 AC4: tool rows land between the user turn and the assistant turn. They are
+                // session-history only - the returned transcript stays a pure user/assistant
+                // dialogue, so the exchange RESULT shape is unchanged and this is purely additive.
+                foreach (var toolEntry in outcome.ToolEntries ?? [])
+                    session.AddEntry(toolEntry);
                 AddTurn(MessageRole.Assistant, finalResponse, transcript, session);
 
                 if (outcome.Finished)
@@ -132,7 +168,12 @@ public sealed class AgentExchangeTurnEngine
             beforeSeal(session);
             session.Status = GatewaySessionStatus.Sealed;
             onSealSuccess(session);
-            await _sessionStore.SaveAsync(session, cancellationToken).ConfigureAwait(false);
+            // #3515: CancellationToken.None, matching the archive call below and both writes in the
+            // error arm. onSealSuccess has ALREADY announced the seal on the line above, so a
+            // cancellation landing here would otherwise abort the persist and leave observers told
+            // the exchange sealed while the stored row still reads Active. A terminal write that has
+            // been announced must be durable; it is bounded work, not something worth abandoning.
+            await _sessionStore.SaveAsync(session, CancellationToken.None).ConfigureAwait(false);
             await ArchiveOnExchangeEndAsync(conversation, sessionId, CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -141,6 +182,12 @@ public sealed class AgentExchangeTurnEngine
             // comment in CrossWorldFederationController.ExecuteRelayAsync for full rationale —
             // sealing here would poison the session for any caller retry.
             throw;
+        }
+        catch (OperationCanceledException ex) when (deadlineCts is { IsCancellationRequested: true })
+        {
+            // Preserve #3515 lifecycle before carrying the engine-owned cause across the service.
+            await SealOnDeadlineAsync(conversation, sessionId, session, beforeSeal).ConfigureAwait(false);
+            throw new AgentExchangeDeadlineExceededException(ex);
         }
         catch (Exception ex)
         {
@@ -170,6 +217,61 @@ public sealed class AgentExchangeTurnEngine
     }
 
     /// <summary>
+    /// Seals and archives an exchange whose engine-owned deadline expired (#3515).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A timed-out exchange is over and nobody is waiting to retry it, so it is sealed exactly like
+    /// any other failure. Both writes use <see cref="CancellationToken.None"/> because the token that
+    /// brought us here is, by construction, already cancelled.
+    /// </para>
+    /// <para>
+    /// <strong>Arm order is the safety property.</strong> The caller-cancellation arm is declared
+    /// FIRST, so genuine ambiguity (caller token and deadline both cancelled) resolves to "caller",
+    /// never "timeout". Cancelling a session that had timed out anyway costs nothing; sealing a
+    /// session its user is still holding is unrecoverable, because the sealed-session 409 guard then
+    /// rejects every retry.
+    /// </para>
+    /// <para>
+    /// Extracted from the catch body deliberately: <c>CancelNoSealArchitectureTests</c> fences the
+    /// seal-on-error catch-all by looking back a bounded window for the caller-cancellation rethrow
+    /// clause, and an inline body here would push that clause out of range.
+    /// </para>
+    /// </remarks>
+    private async Task SealOnDeadlineAsync(
+        Conversation conversation,
+        SessionId sessionId,
+        GatewaySession session,
+        Action<GatewaySession> beforeSeal)
+    {
+        _logger.LogWarning(
+            "Agent exchange for session '{SessionId}' exceeded its deadline; sealing.", sessionId);
+        beforeSeal(session);
+        session.Status = GatewaySessionStatus.Sealed;
+        session.Metadata["error"] = "Agent exchange exceeded its deadline.";
+        await _sessionStore.SaveAsync(session, CancellationToken.None).ConfigureAwait(false);
+        await ArchiveOnExchangeEndAsync(conversation, sessionId, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Builds the engine-owned deadline source for <paramref name="deadline"/>, or null when the
+    /// caller imposed none (#3515).
+    /// </summary>
+    /// <remarks>
+    /// An already-elapsed deadline arms immediately (<c>TimeSpan.Zero</c>) rather than being treated
+    /// as "no deadline": a caller that hands over a past instant has already spent its budget, and
+    /// silently granting it a fresh unbounded one would be the opposite of what it asked for.
+    /// </remarks>
+    private CancellationTokenSource? CreateDeadlineSource(DateTimeOffset? deadline)
+    {
+        if (deadline is not { } instant)
+            return null;
+
+        var remaining = instant - _timeProvider.GetUtcNow();
+        return new CancellationTokenSource(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero, _timeProvider);
+    }
+
+    /// <summary>
     /// Creates and persists a fresh <see cref="ConversationKind.AgentAgent"/> conversation for
     /// this exchange. Each <c>ConverseAsync</c> call is a bounded one-shot loop and gets its
     /// own conversation — they are never reused across calls.
@@ -191,18 +293,17 @@ public sealed class AgentExchangeTurnEngine
         AgentId targetId,
         ChannelKey? channelType,
         string? objective,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ConversationId? parentConversationId = null)
     {
-        var conversation = new Conversation
-        {
-            ConversationId = ConversationId.Create(),
-            AgentId = initiatorId,
-            Kind = ConversationKind.AgentAgent,
-            Initiator = CitizenId.Of(initiatorId),
-            Title = $"{initiatorId.Value} \u2194 {targetId.Value}",
-            Purpose = null,
-            Status = ConversationStatus.Active
-        };
+        // Agent-initiated peer exchange: (Source=Agent, Kind=AgentAgent) is the coherent pair.
+        // Minted through the single creation seam (#2310).
+        var conversation = ConversationFactory.CreateForAgent(
+            ConversationKind.AgentAgent,
+            ConversationId.Create(),
+            initiatorId,
+            title: $"{initiatorId.Value} \u2194 {targetId.Value}",
+            initiator: CitizenId.Of(initiatorId));
 
         if (channelType is { } ct)
         {
@@ -214,6 +315,18 @@ public sealed class AgentExchangeTurnEngine
         if (!string.IsNullOrWhiteSpace(objective))
         {
             conversation.Metadata["objective"] = objective;
+        }
+
+        // #3176 AC5: stamp the originating conversation so the child exchange is resolvable FROM
+        // the parent, not merely listable alongside it. Participant-based lookup
+        // (IConversationStore.ListForCitizenAsync) already returns every exchange an agent took
+        // part in; without this back-pointer a caller holding one parent conversation still could
+        // not tell WHICH of those exchanges belonged to it. Metadata rather than a typed column
+        // because the link is derived navigation, not conversation identity - and adding a column
+        // would force a schema migration on all three conversation stores for a read-only hint.
+        if (parentConversationId is { } parentId && parentId.IsInitialized())
+        {
+            conversation.Metadata["parentConversationId"] = parentId.Value;
         }
 
         return await _conversationStore.CreateAsync(conversation, cancellationToken).ConfigureAwait(false);
@@ -261,7 +374,7 @@ public sealed class AgentExchangeTurnEngine
                     conversation.ConversationId, latest.ActiveSessionId, expectedSessionId);
                 return;
             }
-            await _conversationStore.ArchiveAsync(conversation.ConversationId, cancellationToken).ConfigureAwait(false);
+            await _conversationStore.ArchiveAsync(conversation.ConversationId, "agent-exchange-completion", expectedSessionId.Value, "system", cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

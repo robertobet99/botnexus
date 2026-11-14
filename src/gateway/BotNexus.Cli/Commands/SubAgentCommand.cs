@@ -1,7 +1,9 @@
 using System.CommandLine;
 using System.IO.Abstractions;
+using BotNexus.Gateway.Configuration;
 using Microsoft.Data.Sqlite;
 using Spectre.Console;
+using BotNexus.Cli.Services;
 
 namespace BotNexus.Cli.Commands;
 
@@ -22,7 +24,9 @@ namespace BotNexus.Cli.Commands;
 /// </summary>
 internal sealed class SubAgentCommand
 {
-    private const string SubAgentWorkspaceDirectoryName = "botnexus-subagent-workspaces";
+    // Kept for back-compat call sites; the literal now lives once in the shared resolver so the
+    // gateway and CLI can never drift.
+    internal const string SubAgentWorkspaceDirectoryName = SubAgentWorkspaceRootResolver.DefaultDirectoryName;
 
     private readonly IFileSystem _fileSystem;
 
@@ -51,7 +55,7 @@ internal sealed class SubAgentCommand
         listCommand.SetHandler(context =>
         {
             var target = context.ParseResult.GetValueForOption(targetOption);
-            context.ExitCode = ExecuteList(ResolveSessionsDb(target), ResolveWorkspaceRoot());
+            context.ExitCode = ExecuteList(ResolveSessionsDb(target), ResolveWorkspaceRoot(target));
             return Task.CompletedTask;
         });
 
@@ -65,7 +69,7 @@ internal sealed class SubAgentCommand
         {
             var target = context.ParseResult.GetValueForOption(targetOption);
             var dryRun = context.ParseResult.GetValueForOption(dryRunOption);
-            context.ExitCode = ExecutePrune(ResolveSessionsDb(target), ResolveWorkspaceRoot(), dryRun);
+            context.ExitCode = ExecutePrune(ResolveSessionsDb(target), ResolveWorkspaceRoot(target), dryRun);
             return Task.CompletedTask;
         });
 
@@ -76,19 +80,47 @@ internal sealed class SubAgentCommand
     }
 
     /// <summary>
-    /// Resolves the sessions database path from the (optional) global <c>--target</c> home override,
-    /// mirroring <see cref="DebugSessionsCommand.ResolveSessionsDb"/>.
+    /// Resolves the sessions database path through the shared tolerant resolver
+    /// (<see cref="CliStorePaths"/>), so this reader and <see cref="DebugSessionsCommand.ResolveSessionsDb"/>
+    /// share exactly one definition of the writer/reader filename contract (issue #3126).
     /// </summary>
     internal static string ResolveSessionsDb(string? target)
-        => Path.Combine(CliPaths.ResolveTarget(target), "sessions.db");
+        => CliStorePaths.ResolvePath(DebugSessionsCommand.SessionsStoreName, target);
 
     /// <summary>
     /// Resolves the OS temp sub-agent workspace root, kept in lock-step with
     /// <c>FileAgentWorkspaceManager.GetSubAgentWorkspaceRoot</c> so the CLI reaper targets exactly the
     /// directories the gateway creates.
     /// </summary>
-    internal string ResolveWorkspaceRoot()
-        => _fileSystem.Path.Combine(_fileSystem.Path.GetTempPath(), SubAgentWorkspaceDirectoryName);
+    internal string ResolveWorkspaceRoot(string? target = null)
+        => SubAgentWorkspaceRootResolver.Resolve(LoadConfiguredWorkspaceRoot(target), _fileSystem);
+
+    /// <summary>
+    /// Reads the optional <c>gateway.subAgents.workspaceRoot</c> override from the platform config
+    /// under the resolved home directory. A missing or unreadable config yields <c>null</c> so the
+    /// resolver falls back to the historical temp-root default - the CLI must never fail to list or
+    /// prune just because config could not be loaded.
+    /// </summary>
+    private string? LoadConfiguredWorkspaceRoot(string? target)
+    {
+        try
+        {
+            var configPath = _fileSystem.Path.Combine(CliPaths.ResolveTarget(target), "config.json");
+
+            // Resolved through IPlatformConfigAccessor (#3824), so this sees the same effective
+            // configuration as the gateway - JSON plus the SQLite store, store winning. It used to
+            // call PlatformConfigLoader.Load, which could not see the store and returned an
+            // all-defaults PlatformConfig when config.json was absent. The absence check is gone
+            // deliberately: under #3823 a missing file is the normal case and the store is the only
+            // source, so returning early on it is exactly the bug.
+            var config = PlatformConfigAccessor.Shared.Get(configPath, _fileSystem);
+            return config.Gateway?.SubAgents?.WorkspaceRoot;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// Lists every workspace directory found under the root, tagged with its disposition. Prints a
@@ -102,7 +134,7 @@ internal sealed class SubAgentCommand
 
         if (plan.Count == 0)
         {
-            AnsiConsole.MarkupLine($"[green]No sub-agent workspaces found under[/] [dim]{Markup.Escape(workspaceRoot)}[/].");
+            AnsiConsole.MarkupLine($"[green]No sub-agent workspaces found under[/] [dim]{CliText.SafeDisplay(workspaceRoot)}[/].");
             return 0;
         }
 
@@ -114,8 +146,8 @@ internal sealed class SubAgentCommand
         foreach (var entry in plan)
         {
             table.AddRow(
-                Markup.Escape(entry.AgentDirectoryName),
-                Markup.Escape(entry.Status ?? "(no record)"),
+                CliText.SafeDisplay(entry.AgentDirectoryName),
+                CliText.SafeDisplay(entry.Status ?? "(no record)"),
                 RenderDisposition(entry.Disposition));
         }
 
@@ -147,7 +179,7 @@ internal sealed class SubAgentCommand
         foreach (var entry in prunable)
         {
             var verb = dryRun ? "[dim]would delete[/]" : "[red]deleting[/]";
-            AnsiConsole.MarkupLine($"  {verb} [dim]{Markup.Escape(entry.AgentDirectoryName)}[/] ({RenderDisposition(entry.Disposition)})");
+            AnsiConsole.MarkupLine($"  {verb} [dim]{CliText.SafeDisplay(entry.AgentDirectoryName)}[/] ({RenderDisposition(entry.Disposition)})");
         }
 
         var count = reaper.Prune(plan, dryRun);
@@ -181,7 +213,7 @@ internal sealed class SubAgentCommand
     /// gateway may never have run): an empty map is returned so every on-disk directory is treated as
     /// an orphan and therefore prunable. Opened read-only so the running gateway is never disturbed.
     /// </summary>
-    private static IReadOnlyDictionary<string, string> LoadStatusesByAgentDirectory(string sessionsDbPath)
+    internal static IReadOnlyDictionary<string, string> LoadStatusesByAgentDirectory(string sessionsDbPath)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (!File.Exists(sessionsDbPath))
@@ -224,3 +256,5 @@ internal sealed class SubAgentCommand
         return map;
     }
 }
+
+

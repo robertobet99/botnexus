@@ -59,6 +59,11 @@ public sealed class LearningExtractionPipeline
                 SourceSessionId = entry.SessionId ?? string.Empty,
                 SourceTurnIndex = entry.TurnIndex ?? 0,
                 TargetStore = null,
+                // The distilled item inherits the origin of the row it was distilled from, so a
+                // quarantined transcript row cannot shed its provenance by passing through
+                // extraction (#3232 AC3). Content is consulted as well as the column because a
+                // quarantined row carries its marker in the text.
+                ContributingProvenances = [ContributingProvenanceOf(entry)],
             };
 
             extracted.Add(knowledge);
@@ -77,25 +82,31 @@ public sealed class LearningExtractionPipeline
     }
 
     /// <summary>
-    /// Parses the "User: ...\nAssistant: ..." format stored by MemoryIndexer.
+    /// The provenance an extracted item inherits from its source row.
     /// </summary>
+    /// <remarks>
+    /// Derived through <see cref="MemoryEntry.TrustTier"/> rather than read straight off the
+    /// column, so an in-content quarantine marker (#2519) on a row whose column says otherwise
+    /// still downgrades the extracted item. Mapping tier back to a vocabulary value keeps
+    /// <see cref="ExtractedKnowledge.ContributingProvenances"/> expressed in the one closed
+    /// vocabulary rather than introducing a parallel representation.
+    /// </remarks>
+    private static string ContributingProvenanceOf(MemoryEntry entry)
+        => entry.TrustTier switch
+        {
+            MemoryTrustTier.Quarantined => MemoryProvenance.ExternalUntrusted,
+            MemoryTrustTier.Untrusted => MemoryProvenance.Unknown,
+            _ => entry.NormalizedProvenance,
+        };
+
+    /// <summary>
+    /// Parses a stored turn-pair row back into its two role records.
+    /// </summary>
+    /// <remarks>
+    /// Decoding goes through <see cref="TranscriptTurnFormat"/>, the same seam the writers encode with, so
+    /// the reader can never disagree with the writer about where a role record ends (#2954). The helper
+    /// also handles legacy undelimited rows written before that change.
+    /// </remarks>
     internal static bool TryParseConversationEntry(string content, out string userContent, out string assistantContent)
-    {
-        userContent = string.Empty;
-        assistantContent = string.Empty;
-
-        const string userPrefix = "User: ";
-        const string assistantPrefix = "\nAssistant: ";
-
-        if (!content.StartsWith(userPrefix, StringComparison.Ordinal))
-            return false;
-
-        var assistantIndex = content.IndexOf(assistantPrefix, StringComparison.Ordinal);
-        if (assistantIndex < 0)
-            return false;
-
-        userContent = content[userPrefix.Length..assistantIndex];
-        assistantContent = content[(assistantIndex + assistantPrefix.Length)..];
-        return true;
-    }
+        => TranscriptTurnFormat.TryDecode(content, out userContent, out assistantContent);
 }

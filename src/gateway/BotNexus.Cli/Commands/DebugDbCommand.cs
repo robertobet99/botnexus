@@ -1,6 +1,7 @@
 using System.CommandLine;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
+using BotNexus.Persistence.Sqlite;
 using Spectre.Console;
 
 namespace BotNexus.Cli.Commands;
@@ -83,12 +84,14 @@ internal sealed class DebugDbCommand
         return command;
     }
 
-    internal static int ExecuteTables(string home, string? db, string format, bool includeAgents = false)
+    internal static int ExecuteTables(string home, string? db, string format, bool includeAgents = false, TextWriter? output = null, TextWriter? error = null)
     {
+        output ??= Console.Out;
+        error ??= Console.Error;
         var dbFiles = ResolveDbFiles(home, db, includeAgents);
         if (dbFiles.Length == 0)
         {
-            AnsiConsole.MarkupLine("[red]No database files found.[/]");
+            WriteDiagnostic(error, "No database files found.", format, isError: true);
             return 1;
         }
 
@@ -98,7 +101,7 @@ internal sealed class DebugDbCommand
         {
             if (!File.Exists(dbFile.Path))
             {
-                AnsiConsole.MarkupLine($"[yellow]Skipping {Markup.Escape(dbFile.Name)}: file not found.[/]");
+                WriteDiagnostic(error, $"Skipping {dbFile.Name}: file not found.", format);
                 continue;
             }
 
@@ -118,13 +121,13 @@ internal sealed class DebugDbCommand
             }
             catch (SqliteException ex)
             {
-                AnsiConsole.MarkupLine($"[yellow]Skipping {Markup.Escape(dbFile.Name)}: {Markup.Escape(ex.Message)}[/]");
+                WriteDiagnostic(error, $"Skipping {dbFile.Name}: {ex.Message}", format);
             }
         }
 
         if (format == "json")
         {
-            AnsiConsole.WriteLine(JsonSerializer.Serialize(allTables, JsonOpts));
+            WriteJson(output, allTables);
         }
         else
         {
@@ -134,7 +137,7 @@ internal sealed class DebugDbCommand
             table.AddColumn(new TableColumn("Rows").RightAligned());
 
             foreach (var entry in allTables)
-                table.AddRow(Markup.Escape(entry.Database), Markup.Escape(entry.Table), entry.RowCount.ToString("N0"));
+                table.AddRow(CliText.SafeDisplay(entry.Database), CliText.SafeDisplay(entry.Table), entry.RowCount.ToString("N0"));
 
             AnsiConsole.Write(table);
         }
@@ -142,12 +145,14 @@ internal sealed class DebugDbCommand
         return 0;
     }
 
-    internal static int ExecuteSchema(string home, string? db, string format, bool includeAgents = false)
+    internal static int ExecuteSchema(string home, string? db, string format, bool includeAgents = false, TextWriter? output = null, TextWriter? error = null)
     {
+        output ??= Console.Out;
+        error ??= Console.Error;
         var dbFiles = ResolveDbFiles(home, db, includeAgents);
         if (dbFiles.Length == 0)
         {
-            AnsiConsole.MarkupLine("[red]No database files found.[/]");
+            WriteDiagnostic(error, "No database files found.", format, isError: true);
             return 1;
         }
 
@@ -157,7 +162,7 @@ internal sealed class DebugDbCommand
         {
             if (!File.Exists(dbFile.Path))
             {
-                AnsiConsole.MarkupLine($"[yellow]Skipping {Markup.Escape(dbFile.Name)}: file not found.[/]");
+                WriteDiagnostic(error, $"Skipping {dbFile.Name}: file not found.", format);
                 continue;
             }
 
@@ -180,19 +185,19 @@ internal sealed class DebugDbCommand
             }
             catch (SqliteException ex)
             {
-                AnsiConsole.MarkupLine($"[yellow]Skipping {Markup.Escape(dbFile.Name)}: {Markup.Escape(ex.Message)}[/]");
+                WriteDiagnostic(error, $"Skipping {dbFile.Name}: {ex.Message}", format);
             }
         }
 
         if (format == "json")
         {
-            AnsiConsole.WriteLine(JsonSerializer.Serialize(schemas, JsonOpts));
+            WriteJson(output, schemas);
         }
         else
         {
             foreach (var entry in schemas)
             {
-                AnsiConsole.MarkupLine($"[bold]{Markup.Escape(entry.Database)}[/] → [cyan]{Markup.Escape(entry.Table)}[/]");
+                AnsiConsole.MarkupLine($"[bold]{CliText.SafeDisplay(entry.Database)}[/] → [cyan]{CliText.SafeDisplay(entry.Table)}[/]");
                 AnsiConsole.WriteLine(entry.Ddl);
                 AnsiConsole.WriteLine();
             }
@@ -201,11 +206,13 @@ internal sealed class DebugDbCommand
         return 0;
     }
 
-    internal static int ExecuteSize(string home, string format, bool includeAgents = false)
+    internal static int ExecuteSize(string home, string format, bool includeAgents = false, TextWriter? output = null, TextWriter? error = null)
     {
+        output ??= Console.Out;
+        error ??= Console.Error;
         if (!Directory.Exists(home))
         {
-            AnsiConsole.MarkupLine("[red]BotNexus home directory not found:[/] " + Markup.Escape(home));
+            WriteDiagnostic(error, $"BotNexus home directory not found: {home}", format, isError: true);
             return 1;
         }
 
@@ -213,7 +220,7 @@ internal sealed class DebugDbCommand
 
         if (dbFiles.Length == 0)
         {
-            AnsiConsole.MarkupLine("[yellow]No database files found in:[/] " + Markup.Escape(home));
+            AnsiConsole.MarkupLine("[yellow]No database files found in:[/] " + CliText.SafeDisplay(home));
             return 0;
         }
 
@@ -254,7 +261,7 @@ internal sealed class DebugDbCommand
 
         if (format == "json")
         {
-            AnsiConsole.WriteLine(JsonSerializer.Serialize(entries, JsonOpts));
+            WriteJson(output, entries);
         }
         else
         {
@@ -263,7 +270,7 @@ internal sealed class DebugDbCommand
             table.AddColumn(new TableColumn("Size").RightAligned());
 
             foreach (var entry in entries)
-                table.AddRow(Markup.Escape(entry.File), entry.SizeFormatted);
+                table.AddRow(CliText.SafeDisplay(entry.File), entry.SizeFormatted);
 
             var totalBytes = entries.Sum(e => e.SizeBytes);
             table.AddRow("[bold]Total[/]", $"[bold]{FormatSize(totalBytes)}[/]");
@@ -271,6 +278,17 @@ internal sealed class DebugDbCommand
         }
 
         return 0;
+    }
+
+    private static void WriteJson<T>(TextWriter output, T value)
+        => output.WriteLine(JsonSerializer.Serialize(value, JsonOpts));
+
+    private static void WriteDiagnostic(TextWriter error, string message, string format, bool isError = false)
+    {
+        if (format == "json")
+            error.WriteLine(message);
+        else
+            AnsiConsole.MarkupLine($"[{(isError ? "red" : "yellow")}]{CliText.SafeDisplay(message)}[/]");
     }
 
     /// <summary>
@@ -313,7 +331,9 @@ internal sealed class DebugDbCommand
         // skip warning rather than "no databases found".
         if (matches.Length == 0)
         {
-            var fileName = requested.Contains('.', StringComparison.Ordinal) ? requested : $"{requested}.db";
+            var fileName = requested.Contains('.', StringComparison.Ordinal)
+                ? requested
+                : requested + SqliteStorePathPolicy.CanonicalExtension;
             return [new DbFileInfo(requestedNoExt, Path.Combine(home, fileName))];
         }
 

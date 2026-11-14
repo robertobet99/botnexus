@@ -261,7 +261,11 @@ public sealed class ConversationsControllerHistoryTests
             ConversationId = conversationId,
             AgentId = AgentId.From(agentId),
             Title = "Default",
-            IsDefault = true,
+            // #2488 made the default conversation non-archivable. This helper's subject is session
+            // sealing on archive, not default protection, so the flag is incidental fixture data
+            // here and is set false to keep the fixture archivable. Default-archive behaviour is
+            // pinned by ConversationsControllerDefaultArchiveGuardTests.
+            IsDefault = false,
             Status = ConversationStatus.Active,
             ActiveSessionId = activeSessionId,
             CreatedAt = DateTimeOffset.UtcNow,
@@ -303,8 +307,21 @@ public sealed class ConversationsControllerHistoryTests
 
         public Task PinAsync(ConversationId conversationId, bool pin, CancellationToken ct = default)
             => Task.CompletedTask;
+        public Task<bool> AddBindingAsync(ConversationId conversationId, ChannelBinding binding, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<bool> RemoveBindingAsync(ConversationId conversationId, BindingId bindingId, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<bool> MoveBindingAsync(ConversationId fromConversationId, ConversationId toConversationId, BindingId bindingId, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<Conversation?> PatchMetadataAsync(ConversationId conversationId, ConversationMetadataPatch patch, CancellationToken ct = default)
+            => throw new NotSupportedException();
+        public Task<Conversation?> PatchOverrideAsync(ConversationId conversationId, ConversationOverridePatch patch, CancellationToken ct = default)
+            => throw new NotSupportedException();
 
         public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default)
             => throw new NotSupportedException();
 
         public Task<Dictionary<string, System.Text.Json.JsonElement>?> GetCanvasStateAsync(ConversationId conversationId, CancellationToken ct = default)
@@ -431,8 +448,13 @@ public sealed class ConversationsControllerHistoryTests
     }
 
     [Fact]
-    public async Task GetHistory_HistoricalEntries_AreExcluded()
+    public async Task GetHistory_HistoricalEntries_AreReturned_FlaggedAsFolded()
     {
+        // #2936: this test previously asserted the DEFECT -- that folded (IsHistory) rows are
+        // excluded from the history response. Compaction evicts an entry from the LLM context
+        // window; it does not delete the transcript, and the flag's own contract says historical
+        // entries survive "for transcript fidelity, replay, audit, and UI fold/collapse". The
+        // endpoint now returns them, flagged IsFolded so the portal renders them collapsed.
         var conversationId = ConversationId.From("c_history_excluded");
         var sessions = new InMemorySessionStore();
         var conversationStore = new StubConversationStore(CreateConversation(conversationId, "quill"));
@@ -450,9 +472,11 @@ public sealed class ConversationsControllerHistoryTests
 
         var response = (actionResult as OkObjectResult)?.Value as ConversationHistoryResponse;
         response.ShouldNotBeNull();
-        response!.TotalCount.ShouldBe(2); // historical entry excluded
-        response.Entries.ShouldNotContain(e => e.Content == "Old message");
+        response!.TotalCount.ShouldBe(3); // folded entry now participates in paging
+        var old = response.Entries.Single(e => e.Content == "Old message");
+        old.IsFolded.ShouldBeTrue();
         response.Entries.ShouldContain(e => e.Kind == "compaction" && e.Content == "Compaction summary");
-        response.Entries.ShouldContain(e => e.Content == "New message");
+        var latest = response.Entries.Single(e => e.Content == "New message");
+        latest.IsFolded.ShouldBeFalse();
     }
 }

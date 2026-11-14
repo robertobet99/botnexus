@@ -7,9 +7,7 @@ on:
       - 'docs/**'
       - '**/*.md'
       - '.github/workflows/deploy-docs.yml'
-      - '.squad/**'
       - '.ai-team/**'
-      - '.copilot/**'
       - 'mkdocs.yml'
       - 'package.json'
       - 'package-lock.json'
@@ -24,9 +22,7 @@ on:
       - 'docs/**'
       - '**/*.md'
       - '.github/workflows/deploy-docs.yml'
-      - '.squad/**'
       - '.ai-team/**'
-      - '.copilot/**'
       - 'mkdocs.yml'
       - 'package.json'
       - 'package-lock.json'
@@ -38,19 +34,41 @@ on:
 
 # Redundant CI: on a PR that pushes several commits in quick succession, cancel the
 # superseded in-flight run so the latest commit wins instead of stacking builds.
-# Push runs on main are grouped per ref but not cancelled. See issue #1548.
+#
+# Push runs on main are NOT cancel-in-progress -- but that alone does not guarantee every
+# merge gets gated (#3309). A concurrency group holds at most ONE pending run: when merges land
+# faster than the suite completes, GitHub cancels the older PENDING run to make room for the
+# newer one, so an entire burst of merges can collapse into a single executed run. On 2026-08-17,
+# 15 merges landed in 13 minutes and 11 main push runs were cancelled that way -- which is how a
+# commit that reddened main reached the PR queue unnoticed.
+#
+# Keying the group by SHA instead of by ref gives every merged commit its own group, so no main
+# push run can ever supersede another. Bursty merges then queue rather than silently vanish, and
+# main's true red/green state is recorded per commit. See issues #1548 and #3309.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  # PRs: run only tests affected by the change (fast feedback)
-  impacted-tests:
+  # PRs: run the CORE suite -- everything except the browser/E2E projects.
+  #
+  # This deliberately replaced an impacted-only job. Impacted selection decides what to run from
+  # a diff, so a change that breaks a project it does not textually touch passes CI and fails
+  # later. It also produced no TRX, so its result counters read total=0 even on a green run --
+  # the gate could not prove what it had executed.
+  #
+  # E2E is excluded on purpose and temporarily: on 2026-08-06 a full run reported exit 0 with
+  # 265 of 280 E2E tests NotExecuted, which is neither passed nor failed, so a fixture crash
+  # certified a green gate that had silently skipped them. Core must be trustworthy before E2E
+  # is folded back in. The filter matches infra/buildtest/runner/entrypoint.ps1 'core' mode so
+  # CI and the remote container gate agree on what core means.
+  core-tests:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,19 +82,64 @@ jobs:
       - name: Restore tools and packages
         run: |
           dotnet tool restore
-          dotnet restore
+          dotnet restore dirs.proj
 
       - name: Build
-        run: dotnet build --no-restore
+        run: dotnet build dirs.proj --no-restore
 
-      - name: Test (impacted only)
+      # Canonical CORE scope consumed by Invoke-BoundedCoreTests.ps1:
+      # FullyQualifiedName!~BotNexus.Integration.E2E&FullyQualifiedName!~BotNexus.E2E
+      - name: Test (core)
         shell: pwsh
-        run: ./scripts/repo/test-impacted.ps1 -From origin/${{ github.base_ref }} -NoBuild
+        run: ./scripts/repo/Invoke-BoundedCoreTests.ps1 -ResultsDirectory '${{ github.workspace }}/artifacts/test-results' -CompletionPath '${{ github.workspace }}/artifacts/test-results/completion-core.json' -TimeoutSeconds 2100 -HangTimeoutMinutes 10
+
+      # Judge the run by the same fail-closed contract the remote container gate uses (#3602).
+      #
+      # The step above answers only "did any test that ran fail?". It is silent on whether the
+      # tests ran at all, so a crashed fixture, a filter typo or a missing TRX exits 0 and paints
+      # this check green. On 2026-08-06 the E2E project emitted notExecuted=0 while carrying 265
+      # NotExecuted rows -- 15 of 280 tests executed and the gate passed. The container grew
+      # RunnerResult.ps1 for exactly that (#2851); CI never did, so a PR could be certified by a
+      # standard this repo had already rejected.
+      #
+      # `if: always()` so a red dotnet test still gets its result contract evaluated and reported
+      # rather than being short-circuited -- the contract's failureReason is the more informative
+      # diagnostic of the two.
+      - name: Validate test-result contract (core)
+        if: always()
+        shell: pwsh
+        run: ./scripts/repo/Assert-TestResultContract.ps1 -ResultsDirectory '${{ github.workspace }}/artifacts/test-results' -CompletionPath '${{ github.workspace }}/artifacts/test-results/completion-core.json' -MinimumTotal 12000 -SummaryPath '${{ github.workspace }}/artifacts/test-results/contract-core.json'
+
+      - name: List failed tests (fork-only diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(artifacts/test-results/*.trx)
+          echo "trx files: ${#files[@]}"
+          : > failed-tests.txt
+          if [ ${#files[@]} -gt 0 ]; then
+            grep -h -o '<UnitTestResult [^>]*outcome="Failed"[^>]*>' "${files[@]}" | grep -o 'testName="[^"]*"' | sort >> failed-tests.txt || true
+          fi
+          cat failed-tests.txt
+          echo "FAILED_TEST_COUNT=$(wc -l < failed-tests.txt)"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: core-test-results
+          path: artifacts/test-results
+          if-no-files-found: error
 
   # Push to main: full test suite with coverage (safety net)
   full-tests:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -86,76 +149,51 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore dirs.proj
 
       - name: Build
-        run: dotnet build --no-restore
+        run: dotnet build dirs.proj --no-restore
 
       - name: Test
-        # Excludes tests that require external infrastructure not present in CI:
-        # - BotNexus.Integration.*  : CLI pack/install integration tests (not unit tests)
-        # - BotNexus.Conversation.* : live-gateway SignalR tests (all SkippableFact; gateway not running)
-        # - BotNexus.E2E.*          : Playwright end-to-end tests (browsers not installed)
-        run: dotnet test --no-build --collect:"XPlat Code Coverage" --filter "FullyQualifiedName!~BotNexus.Integration.&FullyQualifiedName!~BotNexus.Conversation.Tests.&FullyQualifiedName!~BotNexus.E2E.Tests."
+        # Core scope: everything except the browser/E2E projects. The filter is kept identical to
+        # the core-tests job above and to infra/buildtest/runner/entrypoint.ps1 'core' mode --
+        # three spellings of the same scope is how they drift apart.
+        #
+        # This previously also excluded BotNexus.Integration.* and BotNexus.Conversation.*, which
+        # was over-broad: those projects declare their own environmental skips with stated reasons
+        # ("Dev gateway not running at localhost:5006", "GITHUB_TOKEN not set"), so the runner can
+        # execute them and report honest skips rather than never running them at all.
+        # FullyQualifiedName!~BotNexus.Integration.E2E&FullyQualifiedName!~BotNexus.E2E
+        shell: pwsh
+        run: ./scripts/repo/Invoke-BoundedCoreTests.ps1 -ResultsDirectory '${{ github.workspace }}/artifacts/test-results' -CompletionPath '${{ github.workspace }}/artifacts/test-results/completion-full.json' -TimeoutSeconds 2100 -HangTimeoutMinutes 10 -CollectCoverage
+
+      # Same fail-closed contract as the PR job above (#3602). Main's push run is the safety net;
+      # a safety net judged by a weaker standard than the PR gate it backstops is not one.
+      #
+      # This job previously emitted no TRX at all -- only coverage -- so there was literally
+      # nothing to audit after the fact. The --logger/--results-directory added above is what
+      # makes main's true red/green state reconstructable per commit.
+      - name: Validate test-result contract (full)
+        if: always()
+        shell: pwsh
+        run: ./scripts/repo/Assert-TestResultContract.ps1 -ResultsDirectory '${{ github.workspace }}/artifacts/test-results' -CompletionPath '${{ github.workspace }}/artifacts/test-results/completion-full.json' -MinimumTotal 12000 -SummaryPath '${{ github.workspace }}/artifacts/test-results/contract-full.json'
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-test-results
+          path: artifacts/test-results
+          if-no-files-found: error
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         if: always()
         with:
-          fail_ci_if_error: false
+          use_oidc: true
+          fail_ci_if_error: true
 
-  # e2e portal Playwright suites (issue #1962).
-  #
-  # The existing Playwright tests never ran in CI: the full-tests job excludes the
-  # BotNexus.Integration. filter and installs no browser. This job installs chromium
-  # and runs the new tests/e2e/ portal suites so that coverage stops being decorative.
-  #
-  # NON-BLOCKING BY DESIGN: continue-on-error is true so a failure here can NEVER break
-  # the required checks for other PRs. Without a live portal (E2E_PORTAL_*_URL unset)
-  # the SkippableFact tests skip cleanly rather than fail. Promote to a required check
-  # only once a portal harness is stood up here and the suite is proven stable.
-  e2e-portal-playwright:
-    name: e2e portal (Playwright, non-blocking)
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-      - name: Restore
-        run: dotnet restore
-      - name: Build e2e portal projects
-        run: |
-          dotnet build tests/e2e/BotNexus.E2E.PortalDesktop.Tests/BotNexus.E2E.PortalDesktop.Tests.csproj --no-restore
-          dotnet build tests/e2e/BotNexus.E2E.PortalMobile.Tests/BotNexus.E2E.PortalMobile.Tests.csproj --no-restore
-      # Install browser system libraries explicitly. Playwright's `--with-deps`
-      # apt list still references `libasound2`, which on Ubuntu 24.04 (noble) is a
-      # virtual package renamed to `libasound2t64` by the 64-bit time_t transition,
-      # so `--with-deps` fails with "Package 'libasound2' has no installation
-      # candidate" (exit 100). We install the deps ourselves against the renamed
-      # package and then install the chromium binary without `--with-deps`.
-      - name: Install Playwright system dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libasound2t64 libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
-            libcups2t64 libdrm2 libgbm1 libxkbcommon0 libxcomposite1 libxdamage1 \
-            libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libatspi2.0-0t64
-      - name: Install Playwright browsers (chromium)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ps1 = Get-ChildItem -Recurse -Filter playwright.ps1 -Path tests/e2e | Select-Object -First 1
-          if ($null -eq $ps1) { throw 'playwright.ps1 not found after build' }
-          & $ps1.FullName install chromium
-      - name: Run e2e portal Playwright suites
-        # Target the two e2e project files explicitly. A bare `dotnet test --filter`
-        # resolves the whole solution and attempts to run every test DLL in the repo;
-        # the non-e2e assemblies reject the filter with "argument ... is invalid" and
-        # the aggregate run exits 1 even though the e2e suites themselves skip cleanly.
-        run: |
-          dotnet test tests/e2e/BotNexus.E2E.PortalDesktop.Tests/BotNexus.E2E.PortalDesktop.Tests.csproj --no-build
-          dotnet test tests/e2e/BotNexus.E2E.PortalMobile.Tests/BotNexus.E2E.PortalMobile.Tests.csproj --no-build
+  # Browser-emulated E2E is quarantined from automatic CI while #3601 is reviewed.
+  # The projects and explicit `Invoke-AzureBuildTest.ps1 -Mode playwright|full` diagnostic paths
+  # remain intact. Re-entry requires repeatable complete runs and a deliberate scope decision;
+  # excluded browser coverage must never be represented as passing.

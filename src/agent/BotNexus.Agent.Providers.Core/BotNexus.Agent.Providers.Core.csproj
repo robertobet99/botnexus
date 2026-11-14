@@ -5,8 +5,29 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The stream-assembly conformance helpers (#2443) expose their mismatch-index and escaped
+         context builders as internal: they are diagnostics detail, not API, but they need direct
+         tests because they are what makes an invisible-character defect readable in a log. -->
+    <InternalsVisibleTo Include="BotNexus.Agent.Providers.Core.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="OpenTelemetry.Api" />
+    <!-- #2855: EmbeddingProviderGenerator adapts the optional IEmbeddingProvider capability to
+         Microsoft.Extensions.AI's IEmbeddingGenerator, the seam BotNexus.Memory already consumes.
+         Referencing the same abstractions package here - and NOT the memory project - is what lets
+         the adapter live on the provider side with no edge between the two assemblies. -->
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- #2881: ProviderHttpErrorHelper must redact secret-shaped values out of provider error
+         bodies BEFORE they are interpolated into an exception message, because that message is
+         persisted as the session-visible ErrorMessage. The redaction seam is ISecretRedactor,
+         which lives in the zero-dependency BotNexus.Domain.Wire assembly precisely so a
+         low-level, widely-referenced project like this one (and the extension ALCs that load it)
+         can consume the interface without taking a dependency on BotNexus.Domain and its Vogen
+         runtime closure. Wire has no references of its own, so this edge is a pure leaf edge. -->
+    <ProjectReference Include="..\..\domain\BotNexus.Domain.Wire\BotNexus.Domain.Wire.csproj" />
   </ItemGroup>
 
 </Project>

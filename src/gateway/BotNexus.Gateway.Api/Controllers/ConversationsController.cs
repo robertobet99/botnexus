@@ -1,13 +1,20 @@
+using System.Collections.Immutable;
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Domain.World;
 using BotNexus.Gateway.Conversations;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using BotNexus.Gateway.Abstractions;
+using BotNexus.Gateway.Abstractions.Configuration;
 using BotNexus.Gateway.Abstractions.Conversations;
+using BotNexus.Gateway.Abstractions.Events;
+using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Abstractions.Services;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Abstractions.Agents;
+using BotNexus.Gateway.Api.Export;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Registry;
 using BotNexus.Agent.Providers.Core.Resolution;
@@ -30,6 +37,7 @@ public sealed class ConversationsController : ControllerBase
     private readonly IConversationStore _conversations;
     private readonly ISessionStore _sessions;
     private readonly IReadOnlyList<IConversationChangeNotifier> _conversationChangeNotifiers;
+    private readonly IConversationEventPublisher? _conversationEventPublisher;
     private readonly ILogger<ConversationsController> _logger;
     private readonly IAskUserResponseRegistry? _askUserResponseRegistry;
     private readonly IConversationResetService? _resetService;
@@ -37,6 +45,12 @@ public sealed class ConversationsController : ControllerBase
     private readonly IConversationHistoryAssembler _historyAssembler;
     private readonly ModelRegistry? _modelRegistry;
     private readonly IAgentRegistry? _agentRegistry;
+    private readonly IConversationReadStateStore? _readStateStore;
+    private readonly IWorldContext? _worldContext;
+    private readonly IReadOnlyList<IConversationReadStateChangeNotifier> _readStateChangeNotifiers;
+    private readonly IAgentSupervisor? _supervisor;
+    private readonly ISessionCompactionDiagnostics? _compactionDiagnostics;
+    private readonly ISessionCompactionCoordinator? _compactionCoordinator;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ConversationsController"/> class.
@@ -55,6 +69,13 @@ public sealed class ConversationsController : ControllerBase
     /// test harnesses constructing the controller directly), a default instance over the same stores is used.</param>
     /// <param name="modelRegistry">Optional model registry used to validate per-conversation model / thinking / context overrides against real model capabilities. When omitted, override values are stored without capability validation.</param>
     /// <param name="agentRegistry">Optional agent registry used to resolve the owning agent's provider and default model when validating overrides.</param>
+    /// <param name="readStateStore">Optional durable per-reader conversation cursor store.</param>
+    /// <param name="worldContext">Optional current-world authority used to scope cursor keys.</param>
+    /// <param name="conversationEventPublisher">Publishes channel-neutral conversation facts after their backing store mutation commits. Optional only for legacy direct-construction test harnesses; production DI supplies it.</param>
+    /// <param name="readStateChangeNotifiers">Publishes best-effort, reader-scoped invalidations after a durable cursor version advances.</param>
+    /// <param name="supervisor">Existing resident-handle authority; diagnostic reads never activate agents.</param>
+    /// <param name="compactionDiagnostics">Fresh read-only compaction policy and provider measurement diagnostics.</param>
+    /// <param name="compactionCoordinator">Canonical pipeline; absent dependencies fail closed.</param>
     public ConversationsController(
         IConversationStore conversations,
         ISessionStore sessions,
@@ -65,11 +86,19 @@ public sealed class ConversationsController : ControllerBase
         IConversationAuditLog? auditLog = null,
         IConversationHistoryAssembler? historyAssembler = null,
         ModelRegistry? modelRegistry = null,
-        IAgentRegistry? agentRegistry = null)
+        IAgentRegistry? agentRegistry = null,
+        IConversationReadStateStore? readStateStore = null,
+        IWorldContext? worldContext = null,
+        IConversationEventPublisher? conversationEventPublisher = null,
+        IEnumerable<IConversationReadStateChangeNotifier>? readStateChangeNotifiers = null,
+        IAgentSupervisor? supervisor = null,
+        ISessionCompactionDiagnostics? compactionDiagnostics = null,
+        ISessionCompactionCoordinator? compactionCoordinator = null)
     {
         _conversations = conversations;
         _sessions = sessions;
         _conversationChangeNotifiers = conversationChangeNotifiers?.ToArray() ?? [];
+        _conversationEventPublisher = conversationEventPublisher;
         _logger = logger ?? NullLogger<ConversationsController>.Instance;
         _askUserResponseRegistry = askUserResponseRegistry;
         _resetService = resetService;
@@ -80,7 +109,297 @@ public sealed class ConversationsController : ControllerBase
         _historyAssembler = historyAssembler ?? new ConversationHistoryAssembler(conversations, sessions);
         _modelRegistry = modelRegistry;
         _agentRegistry = agentRegistry;
+        _readStateStore = readStateStore;
+        _worldContext = worldContext;
+        _readStateChangeNotifiers = readStateChangeNotifiers?.ToArray() ?? [];
+        _supervisor = supervisor;
+        _compactionDiagnostics = compactionDiagnostics;
+        _compactionCoordinator = compactionCoordinator;
     }
+
+    /// <summary>
+    /// Returns content-free local context estimates for this conversation's current active session.
+    /// Never creates a handle, invokes a model, or reads historical sessions as a substitute.
+    /// </summary>
+    /// <remarks>
+    /// observedAtUtc marks the diagnostic read, not the last provider measurement time. Source
+    /// identifies heuristic resident-state accounting, not billed usage. Provider measurement
+    /// provenance remains separate in compactionPolicy. Unavailable counts are null, never zero.
+    /// A changed binding discards all sampled data; clients must refresh rather than render it.
+    /// </remarks>
+    [HttpGet("{conversationId}/context")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> GetContextAsync(string conversationId, CancellationToken cancellationToken = default)
+    {
+        if (!ConversationId.TryFrom(conversationId, out var typedConversationId))
+            return BadRequest();
+
+        var conversation = await _conversations.GetAsync(typedConversationId, cancellationToken).ConfigureAwait(false);
+        if (!CanInspectContext(conversation))
+            return NotFound();
+        // Capture value types before awaits; stores may return mutable shared conversation objects.
+        var agentId = conversation.AgentId;
+        var sessionId = conversation.ActiveSessionId;
+        var conversationStatus = conversation.Status;
+        var observedAtUtc = DateTimeOffset.UtcNow;
+        var status = "no-active-session";
+        object? context = null;
+        IAgentHandle? handle = null;
+        var resident = _supervisor as IAgentHandleInspector;
+
+        if (sessionId is { } activeSessionId)
+        {
+            var session = await _sessions.GetAsync(activeSessionId, cancellationToken).ConfigureAwait(false);
+            status = "unavailable";
+            if (OwnsActiveSession(session, typedConversationId, agentId, activeSessionId) && resident is not null)
+            {
+                handle = resident.GetHandle(agentId, activeSessionId);
+                status = "unloaded";
+                if (handle is not null)
+                {
+                    status = "unavailable";
+                    if (handle.AgentId == agentId && handle.SessionId == activeSessionId)
+                    {
+                        var inspector = handle as IAgentHandleInspector;
+                        var diagnostics = inspector?.GetContextDiagnostics();
+                        observedAtUtc = DateTimeOffset.UtcNow;
+                        status = "unsupported";
+                        if (diagnostics is not null && inspector is not null)
+                        {
+                            var window = inspector.GetContextWindowTokens();
+                            var budget = inspector.GetContextBudgetDiagnostics();
+                            var policy = _compactionDiagnostics is null ? null
+                                : await _compactionDiagnostics.ResolveAsync(agentId, activeSessionId, cancellationToken).ConfigureAwait(false);
+                            context = AgentsController.BuildContextResponse(agentId.Value, activeSessionId.Value,
+                                diagnostics, window, budget, policy);
+                            status = "available";
+                        }
+                    }
+                }
+            }
+
+            // Session seal/ownership and residency may change while fresh policy is resolving.
+            var currentSession = await _sessions.GetAsync(activeSessionId, cancellationToken).ConfigureAwait(false);
+            if (!OwnsActiveSession(currentSession, typedConversationId, agentId, activeSessionId))
+            {
+                context = null;
+                status = "unavailable";
+            }
+        }
+
+        // Last async operation: a reset/replacement must never publish the old sample as current.
+        var current = await _conversations.GetAsync(typedConversationId, cancellationToken).ConfigureAwait(false);
+        if (!CanInspectContext(current))
+            return NotFound();
+        if (current.AgentId != agentId || current.ActiveSessionId != sessionId || current.Status != conversationStatus)
+            return Ok(new { conversationId = typedConversationId.Value, agentId = (string?)null,
+                sessionId = (string?)null, status = "binding-changed", observedAtUtc,
+                source = (string?)null, context = (object?)null });
+
+        if (context is not null && sessionId is { } residentSessionId &&
+            !ReferenceEquals(handle, resident?.GetHandle(agentId, residentSessionId)))
+        {
+            context = null;
+            status = "unloaded";
+        }
+
+        return Ok(new { conversationId = typedConversationId.Value, agentId = agentId.Value,
+            sessionId = sessionId?.Value, status, observedAtUtc,
+            source = context is null ? null : "resident-handle-local-estimate", context });
+    }
+
+    /// <summary>
+    /// Compacts only the caller's explicitly expected, writable current resident session. Reserves
+    /// actual run admission without activation and removes only the captured handle after applying.
+    /// Responses contain fixed outcome codes, never transcript, summary, or provider failure text.
+    /// </summary>
+    [HttpPost("{conversationId}/compact")]
+    public async Task<ActionResult> CompactAsync(string conversationId,
+        [FromBody] CompactConversationRequest request, CancellationToken cancellationToken = default)
+    {
+        if (!ConversationId.TryFrom(conversationId, out var id) ||
+            !SessionId.TryFrom(request.ExpectedSessionId, out var expected))
+            return BadRequest();
+        var conversation = await _conversations.GetAsync(id, cancellationToken).ConfigureAwait(false);
+        if (!CanInspectContext(conversation)) return NotFound();
+        if (conversation.Visibility != ConversationVisibility.UserFacing ||
+            conversation.Status != ConversationStatus.Active || conversation.ActiveSessionId != expected)
+            return Conflict(new { status = "not-current-writable-session" });
+        var agentId = conversation.AgentId;
+        var session = await _sessions.GetAsync(expected, cancellationToken).ConfigureAwait(false);
+        if (session is null || !OwnsActiveSession(session, id, agentId, expected))
+            return Conflict(new { status = "session-unavailable" });
+        var handle = _supervisor?.GetHandle(agentId, expected);
+        if (_supervisor is null || handle is null || handle.AgentId != agentId || handle.SessionId != expected || _compactionCoordinator is null)
+            return Conflict(new { status = "unloaded-or-unsupported" });
+        using var reservation = _supervisor.TryReserveMaintenance(handle);
+        if (reservation is null) return Conflict(new { status = "busy-or-unavailable" });
+
+        async Task<bool> StillCurrentAsync(CancellationToken token)
+        {
+            var currentSession = await _sessions.GetAsync(expected, token).ConfigureAwait(false);
+            var current = await _conversations.GetAsync(id, token).ConfigureAwait(false);
+            return CanInspectContext(current) && current.Visibility == ConversationVisibility.UserFacing &&
+                current.Status == ConversationStatus.Active && current.AgentId == agentId &&
+                current.ActiveSessionId == expected && OwnsActiveSession(currentSession, id, agentId, expected) &&
+                ReferenceEquals(handle, _supervisor.GetHandle(agentId, expected));
+        }
+        if (!await StillCurrentAsync(cancellationToken).ConfigureAwait(false))
+            return Conflict(new { status = "binding-changed" });
+        try
+        {
+            var outcome = await _compactionCoordinator.CompactAsync(agentId, session, cancellationToken,
+                force: true, handlePolicy: CompactionHandlePolicy.KeepCurrent).ConfigureAwait(false);
+            // An applied rewrite invalidates the captured live context even if reset or cancellation
+            // won immediately after persistence. Never release it back to queued producers stale.
+            var stillCurrent = await StillCurrentAsync(CancellationToken.None).ConfigureAwait(false);
+            if (outcome.Applied)
+                await _supervisor.StopIfCurrentAsync(handle, CancellationToken.None).ConfigureAwait(false);
+            if (!stillCurrent)
+                return Conflict(new { status = "binding-changed" });
+            if (outcome.Applied)
+                return Ok(new { status = "compacted", applied = true });
+            if (outcome.SkipReason == CompactionSkipReason.EmptyHistory ||
+                outcome.SkipReason == CompactionSkipReason.NoSummarizableTurns)
+                return Ok(new { status = "no-op", applied = false });
+            if (outcome.SkipReason == CompactionSkipReason.ConcurrentHistoryChange)
+                return Conflict(new { status = "concurrent-session-change" });
+            if (outcome.SkipReason == CompactionSkipReason.SessionRebound)
+                return Conflict(new { status = "binding-changed" });
+            return StatusCode(StatusCodes.Status502BadGateway, new { status = "compaction-failed" });
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Persistence may have committed before cancellation surfaced; invalidate only this
+            // captured context before letting any queued producer proceed.
+            await TryStopCapturedCompactionHandleAsync(handle).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Current-session compaction failed for {ConversationId}", id);
+            await TryStopCapturedCompactionHandleAsync(handle).ConfigureAwait(false);
+            return StatusCode(StatusCodes.Status502BadGateway, new { status = "compaction-failed" });
+        }
+    }
+
+    private async Task TryStopCapturedCompactionHandleAsync(IAgentHandle handle)
+    {
+        try
+        {
+            if (_supervisor is not null)
+                await _supervisor.StopIfCurrentAsync(handle, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Teardown is best effort: never replace the original cancellation or expose disposal
+            // details through an unhandled 500. Exact-instance removal still protects replacements.
+            _logger.LogWarning(ex, "Failed to stop captured compaction handle for {SessionId}", handle.SessionId);
+        }
+    }
+
+    private bool CanInspectContext([NotNullWhen(true)] Conversation? conversation) =>
+        conversation is not null &&
+        conversation.Visibility is ConversationVisibility.UserFacing or ConversationVisibility.InspectableReadOnly &&
+        IsCallerAuthorizedFor(conversation.AgentId);
+
+    private static bool OwnsActiveSession(GatewaySession? session, ConversationId conversationId,
+        AgentId agentId, SessionId sessionId) =>
+        session is not null && session.SessionId == sessionId && session.AgentId == agentId &&
+        session.ConversationId == conversationId && session.Status == SessionStatus.Active;
+
+    /// <summary>Returns this caller's durable read cursor for one authorized conversation.</summary>
+    [HttpGet("{conversationId}/read-state")]
+    [ProducesResponseType(typeof(ConversationReadStateResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> GetReadState(
+        string conversationId,
+        CancellationToken cancellationToken)
+    {
+        var access = await ResolveReadStateAccessAsync(conversationId, cancellationToken).ConfigureAwait(false);
+        if (access.Failure is not null)
+            return access.Failure;
+
+        var state = await _readStateStore!.GetAsync(
+            _worldContext!.CurrentWorldId,
+            access.ReaderId!.Value,
+            access.ConversationId!.Value,
+            cancellationToken).ConfigureAwait(false);
+        return state is null ? NoContent() : Ok(ToReadStateResponse(state));
+    }
+
+    /// <summary>Monotonically advances this caller's durable read cursor.</summary>
+    [HttpPut("{conversationId}/read-state")]
+    [ProducesResponseType(typeof(ConversationReadStateResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> AdvanceReadState(
+        string conversationId,
+        [FromBody] AdvanceConversationReadStateRequest request,
+        CancellationToken cancellationToken)
+    {
+        var access = await ResolveReadStateAccessAsync(conversationId, cancellationToken).ConfigureAwait(false);
+        if (access.Failure is not null)
+            return access.Failure;
+
+        var outcome = await _readStateStore!.AdvanceWithResultAsync(
+            _worldContext!.CurrentWorldId,
+            access.ReaderId!.Value,
+            access.ConversationId!.Value,
+            request.Position,
+            cancellationToken).ConfigureAwait(false);
+
+        if (outcome.Changed)
+            await NotifyReadStateChangedBestEffortAsync(outcome.State, cancellationToken).ConfigureAwait(false);
+
+        return Ok(ToReadStateResponse(outcome.State));
+    }
+
+    private async Task<ReadStateAccess> ResolveReadStateAccessAsync(
+        string conversationId,
+        CancellationToken cancellationToken)
+    {
+        if (_readStateStore is null || _worldContext is null)
+            throw new InvalidOperationException("Conversation read state is not configured.");
+
+        var readerId = ConversationReaderIdentity.Resolve(User);
+        if (readerId is null)
+            return new ReadStateAccess(null, null, Unauthorized());
+
+        if (string.IsNullOrWhiteSpace(conversationId))
+            return new ReadStateAccess(null, null, BadRequest());
+
+        var typedConversationId = ConversationId.From(conversationId);
+        var conversation = await _conversations.GetAsync(typedConversationId, cancellationToken).ConfigureAwait(false);
+        if (conversation is null || !IsCallerAuthorizedFor(conversation.AgentId))
+            return new ReadStateAccess(null, null, NotFound());
+
+        return new ReadStateAccess(readerId, typedConversationId, null);
+    }
+
+    private bool IsCallerAuthorizedFor(AgentId agentId)
+    {
+        if (!HttpContext.Items.TryGetValue(GatewayAuthMiddleware.CallerIdentityItemKey, out var value) ||
+            value is not GatewayCallerIdentity identity)
+            return true;
+
+        return identity.IsAdmin ||
+               identity.AllowedAgents.Count == 0 ||
+               identity.AllowedAgents.Any(allowed =>
+                   string.Equals(allowed, agentId.Value, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static ConversationReadStateResponse ToReadStateResponse(ConversationReadState state) =>
+        new(state.ConversationId, state.Position.Value, state.Version);
+
+    private sealed record ReadStateAccess(
+        ConversationReaderId? ReaderId,
+        ConversationId? ConversationId,
+        ActionResult? Failure);
 
     /// <summary>
     /// Lists conversations. With no <paramref name="agentId"/>, returns global active summaries
@@ -99,34 +418,136 @@ public sealed class ConversationsController : ControllerBase
     /// recently updated first, with a deterministic <see cref="ConversationId"/> tie-breaker.
     /// </remarks>
     /// <param name="agentId">Optional. Filter to conversations relevant to this agent.</param>
+    /// <param name="activitySince">Optional inclusive Activity last-activity cutoff; omitted callers remain unbounded.</param>
+    /// <param name="effectiveActivity">Opt in to effective creation/update/binding timestamps even without a cutoff.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>Array of conversation summaries.</returns>
     [HttpGet]
     [ProducesResponseType(typeof(IReadOnlyList<ConversationSummary>), StatusCodes.Status200OK)]
     public async Task<ActionResult> List(
         [FromQuery] string? agentId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        [FromQuery] DateTimeOffset? activitySince = null,
+        [FromQuery] bool effectiveActivity = false)
     {
         if (string.IsNullOrWhiteSpace(agentId))
         {
-            var allSummaries = await _conversations.GetSummariesAsync(cancellationToken);
+            var allSummaries = activitySince is null && !effectiveActivity
+                ? await _conversations.GetSummariesAsync(cancellationToken)
+                : await _conversations.GetSummariesAsync(activitySince, cancellationToken);
             return Ok(allSummaries);
         }
 
         var citizen = CitizenId.Of(AgentId.From(agentId));
         var relevant = await _conversations.ListForCitizenAsync(citizen, cancellationToken);
 
+        var activityQuery = effectiveActivity || activitySince.HasValue;
         var summaries = relevant
             .Where(c => c.Status == ConversationStatus.Active)
+            // #2338: a nested sub-agent run is not independently addressable - it surfaces only by
+            // expanding its spawning tool call in the parent conversation. Filtering here keeps the
+            // agent-scoped branch consistent with the global GetSummariesAsync branch above, which
+            // applies the same rule in the store.
+            .Where(c => c.ParentConversationId is null)
+            // The agent-scoped path keeps citizen relevance while applying the same effective
+            // timestamp as the global Activity query. Legacy callers keep raw update timestamps.
+            .Select(c => ToSummary(c) with
+            {
+                UpdatedAt = activityQuery
+                    ? c.ChannelBindings.SelectMany(b => new[] { b.LastInboundAt, b.LastOutboundAt })
+                        .Append(c.CreatedAt).Append(c.UpdatedAt)
+                        .Where(at => at.HasValue).Max(at => at.GetValueOrDefault())
+                    : c.UpdatedAt
+            })
+            .Where(c => activitySince is null || c.UpdatedAt >= activitySince.Value)
             .OrderByDescending(c => c.IsPinned)
             .ThenByDescending(c => c.PinnedAt)
             .ThenByDescending(c => c.UpdatedAt)
-            .ThenBy(c => c.ConversationId.Value, StringComparer.Ordinal)
-            .Select(ToSummary)
+            .ThenBy(c => c.ConversationId, StringComparer.Ordinal)
             .ToList();
 
         return Ok(summaries);
     }
+
+    /// <summary>
+    /// Conversation cost rollup (#2898): accumulated spend signals per conversation, derived at
+    /// read time from the session and transcript tables.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// No stored counter backs this - the counts are a <c>GROUP BY</c> over rows that already
+    /// exist, matching the #2557 derive-don't-store precedent, so they cannot drift from the
+    /// transcript.
+    /// </para>
+    /// <para>
+    /// When the configured session store implements <see cref="IConversationCostReader"/> the whole
+    /// rollup comes from one aggregate query. Otherwise the controller degrades to the
+    /// transcript-free session summaries and leaves <c>compactionSummaryCount</c>
+    /// <see langword="null"/> - "not measured", which is the honest answer for a store that cannot
+    /// count compactions without hydrating every transcript. It is deliberately NOT reported as
+    /// <c>0</c>, which would read as "this conversation never compacted" (#2554).
+    /// </para>
+    /// <para>
+    /// Every listed conversation gets a row, including one with no sessions at all: absent from the
+    /// store's rollup means zero <em>measured</em> sessions, and the zero is real here because the
+    /// session table is the evidence.
+    /// </para>
+    /// </remarks>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>One cost row per listed conversation, ranked by total cost descending.</returns>
+    [HttpGet("costs")]
+    [ProducesResponseType(typeof(IReadOnlyList<ConversationCostSummary>), StatusCodes.Status200OK)]
+    public async Task<ActionResult> Costs(CancellationToken cancellationToken)
+    {
+        var summaries = await _conversations.GetSummariesAsync(cancellationToken);
+
+        // Optional capability, probed rather than required: only a store with a query engine can
+        // count compaction summaries without reading every transcript, so this is a widening of
+        // what a store MAY answer, not a new obligation on all fourteen implementations.
+        if (_sessions is IConversationCostReader costReader)
+        {
+            var measured = (await costReader.GetConversationCostsAsync(cancellationToken))
+                .ToDictionary(c => c.ConversationId, StringComparer.Ordinal);
+
+            return Ok(RankCosts(summaries.Select(s =>
+                measured.TryGetValue(s.ConversationId, out var cost)
+                    ? cost
+                    : new ConversationCostSummary(s.ConversationId, 0, 0, 0))));
+        }
+
+        // Degraded path. ListSummariesAsync is unbounded here BY DESIGN: a cost ranking that
+        // silently omitted the most expensive conversations because they fell outside a page
+        // would be worse than no ranking at all.
+        var sessions = await _sessions.ListSummariesAsync(
+            DateTimeOffset.MinValue, limit: null, offset: 0, cancellationToken);
+
+        var bySession = sessions
+            .Where(s => !string.IsNullOrEmpty(s.ConversationId))
+            .GroupBy(s => s.ConversationId!, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => (Sessions: g.Count(), Messages: g.Sum(s => s.MessageCount)), StringComparer.Ordinal);
+
+        return Ok(RankCosts(summaries.Select(s =>
+            bySession.TryGetValue(s.ConversationId, out var counts)
+                // CompactionSummaryCount stays null: this store did not measure it.
+                ? new ConversationCostSummary(s.ConversationId, counts.Sessions, counts.Messages, null)
+                : new ConversationCostSummary(s.ConversationId, 0, 0, null))));
+    }
+
+    /// <summary>
+    /// Applies the ranking contract for the cost rollup: most-accumulated first, with a
+    /// deterministic conversation-id tie-breaker so equal rows never reorder between reads.
+    /// </summary>
+    /// <remarks>
+    /// Ranked on the message count, which is the only always-measured accumulation signal. A null
+    /// token or compaction count contributes nothing to the ordering rather than sorting as zero -
+    /// an unmeasured conversation must not be ranked as a cheap one.
+    /// </remarks>
+    private static IReadOnlyList<ConversationCostSummary> RankCosts(IEnumerable<ConversationCostSummary> costs) =>
+        costs
+            .OrderByDescending(c => c.MessageCount)
+            .ThenByDescending(c => c.SessionCount)
+            .ThenBy(c => c.ConversationId, StringComparer.Ordinal)
+            .ToList();
 
     private static ConversationSummary ToSummary(Conversation c) =>
         new(
@@ -141,12 +562,16 @@ public sealed class ConversationsController : ControllerBase
             c.UpdatedAt,
             c.Purpose,
             c.Kind.ToString(),
+            c.Source.ToString(),
+            c.Visibility.ToString(),
             c.IsPinned,
             c.PinnedAt,
             c.Participants.Select(p => new ParticipantSummary(
                 p.CitizenId.Kind.ToString(),
                 p.CitizenId.Value,
-                p.Role)).ToList());
+                p.Role)).ToList(),
+            // #2121: SourceId travels with Source everywhere Source is projected.
+            c.SourceId);
 
     /// <summary>
     /// Gets a specific conversation by ID, including all channel bindings.
@@ -191,25 +616,20 @@ public sealed class ConversationsController : ControllerBase
         if (ConversationInputValidator.ValidateInstructions(request.Instructions) is { } instructionsError)
             return BadRequest(new { error = instructionsError });
 
-        var conversation = new Conversation
-        {
-            ConversationId = ConversationId.Create(),
-            AgentId = AgentId.From(request.AgentId),
-            Title = string.IsNullOrWhiteSpace(request.Title) ? "New conversation" : request.Title,
-            Purpose = NormalizePurpose(request.Purpose),
-            Instructions = NormalizeInstructions(request.Instructions),
-            Status = ConversationStatus.Active,
-            CreatedAt = DateTimeOffset.UtcNow,
-            UpdatedAt = DateTimeOffset.UtcNow,
+        var conversation = ConversationFactory.CreateForChannel(
+            ConversationId.Create(),
+            AgentId.From(request.AgentId),
+            title: request.Title,
             // Initiator left null: this endpoint is currently unauthenticated, so we cannot
             // determine which user/agent created the conversation. Once SignalR/portal claims-based
             // auth lands (see issue #527) this should be populated from the request principal.
-            Initiator = null
-        };
+            initiator: null,
+            purpose: NormalizePurpose(request.Purpose),
+            instructions: NormalizeInstructions(request.Instructions));
 
         var created = await _conversations.CreateAsync(conversation, cancellationToken);
         await AuditAsync(created.ConversationId.Value, "created", "api", "rest-api", null, created.Title, cancellationToken);
-        await NotifyConversationChangedBestEffortAsync("created", created.AgentId.Value, created.ConversationId.Value, cancellationToken);
+        await PublishConversationCreatedBestEffortAsync(created, cancellationToken);
         return CreatedAtAction(nameof(Get), new { conversationId = created.ConversationId.Value }, ToResponse(created));
     }
 
@@ -229,6 +649,11 @@ public sealed class ConversationsController : ControllerBase
         [FromBody] PatchConversationRequest request,
         CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         if (request.Title is null && request.Purpose is null && request.Instructions is null)
             return BadRequest(new { error = "title or purpose is required." });
 
@@ -263,28 +688,38 @@ public sealed class ConversationsController : ControllerBase
             });
         }
 
+        // Capture previous values for the audit trail, then apply only the supplied fields as a
+        // narrow, transactional patch (#2139). The GetAsync above is used solely for the legacy
+        // guard + audit "previous value"; it is NOT written back via a whole-record SaveAsync,
+        // which would revert bindings/pin/overrides committed concurrently between the read and
+        // the write.
+        var patch = new ConversationMetadataPatch
+        {
+            Title = request.Title is not null ? FieldUpdate<string>.Set(request.Title) : FieldUpdate<string>.Unset,
+            Purpose = request.Purpose is not null ? FieldUpdate<string?>.Set(NormalizePurpose(request.Purpose)) : FieldUpdate<string?>.Unset,
+            Instructions = request.Instructions is not null ? FieldUpdate<string?>.Set(NormalizeInstructions(request.Instructions)) : FieldUpdate<string?>.Unset
+        };
+
+        var updated = await _conversations.PatchMetadataAsync(ConversationId.From(conversationId), patch, cancellationToken);
+        if (updated is null)
+            return NotFound();
+
         if (request.Title is not null)
-        {
-            var prevTitle = conversation.Title;
-            conversation.Title = request.Title;
-            await AuditAsync(conversationId, "title_changed", "api", "rest-api", prevTitle, request.Title, cancellationToken);
-        }
+            await AuditAsync(conversationId, "title_changed", "api", "rest-api", conversation.Title, updated.Title, cancellationToken);
         if (request.Purpose is not null)
-        {
-            var prevPurpose = conversation.Purpose;
-            conversation.Purpose = NormalizePurpose(request.Purpose);
-            await AuditAsync(conversationId, "purpose_set", "api", "rest-api", prevPurpose, conversation.Purpose, cancellationToken);
-        }
+            await AuditAsync(conversationId, "purpose_set", "api", "rest-api", conversation.Purpose, updated.Purpose, cancellationToken);
         if (request.Instructions is not null)
-        {
-            var prevInstructions = conversation.Instructions;
-            conversation.Instructions = NormalizeInstructions(request.Instructions);
-            await AuditAsync(conversationId, "instructions_set", "api", "rest-api", prevInstructions, conversation.Instructions, cancellationToken);
-        }
-        conversation.UpdatedAt = DateTimeOffset.UtcNow;
-        await _conversations.SaveAsync(conversation, cancellationToken);
-        await NotifyConversationChangedBestEffortAsync("updated", conversation.AgentId.Value, conversation.ConversationId.Value, cancellationToken);
-        return Ok(ToResponse(conversation));
+            await AuditAsync(conversationId, "instructions_set", "api", "rest-api", conversation.Instructions, updated.Instructions, cancellationToken);
+
+        var changedFields = ImmutableArray.CreateBuilder<string>(3);
+        if (request.Title is not null && !string.Equals(conversation.Title, updated.Title, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.Title));
+        if (request.Purpose is not null && !string.Equals(conversation.Purpose, updated.Purpose, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.Purpose));
+        if (request.Instructions is not null && !string.Equals(conversation.Instructions, updated.Instructions, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.Instructions));
+        await PublishConversationUpdatedBestEffortAsync(updated, changedFields.ToImmutable(), cancellationToken);
+        return Ok(ToResponse(updated));
     }
 
     private static bool IsResolverOwnedLegacyConversation(Conversation conversation)
@@ -302,18 +737,44 @@ public sealed class ConversationsController : ControllerBase
     /// <param name="conversationId">The conversation identifier.</param>
     /// <param name="request">The binding request body.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>201 with the created binding, or 404 if conversation not found.</returns>
+    /// <returns>201 with the created binding, 400 for a malformed request, 404 if the conversation is not found, or 409 when the address is already bound for this agent.</returns>
     [HttpPost("{conversationId}/bindings")]
     [ProducesResponseType(StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
     public async Task<ActionResult> AddBinding(
         string conversationId,
         [FromBody] AddBindingRequest request,
         CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
+        if (request is null || string.IsNullOrWhiteSpace(request.ChannelType))
+            return BadRequest(new { error = "channelType is required." });
+
         var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
         if (conversation is null)
             return NotFound();
+
+        // Inbound routing resolves (agentId, channelType, channelAddress) to exactly one
+        // conversation. Allowing a second conversation of the same agent to claim the same pair
+        // would make ResolveByBindingAsync ambiguous and route messages non-deterministically,
+        // so an explicit attach that would create that ambiguity is refused up front (#140).
+        var channelType = ChannelKey.From(request.ChannelType);
+        var channelAddress = ChannelAddress.From(request.ChannelAddress ?? string.Empty);
+        var conflict = await FindConflictingBindingOwnerAsync(conversation.AgentId, channelType, channelAddress, cancellationToken);
+        if (conflict is not null)
+        {
+            return Conflict(new
+            {
+                error = $"{channelType.Value}:{channelAddress.Value} is already bound to conversation {conflict}.",
+                conflictingConversationId = conflict
+            });
+        }
 
         if (!Enum.TryParse<BindingMode>(request.Mode, ignoreCase: true, out var bindingMode))
             bindingMode = BindingMode.Interactive;
@@ -324,17 +785,27 @@ public sealed class ConversationsController : ControllerBase
         var binding = new ChannelBinding
         {
             BindingId = BindingId.Create(),
-            ChannelType = ChannelKey.From(request.ChannelType),
-            ChannelAddress = ChannelAddress.From(request.ChannelAddress ?? string.Empty),
+            ChannelType = channelType,
+            ChannelAddress = channelAddress,
             Mode = bindingMode,
             ThreadingMode = threadingMode,
             DisplayPrefix = request.DisplayPrefix,
             BoundAt = DateTimeOffset.UtcNow
         };
 
-        conversation.ChannelBindings.Add(binding);
-        conversation.UpdatedAt = DateTimeOffset.UtcNow;
-        await _conversations.SaveAsync(conversation, cancellationToken);
+        // Transactional single-binding append (#2139): inserts only the new binding row instead
+        // of deleting and recreating every binding from a detached snapshot, so two concurrent
+        // add-binding requests both survive.
+        var added = await _conversations.AddBindingAsync(ConversationId.From(conversationId), binding, cancellationToken);
+        if (!added)
+            return NotFound();
+
+        await AuditAsync(conversationId, "binding_added", "api", "rest-api", null, DescribeBinding(binding), cancellationToken);
+        // The transactional append returns only success. Re-read the committed aggregate rather
+        // than publishing the detached pre-mutation conversation or its mutable binding list.
+        var updated = await _conversations.GetAsync(conversation.ConversationId, cancellationToken);
+        if (updated is not null && updated.ChannelBindings.Any(b => b.BindingId == binding.BindingId))
+            await PublishConversationBindingAddedBestEffortAsync(updated, binding.BindingId, cancellationToken);
 
         return StatusCode(StatusCodes.Status201Created, ToBindingResponse(binding));
     }
@@ -354,20 +825,187 @@ public sealed class ConversationsController : ControllerBase
         string bindingId,
         CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
         if (conversation is null)
             return NotFound();
 
-        var binding = conversation.ChannelBindings.FirstOrDefault(b =>
+        // Transactional single-binding removal (#2139): deletes only the requested binding row,
+        // so an unrelated binding added concurrently between the read and the write is not
+        // resurrected or dropped by a whole-record rewrite.
+        var existing = conversation.ChannelBindings.FirstOrDefault(b =>
             string.Equals(b.BindingId.Value, bindingId, StringComparison.Ordinal));
-        if (binding is null)
+
+        var removed = await _conversations.RemoveBindingAsync(
+            ConversationId.From(conversationId),
+            BindingId.From(bindingId),
+            cancellationToken);
+        if (!removed)
             return NotFound();
 
-        conversation.ChannelBindings.Remove(binding);
-        conversation.UpdatedAt = DateTimeOffset.UtcNow;
-        await _conversations.SaveAsync(conversation, cancellationToken);
+        await AuditAsync(
+            conversationId,
+            "binding_removed",
+            "api",
+            "rest-api",
+            existing is null ? bindingId : DescribeBinding(existing),
+            null,
+            cancellationToken);
+        // The detached binding comes from the pre-mutation aggregate; reload the committed
+        // binding set before publishing so sinks observe the post-removal state.
+        var updated = await _conversations.GetAsync(conversation.ConversationId, cancellationToken);
+        if (existing is not null && updated is not null &&
+            updated.ChannelBindings.All(b => b.BindingId != existing.BindingId))
+            await PublishConversationBindingRemovedBestEffortAsync(updated, existing, cancellationToken);
         return NoContent();
     }
+
+    /// <summary>
+    /// Moves an existing channel binding from one conversation to another (issue #140).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the "merge" / "re-home" operation: the binding keeps its identity, address, mode
+    /// and bound-at stamp, so the channel keeps delivering to the same address while future
+    /// inbound traffic resolves to the target conversation instead. Deleting and re-adding a
+    /// binding is <em>not</em> equivalent — it mints a new <c>BindingId</c>, which breaks any
+    /// outbound fan-out suppression keyed on the originating binding.
+    /// </para>
+    /// <para>Two guards keep routing unambiguous and are deliberately checked before the store call:</para>
+    /// <list type="bullet">
+    ///   <item>The target must belong to the <em>same agent</em>. Re-parenting under a different
+    ///     agent would silently re-route a live channel to a different brain — a surprise, not a
+    ///     binding edit.</item>
+    ///   <item>The target must not already hold a binding for the same (channel type, address),
+    ///     which would leave the agent with two candidate conversations for one address.</item>
+    /// </list>
+    /// </remarks>
+    /// <param name="conversationId">The conversation currently owning the binding.</param>
+    /// <param name="bindingId">The binding to move.</param>
+    /// <param name="request">The move request naming the target conversation.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>200 with the moved binding, 400 for a malformed or cross-agent move, 404 when the conversation or binding is not found, or 409 on an address collision at the target.</returns>
+    [HttpPost("{conversationId}/bindings/{bindingId}/move")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    public async Task<ActionResult> MoveBinding(
+        string conversationId,
+        string bindingId,
+        [FromBody] MoveBindingRequest request,
+        CancellationToken cancellationToken)
+    {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure is NotFoundResult
+                ? NotFound(new { error = $"Conversation {conversationId} not found." })
+                : clientWriteFailure;
+        if (request is not null && !string.IsNullOrWhiteSpace(request.TargetConversationId))
+        {
+            var targetWriteFailure = ClientConversationWriteGuard.Check(this,
+                await _conversations.GetAsync(ConversationId.From(request.TargetConversationId), cancellationToken));
+            if (targetWriteFailure is not null)
+                return targetWriteFailure is NotFoundResult
+                    ? NotFound(new { error = $"Conversation {request.TargetConversationId} not found." })
+                    : targetWriteFailure;
+        }
+
+        if (request is null || string.IsNullOrWhiteSpace(request.TargetConversationId))
+            return BadRequest(new { error = "targetConversationId is required." });
+
+        if (string.Equals(request.TargetConversationId, conversationId, StringComparison.Ordinal))
+            return BadRequest(new { error = "targetConversationId must differ from the source conversation." });
+
+        var sourceId = ConversationId.From(conversationId);
+        var source = await _conversations.GetAsync(sourceId, cancellationToken);
+        if (source is null)
+            return NotFound(new { error = $"Conversation {conversationId} not found." });
+
+        var binding = source.ChannelBindings.FirstOrDefault(b =>
+            string.Equals(b.BindingId.Value, bindingId, StringComparison.Ordinal));
+        if (binding is null)
+            return NotFound(new { error = $"Binding {bindingId} not found on conversation {conversationId}." });
+
+        var targetId = ConversationId.From(request.TargetConversationId);
+        var target = await _conversations.GetAsync(targetId, cancellationToken);
+        if (target is null)
+            return NotFound(new { error = $"Target conversation {request.TargetConversationId} not found." });
+
+        if (target.AgentId != source.AgentId)
+        {
+            return BadRequest(new
+            {
+                error = $"Cannot move a binding across agents: conversation {conversationId} belongs to {source.AgentId.Value} but {request.TargetConversationId} belongs to {target.AgentId.Value}."
+            });
+        }
+
+        if (target.ChannelBindings.Any(b => b.ChannelType == binding.ChannelType && b.ChannelAddress == binding.ChannelAddress))
+        {
+            return Conflict(new
+            {
+                error = $"{binding.ChannelType.Value}:{binding.ChannelAddress.Value} is already bound to conversation {request.TargetConversationId}.",
+                conflictingConversationId = request.TargetConversationId
+            });
+        }
+
+        // Transactional re-parent (#2139 store operation, wired to REST by #140): a single UPDATE
+        // of the binding row under both conversation locks, so neither aggregate is rewritten and
+        // the binding is never transiently absent from both.
+        var moved = await _conversations.MoveBindingAsync(sourceId, targetId, binding.BindingId, cancellationToken);
+        if (!moved)
+            return NotFound(new { error = $"Binding {bindingId} could not be moved; it is no longer on conversation {conversationId}." });
+
+        await AuditAsync(
+            conversationId,
+            "binding_moved",
+            "api",
+            "rest-api",
+            $"{DescribeBinding(binding)} on {conversationId}",
+            $"{DescribeBinding(binding)} on {request.TargetConversationId}",
+            cancellationToken);
+
+        // Reuse attachment/detachment facts for the two changed aggregates. Each reload and
+        // publication is isolated: losing one best-effort fact must not suppress the other or
+        // either existing legacy notification.
+        await PublishMovedBindingBestEffortAsync(sourceId, binding, removed: true, cancellationToken);
+        await PublishMovedBindingBestEffortAsync(targetId, binding, removed: false, cancellationToken);
+
+        // Both aggregates changed, so both are announced — announcing only the target would leave
+        // the source pane showing a binding that no longer exists there.
+        await NotifyConversationChangedBestEffortAsync("updated", source.AgentId.Value, conversationId, cancellationToken);
+        await NotifyConversationChangedBestEffortAsync("updated", target.AgentId.Value, request.TargetConversationId, cancellationToken);
+
+        return Ok(ToBindingResponse(binding));
+    }
+
+    /// <summary>
+    /// Returns the id of a conversation of <paramref name="agentId"/> that already holds a binding
+    /// for <paramref name="channelType"/>/<paramref name="channelAddress"/>, or <c>null</c> when the
+    /// pair is unclaimed. Addressless bindings are exempt: an empty address is not a routable
+    /// identity, so several may legitimately coexist.
+    /// </summary>
+    private async Task<string?> FindConflictingBindingOwnerAsync(
+        AgentId agentId,
+        ChannelKey channelType,
+        ChannelAddress channelAddress,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(channelAddress.Value))
+            return null;
+
+        var existing = await _conversations.ResolveByBindingAsync(agentId, channelType, channelAddress, cancellationToken);
+        return existing?.ConversationId.Value;
+    }
+
+    /// <summary>Renders a binding for audit-entry values: stable, human-readable, and short enough to survive truncation.</summary>
+    private static string DescribeBinding(ChannelBinding binding)
+        => $"{binding.ChannelType.Value}:{binding.ChannelAddress.Value} ({binding.BindingId.Value})";
 
     /// <summary>
     /// Returns assembled conversation history across all sessions linked to this conversation,
@@ -412,6 +1050,72 @@ public sealed class ConversationsController : ControllerBase
     }
 
     /// <summary>
+    /// Exports the whole conversation - every linked session, with visible session boundary markers -
+    /// as a downloadable transcript in the requested format (issue #3278).
+    /// </summary>
+    /// <remarks>
+    /// The transcript is assembled by <see cref="ExportDocumentAssembler"/> over
+    /// <see cref="ConversationHistoryProjection"/>, the same projection
+    /// <see cref="IConversationHistoryAssembler"/> serves the history endpoint from, so a downloaded
+    /// transcript can never disagree with what the portal renders for the same conversation.
+    /// Secret redaction defaults to ON for every export route regardless of the
+    /// <c>TranscriptExportOptions</c> setting: that option governs the pre-existing session
+    /// markdown route's historical byte-for-byte behaviour, whereas these new routes have no legacy
+    /// output contract to preserve and so choose the safe default (#3278 acceptance criterion 5).
+    /// </remarks>
+    /// <param name="conversationId">The conversation identifier.</param>
+    /// <param name="format">Export format: <c>markdown</c> or <c>html</c>.</param>
+    /// <param name="firstEntryId">
+    /// Optional partial-range start: the entry id of the first included entry (issue #3279). Supply
+    /// with <paramref name="lastEntryId"/>; supplying one without the other is a 400.
+    /// </param>
+    /// <param name="lastEntryId">Optional partial-range end: the entry id of the last included entry.</param>
+    /// <param name="includeTools">Whether tool calls and results are included.</param>
+    /// <param name="includeThinking">Whether assistant reasoning is included.</param>
+    /// <param name="includeSystemMessages">Whether system messages and conversation instructions are included.</param>
+    /// <param name="redactSecrets">Whether recognised secrets are redacted before rendering.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The rendered transcript as a UTF-8 file download, 400 for an unknown format or an invalid range, or 404.</returns>
+    [HttpGet("{conversationId}/export/{format}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> ExportTranscript(
+        string conversationId,
+        string format,
+        [FromQuery] string? firstEntryId = null,
+        [FromQuery] string? lastEntryId = null,
+        [FromQuery] bool includeTools = true,
+        [FromQuery] bool includeThinking = false,
+        [FromQuery] bool includeSystemMessages = true,
+        [FromQuery] bool redactSecrets = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (!ExportFormat.TryParse(format, out var exportFormat))
+            return BadRequest(new { error = "format must be 'markdown' or 'html'." });
+
+        var (range, rangeError) = ExportRangeBinding.Bind(firstEntryId, lastEntryId);
+        if (rangeError is not null)
+            return BadRequest(rangeError);
+
+        var assembler = new ExportDocumentAssembler(_conversations, _sessions);
+        var result = await assembler.AssembleConversationRangeAsync(
+            ConversationId.From(conversationId), range, cancellationToken);
+
+        if (!result.IsSuccess || result.Document is null)
+            return ExportRangeBinding.ToActionResult(result, exportFormat, this);
+
+        var options = new ExportContentOptions(
+            includeTools,
+            includeThinking,
+            includeSystemMessages,
+            redactSecrets);
+        var filtered = ExportContentFilter.Apply(result.Document, options);
+
+        return ExportResponse.File(filtered, exportFormat, this, options.RedactSecrets);
+    }
+
+    /// <summary>
     /// Closes a conversation by archiving it (soft delete).
     /// Archived conversations are hidden from active listings and can be reopened automatically
     /// if a bound channel or explicit conversation id starts activity again.
@@ -426,11 +1130,39 @@ public sealed class ConversationsController : ControllerBase
     [HttpDelete("{conversationId}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
     public async Task<ActionResult> Archive(string conversationId, CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
         if (conversation is null)
             return NotFound();
+
+        // #2488: the agent's default conversation is its permanent home - the row the portal
+        // auto-selects and CronTrigger already exempts from retention cleanup. Archiving it would
+        // put auto-select straight back to resolving null, which is the very regression this guard
+        // exists to prevent. Refuse loudly with 409 rather than no-op: a DELETE that reports success
+        // while changing nothing is indistinguishable from one that worked.
+        //
+        // The refusal comes BEFORE the reset so a rejected archive has no side effects at all -
+        // sealing the session of a conversation we then decline to archive would destroy the live
+        // session while leaving the visible row behind.
+        if (conversation.IsDefault)
+        {
+            _logger.LogInformation(
+                "Refusing to archive conversation {ConversationId}: it is agent {AgentId}'s default conversation.",
+                conversation.ConversationId.Value, conversation.AgentId.Value);
+            return Conflict(new
+            {
+                error = "default_conversation_not_archivable",
+                message = "This is the agent's default conversation and cannot be archived.",
+                conversationId = conversation.ConversationId.Value
+            });
+        }
 
         // Canonical reset of the active session (stop supervisor + flush memory bridge +
         // cancel pending ask_user prompts + seal via SaveAsync + clear ActiveSessionId).
@@ -461,9 +1193,12 @@ public sealed class ConversationsController : ControllerBase
             _askUserResponseRegistry?.CancelAllForConversation(conversation.ConversationId);
         }
 
-        await _conversations.ArchiveAsync(conversation.ConversationId, cancellationToken);
-        await AuditAsync(conversation.ConversationId.Value, "archived", "api", "rest-api", null, null, cancellationToken);
-        await NotifyConversationChangedBestEffortAsync("archived", conversation.AgentId.Value, conversation.ConversationId.Value, cancellationToken);
+        await _conversations.ArchiveAsync(conversation.ConversationId, "rest-api", HttpContext?.TraceIdentifier ?? System.Diagnostics.Activity.Current?.Id, "api", cancellationToken);
+        // The archive store operation does not return its stamped aggregate. Read it back after
+        // commit so the event carries the durable timestamp and immutable binding snapshot.
+        var archived = await _conversations.GetAsync(conversation.ConversationId, cancellationToken);
+        if (archived is not null && archived.Status == ConversationStatus.Archived)
+            await PublishConversationArchivedBestEffortAsync(archived, cancellationToken);
         return NoContent();
     }
 
@@ -492,6 +1227,11 @@ public sealed class ConversationsController : ControllerBase
         if (_resetService is null)
             return StatusCode(StatusCodes.Status503ServiceUnavailable, "Conversation reset service is not configured.");
 
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var result = await _resetService.ResetActiveSessionAsync(ConversationId.From(conversationId), cancellationToken: cancellationToken);
 
         if (result.Outcome == ConversationResetOutcome.NotFound)
@@ -504,6 +1244,210 @@ public sealed class ConversationsController : ControllerBase
     }
 
     // ΓöÇΓöÇ Notification helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+    private async Task NotifyReadStateChangedBestEffortAsync(
+        ConversationReadState state,
+        CancellationToken cancellationToken)
+    {
+        foreach (var notifier in _readStateChangeNotifiers)
+        {
+            try
+            {
+                await notifier.NotifyReadStateChangedAsync(
+                    state.ReaderId, state.ConversationId, state.Position, state.Version, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // The cursor is already durable. A transport outage must not turn its successful
+                // PUT into a failure; clients can always recover by reading the persisted state.
+                _logger.LogWarning(
+                    ex,
+                    "Failed to publish read-state change for conversation {ConversationId} via notifier {NotifierType}.",
+                    state.ConversationId,
+                    notifier.GetType().FullName);
+            }
+        }
+    }
+
+    private async Task PublishConversationCreatedBestEffortAsync(
+        Conversation created,
+        CancellationToken cancellationToken)
+    {
+        if (_conversationEventPublisher is null)
+            return;
+
+        try
+        {
+            // Publication is deliberately post-commit and non-transactional. The returned store
+            // aggregate is the persisted authority (including store-stamped state and bindings),
+            // and clients reconcile from it if this best-effort live hand-off is missed.
+            var accepted = await _conversationEventPublisher.PublishAsync(new ConversationCreatedEvent
+            {
+                AgentId = created.AgentId,
+                ConversationId = created.ConversationId,
+                Title = created.Title,
+                Bindings = ConversationBindingSnapshot.FromMany(created.ChannelBindings),
+                OccurredAt = created.CreatedAt
+            }, cancellationToken).ConfigureAwait(false);
+
+            if (!accepted)
+            {
+                _logger.LogWarning(
+                    "Conversation event publisher rejected creation event for conversation {ConversationId}; clients must reconcile from durable conversation state.",
+                    created.ConversationId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to publish creation event for conversation {ConversationId}; clients must reconcile from durable conversation state.",
+                created.ConversationId);
+        }
+    }
+
+    private async Task PublishConversationUpdatedBestEffortAsync(
+        Conversation updated,
+        ImmutableArray<string> changedFields,
+        CancellationToken cancellationToken)
+    {
+        if (_conversationEventPublisher is null || changedFields.IsEmpty)
+            return;
+
+        try
+        {
+            // Publication follows the committed narrow patch. The store-returned aggregate is the
+            // durable authority, and clients reconcile from it if this best-effort hand-off is missed.
+            var accepted = await _conversationEventPublisher.PublishAsync(new ConversationUpdatedEvent
+            {
+                AgentId = updated.AgentId,
+                ConversationId = updated.ConversationId,
+                ChangedFields = changedFields,
+                Bindings = ConversationBindingSnapshot.FromMany(updated.ChannelBindings),
+                OccurredAt = updated.UpdatedAt
+            }, cancellationToken).ConfigureAwait(false);
+
+            if (!accepted)
+            {
+                _logger.LogWarning(
+                    "Conversation event publisher rejected metadata update for conversation {ConversationId}; clients must reconcile from durable conversation state.",
+                    updated.ConversationId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to publish metadata update for conversation {ConversationId}; clients must reconcile from durable conversation state.",
+                updated.ConversationId);
+        }
+    }
+
+    private async Task PublishConversationArchivedBestEffortAsync(Conversation archived, CancellationToken cancellationToken)
+    {
+        if (_conversationEventPublisher is null)
+            return;
+
+        try
+        {
+            // Publication follows the committed archive. A rejected or failed live hand-off
+            // cannot roll back the mutation; clients reconcile from durable conversation state.
+            var accepted = await _conversationEventPublisher.PublishAsync(new ConversationArchivedEvent
+            {
+                AgentId = archived.AgentId,
+                ConversationId = archived.ConversationId,
+                Bindings = ConversationBindingSnapshot.FromMany(archived.ChannelBindings),
+                OccurredAt = archived.UpdatedAt
+            }, cancellationToken).ConfigureAwait(false);
+
+            if (!accepted)
+                _logger.LogWarning("Conversation event publisher rejected archive event for conversation {ConversationId}; clients must reconcile from durable conversation state.", archived.ConversationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to publish archive event for conversation {ConversationId}; clients must reconcile from durable conversation state.", archived.ConversationId);
+        }
+    }
+
+    private async Task PublishMovedBindingBestEffortAsync(
+        ConversationId conversationId, ChannelBinding binding, bool removed, CancellationToken cancellationToken)
+    {
+        if (_conversationEventPublisher is null)
+            return;
+
+        try
+        {
+            // MoveBindingAsync returns only success. These are post-commit observations, not
+            // an atomic pair of before/after images; a later move may already be reflected.
+            var updated = await _conversations.GetAsync(conversationId, cancellationToken);
+            if (updated is null)
+                return;
+
+            var containsBinding = updated.ChannelBindings.Any(b => b.BindingId == binding.BindingId);
+            if (removed && !containsBinding)
+                await PublishConversationBindingRemovedBestEffortAsync(updated, binding, cancellationToken);
+            else if (!removed && containsBinding)
+                await PublishConversationBindingAddedBestEffortAsync(updated, binding.BindingId, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to reload binding move state for conversation {ConversationId}; clients must reconcile from durable conversation state.", conversationId);
+        }
+    }
+
+    private async Task PublishConversationBindingAddedBestEffortAsync(Conversation updated, BindingId bindingId, CancellationToken cancellationToken)
+    {
+        if (_conversationEventPublisher is null)
+            return;
+
+        try
+        {
+            // Snapshot both the affected binding and the complete committed set before handing
+            // the fact to sinks; publication is post-commit and intentionally non-transactional.
+            var persistedBinding = updated.ChannelBindings.First(b => b.BindingId == bindingId);
+            var accepted = await _conversationEventPublisher.PublishAsync(new ConversationBindingAddedEvent
+            {
+                AgentId = updated.AgentId,
+                ConversationId = updated.ConversationId,
+                Binding = ConversationBindingSnapshot.From(persistedBinding),
+                Bindings = ConversationBindingSnapshot.FromMany(updated.ChannelBindings),
+                OccurredAt = updated.UpdatedAt
+            }, cancellationToken).ConfigureAwait(false);
+
+            if (!accepted)
+                _logger.LogWarning("Conversation event publisher rejected binding attachment for conversation {ConversationId}; clients must reconcile from durable conversation state.", updated.ConversationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to publish binding attachment for conversation {ConversationId}; clients must reconcile from durable conversation state.", updated.ConversationId);
+        }
+    }
+
+    private async Task PublishConversationBindingRemovedBestEffortAsync(Conversation updated, ChannelBinding removed, CancellationToken cancellationToken)
+    {
+        if (_conversationEventPublisher is null)
+            return;
+
+        try
+        {
+            var accepted = await _conversationEventPublisher.PublishAsync(new ConversationBindingRemovedEvent
+            {
+                AgentId = updated.AgentId,
+                ConversationId = updated.ConversationId,
+                Binding = ConversationBindingSnapshot.From(removed),
+                Bindings = ConversationBindingSnapshot.FromMany(updated.ChannelBindings),
+                OccurredAt = updated.UpdatedAt
+            }, cancellationToken).ConfigureAwait(false);
+
+            if (!accepted)
+                _logger.LogWarning("Conversation event publisher rejected binding removal for conversation {ConversationId}; clients must reconcile from durable conversation state.", updated.ConversationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to publish binding removal for conversation {ConversationId}; clients must reconcile from durable conversation state.", updated.ConversationId);
+        }
+    }
 
     private async Task NotifyConversationChangedBestEffortAsync(string changeType, string agentId, string conversationId, CancellationToken cancellationToken)
     {
@@ -543,7 +1487,12 @@ public sealed class ConversationsController : ControllerBase
         UpdatedAt: c.UpdatedAt,
         ModelOverride: c.ModelOverride,
         ThinkingOverride: c.ThinkingOverride,
-        ContextWindowOverride: c.ContextWindowOverride);
+        ContextWindowOverride: c.ContextWindowOverride,
+        CompactionTokenCeiling: c.CompactionTokenCeiling,
+        ToolOverrideJson: c.ToolOverrideJson,
+        Kind: c.Kind.ToString(),
+        Source: c.Source.ToString(),
+        Visibility: c.Visibility.ToString());
 
     private static BindingResponse ToBindingResponse(ChannelBinding b) => new(
         BindingId: b.BindingId.Value,
@@ -620,7 +1569,9 @@ public sealed class ConversationsController : ControllerBase
     /// <c>ModelOverrideResolver</c> when the next session in this conversation starts.
     /// </summary>
     /// <param name="conversationId">The conversation identifier.</param>
-    /// <param name="request">The override request body. Fields left null clear that override.</param>
+    /// <param name="request">The override request body. Omitted/null Model, Thinking and ContextWindow
+    /// clear those overrides, including on ceiling writes. Resend them to preserve them. Tool and
+    /// ceiling fields are changed only when their corresponding Apply flag is true.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>200 with the updated conversation, 400 when an override is invalid, or 404 if not found.</returns>
     [HttpPut("{conversationId}/override")]
@@ -632,6 +1583,11 @@ public sealed class ConversationsController : ControllerBase
         [FromBody] SetConversationOverrideRequest request,
         CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
         if (conversation is null)
             return NotFound();
@@ -648,12 +1604,16 @@ public sealed class ConversationsController : ControllerBase
 
         var resolvedModel = ResolveModelForValidation(conversation.AgentId, effectiveModelId);
 
-        // Model override: only validate that the requested id is registered/known when we can.
-        if (NormalizeOverrideString(request.Model) is { } requestedModelId
-            && _modelRegistry is not null
-            && resolvedModel is null)
+        // Model override: enforce the agent's authority boundary before any persistence, then
+        // validate that the requested id is registered/known when the registry is available.
+        if (NormalizeOverrideString(request.Model) is { } requestedModelId)
         {
-            return BadRequest(new { error = $"Model '{requestedModelId}' is not registered for this agent's provider." });
+            var descriptor = _agentRegistry?.Get(conversation.AgentId);
+            if (descriptor is not null && !AgentModelPermission.IsPermitted(descriptor, requestedModelId))
+                return BadRequest(new { error = AgentModelPermission.FormatRejection(descriptor, requestedModelId) });
+
+            if (_modelRegistry is not null && resolvedModel is null)
+                return BadRequest(new { error = $"Model '{requestedModelId}' is not registered for this agent's provider." });
         }
 
         // Thinking override: parse the wire token and validate against model capabilities.
@@ -678,22 +1638,65 @@ public sealed class ConversationsController : ControllerBase
 
         var prevModel = conversation.ModelOverride;
         var prevThinking = conversation.ThinkingOverride;
+        if (request.ApplyCompactionTokenCeiling && request.CompactionTokenCeiling is <= 0)
+            return BadRequest(new { error = "Compaction token ceiling must be positive or null." });
+
         var prevContext = conversation.ContextWindowOverride;
+        var prevTools = conversation.ToolOverrideJson;
+        var prevCeiling = conversation.CompactionTokenCeiling;
 
-        conversation.ModelOverride = NormalizeOverrideString(request.Model);
-        conversation.ThinkingOverride = NormalizeOverrideString(request.Thinking);
-        conversation.ContextWindowOverride = request.ContextWindow;
-        conversation.UpdatedAt = DateTimeOffset.UtcNow;
-        await _conversations.SaveAsync(conversation, cancellationToken);
+        // Tool overlay (#3271): validated before persistence so an unreadable overlay is rejected
+        // with 400 rather than silently stored and then failed OPEN by the resolver at session
+        // start - a restriction the operator believes is in force but is not.
+        if (request.ApplyToolOverride
+            && NormalizeOverrideString(request.ToolOverrideJson) is { } toolJson
+            && BotNexus.Gateway.Security.SessionToolOverride.FromJson(toolJson) is null)
+        {
+            return BadRequest(new { error = "Tool override is not a readable SessionToolOverride document." });
+        }
 
-        await AuditAsync(conversationId, "model_override_set", "api", "rest-api", prevModel, conversation.ModelOverride, cancellationToken);
-        await AuditAsync(conversationId, "thinking_override_set", "api", "rest-api", prevThinking, conversation.ThinkingOverride, cancellationToken);
-        await AuditAsync(conversationId, "context_override_set", "api", "rest-api", prevContext?.ToString(), conversation.ContextWindowOverride?.ToString(), cancellationToken);
-        await NotifyConversationChangedBestEffortAsync("updated", conversation.AgentId.Value, conversation.ConversationId.Value, cancellationToken);
-        return Ok(ToResponse(conversation));
+        // Narrow, transactional override patch (#2139): writes only the requested override columns,
+        // so a pin/metadata mutation committed concurrently between the read and the write is
+        // preserved instead of being reverted by a whole-record SaveAsync.
+        var overridePatch = new ConversationOverridePatch
+        {
+            Model = FieldUpdate<string?>.Set(NormalizeOverrideString(request.Model)),
+            Thinking = FieldUpdate<string?>.Set(NormalizeOverrideString(request.Thinking)),
+            ContextWindow = FieldUpdate<int?>.Set(request.ContextWindow),
+            CompactionTokenCeiling = request.ApplyCompactionTokenCeiling ? FieldUpdate<int?>.Set(request.CompactionTokenCeiling) : default,
+            // Written only on explicit opt-in, so an existing model-only caller cannot clear an
+            // overlay it never mentioned (#3271).
+            ToolOverrideJson = request.ApplyToolOverride
+                ? FieldUpdate<string?>.Set(NormalizeOverrideString(request.ToolOverrideJson))
+                : default
+        };
+        var updated = await _conversations.PatchOverrideAsync(ConversationId.From(conversationId), overridePatch, cancellationToken);
+        if (updated is null)
+            return NotFound();
+
+        await AuditAsync(conversationId, "model_override_set", "api", "rest-api", prevModel, updated.ModelOverride, cancellationToken);
+        await AuditAsync(conversationId, "thinking_override_set", "api", "rest-api", prevThinking, updated.ThinkingOverride, cancellationToken);
+        await AuditAsync(conversationId, "context_override_set", "api", "rest-api", prevContext?.ToString(), updated.ContextWindowOverride?.ToString(), cancellationToken);
+        if (request.ApplyToolOverride)
+            await AuditAsync(conversationId, "tool_override_set", "api", "rest-api", prevTools, updated.ToolOverrideJson, cancellationToken);
+        // Match metadata PATCH: report changed values only within this patch's write set,
+        // in a stable order. The pre-read is an observation, not an atomic before-image.
+        var changedFields = ImmutableArray.CreateBuilder<string>(5);
+        if (!string.Equals(prevModel, updated.ModelOverride, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.ModelOverride));
+        if (!string.Equals(prevThinking, updated.ThinkingOverride, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.ThinkingOverride));
+        if (prevContext != updated.ContextWindowOverride)
+            changedFields.Add(nameof(Conversation.ContextWindowOverride));
+        if (request.ApplyToolOverride && !string.Equals(prevTools, updated.ToolOverrideJson, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.ToolOverrideJson));
+        if (request.ApplyCompactionTokenCeiling && prevCeiling != updated.CompactionTokenCeiling)
+            changedFields.Add(nameof(Conversation.CompactionTokenCeiling));
+        await PublishConversationUpdatedBestEffortAsync(updated, changedFields.ToImmutable(), cancellationToken);
+        return Ok(ToResponse(updated));
     }
 
-    /// <summary>Clears every per-conversation override, reverting all three fields to the agent default.</summary>
+    /// <summary>Clears all five per-conversation override fields to null.</summary>
     /// <param name="conversationId">The conversation identifier.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>200 with the updated conversation, or 404 if not found.</returns>
@@ -702,19 +1705,46 @@ public sealed class ConversationsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult> ClearOverride(string conversationId, CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
         if (conversation is null)
             return NotFound();
 
         var prevModel = conversation.ModelOverride;
-        conversation.ModelOverride = null;
-        conversation.ThinkingOverride = null;
-        conversation.ContextWindowOverride = null;
-        conversation.UpdatedAt = DateTimeOffset.UtcNow;
-        await _conversations.SaveAsync(conversation, cancellationToken);
+        var prevThinking = conversation.ThinkingOverride;
+        var prevContext = conversation.ContextWindowOverride;
+        var prevTools = conversation.ToolOverrideJson;
+        var prevCeiling = conversation.CompactionTokenCeiling;
+        // Transactional clear of only the override columns (#2139).
+        var clearPatch = new ConversationOverridePatch
+        {
+            Model = FieldUpdate<string?>.Set(null),
+            Thinking = FieldUpdate<string?>.Set(null),
+            ContextWindow = FieldUpdate<int?>.Set(null),
+            CompactionTokenCeiling = FieldUpdate<int?>.Set(null),
+            ToolOverrideJson = FieldUpdate<string?>.Set(null)
+        };
+        var updated = await _conversations.PatchOverrideAsync(ConversationId.From(conversationId), clearPatch, cancellationToken);
+        if (updated is null)
+            return NotFound();
         await AuditAsync(conversationId, "model_override_cleared", "api", "rest-api", prevModel, null, cancellationToken);
-        await NotifyConversationChangedBestEffortAsync("updated", conversation.AgentId.Value, conversation.ConversationId.Value, cancellationToken);
-        return Ok(ToResponse(conversation));
+        var changedFields = ImmutableArray.CreateBuilder<string>(5);
+        if (!string.Equals(prevModel, updated.ModelOverride, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.ModelOverride));
+        if (!string.Equals(prevThinking, updated.ThinkingOverride, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.ThinkingOverride));
+        if (prevContext != updated.ContextWindowOverride)
+            changedFields.Add(nameof(Conversation.ContextWindowOverride));
+        if (!string.Equals(prevTools, updated.ToolOverrideJson, StringComparison.Ordinal))
+            changedFields.Add(nameof(Conversation.ToolOverrideJson));
+        if (prevCeiling != updated.CompactionTokenCeiling)
+            changedFields.Add(nameof(Conversation.CompactionTokenCeiling));
+        await PublishConversationUpdatedBestEffortAsync(updated, changedFields.ToImmutable(), cancellationToken);
+        return Ok(ToResponse(updated));
     }
 
     private LlmModel? ResolveModelForValidation(AgentId agentId, string? modelId)
@@ -750,9 +1780,20 @@ public sealed class ConversationsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult> Pin(string conversationId, CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
         if (conversation is null) return NotFound();
+        // Retain the scalar observation before writing; store-returned aggregates can be mutable.
+        var wasPinned = conversation.IsPinned;
         await _conversations.PinAsync(ConversationId.From(conversationId), true, cancellationToken);
+        var updated = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
+        if (updated is null) return NotFound();
+        if (wasPinned != updated.IsPinned)
+            await PublishConversationUpdatedBestEffortAsync(updated, [nameof(Conversation.IsPinned)], cancellationToken);
         await NotifyConversationChangedBestEffortAsync("updated", conversation.AgentId.Value, conversationId, cancellationToken);
         return NoContent();
     }
@@ -763,9 +1804,20 @@ public sealed class ConversationsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult> Unpin(string conversationId, CancellationToken cancellationToken)
     {
+        var clientWriteFailure = ClientConversationWriteGuard.Check(this,
+            await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken));
+        if (clientWriteFailure is not null)
+            return clientWriteFailure;
+
         var conversation = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
         if (conversation is null) return NotFound();
+        // The pre-read is an observation, not an atomic before-image of the narrow write.
+        var wasPinned = conversation.IsPinned;
         await _conversations.PinAsync(ConversationId.From(conversationId), false, cancellationToken);
+        var updated = await _conversations.GetAsync(ConversationId.From(conversationId), cancellationToken);
+        if (updated is null) return NotFound();
+        if (wasPinned != updated.IsPinned)
+            await PublishConversationUpdatedBestEffortAsync(updated, [nameof(Conversation.IsPinned)], cancellationToken);
         await NotifyConversationChangedBestEffortAsync("updated", conversation.AgentId.Value, conversationId, cancellationToken);
         return NoContent();
     }
@@ -820,7 +1872,14 @@ public sealed class ConversationsController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Truncates persisted conversation metadata without splitting surrogate pairs (#2883).
+    /// </summary>
+    /// <remarks>
+    /// This path <em>stores</em> its result, so a lone surrogate here is unrecoverable: the other
+    /// half of the pair is gone by the time anyone notices the replacement glyph.
+    /// </remarks>
     private static string? Truncate(string? value, int maxLength)
-        => value is null ? null : value.Length <= maxLength ? value : value[..maxLength];
+        => TextTruncation.SafeTruncate(value, maxLength);
 
 }

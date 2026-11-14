@@ -20,6 +20,14 @@ public interface ISubAgentManager
     int ActiveSubAgentCount => 0;
 
     /// <summary>
+    /// Resolves the timeout for a trusted parent without admitting a child or performing I/O.
+    /// Zero selects the configured default; the result must honor the parent's hard ceiling.
+    /// Used only to budget the requesting tool's wait before permission and audit gates run.
+    /// </summary>
+    int ResolveSpawnTimeoutSeconds(AgentId parentAgentId, int requestedTimeoutSeconds)
+        => throw new NotSupportedException("This manager does not support spawn timeout preparation.");
+
+    /// <summary>
     /// Spawns a background sub-agent session for the specified request.
     /// </summary>
     /// <param name="request">The spawn request describing parent context and execution overrides.</param>
@@ -43,6 +51,20 @@ public interface ISubAgentManager
     /// <returns>The sub-agent metadata when found; otherwise <see langword="null" />.</returns>
     Task<SubAgentInfo?> GetAsync(string subAgentId, CancellationToken ct = default);
 
+    /// <summary>Inspects only an exact original parent's durable child result or tool history. Never waits, consumes, dispatches, or restarts work.</summary>
+    Task<string> InspectAsync(string subAgentId, SessionId parentSessionId, string action, int offset = 0,
+        int limit = 20, CancellationToken ct = default)
+        => throw new NotSupportedException("This manager does not support retained inspection.");
+
+    /// <summary>Joins a run's terminal boundary without consuming its result.</summary>
+    Task<SubAgentInfo> WaitAsync(string subAgentId, SessionId parentSessionId, CancellationToken ct = default)
+        => throw new NotSupportedException("This manager does not support joining sub-agent runs.");
+
+    /// <summary>Retains a terminal result on the owning parent tool call before returning it.</summary>
+    Task<string> ConsumeResultAsync(SubAgentInfo info, string toolCallId, string toolName,
+        string argumentsJson, string payload, CancellationToken ct = default, AgentRunId? agentRunId = null)
+        => throw new NotSupportedException("This manager does not support durable result consumption.");
+
     /// <summary>
     /// Terminates a running sub-agent if the requesting session is authorized.
     /// </summary>
@@ -57,7 +79,20 @@ public interface ISubAgentManager
     /// </summary>
     /// <param name="subAgentId">The completed sub-agent identifier.</param>
     /// <param name="resultSummary">A short summary of the sub-agent result.</param>
+    /// <param name="outcome">
+    /// #3565/#4159: the tool-level and provider-level outcome of the child run, including bounded
+    /// audit-backed retry recovery. The completion contract used to be text-only, so a run whose
+    /// tools all failed but which narrated a confident summary was recorded <c>Completed</c> and
+    /// handed to the parent as an unqualified success. Optional
+    /// because a caller that genuinely cannot observe the run's tool timeline (an out-of-band
+    /// completion, a test double) must still be able to complete a sub-agent; <c>null</c> means
+    /// "not measured" and preserves the historical text-only behaviour exactly.
+    /// </param>
     /// <param name="ct">A cancellation token that can be used to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    Task OnCompletedAsync(string subAgentId, string resultSummary, CancellationToken ct = default);
+    Task OnCompletedAsync(
+        string subAgentId,
+        string resultSummary,
+        SubAgentRunOutcome? outcome = null,
+        CancellationToken ct = default);
 }

@@ -1,3 +1,5 @@
+using BotNexus.Domain.Primitives;
+using BotNexus.Memory.Embeddings;
 using System.Reflection;
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
@@ -54,7 +56,6 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
                     Description = "Helpful assistant",
                     Model = "gpt-4.1",
                     AllowedModels = ["gpt-4.1", "gpt-4o"],
-                    SystemPromptFiles = ["AGENTS.md", "SOUL.md"],
                     SubAgents = ["helper-agent"],
                     IsolationStrategy = "remote",
                     MaxConcurrentSessions = 3,
@@ -90,7 +91,16 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
             _configDirectory,
             new ListLogger<PlatformConfigAgentSource>());
 
-        var descriptor = (await source.LoadAsync()).ShouldHaveSingleItem();
+        var descriptors = await source.LoadAsync();
+        descriptors.Count.ShouldBe(2);
+        var disabled = descriptors.Single(d => d.AgentId.Value == "disabled-agent");
+        disabled.Enabled.ShouldBe(false);
+        var registry = new DefaultAgentRegistry(NullLogger<DefaultAgentRegistry>.Instance);
+        foreach (var loaded in descriptors)
+            registry.Register(loaded);
+        registry.Get(disabled.AgentId).ShouldBeNull();
+        registry.GetAll().ShouldHaveSingleItem().AgentId.Value.ShouldBe("assistant");
+        var descriptor = descriptors.Single(d => d.AgentId.Value == "assistant");
 
         descriptor.AgentId.Value.ShouldBe("assistant");
         descriptor.DisplayName.ShouldBe("Assistant");
@@ -107,7 +117,6 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
         descriptor.IsolationOptions.ShouldContainKey("timeoutMs");
         descriptor.IsolationOptions["timeoutMs"].ShouldBe(1000L);
         descriptor.SystemPrompt.ShouldBeNull();
-        descriptor.SystemPromptFiles.ShouldBe(new[] { "AGENTS.md", "SOUL.md" });
         descriptor.Memory.ShouldNotBeNull();
         descriptor.Memory!.Enabled.ShouldBeTrue();
         descriptor.Memory.Indexing.ShouldBe("auto");
@@ -115,30 +124,6 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
         descriptor.Memory.Search!.DefaultTopK.ShouldBe(7);
         descriptor.Memory.Search.TemporalDecay.ShouldNotBeNull();
         descriptor.Memory.Search.TemporalDecay!.HalfLifeDays.ShouldBe(21);
-    }
-
-    [Fact]
-    public async Task LoadAsync_WithLegacySystemPromptFile_MapsSinglePromptFile()
-    {
-        var config = new PlatformConfig
-        {
-            Agents = new Dictionary<string, AgentDefinitionConfig>
-            {
-                ["assistant"] = new()
-                {
-                    Provider = "copilot",
-                    Model = "gpt-4.1",
-                    SystemPromptFile = @"prompts\missing.txt"
-                }
-            }
-        };
-
-        var source = new PlatformConfigAgentSource(new TestOptionsMonitor<PlatformConfig>(config), _configDirectory, new ListLogger<PlatformConfigAgentSource>());
-
-        var descriptor = (await source.LoadAsync()).ShouldHaveSingleItem();
-
-        descriptor.SystemPromptFile.ShouldBe(@"prompts\missing.txt");
-        descriptor.SystemPromptFiles.ShouldBe(new[] { @"prompts\missing.txt" });
     }
 
     [Fact]
@@ -283,76 +268,7 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task LoadAsync_WithWorldDefaults_MergesIntoAgentExtensionConfig()
-    {
-        var config = JsonSerializer.Deserialize<PlatformConfig>(
-            """
-            {
-              "Gateway": {
-                "Extensions": {
-                  "Defaults": {
-                    "ext": { "a": 1 }
-                  }
-                }
-              },
-              "Agents": {
-                "assistant": {
-                  "Provider": "copilot",
-                  "Model": "gpt-4.1",
-                  "Enabled": true
-                }
-              }
-            }
-            """)!;
 
-        var source = new PlatformConfigAgentSource(
-            new TestOptionsMonitor<PlatformConfig>(config),
-            _configDirectory,
-            new ListLogger<PlatformConfigAgentSource>());
-
-        var descriptor = (await source.LoadAsync()).ShouldHaveSingleItem();
-
-        descriptor.ExtensionConfig.ShouldContainKey("ext");
-        AssertJsonEquals(descriptor.ExtensionConfig["ext"], """{"a":1}""");
-    }
-
-    [Fact]
-    public async Task LoadAsync_WithWorldDefaultsAndAgentOverrides_DeepMerges()
-    {
-        var config = JsonSerializer.Deserialize<PlatformConfig>(
-            """
-            {
-              "Gateway": {
-                "Extensions": {
-                  "Defaults": {
-                    "ext": { "a": 1, "b": 2 }
-                  }
-                }
-              },
-              "Agents": {
-                "assistant": {
-                  "Provider": "copilot",
-                  "Model": "gpt-4.1",
-                  "Enabled": true,
-                  "Extensions": {
-                    "ext": { "b": 3, "c": 4 }
-                  }
-                }
-              }
-            }
-            """)!;
-
-        var source = new PlatformConfigAgentSource(
-            new TestOptionsMonitor<PlatformConfig>(config),
-            _configDirectory,
-            new ListLogger<PlatformConfigAgentSource>());
-
-        var descriptor = (await source.LoadAsync()).ShouldHaveSingleItem();
-
-        descriptor.ExtensionConfig.ShouldContainKey("ext");
-        AssertJsonEquals(descriptor.ExtensionConfig["ext"], """{"a":1,"b":3,"c":4}""");
-    }
 
     [Fact]
     public async Task LoadAsync_WithFileAccessPolicy_MapsFileAccess()
@@ -741,21 +657,22 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
         public Task<string> BuildSystemPromptAsync(
             AgentDescriptor descriptor,
             AgentExecutionContext? executionContext,
+            EffectiveExecutionSettings? effectiveSettings = null,
             CancellationToken ct = default)
             => Task.FromResult(descriptor.SystemPrompt ?? string.Empty);
     }
 
     private sealed class StaticAgentToolFactory : IAgentToolFactory
     {
-        public IReadOnlyList<IAgentTool> CreateTools(string workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
-            => [new ReadTool(workingDirectory)];
+        public IReadOnlyList<IAgentTool> CreateTools(WorkingDir workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
+            => [new ReadTool(workingDirectory.Value)];
     }
 
     private sealed class CapturingAgentToolFactory : IAgentToolFactory
     {
         public IPathValidator? CapturedPathValidator { get; private set; }
 
-        public IReadOnlyList<IAgentTool> CreateTools(string workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
+        public IReadOnlyList<IAgentTool> CreateTools(WorkingDir workingDirectory, IPathValidator? pathValidator = null, string[]? shellCommand = null)
         {
             CapturedPathValidator = pathValidator;
             return [];
@@ -805,7 +722,7 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
     {
         private readonly IMemoryStore _store = new StubMemoryStore();
 
-        public IMemoryStore Create(string agentId) => _store;
+        public IMemoryStore Create(AgentId agentId) => _store;
     }
 
     private sealed class StubMemoryStore : IMemoryStore
@@ -817,6 +734,19 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
         public Task<IReadOnlyList<MemoryEntry>> SearchAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<MemoryEntry>>([]);
+
+        // #2781: explicit pass-through. Required (not default-implemented) on IMemoryStore because
+        // Moq returns null for default interface methods rather than running the default body.
+        public async Task<IReadOnlyList<ScoredMemoryEntry>> SearchScoredAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+        {
+            var entries = await SearchAsync(query, topK, filter, ct);
+            return entries.Select(entry => new ScoredMemoryEntry(entry, 0d)).ToList();
+        }
+
+        // #3244: explicit pass-through with a NotAttempted scan report - this stub runs no bounded
+        // vector scan, so claiming any coverage would be a lie the caller could act on.
+        public async Task<MemorySearchResult> SearchWithReportAsync(string query, int topK = 10, MemorySearchFilter? filter = null, CancellationToken ct = default)
+            => new(await SearchScoredAsync(query, topK, filter, ct), MemoryVectorScanReport.NotAttempted);
         public Task DeleteAsync(string id, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearAsync(CancellationToken ct = default) => Task.CompletedTask;
         public Task<MemoryStoreStats> GetStatsAsync(CancellationToken ct = default) => Task.FromResult(new MemoryStoreStats(0, 0, null));
@@ -901,39 +831,6 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
         descriptors.ShouldNotContain(d => d.AgentId.Value.Equals("defaults", StringComparison.OrdinalIgnoreCase));
     }
 
-    [Fact]
-    public async Task LoadAsync_WithAgentsDefaults_MemoryInheritedIntoAgentDescriptor()
-    {
-        // Arrange — agent omits memory; defaults provide it
-        var config = new PlatformConfig
-        {
-            AgentDefaults = new AgentDefaultsConfig
-            {
-                Memory = new MemoryAgentConfig { Enabled = true, Indexing = "semantic" }
-            },
-            Agents = new Dictionary<string, AgentDefinitionConfig>
-            {
-                ["assistant"] = new()
-                {
-                    Provider = "copilot",
-                    Model = "gpt-4.1",
-                    Enabled = true
-                }
-            }
-        };
-        var source = new PlatformConfigAgentSource(
-            new TestOptionsMonitor<PlatformConfig>(config),
-            _configDirectory,
-            new ListLogger<PlatformConfigAgentSource>());
-
-        // Act
-        var descriptor = (await source.LoadAsync()).ShouldHaveSingleItem();
-
-        // Assert
-        descriptor.Memory.ShouldNotBeNull();
-        descriptor.Memory!.Enabled.ShouldBeTrue();
-        descriptor.Memory.Indexing.ShouldBe("semantic");
-    }
 
     [Fact]
     public async Task LoadAsync_WithMemoryEnabledAndPromptInjectionOmitted_DefaultsPromptInjectionToFull()
@@ -1000,37 +897,31 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
         pathProperty!.GetValue(descriptor.Memory)?.ToString().ShouldBe("memory/custom-notes.md");
     }
 
+
     [Fact]
-    public async Task LoadAsync_WithAgentsDefaults_ToolIdsInheritedWhenAgentOmitsThem()
+    public async Task LoadAsync_WithoutConfiguredToolTimeout_UsesGlobalFiveMinuteDefault()
     {
-        // Arrange
-        var config = new PlatformConfig
-        {
-            AgentDefaults = new AgentDefaultsConfig
+        var config = JsonSerializer.Deserialize<PlatformConfig>(
+            """
             {
-                ToolIds = ["read", "write"]
-            },
-            Agents = new Dictionary<string, AgentDefinitionConfig>
-            {
-                ["assistant"] = new()
-                {
-                    Provider = "copilot",
-                    Model = "gpt-4.1",
-                    Enabled = true
-                    // No toolIds
+              "Agents": {
+                "assistant": {
+                  "Provider": "copilot",
+                  "Model": "gpt-4.1",
+                  "Enabled": true
                 }
+              }
             }
-        };
+            """)!;
+
         var source = new PlatformConfigAgentSource(
             new TestOptionsMonitor<PlatformConfig>(config),
             _configDirectory,
             new ListLogger<PlatformConfigAgentSource>());
 
-        // Act
         var descriptor = (await source.LoadAsync()).ShouldHaveSingleItem();
 
-        // Assert — inherited from defaults since no AgentRawElements present (no raw JSON path)
-        descriptor.ToolIds.ShouldBe(["read", "write"]);
+        ReadToolTimeoutSeconds(descriptor).ShouldBe(300);
     }
 
     [Fact]
@@ -1067,34 +958,6 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
         return property!.GetValue(config)?.ToString() ?? string.Empty;
     }
 
-    [Fact]
-    public async Task LoadAsync_WithDefaultsToolTimeoutSeconds_InheritsTimeoutWhenAgentOmitsOverride()
-    {
-        var config = JsonSerializer.Deserialize<PlatformConfig>(
-            """
-            {
-              "Agents": {
-                "defaults": {
-                  "ToolTimeoutSeconds": 11
-                },
-                "assistant": {
-                  "Provider": "copilot",
-                  "Model": "gpt-4.1",
-                  "Enabled": true
-                }
-              }
-            }
-            """)!;
-
-        var source = new PlatformConfigAgentSource(
-            new TestOptionsMonitor<PlatformConfig>(config),
-            _configDirectory,
-            new ListLogger<PlatformConfigAgentSource>());
-
-        var descriptor = (await source.LoadAsync()).ShouldHaveSingleItem();
-
-        ReadToolTimeoutSeconds(descriptor).ShouldBe(11);
-    }
 
     private static int? ReadToolTimeoutSeconds(AgentDescriptor descriptor)
     {
@@ -1321,6 +1184,168 @@ public sealed class PlatformConfigAgentSourceTests : IDisposable
 
         descriptor.Thinking.ShouldBeNull();
         descriptor.ContextWindow.ShouldBeNull();
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #2114: suppress unchanged reload notifications (pre-debounce fingerprint)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Watch_WhenConfigChangesButEffectiveDescriptorsUnchanged_DoesNotInvokeCallback()
+    {
+        // A config-change notification whose effective agent descriptors are unchanged
+        // must NOT propagate a reload. The source computes a stable effective fingerprint
+        // and suppresses identical notifications before scheduling a registry apply.
+        var initial = new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", Enabled = true }
+            }
+        };
+        var monitor = new TestOptionsMonitor<PlatformConfig>(initial);
+        var source = new PlatformConfigAgentSource(monitor, _configDirectory, new ListLogger<PlatformConfigAgentSource>());
+
+        int callbackCount = 0;
+        using var subscription = source.Watch(_ => callbackCount++);
+
+        // Fire a change whose agents are equivalent (fresh instances, same values).
+        monitor.RaiseChanged(new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", Enabled = true }
+            }
+        });
+
+        callbackCount.ShouldBe(0,
+            "Effective descriptors are unchanged, so the notification must be suppressed pre-debounce.");
+    }
+
+    [Fact]
+    public void Watch_RepeatedIdenticalConfigCallbacks_InvokeCallbackZeroTimes()
+    {
+        var config = new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", Enabled = true }
+            }
+        };
+        var monitor = new TestOptionsMonitor<PlatformConfig>(config);
+        var source = new PlatformConfigAgentSource(monitor, _configDirectory, new ListLogger<PlatformConfigAgentSource>());
+
+        int callbackCount = 0;
+        using var subscription = source.Watch(_ => callbackCount++);
+
+        for (int i = 0; i < 5; i++)
+        {
+            monitor.RaiseChanged(new PlatformConfig
+            {
+                Agents = new Dictionary<string, AgentDefinitionConfig>
+                {
+                    ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", Enabled = true }
+                }
+            });
+        }
+
+        callbackCount.ShouldBe(0, "Repeated identical effective descriptors must produce zero applies.");
+    }
+
+    [Fact]
+    public void Watch_WhenRealDescriptorChange_InvokesCallbackExactlyOnce()
+    {
+        var config = new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", Enabled = true }
+            }
+        };
+        var monitor = new TestOptionsMonitor<PlatformConfig>(config);
+        var source = new PlatformConfigAgentSource(monitor, _configDirectory, new ListLogger<PlatformConfigAgentSource>());
+
+        int callbackCount = 0;
+        using var subscription = source.Watch(_ => callbackCount++);
+
+        // A genuine descriptor change (display name) must fire exactly once.
+        monitor.RaiseChanged(new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", DisplayName = "Renamed", Enabled = true }
+            }
+        });
+        // A subsequent identical change must be suppressed.
+        monitor.RaiseChanged(new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", DisplayName = "Renamed", Enabled = true }
+            }
+        });
+
+        callbackCount.ShouldBe(1, "Exactly one apply for a real change; the following identical change is suppressed.");
+    }
+
+    [Fact]
+    public void Watch_EmitsNotificationSuppressedAndApplyMetrics()
+    {
+        using var meter = new System.Diagnostics.Metrics.Meter("BotNexus.Test.ConfigReload." + Guid.NewGuid().ToString("N"));
+        long notifications = 0, suppressed = 0, applies = 0;
+        using var listener = new System.Diagnostics.Metrics.MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter == meter)
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((instrument, measurement, _, _) =>
+        {
+            if (instrument.Name.EndsWith(".notifications", StringComparison.Ordinal)) notifications += measurement;
+            else if (instrument.Name.EndsWith(".suppressed", StringComparison.Ordinal)) suppressed += measurement;
+            else if (instrument.Name.EndsWith(".applies", StringComparison.Ordinal)) applies += measurement;
+        });
+        listener.Start();
+
+        var config = new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", Enabled = true }
+            }
+        };
+        var monitor = new TestOptionsMonitor<PlatformConfig>(config);
+        var source = new PlatformConfigAgentSource(
+            monitor,
+            _configDirectory,
+            new ListLogger<PlatformConfigAgentSource>(),
+            locationResolver: null,
+            modelRegistry: null,
+            metrics: new BotNexus.Gateway.Telemetry.BotNexusMetrics(meter));
+
+        using var subscription = source.Watch(_ => { });
+
+        // Identical change -> suppressed.
+        monitor.RaiseChanged(new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", Enabled = true }
+            }
+        });
+        // Real change -> applied.
+        monitor.RaiseChanged(new PlatformConfig
+        {
+            Agents = new Dictionary<string, AgentDefinitionConfig>
+            {
+                ["assistant"] = new() { Provider = "copilot", Model = "gpt-4.1", DisplayName = "Renamed", Enabled = true }
+            }
+        });
+        listener.Dispose();
+
+        notifications.ShouldBe(2);
+        suppressed.ShouldBe(1);
+        applies.ShouldBe(1);
     }
 
     private sealed class StubLocationResolver(IReadOnlyDictionary<string, string> paths) : ILocationResolver

@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <!-- Vogen is pinned PrivateAssets="all" in BotNexus.Domain so the generator cannot leak into
+         the Blazor WASM payload (#2329). This project asserts on Vogen types directly, so it
+         declares its own reference rather than relying on transitive flow. -->
+    <PackageReference Include="Vogen" />
     <PackageReference Include="coverlet.collector" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="NSubstitute" />
@@ -16,10 +20,19 @@
   <ItemGroup>
     <ProjectReference Include="..\..\..\src\gateway\BotNexus.Gateway.Webhooks\BotNexus.Gateway.Webhooks.csproj" />
     <ProjectReference Include="..\..\..\src\domain\BotNexus.Domain\BotNexus.Domain.csproj" />
+    <!-- #3523: IAgentRegistry / AgentDescriptor for the provisioner's startup reconciliation. -->
+    <ProjectReference Include="..\..\..\src\gateway\BotNexus.Gateway.Abstractions\BotNexus.Gateway.Abstractions.csproj" />
+    <!-- #3523: IAgentWebhookTargetNotifier, the product-agnostic delivery seam. -->
+    <ProjectReference Include="..\..\..\src\gateway\BotNexus.Gateway.Contracts\BotNexus.Gateway.Contracts.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\..\BotNexus.Testing\SqlitePoolCleanup.cs" Link="Shared\SqlitePoolCleanup.cs" />
+    <Using Include="BotNexus.Testing" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+  </ItemGroup>
 </Project>

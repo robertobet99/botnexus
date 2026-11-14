@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using BotNexus.Agent.Providers.Core.Utilities;
@@ -65,9 +66,13 @@ public static class CopilotOAuth
         }, ct);
 
         var codeJson = await ReadJsonAsync(codeResponse, ct);
-        var deviceCode = codeJson.GetProperty("device_code").GetString()!;
-        var userCode = codeJson.GetProperty("user_code").GetString()!;
-        var verificationUri = codeJson.GetProperty("verification_uri").GetString()!;
+        // The envelope is already known to be a JSON object (ReadBoundedJsonAsync enforces that),
+        // but the individual fields are still peer-controlled: a well-formed object missing
+        // device_code used to slip a null past ! and surface as a NullReferenceException far
+        // downstream. Fail here, by field name, with no body text. (#2894)
+        var deviceCode = RequireStringProperty(codeJson, "device_code", DeviceCodeUrl);
+        var userCode = RequireStringProperty(codeJson, "user_code", DeviceCodeUrl);
+        var verificationUri = RequireStringProperty(codeJson, "verification_uri", DeviceCodeUrl);
         var interval = codeJson.TryGetProperty("interval", out var intervalEl) ? intervalEl.GetInt32() : 5;
         var expiresIn = codeJson.TryGetProperty("expires_in", out var expiresEl) ? expiresEl.GetInt32() : 900;
 
@@ -76,9 +81,13 @@ public static class CopilotOAuth
 
         // Step 3: Poll for authorization
         var pollInterval = Math.Max(interval, 1);
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(expiresIn);
+        // #3738: the device-code window is bounded monotonically. A backwards host clock step would
+        // otherwise extend polling past the code's real expiry (the server rejects the code anyway, so
+        // the loop would spin until cancelled); a forward step would abandon a still-valid code early.
+        var expiry = TimeSpan.FromSeconds(expiresIn);
+        var elapsed = Stopwatch.StartNew();
 
-        while (DateTimeOffset.UtcNow < deadline)
+        while (elapsed.Elapsed < expiry)
         {
             ct.ThrowIfCancellationRequested();
             await Task.Delay(TimeSpan.FromSeconds(pollInterval), ct);
@@ -224,8 +233,13 @@ public static class CopilotOAuth
         return (token, expiresAt, apiEndpoint);
     }
 
-    private static async Task<HttpResponseMessage> PostFormAsync(
+    private static Task<HttpResponseMessage> PostFormAsync(
         string url, IReadOnlyDictionary<string, string> fields, CancellationToken ct)
+        => PostFormAsync(SharedClient, url, fields, ct);
+
+    internal static async Task<HttpResponseMessage> PostFormAsync(
+        HttpClient client, string url, IReadOnlyDictionary<string, string> fields, CancellationToken ct,
+        TimeProvider? timeProvider = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, url)
         {
@@ -233,9 +247,98 @@ public static class CopilotOAuth
         };
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-        var response = await SharedClient.SendAsync(request, ct);
-        response.EnsureSuccessStatusCode();
-        return response;
+        // ResponseHeadersRead ends HttpClient's timeout at the headers. Keep the SAME
+        // whole-request budget over sending AND body consumption, not a fresh per-chunk
+        // or body-only timeout. Infinite client timeouts remain infinite.
+        using var deadline = new CancellationTokenSource(client.Timeout, timeProvider ?? TimeProvider.System);
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
+        var readToken = operation.Token;
+        HttpResponseMessage? response = null;
+        try
+        {
+            // Read headers first so the cap applies before any unbounded buffering.
+            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, readToken);
+            if (response.IsSuccessStatusCode)
+            {
+                // Buffer within the deadline before transferring ownership. This preserves the
+                // original content, bytes, charset and headers, and no network reads escape the
+                // request budget when callers subsequently parse the successful response.
+                await response.Content.LoadIntoBufferAsync(OAuthResponseMaxBytes, readToken);
+                readToken.ThrowIfCancellationRequested();
+                return response;
+            }
+
+            var code = await ReadRejectionCodeAsync(response.Content, readToken);
+            readToken.ThrowIfCancellationRequested();
+            // Only production-owned endpoint literals may enter diagnostics, never redirected
+            // RequestMessage URIs, reason phrases, headers, descriptions, or arbitrary error values.
+            var endpoint = url switch
+            {
+                DeviceCodeUrl => DeviceCodeUrl,
+                AccessTokenUrl => AccessTokenUrl,
+                _ => "the GitHub OAuth endpoint"
+            };
+            throw new HttpRequestException(
+                $"GitHub OAuth request to {endpoint} failed with HTTP {(int)response.StatusCode}: {code}.",
+                inner: null, statusCode: response.StatusCode);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            response?.Dispose();
+            // Do not expose the linked operation/idle token as the caller's identity.
+            ct.ThrowIfCancellationRequested();
+            throw;
+        }
+        catch (OperationCanceledException error) when (deadline.IsCancellationRequested)
+        {
+            response?.Dispose();
+            throw new TaskCanceledException("GitHub OAuth request exceeded the configured HttpClient timeout.",
+                new TimeoutException("The whole-request deadline elapsed.", error), readToken);
+        }
+        catch
+        {
+            // Until successful buffering completes, this method owns the response on ALL failures.
+            response?.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<string> ReadRejectionCodeAsync(HttpContent content, CancellationToken ct)
+    {
+        try
+        {
+            var body = await BoundedHttpContent.ReadStringWithLimitAsync(content, OAuthResponseMaxBytes, ct);
+            using var document = JsonDocument.Parse(body);
+            if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("error", out var error) &&
+                error.ValueKind == JsonValueKind.String)
+            {
+                // Return fixed literals, not the peer string, even when it resembles an error code.
+                return error.GetString() switch
+                {
+                    "authorization_pending" => "authorization_pending",
+                    "slow_down" => "slow_down",
+                    "expired_token" => "expired_token",
+                    "unsupported_grant_type" => "unsupported_grant_type",
+                    "incorrect_client_credentials" => "incorrect_client_credentials",
+                    "incorrect_device_code" => "incorrect_device_code",
+                    "access_denied" => "access_denied",
+                    "device_flow_disabled" => "device_flow_disabled",
+                    _ => "unknown_error"
+                };
+            }
+        }
+        catch (JsonException)
+        {
+            // A malformed diagnostic body must not replace the original HTTP rejection.
+        }
+        catch (ResponseContentTooLargeException)
+        {
+            // Oversized diagnostics are discarded, not parsed as a potentially valid prefix.
+        }
+
+        // Cancellation and unrelated transport/read failures deliberately propagate unchanged.
+        return "unknown_error";
     }
 
     // All three OAuth reads funnel through this choke-point, so capping here bounds every
@@ -256,7 +359,49 @@ public static class CopilotOAuth
     {
         var json = await BoundedHttpContent.ReadStringWithLimitAsync(response.Content, maxBytes, ct);
         using var doc = JsonDocument.Parse(json);
+
+        // Every OAuth caller indexes the result with GetProperty / TryGetProperty, which requires a
+        // JSON object. A hostile or rewriting endpoint returning a JSON null, an array or a scalar
+        // otherwise produced a raw System.Text.Json InvalidOperationException instead of a
+        // controlled authentication failure. Validate once here so all three call sites are covered.
+        // The diagnostic names the endpoint and the observed kind only - never any body text, which
+        // can reflect the just-submitted credential back at us (see #1884). (#2894)
+        if (doc.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            var endpoint = response.RequestMessage?.RequestUri?.ToString() ?? "the GitHub OAuth endpoint";
+            throw new InvalidOperationException(
+                $"GitHub returned an unexpected response from {endpoint}: expected a JSON object " +
+                $"but the response root was {doc.RootElement.ValueKind}.");
+        }
+
         return doc.RootElement.Clone();
+    }
+
+    /// <summary>
+    /// Reads a required string field out of a validated OAuth response object, failing by field
+    /// name when it is absent or not a JSON string. Replaces the null-forgiving
+    /// <c>GetProperty(...).GetString()!</c> reads so a well-formed but incomplete envelope produces
+    /// an actionable authentication error rather than a NullReferenceException later in the flow.
+    /// The message carries the field name and the endpoint only - never the value of any field,
+    /// because siblings in the envelope can be credentials. (#2894)
+    /// </summary>
+    /// <param name="root">A JSON object element previously validated by <see cref="ReadBoundedJsonAsync"/>.</param>
+    /// <param name="propertyName">The required property name.</param>
+    /// <param name="endpoint">The endpoint URL to name in the failure diagnostic.</param>
+    /// <returns>The property's string value.</returns>
+    internal static string RequireStringProperty(JsonElement root, string propertyName, string endpoint)
+    {
+        if (!root.TryGetProperty(propertyName, out var element) || element.ValueKind != JsonValueKind.String)
+        {
+            throw new InvalidOperationException(
+                $"GitHub returned an unexpected response from {endpoint}: " +
+                $"required field '{propertyName}' was missing or was not a JSON string.");
+        }
+
+        return element.GetString()
+            ?? throw new InvalidOperationException(
+                $"GitHub returned an unexpected response from {endpoint}: " +
+                $"required field '{propertyName}' was missing or was not a JSON string.");
     }
 
     /// <summary>

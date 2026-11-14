@@ -1,6 +1,6 @@
 using System.Text.Json;
 using BotNexus.Agent.Core.Configuration;
-using BotNexus.Agent.Core.Hooks;
+using BotNexus.Agent.Core.ExtensionPoints.ToolExecution;
 using BotNexus.Agent.Core.Loop;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Tests.TestUtils;
@@ -36,16 +36,29 @@ public sealed class ToolExecutorSecurityTests
         result.Result.Content[0].Value.ShouldBe(payload);
     }
 
+    /// <summary>
+    /// Was <c>VeryLargeToolResult_IsNotCapped_CurrentBehavior</c>, a <c>SecurityGap</c> test that
+    /// PINNED the defect: the executor applied no size budget, so a 10 MB tool result reached the
+    /// model verbatim. #3162 closed that gap with a central backstop, so the assertion is inverted
+    /// rather than weakened - the gap trait is dropped because the gap no longer exists.
+    /// </summary>
     [Fact]
     [Trait("Category", "Security")]
-    [Trait("Category", "SecurityGap")]
-    public async Task VeryLargeToolResult_IsNotCapped_CurrentBehavior()
+    public async Task VeryLargeToolResult_IsBoundedByTheCentralBudget()
     {
         var payload = new string('x', 10 * 1024 * 1024);
         var tool = CreateTool("large", _ => Task.FromResult(new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, payload)])));
 
         var result = await ExecuteSingleToolCall(tool);
-        result.Result.Content[0].Value.Length.ShouldBe(payload.Length);
+
+        // Bounded, and bounded as a SUCCESS carrying recovery guidance - never an error.
+        result.IsError.ShouldBeFalse();
+        result.Result.Content[0].Value.Length.ShouldBe(ToolOutputBudget.DefaultMaxBytes);
+        var text = string.Concat(result.Result.Content
+            .Where(block => block.Type == AgentToolContentType.Text)
+            .Select(block => block.Value));
+        text.ShouldContain("[tool output truncated:");
+        text.ShouldContain(ToolOutputBudget.NarrowingGuidance);
     }
 
     [Fact]
@@ -173,7 +186,7 @@ public sealed class ToolExecutorSecurityTests
     {
         var tool = CreateTool("echo", _ => Task.FromResult(new AgentToolResult([new AgentToolContent(AgentToolContentType.Text, "ok")])));
         var assistant = CreateAssistant(("tc1", "echo", "x"));
-        var config = TestHelpers.CreateTestConfig(beforeToolCall: (_, _) => Task.FromResult<BeforeToolCallResult?>(new BeforeToolCallResult(true, "blocked by policy")));
+        var config = TestHelpers.CreateTestConfig(beforeToolCall: (_, _) => Task.FromResult<ToolExecutionDecision?>(new ToolExecutionDecision(true, "blocked by policy")));
         var context = new AgentContext(null, [], [tool]);
 
         var results = await ToolExecutor.ExecuteAsync(context, assistant, config, _ => Task.CompletedTask, CancellationToken.None);

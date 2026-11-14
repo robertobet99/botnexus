@@ -6,7 +6,7 @@ The Web Tools extension provides agents with web search and URL fetching capabil
 
 | Property | Value |
 |----------|-------|
-| Extension ID | `botnexus-web-tools` |
+| Extension ID | `botnexus-web` |
 | Tool names | `web_search`, `web_fetch` |
 | Source | `BotNexus.Extensions.WebTools` |
 
@@ -39,7 +39,7 @@ Configure in your agent's extension config block:
 ```json
 {
   "extensions": {
-    "botnexus-web-tools": {
+    "botnexus-web": {
       "search": {
         "provider": "brave",
         "apiKey": "${env:BRAVE_API_KEY}",
@@ -106,6 +106,14 @@ By default, the fetch tool blocks requests to:
 - Reserved IP ranges
 
 Set `allowPrivateNetworks: true` only for self-hosted deployments where agents legitimately need to reach internal services.
+
+#### Reaching this gateway from an agent
+
+The refusal covers the gateway's own loopback endpoints, so an agent **cannot** call
+`http://localhost:5005/health` or `/api/logs/recent` with `web_fetch`. As of #2691 this restriction
+is stated in the tool's own description rather than discovered at call time, so an agent can pick a
+working approach before burning a turn. The sanctioned alternative is to issue the request from the
+`shell`/`exec` tool against the local API.
 
 ### Host Blocking
 

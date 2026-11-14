@@ -1,5 +1,6 @@
 using System.CommandLine;
 using System.Text.Json;
+using BotNexus.Cli.Services;
 using BotNexus.Gateway.Configuration;
 using Spectre.Console;
 
@@ -11,10 +12,15 @@ internal sealed class ValidateCommand
     {
         var remoteOption = new Option<bool>("--remote", "Validate using the running gateway /api/config/validate endpoint.");
         var gatewayUrlOption = new Option<string?>("--gateway-url", "Gateway base URL override for remote validation.");
+        // #2747 clause 1: --gateway-url names an operator-supplied host. The local gateway's
+        // credential is never sent there, so a non-loopback target must carry its own token or
+        // the command refuses rather than probing it unauthenticated.
+        var tokenOption = new Option<string?>("--token", "API key for the target gateway. Required when --gateway-url is not loopback.");
         var command = new Command("validate", "Validate BotNexus platform configuration.")
         {
             remoteOption,
-            gatewayUrlOption
+            gatewayUrlOption,
+            tokenOption
         };
 
         command.SetHandler(async context =>
@@ -22,11 +28,12 @@ internal sealed class ValidateCommand
             var remote = context.ParseResult.GetValueForOption(remoteOption);
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
             var gatewayUrlOverride = context.ParseResult.GetValueForOption(gatewayUrlOption);
+            var token = context.ParseResult.GetValueForOption(tokenOption);
             var target = context.ParseResult.GetValueForOption(targetOption);
             var home = CliPaths.ResolveTarget(target);
             var configPath = Path.Combine(home, "config.json");
             context.ExitCode = remote
-                ? await ExecuteRemoteAsync(gatewayUrlOverride, verbose, CancellationToken.None)
+                ? await ExecuteRemoteAsync(gatewayUrlOverride, verbose, CancellationToken.None, token)
                 : await ExecuteAsync(configPath, verbose, CancellationToken.None);
         });
 
@@ -39,17 +46,51 @@ internal sealed class ValidateCommand
     public async Task<int> ExecuteAsync(string configPath, bool verbose, CancellationToken cancellationToken)
     {
         AnsiConsole.MarkupLine("BotNexus config validation [dim](local)[/]");
-        AnsiConsole.MarkupLine($"Config path: [dim]{Markup.Escape(configPath)}[/]");
+        AnsiConsole.MarkupLine($"Config path: [dim]{CliText.SafeDisplay(configPath)}[/]");
 
-        if (!File.Exists(configPath))
+        if (!ConfigPresence.Exists(configPath))
         {
             PrintResult(
                 valid: false,
                 warnings: [],
                 errors:
                 [
-                    $"Config file not found at '{configPath}'.",
+                    $"No configuration found at '{configPath}' or in a SQLite store beside it.",
                     "Create ~/.botnexus/config.json (or set BOTNEXUS_HOME) and retry."
+                ]);
+            return 1;
+        }
+
+        // Parse failures have to be caught here explicitly. The loader deliberately falls back to
+        // defaults on unreadable JSON so the gateway stays up, which is right for the gateway - but
+        // it means the accessor below hands back a pristine PlatformConfig for a file that is not
+        // JSON at all. Validating that reported "VALID" for a config the gateway could not read and
+        // was silently ignoring, which is the opposite of what this command exists to tell you.
+        string rawJson;
+        try
+        {
+            rawJson = await File.ReadAllTextAsync(configPath, cancellationToken);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            PrintResult(valid: false, warnings: [], errors: [$"Unable to read config: {ex.Message}"]);
+            return 1;
+        }
+
+        try
+        {
+            using var _ = JsonDocument.Parse(rawJson, new JsonDocumentOptions { AllowTrailingCommas = true });
+        }
+        catch (JsonException ex)
+        {
+            PrintResult(
+                valid: false,
+                warnings: [],
+                errors:
+                [
+                    $"Config file is not valid JSON. {ex.Message}",
+                    "The gateway ignores an unreadable config and runs on defaults, so this would not "
+                    + "have surfaced as a startup failure - fix the JSON and restart to apply the file."
                 ]);
             return 1;
         }
@@ -57,7 +98,7 @@ internal sealed class ValidateCommand
         PlatformConfig config;
         try
         {
-            config = await PlatformConfigLoader.LoadAsync(configPath, cancellationToken, validateOnLoad: false);
+            config = PlatformConfigAccessor.Shared.Get(configPath);
         }
         catch (Exception ex)
         {
@@ -71,7 +112,7 @@ internal sealed class ValidateCommand
         {
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[dim]Validation trace:[/]");
-            AnsiConsole.MarkupLine($"[dim]- Loaded config file: {Markup.Escape(configPath)}[/]");
+            AnsiConsole.MarkupLine($"[dim]- Loaded config file: {CliText.SafeDisplay(configPath)}[/]");
             AnsiConsole.MarkupLine($"[dim]- Ran {nameof(PlatformConfigLoader)}.{nameof(PlatformConfigLoader.Validate)}[/]");
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[dim]Config details:[/]");
@@ -82,7 +123,7 @@ internal sealed class ValidateCommand
         return errors.Count == 0 ? 0 : 1;
     }
 
-    public async Task<int> ExecuteRemoteAsync(string? gatewayUrlOverride, bool verbose, CancellationToken cancellationToken)
+    public async Task<int> ExecuteRemoteAsync(string? gatewayUrlOverride, bool verbose, CancellationToken cancellationToken, string? token = null)
     {
         var gatewayUrl = ResolveGatewayUrl(gatewayUrlOverride);
         if (!Uri.TryCreate(gatewayUrl, UriKind.Absolute, out var gatewayBaseUri))
@@ -93,10 +134,24 @@ internal sealed class ValidateCommand
 
         var endpoint = new Uri(gatewayBaseUri, "/api/config/validate");
         AnsiConsole.MarkupLine("BotNexus config validation [dim](remote)[/]");
-        AnsiConsole.MarkupLine($"Gateway URL: [dim]{Markup.Escape(gatewayBaseUri.ToString())}[/]");
-        AnsiConsole.MarkupLine($"Endpoint: [dim]{Markup.Escape(endpoint.ToString())}[/]");
+        AnsiConsole.MarkupLine($"Gateway URL: [dim]{CliText.SafeDisplay(gatewayBaseUri.ToString())}[/]");
+        AnsiConsole.MarkupLine($"Endpoint: [dim]{CliText.SafeDisplay(endpoint.ToString())}[/]");
 
-        using var httpClient = new HttpClient();
+        // #2747 clause 1: routed through the one factory so the credential policy is applied
+        // here too - previously this was a bare client that contacted any --gateway-url host
+        // unauthenticated, and never presented a credential to a gateway that required one.
+        var resolution = GatewayClientFactory.Resolve(
+            gatewayBaseUri.ToString(),
+            TimeSpan.FromSeconds(30),
+            token,
+            GatewayClientFactory.DefaultCredentialSource());
+        if (resolution.IsRefused)
+        {
+            PrintResult(valid: false, warnings: [], errors: [resolution.RefusalMessage!]);
+            return 1;
+        }
+
+        using var httpClient = resolution.Client!;
         HttpResponseMessage response;
         try
         {
@@ -136,9 +191,9 @@ internal sealed class ValidateCommand
         {
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[dim]Validation trace:[/]");
-            AnsiConsole.MarkupLine($"[dim]- GET {Markup.Escape(endpoint.ToString())}[/]");
+            AnsiConsole.MarkupLine($"[dim]- GET {CliText.SafeDisplay(endpoint.ToString())}[/]");
             AnsiConsole.MarkupLine($"[dim]- HTTP {(int)response.StatusCode} {response.ReasonPhrase}[/]");
-            AnsiConsole.MarkupLine($"[dim]- Validated config path: {Markup.Escape(validation.ConfigPath)}[/]");
+            AnsiConsole.MarkupLine($"[dim]- Validated config path: {CliText.SafeDisplay(validation.ConfigPath)}[/]");
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine("[dim]Response details:[/]");
             AnsiConsole.WriteLine(payload);
@@ -155,12 +210,15 @@ internal sealed class ValidateCommand
 
         try
         {
-            var config = PlatformConfigLoader.Load(validateOnLoad: false);
-            return config.Gateway?.ListenUrl ?? "http://localhost:5005";
+            // No explicit path: resolve the default the same way the loader did, then read through
+            // the provider pipeline like every other call site.
+            var config = PlatformConfigAccessor.Shared.Get(
+                PlatformConfigLoader.GetDefaultConfigPath(new System.IO.Abstractions.FileSystem()));
+            return config.Gateway?.ListenUrl ?? GatewayClientFactory.DefaultUrl;
         }
         catch
         {
-            return "http://localhost:5005";
+            return GatewayClientFactory.DefaultUrl;
         }
     }
 
@@ -175,14 +233,14 @@ internal sealed class ValidateCommand
         {
             AnsiConsole.MarkupLine("\n[yellow]Warnings:[/]");
             foreach (var warning in warnings)
-                AnsiConsole.MarkupLine($"  [yellow]•[/] {Markup.Escape(warning)}");
+                AnsiConsole.MarkupLine($"  [yellow]•[/] {CliText.SafeDisplay(warning)}");
         }
 
         if (errors.Count > 0)
         {
             AnsiConsole.MarkupLine("\n[red]Errors:[/]");
             foreach (var error in errors)
-                AnsiConsole.MarkupLine($"  [red]•[/] {Markup.Escape(error)}");
+                AnsiConsole.MarkupLine($"  [red]•[/] {CliText.SafeDisplay(error)}");
         }
 
         if (warnings.Count == 0 && errors.Count == 0)
@@ -207,3 +265,4 @@ internal sealed record ConfigValidationResponse(
     string ConfigPath,
     IReadOnlyList<string>? Warnings,
     IReadOnlyList<string>? Errors);
+

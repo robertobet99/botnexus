@@ -44,6 +44,13 @@ public sealed class SessionContextProjectorTests
         IsCompactionSummary = true,
     };
 
+    private static SessionEntry ReplayBanner(string content = "banner") => new()
+    {
+        Role = MessageRole.System,
+        Content = content,
+        IsReplayBanner = true,
+    };
+
     [Fact]
     public void IsVisibleOnResume_ExcludesIsHistory()
     {
@@ -82,6 +89,41 @@ public sealed class SessionContextProjectorTests
     public void IsVisibleOnResume_ExcludesNonSummarySystem()
     {
         SessionContextProjector.IsVisibleOnResume(RawSystem()).ShouldBeFalse();
+    }
+
+    /// <summary>
+    /// #3046: a restart-replay banner is gateway-authored System content that MUST reach the model on
+    /// cold resume - it carries the only signal telling the agent its prior turn was cut off at an
+    /// unknown point. Without this the banner persists, renders in the transcript UI, and is silently
+    /// dropped before the LLM call.
+    /// </summary>
+    [Fact]
+    public void IsVisibleOnResume_IncludesReplayBanner_AsSystem()
+    {
+        SessionContextProjector.IsVisibleOnResume(ReplayBanner()).ShouldBeTrue();
+    }
+
+    /// <summary>
+    /// #3046 non-widening guard: the carve-out admits ONLY flagged system entries. A system entry with
+    /// neither flag set must still be excluded, so the exception cannot silently grow into
+    /// "all system entries pass" - which would push the rebuilt system prompt back into the message list.
+    /// </summary>
+    [Fact]
+    public void IsVisibleOnResume_ExcludesSystem_WithNeitherFlag()
+    {
+        var entry = RawSystem() with { IsCompactionSummary = false, IsReplayBanner = false };
+        SessionContextProjector.IsVisibleOnResume(entry).ShouldBeFalse();
+    }
+
+    /// <summary>
+    /// #3046: the banner is still a projection candidate, not a privileged row. Once folded into a
+    /// compaction summary it must drop out like anything else.
+    /// </summary>
+    [Fact]
+    public void IsVisibleOnResume_ExcludesReplayBanner_WhenHistory()
+    {
+        var entry = ReplayBanner() with { IsHistory = true };
+        SessionContextProjector.IsVisibleOnResume(entry).ShouldBeFalse();
     }
 
     [Fact]
@@ -133,9 +175,55 @@ public sealed class SessionContextProjectorTests
     }
 
     [Fact]
+    public void IsVisibleInLiveContext_ExcludesHostToolResultBudgetNotice()
+    {
+        var notice = RawSystem("Host budget notice") with { Kind = ToolResultBudgetNotice.Kind };
+
+        SessionContextProjector.IsVisibleInLiveContext(notice).ShouldBeFalse();
+        SessionContextProjector.IsVisibleOnResume(notice).ShouldBeFalse();
+    }
+
+    [Fact]
+    public void ProjectForLiveContext_ExcludesBudgetNotice_PreservingNormalSystemAndToolEntries()
+    {
+        var system = RawSystem("System instructions");
+        var tool = Tool("Tool result");
+        var notice = RawSystem("Host budget notice") with { Kind = ToolResultBudgetNotice.Kind };
+        var history = new[] { User(), system, Assistant(), tool, notice, Summary(), ReplayBanner() };
+
+        var projected = SessionContextProjector.ProjectForLiveContext(history);
+
+        projected.ShouldBe(new[] { history[0], system, history[2], tool, history[5], history[6] });
+        history.ShouldContain(notice);
+    }
+
+    [Fact]
     public void IsVisibleInLiveContext_IncludesCompactionSummary()
     {
         SessionContextProjector.IsVisibleInLiveContext(Summary()).ShouldBeTrue();
+    }
+
+    [Fact]
+    public void ProjectForResume_ExcludesFoldedEntries_EvenThoughTheUiNowShowsThem()
+    {
+        // #2936 AC5: the portal history endpoint stopped filtering IsHistory so pre-compaction
+        // transcript stays reachable in the UI. That is a READ-PATH change only -- LLM context
+        // projection must be untouched. A folded turn beside a live one is still evicted here.
+        var history = new[]
+        {
+            User("folded-user") with { IsHistory = true },
+            Assistant("folded-assistant") with { IsHistory = true },
+            Summary("active summary"),
+            User("live-user"),
+            Assistant("live-assistant"),
+        };
+
+        var projected = SessionContextProjector.ProjectForResume(history);
+
+        projected.ShouldNotContain(e => e.Content == "folded-user");
+        projected.ShouldNotContain(e => e.Content == "folded-assistant");
+        projected.Select(e => e.Content).ShouldContain("live-user");
+        projected.Select(e => e.Content).ShouldContain("live-assistant");
     }
 
     [Fact]

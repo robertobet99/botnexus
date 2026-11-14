@@ -1,6 +1,7 @@
 using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Abstractions.Sessions;
+using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Configuration;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Agents;
@@ -15,7 +16,7 @@ public sealed class WorkspaceContextBuilderTests
     private readonly MockFileSystem _fileSystem = new();
 
     [Fact]
-    public async Task BuildSystemPromptAsync_WithExplicitPromptFiles_LoadsInOrderAndDeletesBootstrap()
+    public async Task BuildSystemPromptAsync_StandardPromptFiles_LoadInOrderAndDeleteBootstrap()
     {
         var workspacePath = CreateWorkspace(
             ("AGENTS.md", "AGENTS"),
@@ -33,14 +34,110 @@ public sealed class WorkspaceContextBuilderTests
                 DisplayName = "Farnsworth",
                 ModelId = "test-model",
                 ApiProvider = "test-provider",
-                SystemPromptFiles = ["AGENTS.md", "BOOTSTRAP.md", "TOOLS.md"]
             });
 
             result.ShouldContain("AGENTS");
             result.ShouldContain("BOOTSTRAP");
             result.ShouldContain("TOOLS");
-            result.ShouldNotContain("SOUL");
+            result.ShouldContain("SOUL");
             _fileSystem.File.Exists(Path.Combine(workspacePath, "BOOTSTRAP.md")).ShouldBeFalse();
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_WithDeniedStandardPromptPath_ExcludesExactMatchAndKeepsNeighbor()
+    {
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "ALLOWED NEIGHBOR SENTINEL"),
+            ("SOUL.md", "EXACT DENIED SENTINEL"));
+        try
+        {
+            var descriptor = new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("policy-test"),
+                DisplayName = "Policy Test",
+                ModelId = "test-model",
+                ApiProvider = "test-provider",
+                FileAccess = new FileAccessPolicy
+                {
+                    DeniedPaths = [Path.Combine(workspacePath, "SOUL.md")]
+                }
+            };
+
+            var result = await new WorkspaceContextBuilder(new StubWorkspaceManager(workspacePath), _fileSystem)
+                .BuildSystemPromptAsync(descriptor);
+
+            result.ShouldContain("ALLOWED NEIGHBOR SENTINEL");
+            result.ShouldNotContain("EXACT DENIED SENTINEL");
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_WhenResolvedVariantIsDenied_DoesNotFallBackToBaseFile()
+    {
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "BASE SENTINEL"),
+            ("AGENTS.gpt-5.md", "DENIED VARIANT SENTINEL"),
+            ("SOUL.md", "ALLOWED VARIANT NEIGHBOR"));
+        try
+        {
+            var descriptor = new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("variant-policy-test"),
+                DisplayName = "Variant Policy Test",
+                ModelId = "gpt-5",
+                ApiProvider = "test-provider",
+                FileAccess = new FileAccessPolicy
+                {
+                    DeniedPaths = [Path.Combine(workspacePath, "AGENTS.gpt-5.md")]
+                }
+            };
+
+            var result = await new WorkspaceContextBuilder(new StubWorkspaceManager(workspacePath), _fileSystem)
+                .BuildSystemPromptAsync(descriptor);
+
+            result.ShouldContain("ALLOWED VARIANT NEIGHBOR");
+            result.ShouldNotContain("DENIED VARIANT SENTINEL");
+            result.ShouldNotContain("BASE SENTINEL");
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_WhenResolvedBootstrapVariantIsDenied_DoesNotReadOrDeleteIt()
+    {
+        var workspacePath = CreateWorkspace(("BOOTSTRAP.gpt-5.md", "DENIED BOOTSTRAP SENTINEL"));
+        var bootstrapPath = Path.Combine(workspacePath, "BOOTSTRAP.gpt-5.md");
+        try
+        {
+            var descriptor = new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("bootstrap-policy-test"),
+                DisplayName = "Bootstrap Policy Test",
+                ModelId = "gpt-5",
+                ApiProvider = "test-provider",
+                FileAccess = new FileAccessPolicy
+                {
+                    DeniedPaths = [bootstrapPath]
+                }
+            };
+
+            var result = await new WorkspaceContextBuilder(new StubWorkspaceManager(workspacePath), _fileSystem)
+                .BuildSystemPromptAsync(descriptor);
+
+            result.ShouldNotContain("DENIED BOOTSTRAP SENTINEL");
+            _fileSystem.File.Exists(bootstrapPath).ShouldBeTrue();
         }
         finally
         {
@@ -79,6 +176,64 @@ public sealed class WorkspaceContextBuilderTests
             result.ShouldContain("IDENTITY");
             result.ShouldContain("USER");
             _fileSystem.File.Exists(Path.Combine(workspacePath, "BOOTSTRAP.md")).ShouldBeFalse();
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_TrailguideIncludesUserOwnedCustomOverlay()
+    {
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "CANONICAL AGENTS"),
+            ("SOUL.md", "CANONICAL SOUL"),
+            ("TRAILGUIDE.custom.md", "USER CUSTOMIZATION"));
+        try
+        {
+            var manager = new StubWorkspaceManager(workspacePath);
+            var builder = new WorkspaceContextBuilder(manager, _fileSystem);
+
+            var result = await builder.BuildSystemPromptAsync(new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("nexus-trailguide"),
+                DisplayName = "Nexus Trailguide",
+                ModelId = "test-model",
+                ApiProvider = "test-provider"
+            });
+
+            result.ShouldContain("CANONICAL AGENTS");
+            result.ShouldContain("CANONICAL SOUL");
+            result.ShouldContain("USER CUSTOMIZATION");
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_OrdinaryAgentDoesNotLoadTrailguideCustomOverlay()
+    {
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "AGENTS"),
+            ("TRAILGUIDE.custom.md", "TRAILGUIDE ONLY"));
+        try
+        {
+            var manager = new StubWorkspaceManager(workspacePath);
+            var builder = new WorkspaceContextBuilder(manager, _fileSystem);
+
+            var result = await builder.BuildSystemPromptAsync(new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("ordinary-agent"),
+                DisplayName = "Ordinary",
+                ModelId = "test-model",
+                ApiProvider = "test-provider"
+            });
+
+            result.ShouldContain("AGENTS");
+            result.ShouldNotContain("TRAILGUIDE ONLY");
         }
         finally
         {
@@ -149,6 +304,192 @@ public sealed class WorkspaceContextBuilderTests
         {
             _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_DefaultPrompt_IncludesRecentDailyMemoryFiles()
+    {
+        var today = DateTime.Now.Date;
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "AGENTS"),
+            ("SOUL.md", "SOUL"),
+            (Path.Combine("memory", $"{today:yyyy-MM-dd}.md"), "TODAY MEMORY ENTRY"),
+            (Path.Combine("memory", $"{today.AddDays(-1):yyyy-MM-dd}.md"), "YESTERDAY MEMORY ENTRY"));
+        try
+        {
+            var manager = new StubWorkspaceManager(workspacePath);
+            var builder = new WorkspaceContextBuilder(manager, _fileSystem);
+
+            var result = await builder.BuildSystemPromptAsync(new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("farnsworth"),
+                DisplayName = "Farnsworth",
+                ModelId = "test-model",
+                ApiProvider = "test-provider",
+            });
+
+            result.ShouldContain("AGENTS");
+            result.ShouldContain("TODAY MEMORY ENTRY");
+            result.ShouldContain("YESTERDAY MEMORY ENTRY");
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_DefaultPromptWithMemoryFactory_IncludesDailyNotes()
+    {
+        var workspacePath = CreateWorkspace(("AGENTS.md", "AGENTS"));
+        try
+        {
+            var manager = new StubWorkspaceManager(workspacePath);
+            var homePath = Path.Combine(Path.GetTempPath(), "botnexus-home-" + Guid.NewGuid().ToString("N"));
+            _fileSystem.Directory.CreateDirectory(homePath);
+            var home = new BotNexusHome(_fileSystem, homePath);
+
+            var memoryContext = new AgentMemoryContext(
+                null,
+                [new AgentMemoryDailyNote(DateOnly.FromDateTime(DateTime.Now), "Daily note from IAgentMemory")],
+                50);
+            var builder = new WorkspaceContextBuilder(
+                manager, _fileSystem, home,
+                Substitute.For<IConversationStore>(), Substitute.For<ISessionStore>(),
+                new StubAgentMemoryFactory(memoryContext));
+
+            var result = await builder.BuildSystemPromptAsync(new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("farnsworth"),
+                DisplayName = "Farnsworth",
+                ModelId = "test-model",
+                ApiProvider = "test-provider",
+            });
+
+            result.ShouldContain("AGENTS");
+            result.ShouldContain("Daily note from IAgentMemory");
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_DailyMemoryPass_EmitsEachNoteOnce()
+    {
+        var today = DateTime.Now.Date;
+        var yesterday = today.AddDays(-1);
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "AGENTS"),
+            (Path.Combine("memory", $"{today:yyyy-MM-dd}.md"), "TODAY MEMORY ENTRY"),
+            (Path.Combine("memory", $"{yesterday:yyyy-MM-dd}.md"), "YESTERDAY MEMORY ENTRY"));
+        try
+        {
+            var manager = new StubWorkspaceManager(workspacePath);
+            var builder = new WorkspaceContextBuilder(manager, _fileSystem);
+
+            var result = await builder.BuildSystemPromptAsync(new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("farnsworth"),
+                DisplayName = "Farnsworth",
+                ModelId = "test-model",
+                ApiProvider = "test-provider",
+            });
+
+            // Both notes arrive through the automatic daily-memory pass; each must appear once.
+            result.ShouldContain("YESTERDAY MEMORY ENTRY");
+            CountOccurrences(result, "TODAY MEMORY ENTRY").ShouldBe(1);
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_WithPromptInjectionNone_SkipsRecentDailyMemoryFiles()
+    {
+        var today = DateTime.Now.Date;
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "AGENTS"),
+            (Path.Combine("memory", $"{today:yyyy-MM-dd}.md"), "TODAY MEMORY ENTRY"));
+        try
+        {
+            var manager = new StubWorkspaceManager(workspacePath);
+            var builder = new WorkspaceContextBuilder(manager, _fileSystem);
+            var memoryConfig = new MemoryAgentConfig { Enabled = true };
+
+            // Positive control: the same workspace does surface the daily note
+            // when injection is left at its default, so the negative assertion below is meaningful.
+            var descriptor = new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("farnsworth"),
+                DisplayName = "Farnsworth",
+                ModelId = "test-model",
+                ApiProvider = "test-provider",
+                Memory = memoryConfig
+            };
+            (await builder.BuildSystemPromptAsync(descriptor)).ShouldContain("TODAY MEMORY ENTRY");
+
+            SetPromptInjection(memoryConfig, "none");
+            var result = await builder.BuildSystemPromptAsync(descriptor);
+
+            result.ShouldContain("AGENTS");
+            result.ShouldNotContain("TODAY MEMORY ENTRY");
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildSystemPromptAsync_WithPromptInjectionNone_DoesNotLoadDailyNotes()
+    {
+        var today = DateTime.Now.Date;
+        var yesterday = today.AddDays(-1);
+        var workspacePath = CreateWorkspace(
+            ("AGENTS.md", "AGENTS"),
+            (Path.Combine("memory", $"{today:yyyy-MM-dd}.md"), "TODAY MEMORY ENTRY"),
+            (Path.Combine("memory", $"{yesterday:yyyy-MM-dd}.md"), "YESTERDAY MEMORY ENTRY"));
+        try
+        {
+            var manager = new StubWorkspaceManager(workspacePath);
+            var builder = new WorkspaceContextBuilder(manager, _fileSystem);
+            var memoryConfig = new MemoryAgentConfig { Enabled = true };
+            SetPromptInjection(memoryConfig, "none");
+
+            var result = await builder.BuildSystemPromptAsync(new AgentDescriptor
+            {
+                AgentId = BotNexus.Domain.Primitives.AgentId.From("farnsworth"),
+                DisplayName = "Farnsworth",
+                ModelId = "test-model",
+                ApiProvider = "test-provider",
+                Memory = memoryConfig
+            });
+
+            // With custom prompt-file selection retired, `none` suppresses all automatic daily-note injection.
+            result.ShouldNotContain("TODAY MEMORY ENTRY");
+            result.ShouldNotContain("YESTERDAY MEMORY ENTRY");
+        }
+        finally
+        {
+            _fileSystem.Directory.Delete(Path.GetDirectoryName(workspacePath)!, recursive: true);
+        }
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var index = haystack.IndexOf(needle, StringComparison.Ordinal);
+        while (index >= 0)
+        {
+            count++;
+            index = haystack.IndexOf(needle, index + needle.Length, StringComparison.Ordinal);
+        }
+
+        return count;
     }
 
     [Fact]

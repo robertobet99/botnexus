@@ -8,9 +8,161 @@ using BotNexus.Persistence.Sqlite;
 
 namespace BotNexus.Cron;
 
-public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = null, ILogger<SqliteCronStore>? logger = null) : ICronStore
+public sealed class SqliteCronStore(
+    string dbPath,
+    IFileSystem? fileSystem = null,
+    ILogger<SqliteCronStore>? logger = null,
+    Func<int>? retentionDaysAccessor = null,
+    TimeProvider? timeProvider = null) : ICronStore
 {
     private readonly string _dbPath = dbPath;
+    private readonly TimeProvider _activityTimeProvider = timeProvider ?? TimeProvider.System;
+
+    /// <inheritdoc />
+    public async Task<CronRunActivity> GetRunActivityAsync(CronRunActivityQuery? query = null, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        query ??= new CronRunActivityQuery();
+        var now = _activityTimeProvider.GetUtcNow().ToUniversalTime();
+        var requestedEnd = (query.EndExclusive ?? now).ToUniversalTime();
+        var requestedStart = query.StartInclusive?.ToUniversalTime() ?? SubtractActivityDays(requestedEnd, 1);
+        // At the minimum representable instant, a default 24-hour window saturates to empty.
+        if (requestedStart > requestedEnd || (requestedStart == requestedEnd &&
+            (query.StartInclusive.HasValue || query.EndExclusive.HasValue)))
+            throw new ArgumentException("The activity start must precede its exclusive end.", nameof(query));
+
+        var horizon = SubtractActivityDays(now, Math.Max(1, _retentionDaysAccessor()));
+        var start = requestedStart < horizon ? horizon : requestedStart;
+        if (start > now) start = now;
+        var end = requestedEnd > now ? now : requestedEnd;
+        if (end < start) end = start;
+        await InitializeAsync(ct).ConfigureAwait(false);
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        // Deferred BEGIN does not reserve the writer lock. The first SELECT establishes the
+        // snapshot and both aggregate reads share it, even if finalization/purge commits between.
+        using var transaction = connection.BeginTransaction(deferred: true);
+        try
+        {
+            await using var totalsCommand = CreateActivityCommand(connection, transaction, query, start, end, top: false);
+            CronRunActivityTotals totals;
+            await using (var reader = await totalsCommand.ExecuteReaderAsync(ct).ConfigureAwait(false))
+            {
+                if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+                    throw new InvalidOperationException("Activity aggregate did not return its totals row.");
+                totals = ReadActivityTotals(reader, 0);
+            }
+            await using var topCommand = CreateActivityCommand(connection, transaction, query, start, end, top: true);
+            var jobs = new List<CronRunActivityJob>();
+            await using (var reader = await topCommand.ExecuteReaderAsync(ct).ConfigureAwait(false))
+            {
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                    jobs.Add(new CronRunActivityJob
+                    {
+                        JobId = JobId.From(reader.GetString(0)), Totals = ReadActivityTotals(reader, 1)
+                    });
+            }
+            // Exactly two SELECTs after initialization, independent of matching runs/job count.
+            // Only one totals row and at most 50 grouped rows are materialized; no run payloads.
+            ct.ThrowIfCancellationRequested();
+            transaction.Commit();
+            return new CronRunActivity
+            {
+                RequestedStartInclusiveUtc = requestedStart, RequestedEndExclusiveUtc = requestedEnd,
+                EffectiveStartInclusiveUtc = start, EffectiveEndExclusiveUtc = end,
+                WindowTruncatedByRetention = requestedStart < horizon,
+                WindowTruncatedByNow = requestedEnd > now,
+                Totals = totals, TopJobs = jobs
+            };
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 1 &&
+            ex.Message.Contains("integer overflow", StringComparison.OrdinalIgnoreCase))
+        {
+            // Deliberately omit the provider exception: no SQL, paths or stored identifiers escape.
+            throw new InvalidOperationException(ActivityMeasurementOutOfRange);
+        }
+    }
+
+    private static DateTimeOffset SubtractActivityDays(DateTimeOffset value, int days)
+    {
+        // Compare whole days before multiplication: int.MaxValue days exceeds Int64 ticks.
+        if (days > value.Ticks / TimeSpan.TicksPerDay) return DateTimeOffset.MinValue;
+        return value.AddTicks(-(long)days * TimeSpan.TicksPerDay);
+    }
+
+    private const string ActivityMeasurementOutOfRange = "Activity measurement is out of range.";
+
+    private const string ActivityTokenSum =
+        "SUM(CASE WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL " +
+        "THEN COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0) END)";
+
+    internal static string BuildActivitySql(bool scoped, bool top)
+        => $"""
+            SELECT {(top ? "job_id, " : "")}
+                   COUNT(*), COUNT(DISTINCT job_id),
+                   COUNT(CASE WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL THEN 1 END),
+                   COUNT(CASE WHEN status = 'running' THEN 1 END),
+                   COUNT(CASE WHEN completed_at IS NULL THEN 1 END),
+                   SUM(prompt_tokens), SUM(completion_tokens), {ActivityTokenSum},
+                   SUM(turn_count), SUM(tool_call_count), SUM(duration_ms),
+                   COUNT(prompt_tokens), COUNT(completion_tokens), COUNT(turn_count),
+                   COUNT(tool_call_count), COUNT(duration_ms),
+                   typeof(SUM(prompt_tokens)), typeof(SUM(completion_tokens)), typeof({ActivityTokenSum}),
+                   typeof(SUM(turn_count)), typeof(SUM(tool_call_count)), typeof(SUM(duration_ms)),
+                   MAX(CASE WHEN typeof(COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0)) <> 'integer'
+                            THEN 1 ELSE 0 END)
+            FROM cron_runs
+            WHERE started_at >= $start AND started_at < $end
+            {(scoped ? "AND job_id = $job" : "")}
+            {(top ? $"GROUP BY job_id ORDER BY {ActivityTokenSum} DESC, job_id COLLATE BINARY ASC LIMIT $limit" : "")}
+            """;
+
+    private static SqliteCommand CreateActivityCommand(SqliteConnection connection, SqliteTransaction transaction,
+        CronRunActivityQuery query, DateTimeOffset start, DateTimeOffset end, bool top)
+    {
+        var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = BuildActivitySql(query.JobId.HasValue, top);
+        command.Parameters.AddWithValue("$start", start.ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$end", end.ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+        if (query.JobId is { } jobId) command.Parameters.AddWithValue("$job", jobId.Value);
+        if (top) command.Parameters.AddWithValue("$limit", Math.Clamp(query.TopJobLimit, 1, 50));
+        return command;
+    }
+
+    private static CronRunActivityTotals ReadActivityTotals(SqliteDataReader reader, int offset)
+    {
+        // Exact Int64 totals only. SQLite promotes overflowing per-row addition to REAL,
+        // and GetInt64 can coerce that lossy value. Reject it before reading any measurement.
+        // NULL still means unmeasured; overflow is never converted to NULL, zero or saturation.
+        for (var ordinal = 16; ordinal < 22; ordinal++)
+        {
+            var storageType = reader.GetString(offset + ordinal);
+            if (storageType != "integer" && storageType != "null")
+                throw new InvalidOperationException(ActivityMeasurementOutOfRange);
+        }
+        if (!reader.IsDBNull(offset + 22) && reader.GetInt64(offset + 22) != 0)
+            throw new InvalidOperationException(ActivityMeasurementOutOfRange);
+        long? NullableSum(int ordinal) => reader.IsDBNull(offset + ordinal) ? null : reader.GetInt64(offset + ordinal);
+        return new CronRunActivityTotals
+        {
+            RunCount = reader.GetInt64(offset), JobCount = reader.GetInt64(offset + 1),
+            MeasuredRunCount = reader.GetInt64(offset + 2), RunningRunCount = reader.GetInt64(offset + 3),
+            UnfinalizedRunCount = reader.GetInt64(offset + 4),
+            TotalPromptTokens = NullableSum(5), TotalCompletionTokens = NullableSum(6), TotalTokens = NullableSum(7),
+            TotalTurns = NullableSum(8), TotalToolCalls = NullableSum(9), TotalDurationMs = NullableSum(10),
+            PromptTokenRunCount = reader.GetInt64(offset + 11), CompletionTokenRunCount = reader.GetInt64(offset + 12),
+            TurnRunCount = reader.GetInt64(offset + 13), ToolCallRunCount = reader.GetInt64(offset + 14),
+            DurationRunCount = reader.GetInt64(offset + 15)
+        };
+    }
+
+    // #2641 AC6: the cost rollup window can never exceed the retention horizon, because the
+    // retention service has already deleted everything older. Read through an accessor rather than
+    // captured at construction so a live options change is honoured by the very next rollup - a
+    // snapshotted value would drift into reporting a window the store no longer holds.
+    private readonly Func<int> _retentionDaysAccessor =
+        retentionDaysAccessor ?? (() => new CronRunRetentionOptions().RetentionDays);
     private readonly SqliteWalMaintenance _walMaintenance = new(fileSystem);
     private readonly string _connectionString = $"Data Source={dbPath};Mode=ReadWriteCreate";
     private readonly IFileSystem _fileSystem = fileSystem ?? new FileSystem();
@@ -18,10 +170,40 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private bool _initialized;
 
+    /// <summary>
+    /// The schema version this build of the cron store writes and understands (#2835).
+    /// </summary>
+    public const int CurrentSchemaVersion = 1;
+
+    private static readonly SqliteSchemaMigration[] Migrations = [];
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
+
+    /// <summary>
+    /// #2641 per-run cost column definitions, used both by the additive migration and (by name)
+    /// by every run SELECT. Held in one place so a column can never be migrated in but forgotten
+    /// in the projection - the straggler shape that leaves a written value permanently unread.
+    /// </summary>
+    private static readonly string[] CostColumnDefinitions =
+    [
+        "turn_count INTEGER NULL",
+        "tool_call_count INTEGER NULL",
+        "duration_ms INTEGER NULL",
+        "prompt_tokens INTEGER NULL",
+        "completion_tokens INTEGER NULL",
+        "effective_model_json TEXT NULL"
+    ];
+
+    /// <summary>
+    /// The full ordered column list every <c>cron_runs</c> SELECT projects, so <see cref="ReadRun"/>
+    /// can rely on fixed ordinals and no caller can silently omit the cost columns.
+    /// </summary>
+    private const string RunColumns =
+        "id, job_id, started_at, completed_at, status, error, session_id, " +
+        "turn_count, tool_call_count, duration_ms, prompt_tokens, completion_tokens, effective_model_json";
 
     public async Task InitializeAsync(CancellationToken ct = default)
     {
@@ -67,8 +249,15 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
                     last_run_error TEXT NULL,
                     metadata_json TEXT NULL,
                     conversation_id TEXT NULL,
-                    delete_after_run INTEGER NOT NULL DEFAULT 0
-                );
+                    delete_after_run INTEGER NOT NULL DEFAULT 0,
+                    schedule_activated_at TEXT NULL,
+                    failure_alerts_enabled INTEGER NOT NULL DEFAULT 0,
+                     failure_alert_conversation_id TEXT NULL,
+                     delete_job_after_run INTEGER NOT NULL DEFAULT 0,
+                     expires_at TEXT NULL,
+                     execution_class INTEGER NOT NULL DEFAULT 0,
+                     backoff_until TEXT NULL
+                 );
 
                 CREATE INDEX IF NOT EXISTS idx_cron_jobs_enabled_next_run_at
                 ON cron_jobs(enabled, next_run_at);
@@ -81,11 +270,36 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
                     status TEXT NOT NULL,
                     error TEXT NULL,
                     session_id TEXT NULL,
+                    turn_count INTEGER NULL,
+                    tool_call_count INTEGER NULL,
+                    duration_ms INTEGER NULL,
+                    prompt_tokens INTEGER NULL,
+                    completion_tokens INTEGER NULL,
                     FOREIGN KEY(job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id_started_at
                 ON cron_runs(job_id, started_at DESC);
+
+                -- #4626: synthetic 10k-row EXPLAIN shows global interval aggregates scan
+                -- without a time-leading index; this additive index bounds both SQL reads.
+                CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at
+                ON cron_runs(started_at);
+
+                -- #2838: the cross-job recent-run query filters on status and orders by
+                -- started_at across many job ids, so the (job_id, started_at) index alone cannot
+                -- serve the failed-only view without scanning each job's history. This covering
+                -- index is what makes "which of my jobs failed recently" one cheap query.
+                CREATE INDEX IF NOT EXISTS idx_cron_runs_status_started_at
+                ON cron_runs(status, started_at DESC);
+
+                -- #2477: a missed run's identity is (job_id, scheduled occurrence). Startup
+                -- detection rescans the same window after every restart because the missed
+                -- path never advances last_run_at, so the write must be idempotent. The index
+                -- is partial (status = 'missed') to leave real executions - which legitimately
+                -- may share a started_at instant - completely unconstrained.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_missed_occurrence
+                ON cron_runs(job_id, started_at) WHERE status = 'missed';
                 """;
             await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
 
@@ -94,40 +308,40 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             migrate.CommandText = """
                 ALTER TABLE cron_jobs ADD COLUMN time_zone TEXT NULL;
                 """;
-            try { await migrate.ExecuteNonQueryAsync(ct).ConfigureAwait(false); }
-            catch (SqliteException) { /* column already exists */ }
+            await SqliteAdditiveMigration.ExecuteAsync(migrate, ct).ConfigureAwait(false);
 
             // Migrate existing databases: add system column if missing.
             await using var migrateSystem = connection.CreateCommand();
             migrateSystem.CommandText = """
                 ALTER TABLE cron_jobs ADD COLUMN system INTEGER NOT NULL DEFAULT 0;
                 """;
-            try { await migrateSystem.ExecuteNonQueryAsync(ct).ConfigureAwait(false); }
-            catch (SqliteException) { /* column already exists */ }
+            await SqliteAdditiveMigration.ExecuteAsync(migrateSystem, ct).ConfigureAwait(false);
+
+            // An absent probe preserves existing jobs exactly: never backfill executable text.
+            await using var migratePrecondition = connection.CreateCommand();
+            migratePrecondition.CommandText = "ALTER TABLE cron_jobs ADD COLUMN precondition_command TEXT NULL;";
+            await SqliteAdditiveMigration.ExecuteAsync(migratePrecondition, ct).ConfigureAwait(false);
 
             // Migrate existing databases: add model column if missing.
             await using var migrateModel = connection.CreateCommand();
             migrateModel.CommandText = """
                 ALTER TABLE cron_jobs ADD COLUMN model TEXT NULL;
                 """;
-            try { await migrateModel.ExecuteNonQueryAsync(ct).ConfigureAwait(false); }
-            catch (SqliteException) { /* column already exists */ }
+            await SqliteAdditiveMigration.ExecuteAsync(migrateModel, ct).ConfigureAwait(false);
 
             // Migrate existing databases: add template_name column if missing.
             await using var migrateTemplateName = connection.CreateCommand();
             migrateTemplateName.CommandText = """
                 ALTER TABLE cron_jobs ADD COLUMN template_name TEXT NULL;
                 """;
-            try { await migrateTemplateName.ExecuteNonQueryAsync(ct).ConfigureAwait(false); }
-            catch (SqliteException) { /* column already exists */ }
+            await SqliteAdditiveMigration.ExecuteAsync(migrateTemplateName, ct).ConfigureAwait(false);
 
             // Migrate existing databases: add template_parameters_json column if missing.
             await using var migrateTemplateParameters = connection.CreateCommand();
             migrateTemplateParameters.CommandText = """
                 ALTER TABLE cron_jobs ADD COLUMN template_parameters_json TEXT NULL;
                 """;
-            try { await migrateTemplateParameters.ExecuteNonQueryAsync(ct).ConfigureAwait(false); }
-            catch (SqliteException) { /* column already exists */ }
+            await SqliteAdditiveMigration.ExecuteAsync(migrateTemplateParameters, ct).ConfigureAwait(false);
 
             // Migrate existing databases: add conversation_id column if missing (P9-D).
             // CronJob.ConversationId is the canonical link from a cron job to its conversation;
@@ -136,8 +350,7 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             migrateConversationId.CommandText = """
                 ALTER TABLE cron_jobs ADD COLUMN conversation_id TEXT NULL;
                 """;
-            try { await migrateConversationId.ExecuteNonQueryAsync(ct).ConfigureAwait(false); }
-            catch (SqliteException) { /* column already exists */ }
+            await SqliteAdditiveMigration.ExecuteAsync(migrateConversationId, ct).ConfigureAwait(false);
 
             // Migrate existing databases: add delete_after_run column if missing (#1561).
             // Opt-in ephemeral-run cleanup flag; pre-existing rows default to 0 (no auto-delete),
@@ -146,8 +359,97 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             migrateDeleteAfterRun.CommandText = """
                 ALTER TABLE cron_jobs ADD COLUMN delete_after_run INTEGER NOT NULL DEFAULT 0;
                 """;
-            try { await migrateDeleteAfterRun.ExecuteNonQueryAsync(ct).ConfigureAwait(false); }
-            catch (SqliteException) { /* column already exists */ }
+            await SqliteAdditiveMigration.ExecuteAsync(migrateDeleteAfterRun, ct).ConfigureAwait(false);
+
+            // Migrate existing databases: add schedule_activated_at column if missing (#2554).
+            // Pre-existing rows are left NULL, which the read path treats as "unknown" and which
+            // missed-run detection deliberately reads as "no clamp" -- byte-identical to today's
+            // behaviour. Backfilling a value here (e.g. now, or created_at) would either
+            // retroactively suppress legitimate missed runs for every existing job on the first
+            // restart after upgrade, or claim an activation instant nothing actually observed.
+            await using var migrateScheduleActivatedAt = connection.CreateCommand();
+            migrateScheduleActivatedAt.CommandText = """
+                ALTER TABLE cron_jobs ADD COLUMN schedule_activated_at TEXT NULL;
+                """;
+            await SqliteAdditiveMigration.ExecuteAsync(migrateScheduleActivatedAt, ct).ConfigureAwait(false);
+
+            // Migrate existing databases: add the #2557 failure-alert columns if missing.
+            // Both are written so that a row predating them reads as "alerts off, no target":
+            // failure_alerts_enabled defaults to 0 and failure_alert_conversation_id to NULL.
+            // The read path must never treat unwritten state as opt-in - a new column the read
+            // path trusts but existing rows never wrote is a recurring defect family here
+            // (#2488, #2324, #2340, #2548, #2556), and here it would mean spamming a conversation
+            // that was never configured.
+            await using var migrateFailureAlertsEnabled = connection.CreateCommand();
+            migrateFailureAlertsEnabled.CommandText = """
+                ALTER TABLE cron_jobs ADD COLUMN failure_alerts_enabled INTEGER NOT NULL DEFAULT 0;
+                """;
+            await SqliteAdditiveMigration.ExecuteAsync(migrateFailureAlertsEnabled, ct).ConfigureAwait(false);
+
+            await using var migrateFailureAlertConversationId = connection.CreateCommand();
+            migrateFailureAlertConversationId.CommandText = """
+                ALTER TABLE cron_jobs ADD COLUMN failure_alert_conversation_id TEXT NULL;
+                """;
+            await SqliteAdditiveMigration.ExecuteAsync(migrateFailureAlertConversationId, ct).ConfigureAwait(false);
+
+            // Migrate existing databases: add the #2634 lifecycle columns if missing.
+            // Both default to the inert state so a row predating them behaves exactly as today:
+            // delete_job_after_run = 0 (no scheduler-driven job removal) and expires_at = NULL
+            // (no expiry, no suppression). This mirrors the #2554 NULL-means-unknown rule -- a new
+            // column that the read path trusts but existing rows never wrote is a recurring defect
+            // family here, and for THIS pair the failure mode would be deleting or silencing a job
+            // a human still wants.
+            await using var migrateDeleteJobAfterRun = connection.CreateCommand();
+            migrateDeleteJobAfterRun.CommandText = """
+                ALTER TABLE cron_jobs ADD COLUMN delete_job_after_run INTEGER NOT NULL DEFAULT 0;
+                """;
+            await SqliteAdditiveMigration.ExecuteAsync(migrateDeleteJobAfterRun, ct).ConfigureAwait(false);
+
+            await using var migrateExpiresAt = connection.CreateCommand();
+            migrateExpiresAt.CommandText = """
+                ALTER TABLE cron_jobs ADD COLUMN expires_at TEXT NULL;
+                """;
+            await SqliteAdditiveMigration.ExecuteAsync(migrateExpiresAt, ct).ConfigureAwait(false);
+
+            // Migrate existing databases: add execution_class column if missing (#2985).
+            // Defaults to 0 (not execution-class) so a row written before the column existed
+            // behaves byte-identically to today: a zero-tool run of an existing job still
+            // records 'ok'. Defaulting to 1 would retroactively reclassify every reporting or
+            // classification job on the platform as failing - the exact opposite of the signal
+            // this column exists to add, and the same NULL/absent-means-inert rule #2554/#2557/
+            // #2634 each had to learn here.
+            await using var migrateExecutionClass = connection.CreateCommand();
+            migrateExecutionClass.CommandText = """
+                ALTER TABLE cron_jobs ADD COLUMN execution_class INTEGER NOT NULL DEFAULT 0;
+                """;
+            await SqliteAdditiveMigration.ExecuteAsync(migrateExecutionClass, ct).ConfigureAwait(false);
+
+            // Migrate existing databases: add backoff_until if missing (#3350). NULLable with no
+            // default, and NULL means "not paced": no floor, so an existing row is scheduled purely
+            // from its expression exactly as it is today. A non-NULL default would be a fabricated
+            // claim that every job on the platform had asked to be deferred - the inert-default rule
+            // #2554/#2634 established at this same seam.
+            await using var migrateBackoffUntil = connection.CreateCommand();
+            migrateBackoffUntil.CommandText = """
+                ALTER TABLE cron_jobs ADD COLUMN backoff_until TEXT NULL;
+                """;
+            await SqliteAdditiveMigration.ExecuteAsync(migrateBackoffUntil, ct).ConfigureAwait(false);
+
+            // #2641: add the per-run cost columns if missing. ALL of them are NULLable with NO
+            // default, which is the whole point: a run recorded before these columns existed
+            // measured nothing, and a NULL here must read as "not measured", never as a free run.
+            // `NOT NULL DEFAULT 0` - the shape every other migration above uses for a boolean flag -
+            // would be actively wrong here: it would backfill every historical run on the platform
+            // with a fabricated zero cost and invert the exact ranking this feature exists to
+            // establish. Same NULL-means-unknown rule as #2554's schedule_activated_at.
+            foreach (var costColumn in CostColumnDefinitions)
+            {
+                await using var migrateCost = connection.CreateCommand();
+                migrateCost.CommandText = $"ALTER TABLE cron_runs ADD COLUMN {costColumn};";
+                await SqliteAdditiveMigration.ExecuteAsync(migrateCost, ct).ConfigureAwait(false);
+            }
+
+            connection.Apply( CurrentSchemaVersion, Migrations);
 
             _initialized = true;
         }
@@ -167,7 +469,17 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         {
             var created = job with
             {
-                CreatedAt = job.CreatedAt == default ? DateTimeOffset.UtcNow : job.CreatedAt
+                CreatedAt = job.CreatedAt == default ? DateTimeOffset.UtcNow : job.CreatedAt,
+
+                // #2554: the activation stamp is store-owned. Whatever the caller put on the
+                // record is discarded. It is set to null ("unknown"), not to "now": a create is
+                // not a schedule *change*, and a fresh stamp here would clamp the scan floor for
+                // any job created with a pre-existing LastRunAt (restore/import/tests), silently
+                // suppressing legitimate missed runs. Null keeps create byte-identical to today's
+                // behaviour; the stamp appears only when UpdateDefinitionAsync observes Schedule
+                // or TimeZone actually change. Honouring an inbound value would let an import or
+                // a crafted POST /api/cron spoof catch-up ownership.
+                ScheduleActivatedAt = null
             };
 
             await using var connection = CreateConnection();
@@ -177,11 +489,13 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             command.CommandText = """
                 INSERT INTO cron_jobs (
                     id, name, schedule, action_type, agent_id, message, template_name, template_parameters_json, model, webhook_url, shell_command,
-                    enabled, system, time_zone, created_by, created_at, last_run_at, next_run_at, last_run_status, last_run_error, metadata_json, conversation_id, delete_after_run
+                    enabled, system, time_zone, created_by, created_at, last_run_at, next_run_at, last_run_status, last_run_error, metadata_json, conversation_id, delete_after_run, schedule_activated_at,
+                    failure_alerts_enabled, failure_alert_conversation_id, delete_job_after_run, expires_at, execution_class, backoff_until, precondition_command
                 )
                 VALUES (
                     $id, $name, $schedule, $actionType, $agentId, $message, @templateName, @templateParametersJson, $model, $webhookUrl, $shellCommand,
-                    $enabled, $system, $timeZone, $createdBy, $createdAt, $lastRunAt, $nextRunAt, $lastRunStatus, $lastRunError, $metadataJson, $conversationId, $deleteAfterRun
+                    $enabled, $system, $timeZone, $createdBy, $createdAt, $lastRunAt, $nextRunAt, $lastRunStatus, $lastRunError, $metadataJson, $conversationId, $deleteAfterRun, $scheduleActivatedAt,
+                    $failureAlertsEnabled, $failureAlertConversationId, $deleteJobAfterRun, $expiresAt, $executionClass, $backoffUntil, $preconditionCommand
                 )
                 """;
             BindJob(command, created);
@@ -209,7 +523,8 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         await using var command = connection.CreateCommand();
         command.CommandText = """
             SELECT id, name, schedule, action_type, agent_id, message, template_name, template_parameters_json, model, webhook_url, shell_command,
-                   enabled, system, time_zone, created_by, created_at, last_run_at, next_run_at, last_run_status, last_run_error, metadata_json, conversation_id, delete_after_run
+                   enabled, system, time_zone, created_by, created_at, last_run_at, next_run_at, last_run_status, last_run_error, metadata_json, conversation_id, delete_after_run, schedule_activated_at,
+                   failure_alerts_enabled, failure_alert_conversation_id, delete_job_after_run, expires_at, execution_class, backoff_until, precondition_command
             FROM cron_jobs
             WHERE id = $id
             """;
@@ -230,7 +545,8 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         await using var command = connection.CreateCommand();
         command.CommandText = """
             SELECT id, name, schedule, action_type, agent_id, message, template_name, template_parameters_json, model, webhook_url, shell_command,
-                   enabled, system, time_zone, created_by, created_at, last_run_at, next_run_at, last_run_status, last_run_error, metadata_json, conversation_id, delete_after_run
+                   enabled, system, time_zone, created_by, created_at, last_run_at, next_run_at, last_run_status, last_run_error, metadata_json, conversation_id, delete_after_run, schedule_activated_at,
+                   failure_alerts_enabled, failure_alert_conversation_id, delete_job_after_run, expires_at, execution_class, backoff_until, precondition_command
             FROM cron_jobs
             WHERE $agentId IS NULL OR agent_id = $agentId
             ORDER BY created_at DESC
@@ -245,9 +561,144 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         return jobs;
     }
 
-    public async Task<CronJob> UpdateAsync(CronJob job, CancellationToken ct = default)
+    /// <summary>
+    /// Applies a user-owned <b>definition</b> update to an existing job. Writes only the
+    /// caller-authored columns (name, schedule, action, agent, message, template, model,
+    /// webhook, shell, enabled, system, time zone, delete-after-run, created-by, metadata).
+    /// It deliberately does <b>not</b> touch scheduler-owned runtime bookkeeping
+    /// (<c>last_run_*</c>, <c>next_run_at</c>) or the CAS-established <c>conversation_id</c>,
+    /// so a controller/tool edit racing a concurrent run can never regress run status,
+    /// timestamps, next-run, or the pinned conversation (#2133). Rescheduling after a
+    /// schedule change is a separate <see cref="SetNextRunAtAsync"/> call. Returns the
+    /// re-read job (runtime columns reflect the current stored state), or <c>null</c> if the
+    /// job no longer exists.
+    ///
+    /// <para>
+    /// #3573: when <paramref name="expectedOwnership"/> is supplied the UPDATE is additionally
+    /// conditioned on <c>created_by</c>/<c>agent_id</c> still holding the values the caller's
+    /// authorization decision was made against, using SQLite's null-safe <c>IS</c> (the same idiom
+    /// the <c>schedule_activated_at</c> re-stamp uses). A mismatch affects zero rows and raises
+    /// <see cref="CronJobOwnershipChangedException"/> instead of silently committing an update
+    /// that rewrites both ownership columns on behalf of a caller who no longer owns the job.
+    /// </para>
+    /// </summary>
+    public async Task<CronJob?> UpdateDefinitionAsync(
+        CronJob job,
+        CronJobOwnershipExpectation? expectedOwnership = null,
+        CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(job);
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        var ownershipRejected = false;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE cron_jobs SET
+                    name = $name,
+                    schedule = $schedule,
+                    action_type = $actionType,
+                    agent_id = $agentId,
+                    message = $message,
+                    template_name = @templateName,
+                    template_parameters_json = @templateParametersJson,
+                    model = $model,
+                    webhook_url = $webhookUrl,
+                    shell_command = $shellCommand,
+                    precondition_command = $preconditionCommand,
+                    enabled = $enabled,
+                    system = $system,
+                    time_zone = $timeZone,
+                    created_by = $createdBy,
+                    delete_after_run = $deleteAfterRun,
+                    failure_alerts_enabled = $failureAlertsEnabled,
+                    failure_alert_conversation_id = $failureAlertConversationId,
+                    delete_job_after_run = $deleteJobAfterRun,
+                    expires_at = $expiresAt,
+                    execution_class = $executionClass,
+                    metadata_json = $metadataJson,
+                    -- #2554: schedule_activated_at is STORE-owned. The inbound record's value is
+                    -- never bound; instead it is re-stamped in SQL, atomically with the write,
+                    -- only when the scheduling inputs actually differ from what is stored. A
+                    -- caller-supplied value therefore cannot spoof catch-up ownership, and an
+                    -- edit that leaves schedule/time zone untouched preserves the existing stamp
+                    -- (including NULL for pre-#2554 rows). 'IS NOT' is SQLite's null-safe
+                    -- inequality, so a null <-> non-null time zone transition counts as a change.
+                    schedule_activated_at = CASE
+                        WHEN schedule IS NOT $schedule OR time_zone IS NOT $timeZone
+                            THEN $scheduleActivatedAt
+                        ELSE schedule_activated_at
+                    END
+                WHERE id = $id
+                  -- #3573: null-safe ownership predicate. When no expectation is supplied both
+                  -- $expect* parameters are NULL and $hasOwnershipExpectation is 0, so the two
+                  -- clauses short-circuit to TRUE and the statement is byte-for-byte the
+                  -- pre-#3573 write. 'IS' rather than '=' because agent_id is nullable and '='
+                  -- against NULL is NULL, which would reject every edit of an untargeted job.
+                  AND ($hasOwnershipExpectation = 0 OR created_by IS $expectedCreatedBy)
+                  AND ($hasOwnershipExpectation = 0 OR agent_id IS $expectedAgentId)
+                """;
+            BindDefinition(command, job);
+            command.Parameters.AddWithValue("$hasOwnershipExpectation", expectedOwnership.HasValue ? 1 : 0);
+            command.Parameters.AddWithValue(
+                "$expectedCreatedBy",
+                (object?)expectedOwnership?.CreatedBy ?? DBNull.Value);
+            command.Parameters.AddWithValue(
+                "$expectedAgentId",
+                (object?)expectedOwnership?.AgentId ?? DBNull.Value);
+            command.Parameters.AddWithValue("$scheduleActivatedAt", DateTimeOffset.UtcNow.ToString("O"));
+            var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+            // Zero rows is ambiguous on its own - the job may simply be gone - so distinguish the
+            // two OUTSIDE the write lock rather than collapsing an authorization answer into a
+            // not-found one. Absence stays absence (null); a surviving row means ownership moved.
+            if (affected == 0 && expectedOwnership.HasValue)
+            {
+                ownershipRejected = true;
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Updated cron job definition '{JobId}' (action={ActionType}, enabled={Enabled}).",
+                    job.Id,
+                    job.ActionType,
+                    job.Enabled);
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        var current = await GetAsync(job.Id, ct).ConfigureAwait(false);
+
+        if (ownershipRejected)
+        {
+            if (current is null)
+                return null;
+
+            _logger.LogWarning(
+                "Rejected cron job definition update for '{JobId}': ownership changed after the caller was authorized (#3573).",
+                job.Id);
+            throw new CronJobOwnershipChangedException(job.Id);
+        }
+
+        return current;
+    }
+
+    /// <summary>
+    /// Scheduler-owned narrow write of <c>next_run_at</c> only. Used by the scheduler's
+    /// Phase-1 initialization/stale-correction and its Phase-2 post-run reschedule, and by
+    /// controller/tool definition edits that explicitly change the schedule. It never touches
+    /// any definition column, the <c>last_run_*</c> bookkeeping, or the conversation pin, so a
+    /// reschedule racing a concurrent definition edit cannot clobber the edit (#2133).
+    /// </summary>
+    public async Task SetNextRunAtAsync(JobId jobId, DateTimeOffset? nextRunAt, CancellationToken ct = default)
+    {
         await InitializeAsync(ct).ConfigureAwait(false);
 
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -257,46 +708,90 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             await connection.OpenAsync(ct).ConfigureAwait(false);
             await using var command = connection.CreateCommand();
             command.CommandText = """
-                INSERT INTO cron_jobs (
-                    id, name, schedule, action_type, agent_id, message, template_name, template_parameters_json, model, webhook_url, shell_command,
-                    enabled, system, time_zone, created_by, created_at, last_run_at, next_run_at, last_run_status, last_run_error, metadata_json, conversation_id, delete_after_run
-                )
-                VALUES (
-                    $id, $name, $schedule, $actionType, $agentId, $message, @templateName, @templateParametersJson, $model, $webhookUrl, $shellCommand,
-                    $enabled, $system, $timeZone, $createdBy, $createdAt, $lastRunAt, $nextRunAt, $lastRunStatus, $lastRunError, $metadataJson, $conversationId, $deleteAfterRun
-                )
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    schedule = excluded.schedule,
-                    action_type = excluded.action_type,
-                    agent_id = excluded.agent_id,
-                    message = excluded.message,
-                    template_name = excluded.template_name,
-                    template_parameters_json = excluded.template_parameters_json,
-                    model = excluded.model,
-                    webhook_url = excluded.webhook_url,
-                    shell_command = excluded.shell_command,
-                    enabled = excluded.enabled,
-                    system = excluded.system,
-                    time_zone = excluded.time_zone,
-                    created_by = excluded.created_by,
-                    created_at = excluded.created_at,
-                    last_run_at = excluded.last_run_at,
-                    next_run_at = excluded.next_run_at,
-                    last_run_status = excluded.last_run_status,
-                    last_run_error = excluded.last_run_error,
-                    metadata_json = excluded.metadata_json,
-                    conversation_id = excluded.conversation_id,
-                    delete_after_run = excluded.delete_after_run
+                UPDATE cron_jobs
+                SET next_run_at = $nextRunAt
+                WHERE id = $jobId
                 """;
-            BindJob(command, job);
+            command.Parameters.AddWithValue("$nextRunAt", ToNullableString(nextRunAt));
+            command.Parameters.AddWithValue("$jobId", jobId.Value);
             await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            _logger.LogInformation(
-                "Updated cron job '{JobId}' (action={ActionType}, enabled={Enabled}).",
-                job.Id,
-                job.ActionType,
-                job.Enabled);
-            return job;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Scheduler-owned narrow write of <c>backoff_until</c> only (#3350) - the job-authored floor
+    /// before which the job asked not to be woken; <c>null</c> clears it.
+    /// </summary>
+    /// <remarks>
+    /// Kept separate from <see cref="SetNextRunAtAsync"/> on purpose: the expression cache and the
+    /// job-authored floor are the two meanings #3350 exists to pull apart, and a single write able
+    /// to touch both would let an ordinary post-run reschedule silently cancel a live backoff. Like
+    /// its sibling it writes exactly one column, so it cannot clobber a concurrent definition edit
+    /// (#2133).
+    /// </remarks>
+    public async Task SetBackoffUntilAsync(JobId jobId, DateTimeOffset? backoffUntil, CancellationToken ct = default)
+    {
+        await InitializeAsync(ct).ConfigureAwait(false);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE cron_jobs
+                SET backoff_until = $backoffUntil
+                WHERE id = $jobId
+                """;
+            command.Parameters.AddWithValue("$backoffUntil", ToNullableString(backoffUntil));
+            command.Parameters.AddWithValue("$jobId", jobId.Value);
+            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Scheduler-owned narrow write of the terminal run bookkeeping (<c>last_run_at</c>,
+    /// <c>last_run_status</c>, <c>last_run_error</c>) for a completed run. It never touches any
+    /// definition column, <c>next_run_at</c>, or the conversation pin, so run finalization racing
+    /// a concurrent definition edit cannot overwrite the edit, and cannot regress the next-run or
+    /// conversation state (#2133).
+    /// </summary>
+    public async Task RecordRunFinalizationAsync(
+        JobId jobId,
+        DateTimeOffset lastRunAt,
+        string lastRunStatus,
+        string? lastRunError,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(lastRunStatus);
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE cron_jobs
+                SET last_run_at = $lastRunAt,
+                    last_run_status = $lastRunStatus,
+                    last_run_error = $lastRunError
+                WHERE id = $jobId
+                """;
+            command.Parameters.AddWithValue("$lastRunAt", lastRunAt.ToString("O"));
+            command.Parameters.AddWithValue("$lastRunStatus", lastRunStatus);
+            command.Parameters.AddWithValue("$lastRunError", (object?)lastRunError ?? DBNull.Value);
+            command.Parameters.AddWithValue("$jobId", jobId.Value);
+            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {
@@ -436,11 +931,102 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         }
     }
 
+    /// <summary>
+    /// Idempotently records a terminal <c>missed</c> history row for a scheduled occurrence that
+    /// elapsed while the gateway was down. Returns <c>false</c> when the row already existed.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately does <b>not</b> reuse <see cref="RecordRunStartAsync"/>: that method stamps a
+    /// fresh random <see cref="RunId"/> at the current wall-clock and advances the job's
+    /// <c>last_run_*</c> bookkeeping, both of which are wrong for a run that never executed. The
+    /// insert relies on the partial unique index <c>idx_cron_runs_missed_occurrence</c> plus
+    /// <c>INSERT OR IGNORE</c>, so concurrent or repeated startup scans converge on one row (#2477).
+    /// </remarks>
+    public async Task<bool> TryRecordMissedRunAsync(JobId jobId, DateTimeOffset scheduledOccurrenceUtc, CancellationToken ct = default)
+    {
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var occurrence = scheduledOccurrenceUtc.ToUniversalTime();
+
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+
+            await using var insert = connection.CreateCommand();
+            insert.CommandText = """
+                INSERT OR IGNORE INTO cron_runs (id, job_id, started_at, completed_at, status, error, session_id)
+                VALUES ($id, $jobId, $startedAt, $completedAt, $status, NULL, NULL)
+                """;
+            insert.Parameters.AddWithValue("$id", RunId.Create().Value);
+            insert.Parameters.AddWithValue("$jobId", jobId.Value);
+            insert.Parameters.AddWithValue("$startedAt", occurrence.ToString("O"));
+            insert.Parameters.AddWithValue("$completedAt", occurrence.ToString("O"));
+            insert.Parameters.AddWithValue("$status", CronRunStatus.Missed);
+            var rows = await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+            return rows > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task RecordRunModelAsync(RunId runId, CronModelSelection selection, CancellationToken ct = default)
+    {
+        await InitializeAsync(ct).ConfigureAwait(false);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE cron_runs SET effective_model_json = COALESCE(effective_model_json, $model) WHERE id = $id";
+            command.Parameters.AddWithValue("$model", JsonSerializer.Serialize(selection, JsonOptions));
+            command.Parameters.AddWithValue("$id", runId.Value);
+            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally { _writeLock.Release(); }
+    }
+
+    public async Task RecordRunSessionAsync(
+        RunId runId,
+        SessionId sessionId,
+        CancellationToken ct = default)
+    {
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE cron_runs
+                SET session_id = $sessionId
+                WHERE id = $runId AND status = $running
+                """;
+            command.Parameters.AddWithValue("$sessionId", sessionId.Value);
+            command.Parameters.AddWithValue("$runId", runId.Value);
+            command.Parameters.AddWithValue("$running", CronRunStatus.Running);
+            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task RecordRunCompleteAsync(
         RunId runId,
         string status,
         string? error = null,
         SessionId? sessionId = null,
+        CronRunCost? cost = null,
         CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(status);
@@ -453,18 +1039,34 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             await connection.OpenAsync(ct).ConfigureAwait(false);
 
             await using var command = connection.CreateCommand();
+
+            // #2641: COALESCE, not plain assignment. A second write against the same run (the
+            // #3161 alert-delivery amendment re-records the terminal row) passes no cost, and a
+            // bare `= $turnCount` would then wipe the measurement the first write stored. COALESCE
+            // makes the cost write additive: supplying a value sets it, supplying NULL leaves
+            // whatever is already there, so "not measured" can never overwrite "measured".
             command.CommandText = """
                 UPDATE cron_runs
                 SET completed_at = $completedAt,
                     status = $status,
                     error = $error,
-                    session_id = $sessionId
+                    session_id = COALESCE($sessionId, session_id),
+                    turn_count = COALESCE($turnCount, turn_count),
+                    tool_call_count = COALESCE($toolCallCount, tool_call_count),
+                    duration_ms = COALESCE($durationMs, duration_ms),
+                    prompt_tokens = COALESCE($promptTokens, prompt_tokens),
+                    completion_tokens = COALESCE($completionTokens, completion_tokens)
                 WHERE id = $runId
                 """;
             command.Parameters.AddWithValue("$completedAt", DateTimeOffset.UtcNow.ToString("O"));
             command.Parameters.AddWithValue("$status", status);
             command.Parameters.AddWithValue("$error", (object?)error ?? DBNull.Value);
             command.Parameters.AddWithValue("$sessionId", sessionId.HasValue ? (object)sessionId.Value.Value : DBNull.Value);
+            command.Parameters.AddWithValue("$turnCount", ToNullableLong(cost?.TurnCount));
+            command.Parameters.AddWithValue("$toolCallCount", ToNullableLong(cost?.ToolCallCount));
+            command.Parameters.AddWithValue("$durationMs", ToNullableLong(cost?.DurationMs));
+            command.Parameters.AddWithValue("$promptTokens", ToNullableLong(cost?.PromptTokens));
+            command.Parameters.AddWithValue("$completionTokens", ToNullableLong(cost?.CompletionTokens));
             command.Parameters.AddWithValue("$runId", runId.Value);
             await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
@@ -472,6 +1074,117 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         {
             _writeLock.Release();
         }
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<CronJobCostRollup>> GetJobCostRollupsAsync(
+        IReadOnlyCollection<JobId> jobIds,
+        int windowDays,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(jobIds);
+
+        // #2838's scoping rule: an empty scope means "no jobs", never "no filter".
+        if (jobIds.Count == 0)
+            return [];
+
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        var requestedDays = Math.Max(1, windowDays);
+        var retentionDays = Math.Max(1, _retentionDaysAccessor());
+
+        // #2641 AC6: clamp to retention and REPORT the clamp. Runs older than the retention
+        // horizon have already been deleted, so an unclamped window would present a total that
+        // silently omits them while being indistinguishable from a complete one - a truncated
+        // number that looks exactly like a correct one is worse than refusing to answer.
+        var truncated = requestedDays > retentionDays;
+        var effectiveDays = truncated ? retentionDays : requestedDays;
+        var windowStart = DateTimeOffset.UtcNow.AddDays(-effectiveDays);
+
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+
+        var jobParameters = new List<string>(jobIds.Count);
+        var index = 0;
+        foreach (var jobId in jobIds)
+        {
+            var parameterName = $"$job{index++}";
+            jobParameters.Add(parameterName);
+            command.Parameters.AddWithValue(parameterName, jobId.Value);
+        }
+
+        // SUM() over a column that is NULL in every row yields NULL, not 0 - which is exactly the
+        // semantics wanted: a job whose runs measured nothing reports "not measured", not "free".
+        // measured_runs counts rows carrying at least one token measurement so the average divides
+        // by the measured population rather than diluting a real figure with unmeasured runs.
+        command.CommandText = $"""
+            SELECT job_id,
+                   COUNT(*) AS run_count,
+                   SUM(CASE WHEN prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL THEN 1 ELSE 0 END) AS measured_runs,
+                   SUM(prompt_tokens) AS total_prompt_tokens,
+                   SUM(completion_tokens) AS total_completion_tokens,
+                   SUM(tool_call_count) AS total_tool_calls,
+                   SUM(turn_count) AS total_turns,
+                   SUM(duration_ms) AS total_duration_ms
+            FROM cron_runs
+            WHERE job_id IN ({string.Join(", ", jobParameters)})
+              AND started_at >= $windowStart
+            GROUP BY job_id
+            """;
+        command.Parameters.AddWithValue("$windowStart", windowStart.ToString("O"));
+
+        var rollups = new List<CronJobCostRollup>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var promptTokens = reader.IsDBNull(3) ? (long?)null : reader.GetInt64(3);
+            var completionTokens = reader.IsDBNull(4) ? (long?)null : reader.GetInt64(4);
+            var totalTokens = promptTokens is null && completionTokens is null
+                ? (long?)null
+                : (promptTokens ?? 0) + (completionTokens ?? 0);
+
+            rollups.Add(new CronJobCostRollup
+            {
+                JobId = JobId.From(reader.GetString(0)),
+                RunCount = reader.GetInt32(1),
+                MeasuredRunCount = reader.IsDBNull(2) ? 0 : reader.GetInt32(2),
+                TotalTokens = totalTokens,
+                TotalToolCalls = reader.IsDBNull(5) ? null : reader.GetInt64(5),
+                TotalTurns = reader.IsDBNull(6) ? null : reader.GetInt64(6),
+                TotalDurationMs = reader.IsDBNull(7) ? null : reader.GetInt64(7),
+                WindowStart = windowStart,
+                WindowDays = effectiveDays,
+                WindowTruncatedByRetention = truncated
+            });
+        }
+
+        // Ordered by TOTAL spend, which is the ranking the feature exists to provide: a job that is
+        // cheap per run but fires 193 times outranks one that is expensive per run but fires 8
+        // times. Unmeasured jobs sort last rather than being treated as zero-cost, so an absent
+        // measurement never masquerades as the cheapest job on the platform.
+        return [.. rollups
+            .OrderByDescending(r => r.TotalTokens.HasValue)
+            .ThenByDescending(r => r.TotalTokens ?? 0)
+            .ThenByDescending(r => r.TotalToolCalls ?? 0)
+            .ThenBy(r => r.JobId.Value, StringComparer.Ordinal)];
+    }
+
+    /// <inheritdoc />
+    public async Task<CronRun?> GetRunAsync(RunId runId, CancellationToken ct = default)
+    {
+        await InitializeAsync(ct).ConfigureAwait(false);
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT {RunColumns}
+            FROM cron_runs
+            WHERE id = $runId
+            """;
+        command.Parameters.AddWithValue("$runId", runId.Value);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        return await reader.ReadAsync(ct).ConfigureAwait(false) ? ReadRun(reader) : null;
     }
 
     public async Task<IReadOnlyList<CronRun>> GetRunHistoryAsync(JobId jobId, int limit = 20, CancellationToken ct = default)
@@ -482,8 +1195,8 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         await using var connection = CreateConnection();
         await connection.OpenAsync(ct).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT id, job_id, started_at, completed_at, status, error, session_id
+        command.CommandText = $"""
+            SELECT {RunColumns}
             FROM cron_runs
             WHERE job_id = $jobId
             ORDER BY started_at DESC
@@ -500,8 +1213,105 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         return runs;
     }
 
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<CronRun>> GetRecentRunsAsync(
+        IReadOnlyCollection<JobId> jobIds,
+        IReadOnlyCollection<string>? statuses = null,
+        int limit = 20,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(jobIds);
+
+        // #2838: an empty scope means "no jobs", never "no filter". Emitting a bare SELECT here
+        // would silently turn a scoped query into a global one - the exact inversion a SQL
+        // `IN ()` invites - so it is short-circuited before any SQL is built.
+        if (jobIds.Count == 0)
+            return [];
+
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        var cappedLimit = Math.Clamp(limit, 1, int.MaxValue);
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+
+        // Both IN lists are built from generated parameter names, never from interpolated values,
+        // so the caller-supplied ids and statuses stay parameterised.
+        var jobParameters = new List<string>(jobIds.Count);
+        var index = 0;
+        foreach (var jobId in jobIds)
+        {
+            var parameterName = $"$job{index++}";
+            jobParameters.Add(parameterName);
+            command.Parameters.AddWithValue(parameterName, jobId.Value);
+        }
+
+        var statusClause = string.Empty;
+        if (statuses is { Count: > 0 })
+        {
+            var statusParameters = new List<string>(statuses.Count);
+            var statusIndex = 0;
+            foreach (var status in statuses)
+            {
+                var parameterName = $"$status{statusIndex++}";
+                statusParameters.Add(parameterName);
+                command.Parameters.AddWithValue(parameterName, status);
+            }
+
+            statusClause = $" AND status IN ({string.Join(", ", statusParameters)})";
+        }
+
+        command.CommandText = $"""
+            SELECT {RunColumns}
+            FROM cron_runs
+            WHERE job_id IN ({string.Join(", ", jobParameters)}){statusClause}
+            ORDER BY started_at DESC
+            LIMIT $limit
+            """;
+        command.Parameters.AddWithValue("$limit", cappedLimit);
+
+        List<CronRun> runs = [];
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            runs.Add(ReadRun(reader));
+
+        return runs;
+    }
+
     private SqliteConnection CreateConnection()
         => SqliteConnectionFactory.Create(_connectionString);
+
+    // #2133: binds ONLY the user-owned definition columns for the narrow UpdateDefinitionAsync
+    // write. Excludes created_at (immutable after create), last_run_*/next_run_at (scheduler-owned)
+    // and conversation_id (CAS-owned) so a definition edit cannot regress runtime/conversation state.
+    private static void BindDefinition(SqliteCommand command, CronJob job)
+    {
+        command.Parameters.AddWithValue("$id", job.Id.Value);
+        command.Parameters.AddWithValue("$name", job.Name);
+        command.Parameters.AddWithValue("$schedule", job.Schedule);
+        command.Parameters.AddWithValue("$actionType", job.ActionType);
+        command.Parameters.AddWithValue("$agentId", job.AgentId.HasValue ? (object)job.AgentId.Value.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$message", (object?)job.Message ?? DBNull.Value);
+        command.Parameters.AddWithValue("@templateName", (object?)job.TemplateName ?? DBNull.Value);
+        command.Parameters.AddWithValue("@templateParametersJson", SerializeTemplateParameters(job.TemplateParameters));
+        command.Parameters.AddWithValue("$model", (object?)job.Model ?? DBNull.Value);
+        command.Parameters.AddWithValue("$webhookUrl", (object?)job.WebhookUrl ?? DBNull.Value);
+        command.Parameters.AddWithValue("$shellCommand", (object?)job.ShellCommand ?? DBNull.Value);
+        command.Parameters.AddWithValue("$preconditionCommand", (object?)job.PreconditionCommand ?? DBNull.Value);
+        command.Parameters.AddWithValue("$enabled", job.Enabled ? 1 : 0);
+        command.Parameters.AddWithValue("$system", job.System ? 1 : 0);
+        command.Parameters.AddWithValue("$timeZone", (object?)job.TimeZone ?? DBNull.Value);
+        command.Parameters.AddWithValue("$createdBy", (object?)job.CreatedBy ?? DBNull.Value);
+        command.Parameters.AddWithValue("$deleteAfterRun", job.DeleteAfterRun ? 1 : 0);
+        command.Parameters.AddWithValue("$failureAlertsEnabled", job.FailureAlertsEnabled ? 1 : 0);
+        command.Parameters.AddWithValue(
+            "$failureAlertConversationId",
+            job.FailureAlertConversationId.HasValue ? (object)job.FailureAlertConversationId.Value.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$deleteJobAfterRun", job.DeleteJobAfterRun ? 1 : 0);
+        command.Parameters.AddWithValue("$expiresAt", ToNullableString(job.ExpiresAt));
+        command.Parameters.AddWithValue("$executionClass", job.ExecutionClass ? 1 : 0);
+        command.Parameters.AddWithValue("$metadataJson", SerializeMetadata(job.Metadata));
+    }
 
     private static void BindJob(SqliteCommand command, CronJob job)
     {
@@ -516,6 +1326,7 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         command.Parameters.AddWithValue("$model", (object?)job.Model ?? DBNull.Value);
         command.Parameters.AddWithValue("$webhookUrl", (object?)job.WebhookUrl ?? DBNull.Value);
         command.Parameters.AddWithValue("$shellCommand", (object?)job.ShellCommand ?? DBNull.Value);
+        command.Parameters.AddWithValue("$preconditionCommand", (object?)job.PreconditionCommand ?? DBNull.Value);
         command.Parameters.AddWithValue("$enabled", job.Enabled ? 1 : 0);
         command.Parameters.AddWithValue("$system", job.System ? 1 : 0);
         command.Parameters.AddWithValue("$timeZone", (object?)job.TimeZone ?? DBNull.Value);
@@ -528,6 +1339,15 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
         command.Parameters.AddWithValue("$metadataJson", SerializeMetadata(job.Metadata));
         command.Parameters.AddWithValue("$conversationId", job.ConversationId.HasValue ? (object)job.ConversationId.Value.Value : DBNull.Value);
         command.Parameters.AddWithValue("$deleteAfterRun", job.DeleteAfterRun ? 1 : 0);
+        command.Parameters.AddWithValue("$scheduleActivatedAt", ToNullableString(job.ScheduleActivatedAt));
+        command.Parameters.AddWithValue("$failureAlertsEnabled", job.FailureAlertsEnabled ? 1 : 0);
+        command.Parameters.AddWithValue(
+            "$failureAlertConversationId",
+            job.FailureAlertConversationId.HasValue ? (object)job.FailureAlertConversationId.Value.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$deleteJobAfterRun", job.DeleteJobAfterRun ? 1 : 0);
+        command.Parameters.AddWithValue("$expiresAt", ToNullableString(job.ExpiresAt));
+        command.Parameters.AddWithValue("$executionClass", job.ExecutionClass ? 1 : 0);
+        command.Parameters.AddWithValue("$backoffUntil", ToNullableString(job.BackoffUntil));
     }
 
     private CronJob ReadJob(SqliteDataReader reader)
@@ -559,7 +1379,36 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             LastRunError = reader.IsDBNull(19) ? null : reader.GetString(19),
             Metadata = DeserializeMetadata(metadataJson, jobId),
             ConversationId = reader.IsDBNull(21) ? null : ConversationId.From(reader.GetString(21)),
-            DeleteAfterRun = !reader.IsDBNull(22) && reader.GetInt32(22) != 0
+            DeleteAfterRun = !reader.IsDBNull(22) && reader.GetInt32(22) != 0,
+
+            // #2554: NULL means "unknown" (row predates the column, or an update never touched
+            // the scheduling inputs). It stays null rather than being coerced to a default so the
+            // missed-run clamp degrades to today's exact behaviour instead of silently suppressing
+            // legitimate missed runs.
+            ScheduleActivatedAt = reader.IsDBNull(23) ? null : ParseDate(reader.GetString(23)),
+
+            // #2557: NULL/absent means "alerts off". A row written before these columns existed
+            // must never read as opt-in, or upgrading would start delivering alerts nobody asked
+            // for (to a conversation that is also NULL). Both defaults are the disabled state.
+            FailureAlertsEnabled = !reader.IsDBNull(24) && reader.GetInt32(24) != 0,
+            FailureAlertConversationId = reader.IsDBNull(25) ? null : ConversationId.From(reader.GetString(25)),
+
+            // #2634: both lifecycle columns read as "inert" when absent. delete_job_after_run
+            // false means no scheduler-driven removal; expires_at NULL means no expiry and no
+            // suppression. A row written before these columns existed therefore schedules and
+            // executes byte-identically to today - the safety property that makes this shippable.
+            DeleteJobAfterRun = !reader.IsDBNull(26) && reader.GetInt32(26) != 0,
+            ExpiresAt = reader.IsDBNull(27) ? null : ParseDate(reader.GetString(27)),
+            // #2985: absent/NULL reads as NOT execution-class. Same inert-default rule as the
+            // columns above - an upgrade must never start demoting existing jobs' runs to a
+            // non-success status nobody opted into.
+            ExecutionClass = !reader.IsDBNull(28) && reader.GetInt32(28) != 0,
+
+            // #3350: NULL means "not paced" - no job-authored floor, so the job wakes purely on its
+            // expression cache, exactly as it did before the column existed. Coercing this to a
+            // concrete instant would invent a deferral no job ever requested.
+            BackoffUntil = reader.IsDBNull(29) ? null : ParseDate(reader.GetString(29)),
+            PreconditionCommand = reader.IsDBNull(30) ? null : reader.GetString(30)
         };
     }
 
@@ -573,12 +1422,29 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             CompletedAt = reader.IsDBNull(3) ? null : ParseDate(reader.GetString(3)),
             Status = reader.GetString(4),
             Error = reader.IsDBNull(5) ? null : reader.GetString(5),
-            SessionId = reader.IsDBNull(6) ? null : SessionId.From(reader.GetString(6))
+            SessionId = reader.IsDBNull(6) ? null : SessionId.From(reader.GetString(6)),
+            EffectiveModel = reader.IsDBNull(12) ? null : JsonSerializer.Deserialize<CronModelSelection>(reader.GetString(12), JsonOptions),
+
+            // #2641: every cost column reads NULL as "not measured". No `?? 0` anywhere on this
+            // path - a coerced zero here would be indistinguishable from a genuinely free run and
+            // would then propagate into the rollup as a real measurement, which is precisely the
+            // failure the nullable columns exist to prevent.
+            Cost = new CronRunCost(
+                TurnCount: reader.IsDBNull(7) ? null : reader.GetInt32(7),
+                ToolCallCount: reader.IsDBNull(8) ? null : reader.GetInt32(8),
+                DurationMs: reader.IsDBNull(9) ? null : reader.GetInt64(9),
+                PromptTokens: reader.IsDBNull(10) ? null : reader.GetInt64(10),
+                CompletionTokens: reader.IsDBNull(11) ? null : reader.GetInt64(11))
         };
     }
 
     private static object ToNullableString(DateTimeOffset? value)
         => value is null ? DBNull.Value : value.Value.ToString("O");
+
+    // #2641: null binds as SQL NULL so the COALESCE in the cost UPDATE preserves any prior
+    // measurement. Widened to long because token counts are summed across a run.
+    private static object ToNullableLong(long? value)
+        => value is null ? DBNull.Value : value.Value;
 
     private static DateTimeOffset ParseDate(string value)
         => DateTimeOffset.TryParse(value, out var parsed) ? parsed : DateTimeOffset.UtcNow;
@@ -633,6 +1499,32 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
     }
 
     /// <inheritdoc />
+    public async Task<IReadOnlyList<CronRun>> ListRunningRunsAsync(CancellationToken ct = default)
+    {
+        await InitializeAsync(ct).ConfigureAwait(false);
+
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT {RunColumns}
+            FROM cron_runs
+            WHERE status = $running
+            ORDER BY started_at DESC
+            """;
+        command.Parameters.AddWithValue("$running", CronRunStatus.Running);
+
+        var runs = new List<CronRun>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            runs.Add(ReadRun(reader));
+        }
+
+        return runs;
+    }
+
+    /// <inheritdoc />
     public async Task<int> PurgeRunsOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
         await using var connection = CreateConnection();
@@ -646,12 +1538,25 @@ public sealed class SqliteCronStore(string dbPath, IFileSystem? fileSystem = nul
             DELETE FROM cron_runs
             WHERE completed_at IS NOT NULL
               AND completed_at < $cutoff
-              AND status IN ($statusOk, $statusError, $statusTimedOut)
+              AND status IN ($statusOk, $statusNoWork, $statusError, $statusTimedOut, $statusNoToolCalls, $statusIncomplete, $statusParked, $statusDeliveryFailed, $statusAborted)
             """;
         command.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
         command.Parameters.AddWithValue("$statusOk", CronRunStatus.Ok);
+        command.Parameters.AddWithValue("$statusNoWork", CronRunStatus.NoWork);
         command.Parameters.AddWithValue("$statusError", CronRunStatus.Error);
         command.Parameters.AddWithValue("$statusTimedOut", CronRunStatus.TimedOut);
+        // #2985: no_tool_calls is a TERMINAL status. Omitting it here would make those rows
+        // permanently immune to retention - the same unbounded-growth trap #2410 found for
+        // orphaned 'running' rows.
+        command.Parameters.AddWithValue("$statusNoToolCalls", CronRunStatus.NoToolCalls);
+        command.Parameters.AddWithValue("$statusIncomplete", CronRunStatus.Incomplete);
+        command.Parameters.AddWithValue("$statusParked", CronRunStatus.Parked);
+        // #3161: delivery_failed is likewise TERMINAL and must be purgeable for the same reason.
+        command.Parameters.AddWithValue("$statusDeliveryFailed", CronRunStatus.DeliveryFailed);
+        // #3160: aborted is likewise TERMINAL. Omitting it would make every operator-aborted run
+        // permanently immune to retention - the same unbounded-growth trap #2410 found for
+        // orphaned 'running' rows.
+        command.Parameters.AddWithValue("$statusAborted", CronRunStatus.Aborted);
         var deleted = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         if (deleted > 0)
             _logger.LogDebug("Purged {Count} cron run record(s) older than {Cutoff}.", deleted, cutoff);

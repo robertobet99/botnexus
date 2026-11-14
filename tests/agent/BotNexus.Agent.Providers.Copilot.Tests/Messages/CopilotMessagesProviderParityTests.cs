@@ -94,6 +94,92 @@ public class CopilotMessagesProviderParityTests
         handler.RequestHeaders.ShouldContainKey("Openai-Intent");
     }
 
+    [Fact]
+    public async Task Stream_Gpt56_AssemblesFormattingPayloadByteIdentically()
+    {
+        const string expected = """
+            ## Formatting Test
+
+            This has **bold**, *italic*, and `inline code`.
+
+            [BotNexus](https://github.com/Sytone/botnexus)
+
+            ```powershell
+            botnexus gateway status
+            ```
+
+            | Component | Status |
+            |---|---|
+            | Gateway | Running |
+            """;
+        var fragments = new[]
+        {
+            "##", " Formatting", " Test\n\nThis", " has", " **", "bold", "**, *italic*, and `inline code`.\n\n[",
+            "BotNexus](https://github.com/Sytone/botnexus)\n\n```powershell\nbotnexus gateway status\n```\n\n",
+            "| Component | Status |\n|---|---|\n| Gateway | Running |"
+        };
+        // #3442: the deltas carry NO CRLF prefix, because mitm captures of these exact endpoints
+        // contain 0 raw CR bytes across 3,025 provider deltas. This test used to synthesise a
+        // "\r\n" + fragment wire that Copilot never sends, and assert our normalizer removed it -
+        // proving only that a transform undid a fixture. What is worth pinning is that a
+        // realistically-chunked markdown payload reassembles byte-identically.
+        var sse = BuildTextSse(fragments);
+        var provider = new CopilotMessagesProvider(new HttpClient(new RecordingHandler(_ => SseResponse(sse))));
+        var model = BuildModel() with { Id = "gpt-5.6-sol", Name = "gpt-5.6-sol" };
+
+        var result = await provider.Stream(
+                model,
+                BuildContext(),
+                new CopilotMessagesOptions { ApiKey = "test-copilot-token" })
+            .GetResultAsync()
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        result.Content.OfType<TextContent>().Single().Text.ShouldBe(expected);
+    }
+
+    // #3442 CONTRACT CHANGE, deliberately re-pinned rather than deleted.
+    // This test has now been inverted twice, and the history is the point. It first asserted a
+    // non-gpt-5.6 model PRESERVED a leading CRLF; #3336 inverted it to assert the CRLF was
+    // STRIPPED, on the theory that the framing was a transport artifact rather than a model-family
+    // one. Both versions were built on a premise that mitm captures have now falsified: Copilot
+    // sends no CR on the wire at all. The corruption came from our own
+    // string.Join(Environment.NewLine, ...) in MessageConverter.ToAgentMessage (#3425, #3428).
+    // So the assertion returns to preservation - not as a reversion, but because a leading CRLF a
+    // model genuinely emits is content, and silently deleting it was a real data-loss path.
+    [Fact]
+    public async Task Stream_LeadingCrLf_IsPreservedAsContent_BecauseItIsNotTransportFraming()
+    {
+        var sse = BuildTextSse(["\r\nintentional"]);
+        var provider = new CopilotMessagesProvider(new HttpClient(new RecordingHandler(_ => SseResponse(sse))));
+
+        var result = await provider.Stream(
+                BuildModel(),
+                BuildContext(),
+                new CopilotMessagesOptions { ApiKey = "test-copilot-token" })
+            .GetResultAsync()
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        result.Content.OfType<TextContent>().Single().Text.ShouldBe("\r\nintentional");
+    }
+
+    [Fact]
+    public async Task Stream_NonGpt56Model_InteriorCrLf_SurvivesAsContent()
+    {
+        // Unchanged by #3442 and still load-bearing: an interior CRLF was never touched even when
+        // the leading strip existed, so this is the invariant that spans both contracts.
+        var sse = BuildTextSse(["before\r\nafter"]);
+        var provider = new CopilotMessagesProvider(new HttpClient(new RecordingHandler(_ => SseResponse(sse))));
+
+        var result = await provider.Stream(
+                BuildModel(),
+                BuildContext(),
+                new CopilotMessagesOptions { ApiKey = "test-copilot-token" })
+            .GetResultAsync()
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        result.Content.OfType<TextContent>().Single().Text.ShouldBe("before\r\nafter");
+    }
+
     private static async Task<(RecordingHandler CopilotHandler, RecordingHandler AnthropicHandler)> DriveBothProvidersAsync()
     {
         var copilotHandler = new RecordingHandler(_ => SseResponse(MinimalSse));
@@ -173,6 +259,37 @@ public class CopilotMessagesProviderParityTests
         "event: message_stop\n" +
         "data: {\"type\":\"message_stop\"}\n" +
         "\n";
+
+    private static string BuildTextSse(IEnumerable<string> fragments)
+    {
+        var builder = new StringBuilder()
+            .AppendLine("event: message_start")
+            .AppendLine("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}")
+            .AppendLine()
+            .AppendLine("event: content_block_start")
+            .AppendLine("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}")
+            .AppendLine();
+        foreach (var fragment in fragments)
+        {
+            builder.AppendLine("event: content_block_delta")
+                .Append("data: ")
+                .AppendLine(JsonSerializer.Serialize(new
+                {
+                    type = "content_block_delta",
+                    index = 0,
+                    delta = new { type = "text_delta", text = fragment }
+                }))
+                .AppendLine();
+        }
+        return builder
+            .AppendLine("event: content_block_stop")
+            .AppendLine("data: {\"type\":\"content_block_stop\",\"index\":0}")
+            .AppendLine()
+            .AppendLine("event: message_stop")
+            .AppendLine("data: {\"type\":\"message_stop\"}")
+            .AppendLine()
+            .ToString();
+    }
 
     private static JsonObject BuildEnvelope(RecordingHandler handler)
     {

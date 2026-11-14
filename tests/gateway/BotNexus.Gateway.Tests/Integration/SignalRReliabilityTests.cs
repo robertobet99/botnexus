@@ -1,3 +1,4 @@
+using System.IO.Abstractions;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -13,9 +14,11 @@ using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Gateway.Abstractions.Sessions;
 using BotNexus.Gateway.Api;
 using BotNexus.Gateway.Configuration;
+using BotNexus.Gateway.Conversations;
 using BotNexus.Gateway.Dispatching;
 using BotNexus.Gateway.Sessions;
 using BotNexus.Gateway.Tests.Helpers;
+using BotNexus.Gateway.Tools;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -23,6 +26,7 @@ using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using GatewaySessionStatus = BotNexus.Gateway.Abstractions.Models.SessionStatus;
 
 using BotNexus.Gateway.Tests;
@@ -146,11 +150,20 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
     /// <summary>
     /// Pins <see href="https://github.com/sytone/botnexus/issues/332">#332</see>: when a
     /// message arrives via an external channel (Telegram, etc.) and a conversation is created
-    /// or updated, every connected SignalR client must see the <c>ConversationChanged</c>
-    /// broadcast so the portal can refresh without a manual reload.
+    /// or updated, connected SignalR clients must see the <c>ConversationChanged</c>
+    /// notification so the portal can refresh without a manual reload.
     /// </summary>
+    /// <remarks>
+    /// Updated by <see href="https://github.com/sytone/botnexus/issues/2541">#2541</see>, which
+    /// narrowed the fan-out from <c>Clients.All</c> to the affected agent's group. The ORIGINAL
+    /// intent of #332 is preserved exactly and is still what is asserted: two independent browsers
+    /// observing the agent both receive the cross-channel update, with the same field-level checks.
+    /// What changed is the precondition -- a connection now declares which agents it observes,
+    /// because broadcasting to every client made each one re-fetch its conversation list on
+    /// activity belonging to agents it does not even render. No assertion was weakened.
+    /// </remarks>
     [Fact]
-    public async Task ConversationChangeNotification_BroadcastsToAllConnectedSignalRClients()
+    public async Task ConversationChangeNotification_ReachesAllClientsObservingThatAgent()
     {
         await using var factory = CreateTestFactory(services =>
         {
@@ -161,6 +174,10 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
 
         await using var browserOne = await CreateStartedConnection(factory, cts.Token);
         await using var browserTwo = await CreateStartedConnection(factory, cts.Token);
+
+        // #2541: notifications follow the subscription, so each browser declares the agent it renders.
+        await browserOne.InvokeAsync("SubscribeAgents", new[] { TestAgentId }, cts.Token);
+        await browserTwo.InvokeAsync("SubscribeAgents", new[] { TestAgentId }, cts.Token);
 
         var oneTcs = new TaskCompletionSource<ConversationChangedPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
         var twoTcs = new TaskCompletionSource<ConversationChangedPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -181,7 +198,7 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
         payloadOne.AgentId.ShouldBe(TestAgentId);
         payloadOne.ChangeType.ShouldBe("created");
         payloadTwo.ConversationId.ShouldBe("conv-from-telegram",
-            "every connected SignalR client must receive cross-channel conversation updates; #332");
+            "every client observing the agent must receive cross-channel conversation updates; #332, scoped by #2541");
     }
 
     // ── #314 — SendMessage after agent switch routes to the new agent ───────
@@ -310,16 +327,15 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
             "whitespace-padded content must still be delivered verbatim — only the literal NO_REPLY sentinel is suppressed");
     }
 
-    // ── #192 — Steering must be dispatched as a control message ────────────
+    // ── #192 / #3034 — Steering intent uses the unified inbound entry point ─
 
     /// <summary>
-    /// Pins <see href="https://github.com/sytone/botnexus/issues/192">#192</see>: a steer used
-    /// to fall through as a normal user prompt in the wrong conversation when the agent
-    /// wasn't running. Steer now bypasses the orchestrator queue entirely and calls
-    /// handle.SteerAsync directly — no InboundMessage is dispatched.
+    /// Pins <see href="https://github.com/sytone/botnexus/issues/192">#192</see> and #3034:
+    /// a steer must remain a steer rather than becoming an ordinary prompt, while still flowing
+    /// through the one gateway-owned inbound entry point.
     /// </summary>
     [Fact]
-    public async Task Steer_InjectsDirectlyViaHandle_NotThroughOrchestratorQueue()
+    public async Task Steer_DispatchesExplicitIntentThroughUnifiedInboundEntryPoint()
     {
         var dispatcher = new RecordingDispatcher();
         await using var factory = CreateTestFactory(services =>
@@ -337,18 +353,21 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
         await connection.InvokeAsync<JsonElement>(
             "Steer", TestAgentId, "steer-session-1", "stop and reconsider", (string?)null, cts.Token);
 
-        // Steer no longer dispatches through the orchestrator
-        dispatcher.Messages.ShouldBeEmpty();
+        var message = dispatcher.Messages.ShouldHaveSingleItem();
+        message.Content.ShouldBe("stop and reconsider");
+        message.RoutingHints.ShouldNotBeNull();
+        message.RoutingHints!.RequestedAgentId.ShouldBe(AgentId.From(TestAgentId));
+        message.RoutingHints.RequestedSessionId.ShouldBe(SessionId.From("steer-session-1"));
+        message.RoutingHints.DeliveryMode.ShouldBe(InboundDeliveryMode.Steer);
     }
 
     /// <summary>
-    /// Pins <see href="https://github.com/sytone/botnexus/issues/192">#192</see>: when the
-    /// caller supplies an explicit <c>conversationId</c>, Steer must succeed and the
-    /// conversationId is carried on the SteeringInjected activity event (not on an
-    /// InboundMessage dispatch).
+    /// Pins <see href="https://github.com/sytone/botnexus/issues/192">#192</see>: an explicit
+    /// conversation identity must survive the unified inbound dispatch rather than being inferred
+    /// from ambient client state.
     /// </summary>
     [Fact]
-    public async Task Steer_WithExplicitConversationId_SucceedsWithoutDispatch()
+    public async Task Steer_WithExplicitConversationId_DispatchesAddressedIntent()
     {
         var dispatcher = new RecordingDispatcher();
         await using var factory = CreateTestFactory(services =>
@@ -359,6 +378,13 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
         await RegisterAgentAsync(factory, cts.Token);
 
         // Pre-create session
+        var conversations = factory.Services.GetRequiredService<IConversationStore>();
+        await conversations.CreateAsync(new Conversation
+        {
+            ConversationId = ConversationId.From("explicit-target-conv"),
+            AgentId = AgentId.From(TestAgentId),
+            Visibility = ConversationVisibility.UserFacing
+        }, cts.Token);
         var sessions = factory.Services.GetRequiredService<ISessionStore>();
         await sessions.GetOrCreateAsync(SessionId.From("steer-session-2"), AgentId.From(TestAgentId), cts.Token);
 
@@ -366,9 +392,12 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
         var result = await connection.InvokeAsync<JsonElement>(
             "Steer", TestAgentId, "steer-session-2", "be more thorough", "explicit-target-conv", cts.Token);
 
-        // Should succeed without dispatching through orchestrator
         result.GetProperty("sessionId").GetString().ShouldBe("steer-session-2");
-        dispatcher.Messages.ShouldBeEmpty();
+        var message = dispatcher.Messages.ShouldHaveSingleItem();
+        message.RoutingHints.ShouldNotBeNull();
+        message.RoutingHints!.RequestedSessionId.ShouldBe(SessionId.From("steer-session-2"));
+        message.RoutingHints.RequestedConversationId.ShouldBe(ConversationId.From("explicit-target-conv"));
+        message.RoutingHints.DeliveryMode.ShouldBe(InboundDeliveryMode.Steer);
     }
 
     // ── #130 — Stale bindings must be muted on disconnect ──────────────────
@@ -620,13 +649,134 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
 
 
     /// <summary>
-    /// Placeholder for <see href="https://github.com/sytone/botnexus/issues/383">#383</see>:
-    /// canvas HTML is not persisted across reconnect and is invisible to a second browser.
-    /// Tracked here so the scenario lights up automatically once the fix lands.
+    /// Pins #383 / #4625: tool-rendered HTML survives a real SignalR disconnect and is
+    /// available to a browser that missed the live event. The portal hydrates canvas on
+    /// conversation selection via REST, not by replaying CanvasUpdated on reconnect.
     /// </summary>
-    [Fact(Skip = "Blocked by #383: canvas HTML is not persisted across reconnect.")]
-    public Task Canvas_PersistsAcrossReconnect_AndIsVisibleToSecondBrowser()
-        => Task.CompletedTask;
+    [Fact]
+    public async Task Canvas_PersistsAcrossReconnect_AndIsVisibleToSecondBrowser()
+    {
+        var root = Directory.CreateTempSubdirectory("botnexus-canvas-4625-").FullName;
+        try
+        {
+            await using var factory = CreateTestFactory(services =>
+            {
+                // Keep the gateway's ConversationCanvasNotifier registration: removing it
+                // must break this test. Only replace the shared harness's in-memory store.
+                services.Replace(ServiceDescriptor.Singleton<IConversationStore>(_ =>
+                    new FileConversationStore(root, NullLogger<FileConversationStore>.Instance, new FileSystem())));
+                // The test harness bypasses extension discovery, which registers this in production.
+                services.TryAddEnumerable(ServiceDescriptor.Singleton<IAgentCanvasNotifier, SignalRCanvasNotifier>());
+            });
+            using var cts = CreateTimeout();
+            await RegisterAgentAsync(factory, cts.Token);
+
+            var conversationId = ConversationId.From($"canvas-{Guid.NewGuid():N}");
+            var otherConversationId = ConversationId.From($"canvas-other-{Guid.NewGuid():N}");
+            var agentId = AgentId.From(TestAgentId);
+            var store = factory.Services.GetRequiredService<IConversationStore>();
+            foreach (var id in new[] { conversationId, otherConversationId })
+            {
+                await store.CreateAsync(new Conversation
+                {
+                    ConversationId = id,
+                    AgentId = agentId,
+                    Visibility = ConversationVisibility.UserFacing
+                }, cts.Token);
+            }
+
+            string CanvasPath(ConversationId id)
+                => $"/api/agents/{TestAgentId}/conversations/{Uri.EscapeDataString(id.Value)}/canvas";
+
+            using var firstHttp = factory.CreateClient();
+            await using var first = await CreateStartedConnection(factory, cts.Token);
+            await first.InvokeAsync("SubscribeAgents", new[] { TestAgentId }, cts.Token);
+            var originalConnectionId = first.ConnectionId;
+            originalConnectionId.ShouldNotBeNullOrWhiteSpace();
+
+            using (var empty = await firstHttp.GetAsync(CanvasPath(conversationId), cts.Token))
+                empty.StatusCode.ShouldBe(HttpStatusCode.NoContent);
+
+            const string html = "<!doctype html><html><body><h1>Primary canvas — #4625</h1><p data-id=\"a\">A &amp; B</p></body></html>";
+            const string otherHtml = "<!doctype html><html><body><h1>Other conversation</h1></body></html>";
+            var liveEvent = new TaskCompletionSource<(string AgentId, string ConversationId, string Html)>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            using var subscription = first.On<string, string, string>("CanvasUpdated", (agent, conversation, content) =>
+                liveEvent.TrySetResult((agent, conversation, content)));
+
+            // Exactly the production tool -> DI notifiers -> persistence + SignalR path.
+            // Never seed CanvasHtml or PUT it through REST: either would hide a broken notifier.
+            var notifiers = factory.Services.GetServices<IAgentCanvasNotifier>().ToArray();
+            var tool = new CanvasTool(agentId, conversationId, store, notifiers);
+            await tool.ExecuteAsync("render-primary", new Dictionary<string, object?>
+            {
+                ["action"] = "render", ["html"] = html
+            }, cts.Token);
+            var delivered = await liveEvent.Task.WaitAsync(cts.Token);
+            delivered.AgentId.ShouldBe(TestAgentId);
+            delivered.ConversationId.ShouldBe(conversationId.Value);
+            delivered.Html.ShouldBe(html);
+
+            // Await the transport stop itself, rather than inferring disconnect from a delay.
+            await first.StopAsync(cts.Token);
+            first.State.ShouldBe(HubConnectionState.Disconnected);
+            subscription.Dispose();
+
+            using (var untouched = await firstHttp.GetAsync(CanvasPath(otherConversationId), cts.Token))
+                untouched.StatusCode.ShouldBe(HttpStatusCode.NoContent,
+                    "rendering one conversation must not populate another conversation for the same agent");
+
+            var otherTool = new CanvasTool(agentId, otherConversationId, store, notifiers);
+            await otherTool.ExecuteAsync("render-other", new Dictionary<string, object?>
+            {
+                ["action"] = "render", ["html"] = otherHtml
+            }, cts.Token);
+
+            // A fresh store instance proves the payloads reached disk, not a shared object/cache.
+            var diskReader = new FileConversationStore(root, NullLogger<FileConversationStore>.Instance, new FileSystem());
+            var persisted = await diskReader.GetAsync(conversationId, cts.Token);
+            persisted.ShouldNotBeNull();
+            persisted.CanvasHtml.ShouldBe(html);
+            var persistedOther = await diskReader.GetAsync(otherConversationId, cts.Token);
+            persistedOther.ShouldNotBeNull();
+            persistedOther.CanvasHtml.ShouldBe(otherHtml);
+
+            await HubFixtureGuard.StartGuardedAsync(first, "SignalRReliabilityTests", cts.Token,
+                testName: nameof(Canvas_PersistsAcrossReconnect_AndIsVisibleToSecondBrowser));
+            first.State.ShouldBe(HubConnectionState.Connected);
+            first.ConnectionId.ShouldNotBeNullOrWhiteSpace();
+            first.ConnectionId.ShouldNotBe(originalConnectionId);
+            await first.InvokeAsync("SubscribeAgents", new[] { TestAgentId }, cts.Token);
+
+            // Match SelectConversationAsync's lazy REST hydration after a missed live event.
+            using (var hydrated = await firstHttp.GetAsync(CanvasPath(conversationId), cts.Token))
+            {
+                hydrated.StatusCode.ShouldBe(HttpStatusCode.OK);
+                hydrated.Content.Headers.ContentType?.MediaType.ShouldBe("text/html");
+                (await hydrated.Content.ReadAsStringAsync(cts.Token)).ShouldBe(html);
+            }
+
+            // This browser did not exist at either render; it has its own SignalR and HTTP clients.
+            using var secondHttp = factory.CreateClient();
+            await using var second = await CreateStartedConnection(factory, cts.Token);
+            second.ConnectionId.ShouldNotBeNullOrWhiteSpace();
+            second.ConnectionId.ShouldNotBe(first.ConnectionId);
+            await second.InvokeAsync("SubscribeAgents", new[] { TestAgentId }, cts.Token);
+            foreach (var (id, expected) in new[] { (conversationId, html), (otherConversationId, otherHtml) })
+            {
+                using var hydrated = await secondHttp.GetAsync(CanvasPath(id), cts.Token);
+                hydrated.StatusCode.ShouldBe(HttpStatusCode.OK);
+                hydrated.Content.Headers.ContentType?.MediaType.ShouldBe("text/html");
+                (await hydrated.Content.ReadAsStringAsync(cts.Token)).ShouldBe(expected,
+                    "a fresh browser must hydrate the exact HTML belonging to the selected conversation");
+            }
+        }
+        finally
+        {
+            // The factory and all clients are disposed before deleting this test-owned root.
+            Directory.Delete(root, recursive: true);
+        }
+    }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -656,7 +806,7 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
                 });
             });
 
-    private static async Task<HubConnection> CreateStartedConnection(WebApplicationFactory<Program> factory, CancellationToken cancellationToken)
+    private static async Task<HubConnection> CreateStartedConnection(WebApplicationFactory<Program> factory, CancellationToken cancellationToken, [System.Runtime.CompilerServices.CallerMemberName] string testName = "")
     {
         var server = factory.Server;
         var handler = server.CreateHandler();
@@ -668,7 +818,7 @@ public sealed class SignalRReliabilityTests : IAsyncDisposable
             })
             .Build();
 
-        await connection.StartAsync(cancellationToken);
+        await HubFixtureGuard.StartGuardedAsync(connection, "SignalRReliabilityTests", cancellationToken, testName: testName);
         return connection;
     }
 

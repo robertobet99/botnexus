@@ -9,6 +9,7 @@ using BotNexus.Gateway.Abstractions.Conversations;
 using BotNexus.Gateway.Conversations;
 using BotNexus.Gateway.Abstractions.Services;
 using BotNexus.Gateway.Dispatching;
+using BotNexus.Gateway.Diagnostics;
 using BotNexus.Gateway.Sessions;
 using BotNexus.Gateway.Tests.Dispatching;
 using BotNexus.Gateway.Tests.Diagnostics;
@@ -93,6 +94,218 @@ public sealed class SignalRHubTests
     }
 
     [Fact]
+    public async Task GatewayHub_SubscribeAll_ReturnsAuthoritativeActiveRunSnapshot()
+    {
+        var summary = new SessionSummary(
+            "session-1",
+            "agent-1",
+            ChannelKey.From("signalr"),
+            SessionStatus.Active,
+            SessionType.UserAgent,
+            true,
+            3,
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow,
+            "conversation-1");
+        var warmup = new Mock<ISessionWarmupService>();
+        warmup.Setup(service => service.GetAvailableSessionsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([summary]);
+
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(value => value.IsRunning).Returns(true);
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(value => value.GetHandle(AgentId.From("agent-1"), BotNexus.Domain.Primitives.SessionId.From("session-1")))
+            .Returns(handle.Object);
+
+        var groups = new Mock<IGroupManager>();
+        groups.Setup(value => value.AddToGroupAsync(
+                "conn-1",
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var hub = CreateHub(
+            groups: groups.Object,
+            warmup: warmup.Object,
+            supervisor: supervisor.Object,
+            connectionId: "conn-1");
+
+        var result = await hub.SubscribeAll();
+
+        var activeRun = result.ActiveRuns.ShouldHaveSingleItem();
+        activeRun.SessionId.ShouldBe("session-1");
+        activeRun.AgentId.ShouldBe("agent-1");
+        activeRun.ConversationId.ShouldBe("conversation-1");
+    }
+
+    [Fact]
+    public async Task GatewayHub_SubscribeAll_PrefersWholeRunTrackerWhenHandleIsIdle()
+    {
+        var summary = new SessionSummary(
+            "session-1",
+            "agent-1",
+            ChannelKey.From("signalr"),
+            SessionStatus.Active,
+            SessionType.UserAgent,
+            true,
+            3,
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow,
+            "conversation-1");
+        var warmup = new Mock<ISessionWarmupService>();
+        warmup.Setup(service => service.GetAvailableSessionsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([summary]);
+
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(value => value.IsRunning).Returns(false);
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(value => value.GetHandle(AgentId.From("agent-1"), SessionId.From("session-1")))
+            .Returns(handle.Object);
+
+        var tracker = new Mock<IActiveLoopTracker>();
+        tracker.Setup(value => value.GetSnapshot()).Returns(new ActiveLoopSnapshot
+        {
+            ActiveCount = 1,
+            PeakCount = 1,
+            TotalCompleted = 0,
+            ActiveLoops =
+            [
+                new ActiveLoopDetail
+                {
+                    LoopId = "loop-1",
+                    AgentId = "agent-1",
+                    SessionId = "session-1",
+                    ConversationId = "conversation-1",
+                    StartedAtUtc = DateTimeOffset.UtcNow
+                }
+            ]
+        });
+
+        var groups = new Mock<IGroupManager>();
+        groups.Setup(value => value.AddToGroupAsync(
+                "conn-1",
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var hub = CreateHub(
+            groups: groups.Object,
+            warmup: warmup.Object,
+            supervisor: supervisor.Object,
+            activeLoopTracker: tracker.Object,
+            connectionId: "conn-1");
+
+        var result = await hub.SubscribeAll();
+
+        var activeRun = result.ActiveRuns.ShouldHaveSingleItem();
+        activeRun.SessionId.ShouldBe("session-1");
+        activeRun.AgentId.ShouldBe("agent-1");
+        activeRun.ConversationId.ShouldBe("conversation-1");
+    }
+
+    [Fact]
+    public async Task GatewayHub_SubscribeAll_UsesTrackerAsAuthoritativeWhenRunCompleted()
+    {
+        var summary = new SessionSummary(
+            "session-1",
+            "agent-1",
+            ChannelKey.From("signalr"),
+            SessionStatus.Active,
+            SessionType.UserAgent,
+            true,
+            3,
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow,
+            "conversation-1");
+        var warmup = new Mock<ISessionWarmupService>();
+        warmup.Setup(service => service.GetAvailableSessionsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([summary]);
+
+        var handle = new Mock<IAgentHandle>();
+        handle.SetupGet(value => value.IsRunning).Returns(true);
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(value => value.GetHandle(AgentId.From("agent-1"), SessionId.From("session-1")))
+            .Returns(handle.Object);
+
+        var tracker = new Mock<IActiveLoopTracker>();
+        tracker.Setup(value => value.GetSnapshot()).Returns(new ActiveLoopSnapshot
+        {
+            ActiveCount = 0,
+            PeakCount = 1,
+            TotalCompleted = 1,
+            ActiveLoops = []
+        });
+
+        var groups = new Mock<IGroupManager>();
+        groups.Setup(value => value.AddToGroupAsync(
+                "conn-1",
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var hub = CreateHub(
+            groups: groups.Object,
+            warmup: warmup.Object,
+            supervisor: supervisor.Object,
+            activeLoopTracker: tracker.Object,
+            connectionId: "conn-1");
+
+        var result = await hub.SubscribeAll();
+
+        result.ActiveRuns.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task GatewayHub_SubscribeAll_RefreshesSessionsAfterJoiningGroupsBeforeSnapshot()
+    {
+        var conversationId = "conversation-1";
+        var oldSession = new SessionSummary(
+            "session-old",
+            "agent-1",
+            ChannelKey.From("signalr"),
+            SessionStatus.Active,
+            SessionType.UserAgent,
+            true,
+            3,
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow,
+            conversationId);
+        var continuationSession = oldSession with { SessionId = "session-continuation" };
+        var warmup = new Mock<ISessionWarmupService>();
+        warmup.SetupSequence(service => service.GetAvailableSessionsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync([oldSession])
+            .ReturnsAsync([oldSession, continuationSession]);
+
+        var continuationHandle = new Mock<IAgentHandle>();
+        continuationHandle.SetupGet(value => value.IsRunning).Returns(true);
+        var supervisor = new Mock<IAgentSupervisor>();
+        supervisor.Setup(value => value.GetHandle(
+                AgentId.From("agent-1"),
+                BotNexus.Domain.Primitives.SessionId.From("session-continuation")))
+            .Returns(continuationHandle.Object);
+
+        var groups = new Mock<IGroupManager>();
+        groups.Setup(value => value.AddToGroupAsync(
+                "conn-1",
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var hub = CreateHub(
+            groups: groups.Object,
+            warmup: warmup.Object,
+            supervisor: supervisor.Object,
+            connectionId: "conn-1");
+
+        var result = await hub.SubscribeAll();
+
+        result.ActiveRuns.ShouldHaveSingleItem().SessionId.ShouldBe("session-continuation");
+        warmup.Verify(
+            service => service.GetAvailableSessionsAsync(It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+    }
+
+    [Fact]
     public async Task GatewayHub_GetAgents_ExcludesSubAgentsAndBuiltins()
     {
         var registry = new Mock<IAgentRegistry>();
@@ -130,6 +343,27 @@ public sealed class SignalRHubTests
         Assert.Equal("farnsworth", result[0].AgentId.Value);
     }
 
+    [Theory]
+    [InlineData(InboundDeliveryMode.Auto)]
+    [InlineData(InboundDeliveryMode.Steer)]
+    [InlineData(InboundDeliveryMode.Interrupt)]
+    public async Task GatewayHub_DeliverMessage_PreservesTheClientsDeliveryIntent(InboundDeliveryMode deliveryMode)
+    {
+        var orchestrator = new CapturingInboundMessageOrchestrator();
+        var conversations = await CreateUserFacingStoreAsync("conversation-1");
+        var hub = CreateHub(conversationStore: conversations, orchestrator: orchestrator, connectionId: "conn-1");
+
+        await hub.DeliverMessage(
+            AgentId.From("agent-a"),
+            ChannelKey.From("signalr"),
+            "same message",
+            "conversation-1",
+            deliveryMode);
+
+        orchestrator.Captured.ShouldHaveSingleItem()
+            .RoutingHints!.DeliveryMode.ShouldBe(deliveryMode);
+    }
+
     [Fact]
     public async Task GatewayHub_SendMessage_UsesVisibleSessionForAgentChannel()
     {
@@ -148,6 +382,24 @@ public sealed class SignalRHubTests
         captured.RoutingHints!.RequestedAgentId.ShouldNotBeNull();
         captured.RoutingHints.RequestedAgentId!.Value.Value.ShouldBe("agent-a");
         captured.Content.ShouldBe("hello");
+    }
+
+    [Theory]
+    [InlineData(InboundDispatchStatus.Busy)]
+    [InlineData(InboundDispatchStatus.NoRoute)]
+    [InlineData(InboundDispatchStatus.Stalled)]
+    [InlineData(InboundDispatchStatus.Rejected)]
+    public async Task GatewayHub_SendMessage_WhenDispatchIsNotAccepted_ThrowsInsteadOfReturningSuccess(InboundDispatchStatus status)
+    {
+        var orchestrator = new CapturingInboundMessageOrchestrator
+        {
+            AdmissionStatus = status
+        };
+        var hub = CreateHub(orchestrator: orchestrator, connectionId: "conn-1");
+
+        var act = () => hub.SendMessage(AgentId.From("agent-a"), ChannelKey.From("signalr"), "Do not lose this");
+
+        (await act.ShouldThrowAsync<HubException>()).Message.ShouldContain("not accepted", Case.Insensitive);
     }
 
     [Fact]
@@ -262,7 +514,9 @@ public sealed class SignalRHubTests
                     SessionId.From(targetSessionId),
                     false,
                     false)));
+        var conversations = await CreateUserFacingStoreAsync(targetConversationId);
         var hub = CreateHub(
+            conversationStore: conversations,
             orchestrator: orchestrator,
             connectionId: "conn-1",
             conversationDispatcher: conversationDispatcher.Object);
@@ -302,6 +556,35 @@ public sealed class SignalRHubTests
     }
 
     [Fact]
+    public async Task GatewayHub_SendMessage_NeverPersistsAgentIdBindingOnAForeignChannelType()
+    {
+        // #2530: the hub mints ChannelAddress.From(agentId) as its conversation-first routing
+        // key. That is only safe on the signalr channel type, whose adapter delivers by
+        // conversation group and never dials the address. The channelType argument is a
+        // client-declared preference; if it were used as the binding identity the hub would
+        // persist e.g. a 'telegram' binding addressed 'agent-a', and fan-out would send a real
+        // undeliverable envelope to it.
+        var conversationStore = new InMemoryConversationStore();
+        var hub = CreateHub(
+            orchestrator: new CapturingInboundMessageOrchestrator(),
+            conversationStore: conversationStore,
+            connectionId: "conn-1");
+
+        await hub.SendMessage(AgentId.From("agent-a"), ChannelKey.From("telegram"), "first");
+
+        var conversations = await conversationStore.ListAsync(AgentId.From("agent-a"), CancellationToken.None);
+        var bindings = conversations.SelectMany(c => c.ChannelBindings).ToList();
+
+        bindings.ShouldNotBeEmpty("the portal binding must still be persisted");
+        bindings.ShouldNotContain(
+            b => b.ChannelAddress.Value == "agent-a" && b.ChannelType.Value != "signalr",
+            "an agent-id address must never be bound to a non-signalr channel type");
+        bindings.ShouldContain(
+            b => b.ChannelAddress.Value == "agent-a" && b.ChannelType.Value == "signalr",
+            "the legitimate signalr portal binding must survive");
+    }
+
+    [Fact]
     public async Task GatewayHub_SendMessage_WithConversationId_ResolvesConversationSession()
     {
         const string defaultSessionId = "session-default";
@@ -335,7 +618,8 @@ public sealed class SignalRHubTests
                     false,
                     false)));
 
-        var hub = CreateHub(orchestrator: orchestrator, conversationDispatcher: conversationDispatcher.Object, connectionId: "conn-1");
+        var conversations = await CreateUserFacingStoreAsync(targetConversationId);
+        var hub = CreateHub(conversationStore: conversations, orchestrator: orchestrator, conversationDispatcher: conversationDispatcher.Object, connectionId: "conn-1");
 
         var result = await hub.SendMessage(AgentId.From("agent-a"), ChannelKey.From("signalr"), "hello targeted", targetConversationId);
 
@@ -387,12 +671,13 @@ public sealed class SignalRHubTests
 
         var conversationDispatcher = new DefaultConversationDispatcher(router, conversationStore);
 
-        static SessionCompactionCoordinator NewCoordinator(ISessionStore store)
+        SessionCompactionCoordinator NewCoordinator(ISessionStore store)
             => new(
                 Mock.Of<ISessionCompactor>(),
                 store,
                 Mock.Of<IAgentSupervisor>(),
-                Mock.Of<IChannelManager>(),
+                eventPublisher: null,
+                conversations: conversationStore,
                 new TestOptionsMonitor<CompactionOptions>(new CompactionOptions()),
                 NullLogger<SessionCompactionCoordinator>.Instance);
 
@@ -412,7 +697,8 @@ public sealed class SignalRHubTests
             Mock.Of<IActivityBroadcaster>(),
             router,
             NewApp(),
-            NullLogger<GatewayHub>.Instance)
+            NullLogger<GatewayHub>.Instance,
+            conversationStore: conversationStore)
         {
             Clients = Mock.Of<IHubCallerClients<IGatewayHubClient>>(),
             Groups = Mock.Of<IGroupManager>(),
@@ -426,7 +712,8 @@ public sealed class SignalRHubTests
             Mock.Of<IActivityBroadcaster>(),
             router,
             NewApp(),
-            NullLogger<GatewayHub>.Instance)
+            NullLogger<GatewayHub>.Instance,
+            conversationStore: conversationStore)
         {
             Clients = Mock.Of<IHubCallerClients<IGatewayHubClient>>(),
             Groups = Mock.Of<IGroupManager>(),
@@ -497,13 +784,199 @@ public sealed class SignalRHubTests
         });
 
         var (requestId, task) = registry.Register(conversation.ConversationId, TimeSpan.FromMinutes(1));
-        var hub = CreateHub(conversationStore: conversationStore, askUserResponseRegistry: registry);
+        var hub = CreateHub(conversationStore: conversationStore, askUserPromptResolver: new AskUserPromptResolver(registry, NullLogger<AskUserPromptResolver>.Instance));
 
         await hub.RespondToAskUser(conversation.ConversationId.Value, requestId, "staging", null, cancelled: false);
 
         var response = await task;
         response.RequestId.ShouldBe(requestId);
         response.FreeFormText.ShouldBe("staging");
+    }
+
+    [Fact]
+    public async Task GatewayHub_RespondToAskUser_ResumesFromDurableCheckpoint_AfterRestart()
+    {
+        // #2047: after a restart there is no live waiter, but the durable checkpoint on the
+        // conversation row lets the response resume the conversation via the checkpoint service.
+        var registry = new AskUserResponseRegistry();
+        var conversationStore = new InMemoryConversationStore();
+        var conversation = await conversationStore.CreateAsync(new Conversation
+        {
+            ConversationId = ConversationId.From("conversation-restart"),
+            AgentId = AgentId.From("agent-a"),
+            Title = "ask user restart",
+            ChannelBindings =
+            [
+                new ChannelBinding
+                {
+                    ChannelType = ChannelKey.From("signalr"),
+                    ChannelAddress = ChannelAddress.From("agent-a")
+                }
+            ],
+            PendingAskUserJson = System.Text.Json.JsonSerializer.Serialize(new AskUserRequest
+            {
+                RequestId = "req-restart",
+                ConversationId = ConversationId.From("conversation-restart"),
+                SessionId = SessionId.From("session-old"),
+                AgentId = AgentId.From("agent-a"),
+                Prompt = "Resume me"
+            }, new System.Text.Json.JsonSerializerOptions { PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase })
+        });
+
+        var resumed = new List<AskUserRequest>();
+        var groups = new Mock<IGroupManager>();
+        var joinedBeforeResume = false;
+        groups.Setup(value => value.AddToGroupAsync(
+                "conn-1",
+                SignalRChannelAdapter.GetConversationGroup(conversation.ConversationId.Value),
+                It.IsAny<CancellationToken>()))
+            .Callback(() => joinedBeforeResume = true)
+            .Returns(Task.CompletedTask);
+        var resumer = new DelegatingResumer((req, _) =>
+        {
+            joinedBeforeResume.ShouldBeTrue("the answering connection must join before the continuation can publish RunStarted");
+            resumed.Add(req);
+            return Task.CompletedTask;
+        });
+
+        // The #2322 resolver is the front door for every channel; with no live waiter it reports
+        // NoPendingPrompt, which is precisely what makes the hub fall through to the durable
+        // checkpoint path being exercised here.
+        var resolver = new AskUserPromptResolver(registry, NullLogger<AskUserPromptResolver>.Instance);
+        var checkpointService = new AskUserCheckpointService(
+            resolver, conversationStore, NullLogger<AskUserCheckpointService>.Instance, resumer);
+
+        var hub = CreateHub(
+            groups: groups.Object,
+            conversationStore: conversationStore,
+            askUserPromptResolver: resolver,
+            askUserCheckpointService: checkpointService,
+            connectionId: "conn-1");
+
+        await hub.RespondToAskUser(conversation.ConversationId.Value, "req-restart", "resumed answer", null, cancelled: false);
+
+        resumed.Count.ShouldBe(1);
+        resumed[0].RequestId.ShouldBe("req-restart");
+        (await conversationStore.GetAsync(conversation.ConversationId))!.PendingAskUserJson.ShouldBeNull();
+
+        // Idempotent: a duplicate submission for the already-claimed checkpoint does not throw or
+        // resume a second time.
+        await hub.RespondToAskUser(conversation.ConversationId.Value, "req-restart", "resumed answer", null, cancelled: false);
+        resumed.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task GatewayHub_RespondToAskUser_ConversationWithoutSignalRBinding_IsAccepted()
+    {
+        // #2654 AC1: the conversation's channel bindings describe ROUTING, not the caller's access.
+        // The portal is a channel-agnostic observer of every turn, so a control-scoped caller must be
+        // able to answer an ask_user prompt on a conversation bound to some other channel. Before the
+        // fix this threw HubException("Caller does not have access to this conversation.").
+        var registry = new AskUserResponseRegistry();
+        var conversationStore = new InMemoryConversationStore();
+        var conversation = await conversationStore.CreateAsync(new Conversation
+        {
+            ConversationId = ConversationId.From("conversation-no-signalr-binding"),
+            AgentId = AgentId.From("agent-a"),
+            Title = "ask user on a telegram-bound conversation",
+            ChannelBindings =
+            [
+                new ChannelBinding
+                {
+                    ChannelType = ChannelKey.From("telegram"),
+                    ChannelAddress = ChannelAddress.From("12345")
+                }
+            ]
+        });
+
+        var (requestId, task) = registry.Register(conversation.ConversationId, TimeSpan.FromMinutes(1));
+        var hub = CreateHub(
+            conversationStore: conversationStore,
+            askUserPromptResolver: new AskUserPromptResolver(registry, NullLogger<AskUserPromptResolver>.Instance),
+            userScopes: [ControlScope]);
+
+        await hub.RespondToAskUser(conversation.ConversationId.Value, requestId, "staging", null, cancelled: false);
+
+        var response = await task;
+        response.RequestId.ShouldBe(requestId);
+        response.FreeFormText.ShouldBe("staging");
+    }
+
+    [Fact]
+    public async Task GatewayHub_RespondToAskUser_NoBindingsAtAll_IsAccepted()
+    {
+        // #2654 AC1 (boundary): a conversation with no bindings at all is still answerable. Binding
+        // state is owned by routing/fan-out; an unrelated binding change must not revoke the ability
+        // to answer a pending prompt.
+        var registry = new AskUserResponseRegistry();
+        var conversationStore = new InMemoryConversationStore();
+        var conversation = await conversationStore.CreateAsync(new Conversation
+        {
+            ConversationId = ConversationId.From("conversation-unbound"),
+            AgentId = AgentId.From("agent-a"),
+            Title = "ask user unbound",
+            ChannelBindings = []
+        });
+
+        var (requestId, task) = registry.Register(conversation.ConversationId, TimeSpan.FromMinutes(1));
+        var hub = CreateHub(
+            conversationStore: conversationStore,
+            askUserPromptResolver: new AskUserPromptResolver(registry, NullLogger<AskUserPromptResolver>.Instance),
+            userScopes: [ControlScope]);
+
+        await hub.RespondToAskUser(conversation.ConversationId.Value, requestId, "yes", null, cancelled: false);
+
+        (await task).FreeFormText.ShouldBe("yes");
+    }
+
+    [Fact]
+    public async Task GatewayHub_RespondToAskUser_ReadOnlyScopedConnection_IsRejected()
+    {
+        // #2654 AC2 - LOAD-BEARING DISCRIMINATION TEST. Removing the signalr-binding check is only a
+        // bugfix if authorisation still bites somewhere. This test is what distinguishes "we deleted a
+        // misplaced routing predicate" from "we deleted the authorisation check". EnsureControlScope is
+        // the real gate (#1524): a read-only connection must still be rejected, and must be rejected
+        // BEFORE the conversation store is ever consulted. Do not delete or weaken this test; if it is
+        // ever removed, the binding-check removal becomes a silent security regression.
+        var conversationStore = new Mock<IConversationStore>(MockBehavior.Strict);
+        var hub = CreateHub(
+            conversationStore: conversationStore.Object,
+            askUserPromptResolver: new AskUserPromptResolver(
+                new AskUserResponseRegistry(), NullLogger<AskUserPromptResolver>.Instance),
+            connectionId: "conn-1",
+            userScopes: [ReadScope]);
+
+        Func<Task> act = () => hub.RespondToAskUser("conversation-any", "req-1", "staging", null, cancelled: false);
+
+        (await act.ShouldThrowAsync<HubException>())
+            .Message.ShouldContain("not authorized to invoke 'RespondToAskUser'");
+        // The rejection happened before any conversation lookup - the guard, not the binding, denied it.
+        conversationStore.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task GatewayHub_RespondToAskUser_UnknownConversation_StillFailsWithNotFoundMessage()
+    {
+        // #2654 AC3: the not-found path stays separately diagnosable from the not-authorised path, so
+        // an investigator reading the message is pointed at conversation state, not at auth.
+        var conversationStore = new InMemoryConversationStore();
+        var hub = CreateHub(
+            conversationStore: conversationStore,
+            askUserPromptResolver: new AskUserPromptResolver(
+                new AskUserResponseRegistry(), NullLogger<AskUserPromptResolver>.Instance),
+            userScopes: [ControlScope]);
+
+        Func<Task> act = () => hub.RespondToAskUser("conversation-missing", "req-1", "staging", null, cancelled: false);
+
+        var ex = await act.ShouldThrowAsync<HubException>();
+        ex.Message.ShouldContain("not found");
+        ex.Message.ShouldNotContain("does not have access");
+    }
+
+    private sealed class DelegatingResumer(Func<AskUserRequest, AskUserResponse, Task> onResume) : IAskUserCheckpointResumer
+    {
+        public Task ResumeAsync(AskUserRequest request, AskUserResponse response, CancellationToken cancellationToken = default)
+            => onResume(request, response);
     }
 
     // GatewayHub_SendMessage_DefaultAgentId_ThrowsHubException was removed: AgentId is now a Vogen
@@ -526,126 +999,74 @@ public sealed class SignalRHubTests
     public async Task GatewayHub_Steer_UsesRequestedSessionId()
     {
         const string requestedSessionId = "session-steer-target";
-
-        // A RUNNING handle is required for a steer to be applied (a steer only makes sense against
-        // an in-flight turn). The hub resolves the live handle via GetHandle first.
-        var handle = new Mock<IAgentHandle>();
-        handle.SetupGet(h => h.IsRunning).Returns(true);
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns(handle.Object);
-
-        var hub = CreateHub(supervisor: supervisor.Object, connectionId: "conn-1");
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Steered };
+        var hub = CreateHub(orchestrator: orchestrator, connectionId: "conn-1");
 
         var result = await hub.Steer(AgentId.From("agent-a"), SessionId.From(requestedSessionId), "nudge", null);
 
         result.SessionId.ShouldBe(requestedSessionId);
-        // Verify SteerAsync was called on the handle with the content
-        handle.Verify(h => h.SteerAsync("nudge", It.IsAny<CancellationToken>()), Times.Once);
+        var inbound = orchestrator.Captured.ShouldHaveSingleItem();
+        inbound.RoutingHints.ShouldNotBeNull();
+        inbound.RoutingHints!.RequestedSessionId.ShouldBe(SessionId.From(requestedSessionId));
+        inbound.RoutingHints.DeliveryMode.ShouldBe(InboundDeliveryMode.Steer);
     }
 
     [Fact]
     public async Task GatewayHub_Steer_SetsConversationIdOnDispatchedMessage()
     {
-        var handle = new Mock<IAgentHandle>();
-        handle.SetupGet(h => h.IsRunning).Returns(true);
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns(handle.Object);
-        var activity = new Mock<IActivityBroadcaster>();
-
-        var hub = CreateHub(supervisor: supervisor.Object, activity: activity.Object, connectionId: "conn-1");
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Steered };
+        var conversations = await CreateUserFacingStoreAsync("conv-42");
+        var hub = CreateHub(conversationStore: conversations, orchestrator: orchestrator, connectionId: "conn-1");
 
         await hub.Steer(AgentId.From("agent-a"), SessionId.From("sess-1"), "nudge", "conv-42");
 
-        // Verify SteeringInjected activity was published with the conversation id
-        activity.Verify(a => a.PublishAsync(
-            It.Is<GatewayActivity>(ga => ga.Type == GatewayActivityType.SteeringInjected && ga.ConversationId == "conv-42"),
-            It.IsAny<CancellationToken>()), Times.Once);
+        var inbound = orchestrator.Captured.ShouldHaveSingleItem();
+        inbound.RoutingHints.ShouldNotBeNull();
+        inbound.RoutingHints!.RequestedConversationId.ShouldBe(ConversationId.From("conv-42"));
     }
 
     [Fact]
     public async Task GatewayHub_Steer_WhenAgentNotRunning_DoesNotInjectOrPersist()
     {
-        // Dead-letter guard: steering a session whose handle is idle must NOT enqueue the message
-        // (an idle handle's PendingMessageQueue is never drained) nor persist it to history.
-        // Regression for the production bug where a steer mis-routed to an unrelated idle session
-        // was silently swallowed.
-        var idleHandle = new Mock<IAgentHandle>();
-        idleHandle.SetupGet(h => h.IsRunning).Returns(false);
-        var supervisor = new Mock<IAgentSupervisor>();
-        // GetHandle returns the idle handle; GetOrCreateAsync (race fallback) returns the same.
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns(idleHandle.Object);
-        supervisor.Setup(s => s.GetOrCreateAsync(It.IsAny<AgentId>(), It.IsAny<SessionId>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(idleHandle.Object);
-
+        var supervisor = new Mock<IAgentSupervisor>(MockBehavior.Strict);
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Accepted };
         var sessions = new InMemorySessionStore();
-        var hub = CreateHub(supervisor: supervisor.Object, sessions: sessions, connectionId: "conn-1");
+        var conversations = await CreateUserFacingStoreAsync("conv-1");
+        var hub = CreateHub(conversationStore: conversations, supervisor: supervisor.Object, orchestrator: orchestrator, sessions: sessions, connectionId: "conn-1");
 
         await hub.Steer(AgentId.From("agent-a"), SessionId.From("idle-sess"), "nudge", "conv-1");
 
-        // The steer is NOT injected into the idle handle.
-        idleHandle.Verify(h => h.SteerAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        // And the message is NOT persisted into the (would-be phantom) session.
+        orchestrator.Captured.ShouldHaveSingleItem().RoutingHints!.DeliveryMode.ShouldBe(InboundDeliveryMode.Steer);
+        supervisor.VerifyNoOtherCalls();
         var persisted = await sessions.GetAsync(SessionId.From("idle-sess"), CancellationToken.None);
-        (persisted is null || persisted.Session.History.Count == 0).ShouldBeTrue(
-            "A steer against an idle agent must not be persisted into session history.");
+        (persisted is null || persisted.Session.History.Count == 0).ShouldBeTrue();
     }
 
     [Fact]
-    public async Task GatewayHub_Steer_WhenAgentNotRunning_PublishesErrorActivity()
+    public async Task GatewayHub_Steer_WhenAdmissionIsRefused_ThrowsVisibleHubError()
     {
-        // The user must get a clear signal instead of the steer silently vanishing.
-        var idleHandle = new Mock<IAgentHandle>();
-        idleHandle.SetupGet(h => h.IsRunning).Returns(false);
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns(idleHandle.Object);
-        supervisor.Setup(s => s.GetOrCreateAsync(It.IsAny<AgentId>(), It.IsAny<SessionId>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(idleHandle.Object);
-        var activity = new Mock<IActivityBroadcaster>();
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Busy };
+        var conversations = await CreateUserFacingStoreAsync("conv-1");
+        var hub = CreateHub(conversationStore: conversations, orchestrator: orchestrator, connectionId: "conn-1");
 
-        var hub = CreateHub(supervisor: supervisor.Object, activity: activity.Object, connectionId: "conn-1");
+        Func<Task> act = () => hub.Steer(AgentId.From("agent-a"), SessionId.From("idle-sess"), "nudge", "conv-1");
 
-        await hub.Steer(AgentId.From("agent-a"), SessionId.From("idle-sess"), "nudge", "conv-1");
-
-        activity.Verify(a => a.PublishAsync(
-            It.Is<GatewayActivity>(ga => ga.Type == GatewayActivityType.Error && ga.ConversationId == "conv-1"),
-            It.IsAny<CancellationToken>()), Times.Once);
-        // SteeringInjected must NOT be published.
-        activity.Verify(a => a.PublishAsync(
-            It.Is<GatewayActivity>(ga => ga.Type == GatewayActivityType.SteeringInjected),
-            It.IsAny<CancellationToken>()), Times.Never);
+        (await act.ShouldThrowAsync<HubException>()).Message.ShouldContain("Busy");
     }
 
     [Fact]
-    public async Task GatewayHub_Steer_SharedDispatchPath_PublishesActivityWithNormalizedIds()
+    public async Task GatewayHub_Steer_SharedDispatchPath_UsesNormalizedAddressedIds()
     {
-        // Structural guard (#1625): every control method routes its ids through the single
-        // ResolveCallContext normalize step and publishes via the shared PublishActivityAsync
-        // envelope path. A padded agent id must surface trimmed on the published activity, and
-        // the centralized envelope must still carry the conversation id the caller supplied.
-        var idleHandle = new Mock<IAgentHandle>();
-        idleHandle.SetupGet(h => h.IsRunning).Returns(false);
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns(idleHandle.Object);
-        supervisor.Setup(s => s.GetOrCreateAsync(It.IsAny<AgentId>(), It.IsAny<SessionId>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(idleHandle.Object);
-        var activity = new Mock<IActivityBroadcaster>();
-
-        var hub = CreateHub(supervisor: supervisor.Object, activity: activity.Object, connectionId: "conn-1");
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Steered };
+        var conversations = await CreateUserFacingStoreAsync("conv-shared");
+        var hub = CreateHub(conversationStore: conversations, orchestrator: orchestrator, connectionId: "conn-1");
 
         await hub.Steer(AgentId.From("  agent-a  "), SessionId.From("sess-shared"), "nudge", "conv-shared");
 
-        activity.Verify(a => a.PublishAsync(
-            It.Is<GatewayActivity>(ga =>
-                ga.Type == GatewayActivityType.Error &&
-                ga.AgentId == "agent-a" &&
-                ga.SessionId == "sess-shared" &&
-                ga.ConversationId == "conv-shared"),
-            It.IsAny<CancellationToken>()), Times.Once);
+        var hints = orchestrator.Captured.ShouldHaveSingleItem().RoutingHints.ShouldNotBeNull();
+        hints.RequestedAgentId.ShouldBe(AgentId.From("agent-a"));
+        hints.RequestedSessionId.ShouldBe(SessionId.From("sess-shared"));
+        hints.RequestedConversationId.ShouldBe(ConversationId.From("conv-shared"));
     }
 
     [Fact]
@@ -672,7 +1093,8 @@ public sealed class SignalRHubTests
 
         var supervisor = new Mock<IAgentSupervisor>(MockBehavior.Strict);
 
-        var hub = CreateHub(clients: clients.Object, sessions: sessions.Object, supervisor: supervisor.Object, resetService: resetService.Object);
+        var conversations = await CreateUserFacingStoreAsync("conv-1");
+        var hub = CreateHub(conversationStore: conversations, clients: clients.Object, sessions: sessions.Object, supervisor: supervisor.Object, resetService: resetService.Object);
 
         await hub.ResetSession(agentId, sessionId);
 
@@ -781,32 +1203,24 @@ public sealed class SignalRHubTests
     }
 
     [Fact]
-    public async Task InterruptAndSteer_WhenHandleExists_CallsInterruptAndSteerAsyncAndReturnsTrue()
+    public async Task InterruptAndSteer_WhenOrchestratorSteers_ReturnsTrue()
     {
-        var handle = new Mock<IAgentHandle>();
-        handle.Setup(h => h.InterruptAndSteerAsync("new direction", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(AgentId.From("agent-a"), SessionId.From("session-1")))
-            .Returns(handle.Object);
-
-        var hub = CreateHub(supervisor: supervisor.Object);
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Steered };
+        var hub = CreateHub(orchestrator: orchestrator);
 
         var result = await hub.InterruptAndSteer(AgentId.From("agent-a"), SessionId.From("session-1"), "new direction");
 
         result.ShouldBeTrue();
-        handle.Verify(h => h.InterruptAndSteerAsync("new direction", It.IsAny<CancellationToken>()), Times.Once);
+        var inbound = orchestrator.Captured.ShouldHaveSingleItem();
+        inbound.Content.ShouldBe("new direction");
+        inbound.RoutingHints!.DeliveryMode.ShouldBe(InboundDeliveryMode.Interrupt);
     }
 
     [Fact]
-    public async Task InterruptAndSteer_WhenNoHandleExists_ReturnsFalseWithoutThrow()
+    public async Task InterruptAndSteer_WhenAdmissionIsRefused_ReturnsFalseWithoutThrow()
     {
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns((IAgentHandle?)null);
-
-        var hub = CreateHub(supervisor: supervisor.Object);
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Busy };
+        var hub = CreateHub(orchestrator: orchestrator);
 
         var result = await hub.InterruptAndSteer(AgentId.From("agent-a"), SessionId.From("missing"), "steer me");
 
@@ -1064,6 +1478,18 @@ public sealed class SignalRHubTests
         dispatched.Metadata["messageType"].ShouldBe("message-with-media");
     }
 
+    internal static async Task<IConversationStore> CreateUserFacingStoreAsync(string conversationId, string agentId = "agent-a")
+    {
+        var store = new InMemoryConversationStore();
+        await store.CreateAsync(new Conversation
+        {
+            ConversationId = ConversationId.From(conversationId),
+            AgentId = AgentId.From(agentId),
+            Visibility = ConversationVisibility.UserFacing
+        });
+        return store;
+    }
+
     internal static GatewayHub CreateHubForTest(
         IInboundMessageOrchestrator? orchestrator = null,
         ISessionStore? sessions = null,
@@ -1102,7 +1528,13 @@ public sealed class SignalRHubTests
             logger: logger);
     }
 
-    private static GatewayHub CreateHub(
+    /// <summary>
+    /// Shared hub composition root for the test assembly. Exposed (was private) so
+    /// follow-up queueing tests in <see cref="GatewayHubFollowUpQueueTests"/> compose a hub the
+    /// same way rather than forking a second, drifting builder. Visibility change only - no
+    /// behaviour or assertion in this file is affected.
+    /// </summary>
+    internal static GatewayHub CreateHub(
         IHubCallerClients<IGatewayHubClient>? clients = null,
         IGroupManager? groups = null,
         ISessionStore? sessions = null,
@@ -1110,19 +1542,22 @@ public sealed class SignalRHubTests
         IActivityBroadcaster? activity = null,
         IAgentRegistry? registry = null,
         IAgentSupervisor? supervisor = null,
+        IActiveLoopTracker? activeLoopTracker = null,
         ISessionCompactor? compactor = null,
         ISessionWarmupService? warmup = null,
         IOptionsMonitor<CompactionOptions>? compactionOptions = null,
         IConversationDispatcher? conversationDispatcher = null,
         IConversationStore? conversationStore = null,
-        IAskUserResponseRegistry? askUserResponseRegistry = null,
+        IAskUserPromptResolver? askUserPromptResolver = null,
+        IAskUserCheckpointService? askUserCheckpointService = null,
         IConversationResetService? resetService = null,
         string connectionId = "conn-test",
         string? userIdentifier = "user",
         string? clientQueryValue = null,
         string? clientVersionQueryValue = null,
         ILogger<GatewayHub>? logger = null,
-        string[]? userScopes = null)
+        string[]? userScopes = null,
+        bool omitConversationStore = false)
     {
         var sessionStore = sessions ?? new InMemorySessionStore();
         var convStore = conversationStore ?? new InMemoryConversationStore();
@@ -1139,7 +1574,8 @@ public sealed class SignalRHubTests
             compactorImpl,
             sessionStore,
             supervisorImpl,
-            Mock.Of<IChannelManager>(),
+            eventPublisher: null,
+            conversations: convStore,
             optionsImpl,
             NullLogger<SessionCompactionCoordinator>.Instance);
 
@@ -1161,8 +1597,10 @@ public sealed class SignalRHubTests
             router,
             app,
             logger ?? NullLogger<GatewayHub>.Instance,
-            convStore,
-            askUserResponseRegistry)
+            omitConversationStore ? null : convStore,
+            askUserPromptResolver,
+            askUserCheckpointService,
+            activeLoopTracker: activeLoopTracker)
         {
             Clients = clients ?? Mock.Of<IHubCallerClients<IGatewayHubClient>>(),
             Groups = groups ?? Mock.Of<IGroupManager>(),
@@ -1301,17 +1739,18 @@ public sealed class SignalRHubTests
     }
 
     [Fact]
-    public async Task GatewayHub_SendMessage_NullUserIdentifier_FallsBackToConnectionId()
+    public async Task GatewayHub_SendMessage_NullUserIdentifier_FallsBackToConnectionIdForLegacyHubContexts()
     {
         var orchestrator = new CapturingInboundMessageOrchestrator();
 
-        // Simulate edge case where UserIdentifier is null (transition period)
+        // Legacy/test hub contexts can still bypass IUserIdProvider. Production unauthenticated
+        // connections receive the server-owned local-owner identity from ClaimsUserIdProvider.
         var hub = CreateHub(orchestrator: orchestrator, connectionId: "conn-fallback", userIdentifier: null);
 
         await hub.SendMessage(AgentId.From("agent-a"), ChannelKey.From("signalr"), "hello");
 
         var dispatched = orchestrator.Captured.ShouldHaveSingleItem();
-        // Falls back to connectionId when no UserIdentifier is available
+        // The compatibility fallback is confined to a hub context with no resolved identifier.
         dispatched.Sender.Value.ShouldBe("conn-fallback");
         dispatched.SenderId.ShouldBe("conn-fallback");
     }
@@ -1338,19 +1777,13 @@ public sealed class SignalRHubTests
     [Fact]
     public async Task Steer_ControlScopedConnection_IsAllowed()
     {
-        // Happy path: a control-scoped connection passes the guard and reaches the handle.
-        var handle = new Mock<IAgentHandle>();
-        handle.SetupGet(h => h.IsRunning).Returns(true);
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns(handle.Object);
-
-        var hub = CreateHub(supervisor: supervisor.Object, connectionId: "conn-1", userScopes: [ControlScope]);
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Steered };
+        var hub = CreateHub(orchestrator: orchestrator, connectionId: "conn-1", userScopes: [ControlScope]);
 
         var result = await hub.Steer(AgentId.From("agent-a"), SessionId.From("sess-1"), "nudge", null);
 
         result.SessionId.ShouldBe("sess-1");
-        handle.Verify(h => h.SteerAsync("nudge", It.IsAny<CancellationToken>()), Times.Once);
+        orchestrator.Captured.ShouldHaveSingleItem();
     }
 
     [Fact]
@@ -1425,21 +1858,13 @@ public sealed class SignalRHubTests
     [Fact]
     public async Task Steer_NoScopeClaims_LegacyFullTrust_IsAllowed()
     {
-        // Back-compat: a connection with NO recognised scope claim is treated as full-trust
-        // (existing authenticated clients that are not yet scope-tagged keep working).
-        var handle = new Mock<IAgentHandle>();
-        handle.SetupGet(h => h.IsRunning).Returns(true);
-        var supervisor = new Mock<IAgentSupervisor>();
-        supervisor.Setup(s => s.GetHandle(It.IsAny<AgentId>(), It.IsAny<SessionId>()))
-            .Returns(handle.Object);
-
-        // userScopes: null -> no scope claim on the principal.
-        var hub = CreateHub(supervisor: supervisor.Object, connectionId: "conn-1");
+        var orchestrator = new CapturingInboundMessageOrchestrator { AdmissionStatus = InboundDispatchStatus.Steered };
+        var hub = CreateHub(orchestrator: orchestrator, connectionId: "conn-1");
 
         var result = await hub.Steer(AgentId.From("agent-a"), SessionId.From("sess-1"), "nudge", null);
 
         result.SessionId.ShouldBe("sess-1");
-        handle.Verify(h => h.SteerAsync("nudge", It.IsAny<CancellationToken>()), Times.Once);
+        orchestrator.Captured.ShouldHaveSingleItem();
     }
 
     [Fact]

@@ -50,11 +50,11 @@ public static class ServiceCollectionExtensions
         var fileSystem = new FileSystem();
         var loader = new AssemblyLoadContextExtensionLoader(services, hookDispatcher, logger, fileSystem);
 
-        var extensionsConfig = platformConfig.Gateway?.Extensions;
+        var extensionsConfig = platformConfig.Gateway?.ExtensionLoader;
         if (extensionsConfig?.Enabled is false)
             return [];
 
-        var extensionsPath = ResolveExtensionsPath(platformConfig, extensionsConfig, fileSystem);
+        var extensionsPath = ResolveExtensionsPath(extensionsConfig, fileSystem);
         var allDiscovered = await loader.DiscoverAsync(extensionsPath, ct);
 
         // Deduplicate by extension ID — if multiple directories contain the same ID,
@@ -111,14 +111,85 @@ public static class ServiceCollectionExtensions
             results.Add(result);
         }
 
+        // All extensions are registered now, so the full service graph is present. Remove any
+        // extension service the host container cannot activate before it is resolved as part of a
+        // startup set (IEnumerable<IAgentTool>, IEnumerable<IAgentToolContributor>, hosted services,
+        // etc.). Without this a single un-activatable extension implementation aborts host startup
+        // (issue #2220): the CLI then shows only a generic health-check timeout. The loader logs a
+        // warning per pruned service.
+        loader.PruneUnconstructableExtensionServices();
+
+        LogConfigurationScopeDiagnostics(platformConfig, loader.GetLoaded(), deduplicationLogger);
+
         services.Replace(ServiceDescriptor.Singleton<IExtensionLoader>(loader));
         return results;
     }
 
-    private static string ResolveExtensionsPath(PlatformConfig config, ExtensionsConfig? extensionConfig, IFileSystem fileSystem)
+    internal static void LogConfigurationScopeDiagnostics(
+        PlatformConfig platformConfig,
+        IReadOnlyList<LoadedExtension> loadedExtensions,
+        ILogger? logger)
     {
+        ArgumentNullException.ThrowIfNull(platformConfig);
+        ArgumentNullException.ThrowIfNull(loadedExtensions);
+
+        try
+        {
+            var document = System.Text.Json.JsonSerializer.SerializeToNode(
+                platformConfig,
+                new System.Text.Json.JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+                })?.AsObject() ?? new System.Text.Json.Nodes.JsonObject();
+            if (platformConfig.AgentDefaults?.Extensions is { Count: > 0 } defaultExtensions)
+            {
+                var agents = document["agents"] as System.Text.Json.Nodes.JsonObject
+                    ?? new System.Text.Json.Nodes.JsonObject();
+                document["agents"] = agents;
+                agents["defaults"] = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["extensions"] = System.Text.Json.JsonSerializer.SerializeToNode(defaultExtensions)
+                };
+            }
+
+            foreach (var violation in ExtensionConfigurationScopeValidator.FindViolations(document, loadedExtensions))
+            {
+                logger?.LogWarning(
+                    "Extension configuration placement is invalid at '{ConfigurationPath}' for extension '{ExtensionId}': {Reason}",
+                    violation.Path,
+                    violation.ExtensionId,
+                    violation.Reason);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(
+                ex,
+                "Skipping extension configuration placement diagnostics because the current configuration snapshot could not be inspected.");
+        }
+    }
+
+    /// <summary>
+    /// Environment variable overriding the extension probe root when config.json does not set one.
+    /// </summary>
+    /// <remarks>
+    /// Issue #2376: the container image bakes its extensions at <c>/app/extensions</c> because
+    /// <c>BOTNEXUS_HOME</c> (<c>/app/config</c>) is a declared <c>VOLUME</c> — anything written there
+    /// at build time is shadowed by the caller's mount on a stock <c>docker run</c>, so the default
+    /// <c>{home}/extensions</c> probe path resolved to an empty directory and the image shipped with
+    /// no SignalR hub, no portal, and an empty <c>/api/extensions</c>.
+    /// </remarks>
+    public const string ExtensionsPathEnvVar = "BOTNEXUS_EXTENSIONS_PATH";
+
+    internal static string ResolveExtensionsPath(ExtensionLoaderConfig? extensionConfig, IFileSystem fileSystem)
+    {
+        // Explicit configuration always wins.
         if (!string.IsNullOrWhiteSpace(extensionConfig?.Path))
             return Path.GetFullPath(extensionConfig.Path);
+
+        var environmentOverride = Environment.GetEnvironmentVariable(ExtensionsPathEnvVar);
+        if (!string.IsNullOrWhiteSpace(environmentOverride))
+            return Path.GetFullPath(environmentOverride);
 
         return Path.Combine(new BotNexusHome(fileSystem).RootPath, "extensions");
     }
