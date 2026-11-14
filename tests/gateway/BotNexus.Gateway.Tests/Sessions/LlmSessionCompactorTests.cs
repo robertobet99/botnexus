@@ -27,6 +27,87 @@ public sealed class LlmSessionCompactorTests
         MaxTokens: 4096);
 
     [Fact]
+    public void Ceiling_ThresholdBoundariesCapacityAndUnknownUsage()
+    {
+        var compactor = CreateCompactor("summary");
+        foreach (var window in new[] { 100, 1_000_000 })
+        {
+            var baseline = new CompactionOptions { ContextWindowTokens = window, TokenThresholdRatio = 0.6, LargestEntryBytesThreshold = 0 };
+            foreach (var ceiling in new int?[] { null, 30, 60, 600_000, 900_000 })
+            {
+                var options = baseline with { CompactionTokenCeiling = ceiling };
+                var threshold = Math.Min((int)Math.Floor(window * 0.6), ceiling ?? int.MaxValue);
+                CompactionThreshold.Resolve(options).ShouldBe(threshold);
+                options.ContextWindowTokens.ShouldBe(window);
+                foreach (var tokens in new[] { threshold - 1, threshold, threshold + 1 })
+                {
+                    var local = CreateSession(("user", new string('a', tokens * 4)));
+                    compactor.ShouldCompact(local.Session, options).ShouldBe(tokens > threshold);
+                    local.Metadata.ShouldNotContainKey(LlmSessionCompactor.ProviderPromptTokensMetadataKey);
+                    var provider = CreateSession(("user", "tiny"));
+                    provider.Metadata[LlmSessionCompactor.ProviderPromptTokensMetadataKey] = tokens;
+                    compactor.ShouldCompact(provider.Session, options).ShouldBe(tokens > threshold);
+                }
+            }
+        }
+        CompactionThreshold.Resolve(new CompactionOptions { ContextWindowTokens = 101, TokenThresholdRatio = 0.5 }).ShouldBe(50);
+        Should.Throw<InvalidOperationException>(() => CompactionThreshold.Resolve(new CompactionOptions { CompactionTokenCeiling = 0 }));
+    }
+
+    [Fact]
+    public async Task Ceiling_LargerConversationOverrideWinsButCannotExceedModelSafety()
+    {
+        var agentId = AgentId.From("ceiling-specific");
+        var conversationId = ConversationId.From("ceiling-specific-conversation");
+        var store = new BotNexus.Gateway.Conversations.InMemoryConversationStore();
+        await store.CreateAsync(new Conversation { AgentId = agentId, ConversationId = conversationId, WorldId = "ceiling-world", CompactionTokenCeiling = 200 });
+        var registry = new Mock<BotNexus.Gateway.Abstractions.Agents.IAgentRegistry>();
+        registry.Setup(value => value.Get(agentId)).Returns(new AgentDescriptor { AgentId = agentId, DisplayName = "A", ModelId = "m", ApiProvider = "p", CompactionTokenCeiling = 100 });
+        var config = new BotNexus.Gateway.Configuration.PlatformConfig
+        {
+            Gateway = new BotNexus.Gateway.Configuration.GatewaySettingsConfig { World = new BotNexus.Domain.WorldIdentity { Id = "ceiling-world", Name = "World" } },
+            World = new BotNexus.Gateway.Configuration.WorldSettingsConfig { CompactionTokenCeiling = 50 }
+        };
+        var resolver = new SessionCompactionCeilingResolver(NullLogger<SessionCompactionCeilingResolver>.Instance, registry.Object, store, new TestOptionsMonitor<BotNexus.Gateway.Configuration.PlatformConfig>(config));
+        var resolved = await resolver.ResolveAsync(agentId, conversationId);
+        resolved.Tokens.ShouldBe(200);
+        resolved.Source.ShouldBe("conversation");
+        var session = CreateSession(("user", new string('a', 600)));
+        var options = new CompactionOptions { ContextWindowTokens = 1000, TokenThresholdRatio = 0.6, CompactionTokenCeiling = resolved.Tokens, LargestEntryBytesThreshold = 0 };
+        CreateCompactor("summary").ShouldCompact(session.Session, options).ShouldBeFalse();
+        CompactionThreshold.Resolve(options).ShouldBe(200);
+        CompactionThreshold.Resolve(options with { ContextWindowTokens = 100 }).ShouldBe(60);
+        CreateCompactor("summary").ShouldCompact(session.Session, options with { ContextWindowTokens = 100 }).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task Ceiling_LowTurnHighVolumeCutPlanMatchesEquivalentWindow()
+    {
+        foreach (var providerCount in new int?[] { null, 500 })
+        {
+            var bounded = CreateSession(("user", "u1"), ("tool", new string('a', providerCount is null ? 4000 : 40)));
+            var equivalent = CreateSession(("user", "u1"), ("tool", new string('a', providerCount is null ? 4000 : 40)));
+            if (providerCount is int count)
+            {
+                bounded.Metadata[LlmSessionCompactor.ProviderPromptTokensMetadataKey] = count;
+                equivalent.Metadata[LlmSessionCompactor.ProviderPromptTokensMetadataKey] = count;
+            }
+            var options = new CompactionOptions { ContextWindowTokens = 1_000_000, CompactionTokenCeiling = 50, TokenThresholdRatio = 0.5, PreservedTurns = 3, LargestEntryBytesThreshold = 0, SummarizationModel = TestModel.Id };
+            var compactor = CreateCompactor("short summary");
+            compactor.ShouldCompact(bounded.Session, options).ShouldBeTrue();
+            var result = await compactor.CompactAsync(bounded, options);
+            var expected = await CreateCompactor("short summary").CompactAsync(equivalent, options with { ContextWindowTokens = 100, CompactionTokenCeiling = null });
+            result.Succeeded.ShouldBeTrue();
+            result.EntriesSummarized.ShouldBeGreaterThan(0);
+            result.EntriesSummarized.ShouldBe(expected.EntriesSummarized);
+            result.EntriesPreserved.ShouldBe(expected.EntriesPreserved);
+            result.CompactedHistory.ShouldNotBeNull();
+            expected.CompactedHistory.ShouldNotBeNull();
+            result.CompactedHistory.Select(entry => entry.Content).ShouldBe(expected.CompactedHistory.Select(entry => entry.Content));
+        }
+    }
+
+    [Fact]
     public void ShouldCompact_BelowThreshold_ReturnsFalse()
     {
         var session = CreateSession(("user", new string('a', 100)));
@@ -182,6 +263,38 @@ public sealed class LlmSessionCompactorTests
         });
 
         result.Succeeded.ShouldBeTrue("a session above the compaction threshold must not no-op");
+        result.CompactedHistory.ShouldNotBeNull();
+        result.EntriesSummarized.ShouldBeGreaterThan(0);
+        result.TokensAfter.ShouldBeLessThan(result.TokensBefore);
+    }
+
+    [Fact]
+    public async Task CompactAsync_SingleUserTurnHugeTailAboveThreshold_SummarizesInsteadOfLoopingForever()
+    {
+        // #3707: the degenerate case the #1574 fallback cannot reach. With exactly ONE user entry at
+        // index 0, SplitHistory finds splitIndex = 0 for every preservedTurns >= 1, so toSummarize is
+        // always empty. The fallback loop counted down to 1 and stopped, never trying the
+        // preservedTurns <= 0 path that SplitHistory already handles correctly (whole history is
+        // summarizable). The session therefore stayed permanently above threshold, shed nothing, and
+        // tripped the circuit breaker (observed live: 554,888 visible tokens vs a 120,000 threshold,
+        // 1,457 entries preserved, zero shed).
+        var hugeTail = new string('a', 4_000); // ~1000 tokens (chars/4), far above the 50-token threshold
+        var session = CreateSession(
+            ("user", "the only user message"),
+            ("assistant", hugeTail),
+            ("tool", hugeTail));
+        var compactor = CreateCompactor("summary of the whole degenerate session");
+
+        var result = await compactor.CompactAsync(session, new CompactionOptions
+        {
+            PreservedTurns = 1,                 // the value the old fallback loop floored at
+            ContextWindowTokens = 100,
+            TokenThresholdRatio = 0.5,          // threshold = 50 tokens; visible tail ~2000 >> 50
+            SummarizationModel = TestModel.Id
+        });
+
+        result.Succeeded.ShouldBeTrue(
+            "a single-user-turn session above the compaction threshold must shed context, not loop");
         result.CompactedHistory.ShouldNotBeNull();
         result.EntriesSummarized.ShouldBeGreaterThan(0);
         result.TokensAfter.ShouldBeLessThan(result.TokensBefore);
@@ -770,6 +883,227 @@ public sealed class LlmSessionCompactorTests
 
         compactor.ShouldCompact(session.Session, options).ShouldBeTrue(
             "a multibyte entry under the char threshold but over the byte threshold must trigger");
+    }
+
+    // ─── Issue #3681: byte-triggered compaction must not re-fire forever ────────────
+
+    /// <summary>
+    /// #3681 regression (fails against main): the oversized entry sits inside the tail that
+    /// <c>SplitHistory</c> always preserves, so a byte-triggered compaction SUCCEEDS - it sheds the
+    /// older entries, resets the circuit breaker - and leaves the oversized entry visible and still
+    /// the maximum. On main <c>ShouldCompact</c> therefore returns true again immediately, forever,
+    /// with the transcript growing each cycle; neither the breaker nor the #2460 no-split guard can
+    /// bound it because the cut was a success.
+    /// </summary>
+    [Fact]
+    public async Task ShouldCompact_AfterIneffectiveByteCompaction_DoesNotReFireOnBytes()
+    {
+        var oversized = new string('x', 70 * 1024);
+        var session = CreateSession(
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("tool", oversized));   // newer than the preserved boundary => always survives the cut
+        var compactor = CreateCompactor("summary");
+        var options = new CompactionOptions
+        {
+            PreservedTurns = 1,
+            ContextWindowTokens = 1_000_000,
+            TokenThresholdRatio = 0.5,
+            LargestEntryBytesThreshold = 64 * 1024,
+            SummarizationModel = TestModel.Id
+        };
+
+        compactor.ShouldCompact(session.Session, options).ShouldBeTrue(
+            "the oversized entry must trip the #1599 bloat trigger the first time");
+
+        var result = await compactor.CompactAsync(session, options);
+        result.Succeeded.ShouldBeTrue("this is the success path, not an aborted no-split cut");
+        session.ReplaceHistory(result.CompactedHistory!);
+
+        // The cut really did happen and really did NOT shed the oversized entry.
+        session.GetHistorySnapshot()
+            .Where(SessionContextProjector.IsVisibleInLiveContext)
+            .ShouldContain(e => e.Content == oversized);
+
+        compactor.ShouldCompact(session.Session, options).ShouldBeFalse(
+            "a successful compaction that left the largest visible entry unchanged must not re-fire " +
+            "the byte trigger on that same unchanged entry");
+    }
+
+    /// <summary>
+    /// #3681 AC2: the suppression is scoped to the BYTE signal only. Normal token pressure must still
+    /// trigger compaction on a session whose byte trigger has been suppressed.
+    /// </summary>
+    [Fact]
+    public async Task ShouldCompact_AfterIneffectiveByteCompaction_TokenPressureStillTriggers()
+    {
+        var session = CreateSession(
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("tool", new string('x', 70 * 1024)));
+        var compactor = CreateCompactor("summary");
+        var byteOnlyOptions = new CompactionOptions
+        {
+            PreservedTurns = 1,
+            ContextWindowTokens = 1_000_000,
+            TokenThresholdRatio = 0.5,
+            LargestEntryBytesThreshold = 64 * 1024,
+            SummarizationModel = TestModel.Id
+        };
+
+        var result = await compactor.CompactAsync(session, byteOnlyOptions);
+        result.Succeeded.ShouldBeTrue();
+        session.ReplaceHistory(result.CompactedHistory!);
+        compactor.ShouldCompact(session.Session, byteOnlyOptions).ShouldBeFalse();
+
+        // Same session, same suppressed byte signature - but now genuinely over the token budget.
+        var tokenPressureOptions = byteOnlyOptions with
+        {
+            ContextWindowTokens = 1_000,
+            TokenThresholdRatio = 0.5
+        };
+
+        compactor.ShouldCompact(session.Session, tokenPressureOptions).ShouldBeTrue(
+            "suppressing the byte signal must not suppress token-count pressure");
+    }
+
+    /// <summary>
+    /// #3681 AC3: the suppression fingerprints the oversized population, so it does not survive a
+    /// change to it. A NEW entry above the threshold must re-arm the byte trigger.
+    /// </summary>
+    [Fact]
+    public async Task ShouldCompact_NewOversizedEntryAfterSuppression_TriggersAgain()
+    {
+        var session = CreateSession(
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("tool", new string('x', 70 * 1024)));
+        var compactor = CreateCompactor("summary");
+        var options = new CompactionOptions
+        {
+            PreservedTurns = 1,
+            ContextWindowTokens = 1_000_000,
+            TokenThresholdRatio = 0.5,
+            LargestEntryBytesThreshold = 64 * 1024,
+            SummarizationModel = TestModel.Id
+        };
+
+        var result = await compactor.CompactAsync(session, options);
+        result.Succeeded.ShouldBeTrue();
+        session.ReplaceHistory(result.CompactedHistory!);
+        compactor.ShouldCompact(session.Session, options).ShouldBeFalse();
+
+        session.AddEntry(new SessionEntry
+        {
+            Role = MessageRole.Tool,
+            Content = new string('y', 80 * 1024)   // a DIFFERENT oversized entry
+        });
+
+        compactor.ShouldCompact(session.Session, options).ShouldBeTrue(
+            "a new entry above the byte threshold must re-arm the trigger despite the suppression");
+    }
+
+    /// <summary>
+    /// #3681 AC3 (second clause): when the recorded oversized entry becomes historical it is no longer
+    /// LLM-visible, the fingerprint changes, and the stale suppression must not linger to mask a
+    /// genuinely oversized successor that IS shrinkable.
+    /// </summary>
+    [Fact]
+    public async Task ShouldCompact_SuppressedEntryGoesHistorical_ReArmsTrigger()
+    {
+        var oversized = new string('x', 70 * 1024);
+        var session = CreateSession(
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+            ("tool", oversized));
+        var compactor = CreateCompactor("summary");
+        var options = new CompactionOptions
+        {
+            PreservedTurns = 1,
+            ContextWindowTokens = 1_000_000,
+            TokenThresholdRatio = 0.5,
+            LargestEntryBytesThreshold = 64 * 1024,
+            SummarizationModel = TestModel.Id
+        };
+
+        var result = await compactor.CompactAsync(session, options);
+        result.Succeeded.ShouldBeTrue();
+        session.ReplaceHistory(result.CompactedHistory!);
+        compactor.ShouldCompact(session.Session, options).ShouldBeFalse();
+
+        // Fold the oversized entry away, and add a fresh oversized one in its place.
+        var folded = session.GetHistorySnapshot()
+            .Select(e => e.Content == oversized ? e with { IsHistory = true } : e)
+            .ToList();
+        folded.Add(new SessionEntry { Role = MessageRole.Tool, Content = new string('z', 70 * 1024) });
+        session.ReplaceHistory(folded);
+
+        compactor.ShouldCompact(session.Session, options).ShouldBeTrue(
+            "once the recorded oversized entry is no longer visible the suppression must not apply");
+    }
+
+    /// <summary>
+    /// #3681 AC4: a lifecycle reset produces a session with fresh metadata, so no suppression state
+    /// carries across. An oversized entry on a brand-new session always triggers.
+    /// </summary>
+    [Fact]
+    public void ShouldCompact_LifecycleReset_ClearsSuppressionState()
+    {
+        var session = CreateSession(
+            ("user", "tiny"),
+            ("tool", new string('x', 70 * 1024)),
+            ("user", "latest"));
+        var compactor = CreateCompactor("summary");
+        var options = new CompactionOptions
+        {
+            ContextWindowTokens = 1_000_000,
+            TokenThresholdRatio = 0.5,
+            LargestEntryBytesThreshold = 64 * 1024
+        };
+
+        session.Session.Metadata.ShouldNotContainKey(
+            LlmSessionCompactor.IneffectiveByteCompactionMetadataKey,
+            "a freshly reset session carries no compaction suppression state");
+        compactor.ShouldCompact(session.Session, options).ShouldBeTrue();
+    }
+
+    /// <summary>
+    /// #3681 AC6: an EFFECTIVE byte compaction - one that does shed the oversized entry - must record
+    /// no suppression at all, so the byte trigger stays fully armed for whatever comes next.
+    /// </summary>
+    [Fact]
+    public async Task CompactAsync_EffectiveByteCompaction_RecordsNoSuppression()
+    {
+        // PreservedTurns = 1 splits at "u2", so the oversized tool result (older than that boundary)
+        // is summarised away and the byte signal genuinely clears.
+        var session = CreateSession(
+            ("user", "u1"),
+            ("tool", new string('x', 70 * 1024)),
+            ("user", "u2"),
+            ("assistant", "a2"));
+        var compactor = CreateCompactor("summary");
+        var options = new CompactionOptions
+        {
+            PreservedTurns = 1,
+            ContextWindowTokens = 1_000_000,
+            TokenThresholdRatio = 0.5,
+            LargestEntryBytesThreshold = 64 * 1024,
+            SummarizationModel = TestModel.Id
+        };
+
+        var result = await compactor.CompactAsync(session, options);
+        result.Succeeded.ShouldBeTrue();
+        session.ReplaceHistory(result.CompactedHistory!);
+
+        session.Session.Metadata.ShouldNotContainKey(
+            LlmSessionCompactor.IneffectiveByteCompactionMetadataKey,
+            "a compaction that actually shed the oversized entry must record no suppression");
+        compactor.ShouldCompact(session.Session, options).ShouldBeFalse(
+            "the oversized entry is now historical, so the byte trigger is legitimately quiet");
     }
 
     // ─── Issue #665: Session compactor continuity audit ──────────────────────

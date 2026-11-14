@@ -1,3 +1,4 @@
+using BotNexus.Domain.Text;
 using System.Text;
 using BotNexus.Domain.Primitives;
 using BotNexus.Gateway.Abstractions.Models;
@@ -74,7 +75,7 @@ public static class SessionTranscriptRenderer
             }
             else if (entry.Role == MessageRole.Tool)
             {
-                if (!string.IsNullOrEmpty(entry.ToolName) && !string.IsNullOrEmpty(entry.ToolArgs))
+                if (entry.IsToolStartRow() && !string.IsNullOrEmpty(entry.ToolName) && !string.IsNullOrEmpty(entry.ToolArgs))
                 {
                     sb.AppendLine($"### 🔧 Tool Call: `{entry.ToolName}` [{timestamp}]");
                     sb.AppendLine();
@@ -116,5 +117,5 @@ public static class SessionTranscriptRenderer
         => redactSecrets ? TranscriptSecretRedactor.Redact(value) ?? value : value;
 
     private static string Truncate(string value, int maxLength)
-        => value.Length > maxLength ? value[..maxLength] + "\n... (truncated)" : value;
+        => TextTruncation.SafeTruncate(value, maxLength, "\n... (truncated)")!;
 }

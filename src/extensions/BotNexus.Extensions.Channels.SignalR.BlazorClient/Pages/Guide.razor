@@ -1,0 +1,344 @@
+@page "/guide"
+@page "/guide/{SectionId}"
+@using System.Net.Http.Json
+@using System.Text.Json.Serialization
+@inject HttpClient Http
+@inject IJSRuntime JS
+@inject NavigationManager Nav
+@implements IDisposable
+
+<PageTitle>BotNexus &mdash; Guide</PageTitle>
+
+<div class="platform-config-page">
+    <header class="platform-config-toolbar">
+        <h2 class="page-heading"><Icon Name="guide" Size="24" /><span>Guide</span></h2>
+        <input class="guide-search t-body"
+               type="search"
+               placeholder="Search the guide…"
+               aria-label="Search the guide"
+               data-testid="guide-search"
+               value="@_query"
+               @oninput="OnSearchInput" />
+    </header>
+
+    <div class="config-page">
+        <div class="guide-layout">
+            <nav class="guide-nav" aria-label="Guide contents">
+                @if (_index is null)
+                {
+                    <div class="workspace-state t-caption">Loading contents…</div>
+                }
+                else if (Matches.Count == 0)
+                {
+                    <div class="workspace-state t-caption">
+                        Nothing matches “@_query”.
+                        @if (_indexingTask is { IsCompleted: false })
+                        {
+                            <span> Still indexing page contents…</span>
+                        }
+                        else if (!_fullTextLoaded)
+                        {
+                            <span> Search again to retry missing page contents.</span>
+                        }
+                    </div>
+                }
+                else
+                {
+                    @foreach (var s in Matches)
+                    {
+                        <button class="guide-nav-item @(s.Id == _currentId ? "active" : "")"
+                                data-testid="guide-nav-@s.Id"
+                                title="@s.Blurb"
+                                @onclick="() => SelectFromContentsAsync(s.Id)">
+                            <span class="guide-nav-title t-label">@s.Title</span>
+                            @if (!string.IsNullOrWhiteSpace(s.Blurb))
+                            {
+                                <span class="guide-nav-blurb t-caption">@s.Blurb</span>
+                            }
+                        </button>
+
+                        @if (s.Children is { Count: > 0 } && s.Id == _currentTopId)
+                        {
+                            @foreach (var c in s.Children)
+                            {
+                                <button class="guide-nav-item is-child @(c.Id == _currentId ? "active" : "")"
+                                        data-testid="guide-nav-@c.Id"
+                                        @onclick="() => SelectFromContentsAsync(c.Id)">
+                                    <span class="guide-nav-title t-caption">@c.Title</span>
+                                </button>
+                            }
+                        }
+                    }
+                }
+            </nav>
+
+            <article class="guide-content" data-testid="guide-content">
+                @if (_error is not null)
+                {
+                    <p class="workspace-state t-body">@_error</p>
+                }
+                else if (_isLoading)
+                {
+                    <p class="workspace-state t-body">Loading…</p>
+                }
+                else if (_html is not null)
+                {
+                    <div class="msg-content guide-body">@((MarkupString)_html)</div>
+                }
+            </article>
+        </div>
+    </div>
+</div>
+
+@code {
+    /// <summary>Section to open, from the route. Enables deep links from contextual help buttons.</summary>
+    [Parameter]
+    public string? SectionId { get; set; }
+
+    private GuideIndex? _index;
+    private string? _currentId;
+    private string? _currentTopId;
+    private string? _html;
+    private string? _error;
+    private bool _isLoading;
+    private long _selectionGeneration;
+    private string _query = string.Empty;
+
+    // Page bodies, fetched once so search can look inside them. Titles alone are a poor index:
+    // the answer to "why is my agent 404ing" is in a page called "Troubleshooting", which the
+    // word "404" would never match.
+    private readonly Dictionary<string, string> _bodies = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CancellationTokenSource _disposeCancellation = new();
+    private Task? _indexingTask;
+    private bool _fullTextLoaded;
+    private bool _disposed;
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _index = await Http.GetFromJsonAsync<GuideIndex>("guide/guide-index.json");
+        }
+        catch (Exception ex)
+        {
+            _error = $"Could not load the guide contents: {ex.Message}";
+            return;
+        }
+
+        var initialId = ResolvePage(SectionId)?.Id ?? _index?.Sections.FirstOrDefault()?.Id;
+        if (initialId is not null && !string.Equals(SectionId, initialId, StringComparison.OrdinalIgnoreCase))
+            NavigateToSection(initialId, replaceHistoryEntry: true);
+
+        await SelectAsync(initialId);
+    }
+
+    // A deep link arriving while the page is already open changes the parameter, not the component.
+    protected override async Task OnParametersSetAsync()
+    {
+        if (_index is null)
+            return;
+
+        var requestedId = ResolvePage(SectionId)?.Id ?? _index.Sections.FirstOrDefault()?.Id;
+        if (requestedId is null)
+            return;
+
+        if (!string.Equals(SectionId, requestedId, StringComparison.OrdinalIgnoreCase))
+            NavigateToSection(requestedId, replaceHistoryEntry: true);
+
+        if (!string.Equals(requestedId, _currentId, StringComparison.OrdinalIgnoreCase))
+            await SelectAsync(requestedId);
+    }
+
+    private IReadOnlyList<GuideSection> Matches
+    {
+        get
+        {
+            var all = _index?.Sections ?? [];
+            if (string.IsNullOrWhiteSpace(_query))
+                return all;
+
+            var q = _query.Trim();
+            return [.. all.Where(s =>
+                Contains(s.Title, q)
+                || Contains(s.Blurb, q)
+                || (_bodies.TryGetValue(s.Id, out var body) && Contains(body, q))
+                || (s.Children?.Any(c => Contains(c.Title, q)
+                        || (_bodies.TryGetValue(c.Id, out var cb) && Contains(cb, q))) ?? false))];
+        }
+    }
+
+    private static bool Contains(string? haystack, string needle) =>
+        haystack is not null && haystack.Contains(needle, StringComparison.OrdinalIgnoreCase);
+
+    private async Task OnSearchInput(ChangeEventArgs e)
+    {
+        _query = e.Value?.ToString() ?? string.Empty;
+
+        // Fetched on first keystroke rather than at page load: most visits read a page and never
+        // search, and the whole guide is ~150 KB that those visits should not pay for.
+        if (!_fullTextLoaded && !string.IsNullOrWhiteSpace(_query))
+            await LoadAllBodiesAsync();
+    }
+
+    private async Task LoadAllBodiesAsync()
+    {
+        var indexingTask = _indexingTask ??= IndexMissingBodiesAsync(_disposeCancellation.Token);
+        StateHasChanged();
+
+        try
+        {
+            await indexingTask;
+        }
+        finally
+        {
+            if (ReferenceEquals(_indexingTask, indexingTask))
+                _indexingTask = null;
+        }
+    }
+
+    private async Task IndexMissingBodiesAsync(CancellationToken cancellationToken)
+    {
+        var failed = false;
+        foreach (var (id, file) in AllPages())
+        {
+            if (_bodies.ContainsKey(id))
+                continue;
+
+            try
+            {
+                _bodies[id] = await Http.GetStringAsync($"guide/{file}", cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                failed = true;
+            }
+        }
+
+        _fullTextLoaded = !failed && AllPages().All(page => _bodies.ContainsKey(page.Id));
+        StateHasChanged();
+    }
+
+    private IEnumerable<(string Id, string File)> AllPages()
+    {
+        foreach (var s in _index?.Sections ?? [])
+        {
+            yield return (s.Id, s.File);
+            foreach (var c in s.Children ?? [])
+                yield return (c.Id, c.File);
+        }
+    }
+
+    private async Task SelectFromContentsAsync(string id)
+    {
+        var page = ResolvePage(id);
+        if (page is null)
+            return;
+
+        // Start selection first so a synchronous route callback observes the new current section and
+        // does not create a duplicate request. Explicit contents navigation remains a history entry.
+        var selection = SelectAsync(page.Value.Id);
+        NavigateToSection(page.Value.Id, replaceHistoryEntry: false);
+        await selection;
+    }
+
+    private void NavigateToSection(string id, bool replaceHistoryEntry) =>
+        Nav.NavigateTo($"guide/{Uri.EscapeDataString(id)}", replace: replaceHistoryEntry);
+
+    private (string Id, string File)? ResolvePage(string? id)
+    {
+        if (_index is null || string.IsNullOrWhiteSpace(id))
+            return null;
+
+        var page = AllPages().FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));
+        return page.File is null ? null : page;
+    }
+
+    private async Task SelectAsync(string? id)
+    {
+        var page = ResolvePage(id);
+        if (page is null)
+            return;
+
+        var resolvedPage = page.Value;
+
+        var selectionGeneration = ++_selectionGeneration;
+        _currentId = resolvedPage.Id;
+        _currentTopId = _index!.Sections
+            .FirstOrDefault(s => s.Id == resolvedPage.Id || (s.Children?.Any(c => c.Id == resolvedPage.Id) ?? false))?.Id;
+
+        _isLoading = true;
+        _error = null;
+        _html = null;
+        StateHasChanged();
+
+        try
+        {
+            var markdown = _bodies.TryGetValue(resolvedPage.Id, out var cached)
+                ? cached
+                : await Http.GetStringAsync($"guide/{resolvedPage.File}");
+            _bodies[resolvedPage.Id] = markdown;
+
+            if (selectionGeneration != _selectionGeneration)
+                return;
+
+            // Guide links need the current source path and complete index to resolve relative
+            // documents into in-app routes. The renderer still shares the chat sanitization path
+            // and fails closed when marked or DOMPurify is unavailable.
+            var html = await JS.InvokeAsync<string>(
+                "BotNexus.renderGuideMarkdown",
+                markdown,
+                resolvedPage.File,
+                AllPages().Select(page => new GuideLinkTarget(page.Id, page.File)).ToArray());
+            if (selectionGeneration != _selectionGeneration)
+                return;
+
+            _html = html;
+        }
+        catch (Exception ex)
+        {
+            if (selectionGeneration == _selectionGeneration)
+                _error = $"Could not load this page: {ex.Message}";
+        }
+        finally
+        {
+            if (selectionGeneration == _selectionGeneration)
+                _isLoading = false;
+        }
+
+        if (selectionGeneration == _selectionGeneration)
+            StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        _disposeCancellation.Cancel();
+        _disposeCancellation.Dispose();
+    }
+
+    private sealed record GuideLinkTarget(
+        [property: JsonPropertyName("id")] string Id,
+        [property: JsonPropertyName("file")] string File);
+
+    private sealed class GuideIndex
+    {
+        [JsonPropertyName("sections")]
+        public List<GuideSection> Sections { get; set; } = [];
+    }
+
+    private sealed class GuideSection
+    {
+        [JsonPropertyName("id")] public string Id { get; set; } = string.Empty;
+        [JsonPropertyName("file")] public string File { get; set; } = string.Empty;
+        [JsonPropertyName("title")] public string Title { get; set; } = string.Empty;
+        [JsonPropertyName("blurb")] public string? Blurb { get; set; }
+        [JsonPropertyName("children")] public List<GuideSection>? Children { get; set; }
+    }
+}

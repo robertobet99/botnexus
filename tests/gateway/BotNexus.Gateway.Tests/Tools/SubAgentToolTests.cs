@@ -41,14 +41,14 @@ public sealed class SubAgentToolTests
             .ReturnsAsync(CreateSubAgentInfo());
         var tool = new SubAgentSpawnTool(manager.Object, AgentId.From("parent-agent"), SessionId.From("parent-session"), ConversationId.From("conv-parent"));
 
-        await tool.ExecuteAsync("call-1", new Dictionary<string, object?> { ["task"] = "Investigate issue" });
+        await tool.ExecuteAsync("call-1", new Dictionary<string, object?> { ["background"] = true, ["task"] = "Investigate issue" });
 
         captured.ShouldNotBeNull();
         captured!.ParentAgentId.Value.ShouldBe("parent-agent");
         captured.ParentSessionId.Value.ShouldBe("parent-session");
         captured.Task.ShouldBe("Investigate issue");
         captured.MaxTurns.ShouldBe(30);
-        captured.TimeoutSeconds.ShouldBe(600);
+        captured.TimeoutSeconds.ShouldBe(0, "omission delegates default and ceiling resolution to the manager");
         captured.InheritedConversationId.Value.ShouldBe("conv-parent");
         var embody = captured.Mode.ShouldBeOfType<Embody>();
         embody.Role.ShouldBe(SubAgentArchetype.General);
@@ -68,7 +68,7 @@ public sealed class SubAgentToolTests
         var tool = new SubAgentSpawnTool(manager.Object, AgentId.From("parent-agent"), SessionId.From("parent-session"), ConversationId.From("conv-1"));
 
         await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
-        {
+        { ["background"] = true,
             ["task"] = "Investigate issue",
             ["model"] = "gpt-5-mini",
             ["tools"] = new[] { "read", "write" },
@@ -99,7 +99,7 @@ public sealed class SubAgentToolTests
                 name: "Research Task"));
         var tool = new SubAgentSpawnTool(manager.Object, AgentId.From("parent-agent"), SessionId.From("parent-session"), ConversationId.From("conv-1"));
 
-        var result = await tool.ExecuteAsync("call-1", new Dictionary<string, object?> { ["task"] = "Investigate issue" });
+        var result = await tool.ExecuteAsync("call-1", new Dictionary<string, object?> { ["background"] = true, ["task"] = "Investigate issue" });
         using var document = JsonDocument.Parse(ReadText(result));
 
         document.RootElement.GetProperty("subAgentId").GetString().ShouldBe("sub-123");
@@ -117,7 +117,7 @@ public sealed class SubAgentToolTests
     [Fact]
     public async Task SpawnTool_BuildsMode_AsEmbodyGeneral_WhenNoCustomisations()
     {
-        var captured = await CaptureSpawnRequest(new Dictionary<string, object?> { ["task"] = "T" });
+        var captured = await CaptureSpawnRequest(new Dictionary<string, object?> { ["background"] = true, ["task"] = "T" });
 
         var embody = captured.Mode.ShouldBeOfType<Embody>();
         embody.Role.ShouldBe(SubAgentArchetype.General);
@@ -128,7 +128,7 @@ public sealed class SubAgentToolTests
     public async Task SpawnTool_BuildsMode_AsEmbodyWithArchetype_WhenArchetypeOnlySupplied()
     {
         var captured = await CaptureSpawnRequest(new Dictionary<string, object?>
-        {
+        { ["background"] = true,
             ["task"] = "T",
             ["archetype"] = "reviewer"
         });
@@ -142,7 +142,7 @@ public sealed class SubAgentToolTests
     public async Task SpawnTool_BuildsMode_AsEmbodyWithCustomisations_WhenAnyOverrideSupplied()
     {
         var captured = await CaptureSpawnRequest(new Dictionary<string, object?>
-        {
+        { ["background"] = true,
             ["task"] = "T",
             ["archetype"] = "coder",
             ["name"] = "my-coder",
@@ -165,17 +165,58 @@ public sealed class SubAgentToolTests
     public async Task SpawnTool_BuildsMode_AsMirror_WhenTargetAgentIdOnlySupplied()
     {
         var captured = await CaptureSpawnRequest(new Dictionary<string, object?>
-        {
+        { ["background"] = true,
             ["task"] = "T",
             ["targetAgentId"] = "alex"
         });
 
         var mirror = captured.Mode.ShouldBeOfType<Mirror>();
         mirror.TargetAgentId.Value.ShouldBe("alex");
+        mirror.RunName.ShouldBeNull(
+            "targetAgentId alone must not synthesise a run label (#3570 clause 4 - unchanged behaviour).");
+    }
+
+    /// <summary>
+    /// #3570 clause 1 + 2: `name` labels the RUN, not the descriptor, so it must be
+    /// accepted alongside `targetAgentId` and carried through to the Mirror mode as the
+    /// run label. Previously this pair was refused outright, failing an automated
+    /// PR-review workflow on 100% of its invocations.
+    /// </summary>
+    [Fact]
+    public async Task SpawnTool_BuildsMode_AsMirror_CarryingRunName_WhenTargetAgentIdAndNameSupplied()
+    {
+        var captured = await CaptureSpawnRequest(new Dictionary<string, object?>
+        { ["background"] = true,
+            ["task"] = "T",
+            ["targetAgentId"] = "alex",
+            ["name"] = "pr-review-run"
+        });
+
+        var mirror = captured.Mode.ShouldBeOfType<Mirror>();
+        mirror.TargetAgentId.Value.ShouldBe("alex",
+            "the target's descriptor must still be mirrored verbatim - a run label changes nothing about identity.");
+        // Non-vacuity: the SUPPLIED name, not merely non-null.
+        mirror.RunName.ShouldBe("pr-review-run");
+    }
+
+    /// <summary>
+    /// #3570 clause 2: a whitespace-only name is not a label. It must normalise to null
+    /// rather than titling the run with blanks.
+    /// </summary>
+    [Fact]
+    public async Task SpawnTool_MirrorRunName_IsNull_WhenNameIsWhitespace()
+    {
+        var captured = await CaptureSpawnRequest(new Dictionary<string, object?>
+        { ["background"] = true,
+            ["task"] = "T",
+            ["targetAgentId"] = "alex",
+            ["name"] = "   "
+        });
+
+        captured.Mode.ShouldBeOfType<Mirror>().RunName.ShouldBeNull();
     }
 
     [Theory]
-    [InlineData("name", "my-mirror")]
     [InlineData("model", "gpt-5-mini")]
     [InlineData("apiProvider", "openai")]
     [InlineData("systemPrompt", "Custom")]
@@ -183,7 +224,7 @@ public sealed class SubAgentToolTests
     public async Task SpawnTool_RejectsMixing_TargetAgentId_WithSingleEmbodyField(string conflictKey, object conflictValue)
     {
         var args = new Dictionary<string, object?>
-        {
+        { ["background"] = true,
             ["task"] = "T",
             ["targetAgentId"] = "alex",
             [conflictKey] = conflictValue
@@ -201,7 +242,7 @@ public sealed class SubAgentToolTests
     public async Task SpawnTool_RejectsMixing_TargetAgentId_WithToolsArray()
     {
         var args = new Dictionary<string, object?>
-        {
+        { ["background"] = true,
             ["task"] = "T",
             ["targetAgentId"] = "alex",
             ["tools"] = new[] { "read" }
@@ -218,10 +259,9 @@ public sealed class SubAgentToolTests
     public async Task SpawnTool_RejectsMixing_ReportsAllConflictingFields_InOneMessage()
     {
         var args = new Dictionary<string, object?>
-        {
+        { ["background"] = true,
             ["task"] = "T",
             ["targetAgentId"] = "alex",
-            ["name"] = "x",
             ["model"] = "y",
             ["systemPrompt"] = "z"
         };
@@ -230,9 +270,44 @@ public sealed class SubAgentToolTests
         var ex = await Should.ThrowAsync<ArgumentException>(
             () => tool.ExecuteAsync("call-1", args));
 
-        ex.Message.ShouldContain("name");
         ex.Message.ShouldContain("model");
         ex.Message.ShouldContain("systemPrompt");
+    }
+
+    /// <summary>
+    /// #3570 clause 3: the refusal must enumerate only the descriptor fields the caller
+    /// actually supplied. A run label supplied alongside them is accepted, so it must not
+    /// appear in the conflict list, and neither may a descriptor field that was never sent.
+    /// </summary>
+    [Fact]
+    public async Task SpawnTool_RejectsMixing_NamesOnlyTheFieldsActuallySupplied()
+    {
+        var args = new Dictionary<string, object?>
+        { ["background"] = true,
+            ["task"] = "T",
+            ["targetAgentId"] = "alex",
+            ["name"] = "pr-review-run",
+            ["model"] = "gpt-5-mini"
+        };
+        var tool = CreateSpawnTool(out _);
+
+        var ex = await Should.ThrowAsync<ArgumentException>(
+            () => tool.ExecuteAsync("call-1", args));
+
+        // Parse the enumerated conflict list out of the message so the assertion is exact
+        // rather than a substring smell test: "...embody-only fields: a, b. Mirror mode..."
+        var marker = "embody-only fields: ";
+        var start = ex.Message.IndexOf(marker, StringComparison.Ordinal);
+        start.ShouldBeGreaterThanOrEqualTo(0, "the refusal must enumerate the conflicting fields.");
+        var listStart = start + marker.Length;
+        var listEnd = ex.Message.IndexOf('.', listStart);
+        listEnd.ShouldBeGreaterThan(listStart);
+        var reported = ex.Message[listStart..listEnd]
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        reported.ShouldBe(new[] { "model" },
+            "only the descriptor fields actually supplied may be named. 'name' is a run label " +
+            "and is accepted; apiProvider/tools/systemPrompt/archetype were never supplied.");
     }
 
     private static SubAgentSpawnTool CreateSpawnTool(out Mock<ISubAgentManager> manager)
@@ -340,6 +415,11 @@ public sealed class SubAgentToolTests
                 subAgentId: "sub-123",
                 status: SubAgentStatus.Completed,
                 resultSummary: "Done"));
+        manager.Setup(m => m.WaitAsync("sub-123", SessionId.From("parent-session"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(CreateSubAgentInfo(subAgentId: "sub-123", status: SubAgentStatus.Completed, resultSummary: "Done"));
+        manager.Setup(m => m.ConsumeResultAsync(It.IsAny<SubAgentInfo>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<BotNexus.Domain.Primitives.AgentRunId?>()))
+            .Returns<SubAgentInfo, string, string, string, string, CancellationToken, BotNexus.Domain.Primitives.AgentRunId?>((_, _, _, _, payload, _, _) => Task.FromResult(payload));
         var tool = new SubAgentManageTool(manager.Object, SessionId.From("parent-session"));
 
         var result = await tool.ExecuteAsync("call-1", new Dictionary<string, object?>
@@ -350,7 +430,7 @@ public sealed class SubAgentToolTests
         using var document = JsonDocument.Parse(ReadText(result));
 
         document.RootElement.GetProperty("subAgentId").GetString().ShouldBe("sub-123");
-        document.RootElement.GetProperty("status").GetInt32().ShouldBe((int)SubAgentStatus.Completed);
+        document.RootElement.GetProperty("status").GetString().ShouldBe(nameof(SubAgentStatus.Completed));
         document.RootElement.GetProperty("resultSummary").GetString().ShouldBe("Done");
     }
 

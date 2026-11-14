@@ -30,14 +30,15 @@ public sealed class AgentCommandsTests
     {
         await using var fixture = await CliTestFixture.CreateAsync("""{"agents":{}}""");
 
-        var result = await fixture.RunCliAsync("agent", "add", "reviewer", "--provider", "copilot", "--model", "gpt-5", "--enabled", "true");
+        // #2136: 'reviewer' is a reserved sub-agent archetype id, so a non-reserved id is used here.
+        var result = await fixture.RunCliAsync("agent", "add", "helper", "--provider", "copilot", "--model", "gpt-5", "--enabled", "true");
         var config = await fixture.LoadConfigAsync();
 
         result.ExitCode.ShouldBe(0);
         config.Agents.ShouldNotBeNull();
         var agents = config.Agents ?? throw new InvalidOperationException("Expected agents config.");
-        agents.ShouldContainKey("reviewer");
-        agents["reviewer"].Model.ShouldBe("gpt-5");
+        agents.ShouldContainKey("helper");
+        agents["helper"].Model.ShouldBe("gpt-5");
     }
 
     [Fact]
@@ -108,6 +109,6 @@ public sealed class AgentCommandsTests
         var result = await fixture.RunCliAsync("agent", "remove", "assistant");
 
         result.ExitCode.ShouldBe(1);
-        result.CombinedOutput.ShouldContain("config file not found");
+        result.CombinedOutput.ShouldContain("No configuration found");
     }
 }

@@ -9,6 +9,7 @@ using BotNexus.Gateway.Abstractions.Models;
 using Microsoft.Data.Sqlite;
 using BotNexus.Persistence.Sqlite;
 using Microsoft.Extensions.Logging;
+using BotNexus.Gateway.Telemetry;
 
 namespace BotNexus.Gateway.Conversations;
 
@@ -20,6 +21,38 @@ namespace BotNexus.Gateway.Conversations;
 /// </summary>
 public sealed class SqliteConversationStore : IConversationStore
 {
+    /// <inheritdoc />
+    public async Task<ConversationOwnership?> GetOwnershipAsync(ConversationId conversationId, CancellationToken ct = default)
+    {
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT agent_id FROM conversations WHERE id=$id";
+        command.Parameters.AddWithValue("$id", conversationId.Value);
+        var owner = await command.ExecuteScalarAsync(ct).ConfigureAwait(false) as string;
+        return owner is null ? null : new(conversationId, AgentId.From(owner));
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationOwnership>> ListOwnershipAsync(AgentId? agentId = null, CancellationToken ct = default)
+    {
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT id, agent_id FROM conversations" + (agentId is null ? "" : " WHERE agent_id=$agent");
+        if (agentId is { } owner) command.Parameters.AddWithValue("$agent", owner.Value);
+        var result = new List<ConversationOwnership>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            ct.ThrowIfCancellationRequested();
+            result.Add(new(ConversationId.From(reader.GetString(0)), AgentId.From(reader.GetString(1))));
+        }
+        return result;
+    }
+
     private static readonly ActivitySource ActivitySource = new("BotNexus.Gateway");
     internal static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -27,17 +60,44 @@ public sealed class SqliteConversationStore : IConversationStore
     };
 
     private readonly string _connectionString;
+    private readonly SqliteWalMaintenance _journalModeMaintenance;
     private readonly ILogger<SqliteConversationStore> _logger;
     private readonly IWorldContext? _worldContext;
+    private readonly StoreMetrics? _storeMetrics;
     private readonly SemaphoreSlim _initLock = new(1, 1);
     // Striped write locks: a fixed pool hashed by conversation id. Bounds the number
     // of sync primitives (no per-conversation SemaphoreSlim leak over the process
     // lifetime) and cannot strand a lock on an exception (the stripe is pool-owned).
     private readonly StripedAsyncLock _conversationLocks = new();
+
+    /// <summary>
+    /// Default bound on the archive path's wait for a conversation stripe (#3517).
+    /// </summary>
+    public static readonly TimeSpan DefaultArchiveLockTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How long <see cref="ArchiveAsync(ConversationId, string, string?, string, CancellationToken)"/>
+    /// waits for the conversation stripe before failing with <see cref="StripeLockTimeoutException"/>.
+    /// </summary>
+    /// <remarks>
+    /// Archive is the one write that is routinely issued by a JANITOR (cron one-shot removal,
+    /// duplicate cleanup) rather than by the conversation's own writer, and janitors run with
+    /// <see cref="CancellationToken.None"/>. #3517: with no bound of its own that made a stripe
+    /// held by a wedged run an unbounded wait, so the delete could never complete and the caller
+    /// retried the identical failure every five minutes forever. Settable for tests only.
+    /// </remarks>
+    internal TimeSpan ArchiveLockTimeout { get; set; } = DefaultArchiveLockTimeout;
     // Bounded read-through cache capped by LRU so a long-running gateway does not
     // retain every conversation ever touched. Cold reads fall through to SQLite.
     private readonly BoundedLruCache<string, Conversation> _cache;
     private bool _initialized;
+
+    /// <summary>
+    /// The schema version this build of the conversation store writes and understands (#2835).
+    /// </summary>
+    public const int CurrentSchemaVersion = 1;
+
+    private static readonly SqliteSchemaMigration[] Migrations = [];
 
     // Read round-trip counter (issue #1626). Incremented once per database query issued by the
     // batched list path of THIS store instance, so the N+1 regression guard can assert that a
@@ -101,11 +161,19 @@ public sealed class SqliteConversationStore : IConversationStore
     /// evicted by LRU; cold reads fall through to SQLite. Defaults to
     /// <see cref="DefaultConversationCacheCapacity"/>.
     /// </param>
-    public SqliteConversationStore(string connectionString, ILogger<SqliteConversationStore> logger, IWorldContext? worldContext, int cacheCapacity = DefaultConversationCacheCapacity)
+    public SqliteConversationStore(
+        string connectionString,
+        ILogger<SqliteConversationStore> logger,
+        IWorldContext? worldContext,
+        int cacheCapacity = DefaultConversationCacheCapacity,
+        StoreMetrics? storeMetrics = null,
+        SqliteWalMaintenance? journalModeMaintenance = null)
     {
         _connectionString = connectionString;
+        _journalModeMaintenance = journalModeMaintenance ?? new SqliteWalMaintenance();
         _logger = logger;
         _worldContext = worldContext;
+        _storeMetrics = storeMetrics;
         _cache = new BoundedLruCache<string, Conversation>(cacheCapacity, StringComparer.Ordinal);
     }
 
@@ -124,18 +192,23 @@ public sealed class SqliteConversationStore : IConversationStore
     {
         using var activity = ActivitySource.StartActivity("conversation.get", ActivityKind.Internal);
         activity?.SetTag("botnexus.conversation.id", conversationId.Value);
+        using var metric = _storeMetrics?.Start("conversation", "get");
 
         await EnsureCreatedAsync(ct).ConfigureAwait(false);
         var conversationLock = await AcquireConversationLockAsync(conversationId.Value, ct).ConfigureAwait(false);
         try
         {
             if (_cache.TryGet(conversationId.Value, out var cached))
+            {
+                metric?.Complete();
                 return BackfillWorldId(CloneConversation(cached));
+            }
 
             var loaded = await LoadConversationAsync(conversationId, ct).ConfigureAwait(false);
             if (loaded is not null)
                 _cache.Set(conversationId.Value, CloneConversation(loaded));
 
+            metric?.Complete();
             return BackfillWorldId(loaded);
         }
         finally
@@ -148,6 +221,7 @@ public sealed class SqliteConversationStore : IConversationStore
     public async Task<IReadOnlyList<Conversation>> ListAsync(AgentId? agentId = null, CancellationToken ct = default)
     {
         using var activity = ActivitySource.StartActivity("conversation.list", ActivityKind.Internal);
+        using var metric = _storeMetrics?.Start("conversation", "list");
         if (agentId is not null)
             activity?.SetTag("botnexus.agent.id", agentId.Value);
 
@@ -169,7 +243,9 @@ public sealed class SqliteConversationStore : IConversationStore
                 orderedIds.Add(reader.GetString(0));
         }
 
-        return await MaterializeOrderedAsync(connection, orderedIds, ct).ConfigureAwait(false);
+        var conversations = await MaterializeOrderedAsync(connection, orderedIds, ct).ConfigureAwait(false);
+        metric?.Complete(conversations.Count);
+        return conversations;
     }
 
     /// <inheritdoc />
@@ -309,6 +385,8 @@ public sealed class SqliteConversationStore : IConversationStore
 
     public async Task<Conversation> CreateAsync(Conversation conversation, CancellationToken ct = default)
     {
+        if (conversation.CompactionTokenCeiling is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(conversation), "CompactionTokenCeiling must be positive or null.");
         using var activity = ActivitySource.StartActivity("conversation.create", ActivityKind.Internal);
         activity?.SetTag("botnexus.conversation.id", conversation.ConversationId.Value);
         activity?.SetTag("botnexus.agent.id", conversation.AgentId.Value);
@@ -323,7 +401,8 @@ public sealed class SqliteConversationStore : IConversationStore
             StampWorldId(conversation);
             await using var connection = CreateConnection();
             await connection.OpenAsync(ct).ConfigureAwait(false);
-            await SaveConversationAsync(connection, conversation, upsert: false, ct).ConfigureAwait(false);
+            await SaveConversationAsync(connection, conversation, upsert: false, expectedVersion: 0, ct).ConfigureAwait(false);
+            conversation.Version = 1;
             _cache.Set(conversation.ConversationId.Value, CloneConversation(conversation));
             return CloneConversation(conversation);
         }
@@ -336,6 +415,9 @@ public sealed class SqliteConversationStore : IConversationStore
     /// <inheritdoc />
     public async Task SaveAsync(Conversation conversation, CancellationToken ct = default)
     {
+        if (conversation.CompactionTokenCeiling is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(conversation), "CompactionTokenCeiling must be positive or null.");
+        ValidateLifecycleState(conversation);
         using var activity = ActivitySource.StartActivity("conversation.save", ActivityKind.Internal);
         activity?.SetTag("botnexus.conversation.id", conversation.ConversationId.Value);
         activity?.SetTag("botnexus.agent.id", conversation.AgentId.Value);
@@ -350,7 +432,21 @@ public sealed class SqliteConversationStore : IConversationStore
 
             await using var connection = CreateConnection();
             await connection.OpenAsync(ct).ConfigureAwait(false);
-            await SaveConversationAsync(connection, updated, upsert: true, ct).ConfigureAwait(false);
+            // #2131: compare-and-swap on the revision the caller's snapshot was read at. A stale
+            // whole-aggregate save is rejected outright rather than silently overwriting fields a
+            // narrow mutation committed after that read.
+            var newVersion = await SaveConversationAsync(connection, updated, upsert: true, conversation.Version, ct).ConfigureAwait(false);
+            if (newVersion is null)
+            {
+                // The committed row moved on. Evict the cache so the caller's retry re-reads the
+                // winning state rather than the snapshot it is holding.
+                _cache.Remove(updated.ConversationId.Value);
+                var actual = await ReadVersionAsync(connection, updated.ConversationId, ct).ConfigureAwait(false);
+                throw new ConversationConcurrencyException(updated.ConversationId.Value, conversation.Version, actual);
+            }
+
+            updated.Version = newVersion.Value;
+            conversation.Version = newVersion.Value;
             _cache.Set(updated.ConversationId.Value, CloneConversation(updated));
         }
         finally
@@ -378,7 +474,8 @@ public sealed class SqliteConversationStore : IConversationStore
                 UPDATE conversations
                 SET status = $status,
                     active_session_id = NULL,
-                    updated_at = $updatedAt
+                    updated_at = $updatedAt,
+                    version = version + 1
                 WHERE id = $id
                 """;
             command.Parameters.AddWithValue("$status", ConversationStatus.Archived.ToString());
@@ -392,12 +489,158 @@ public sealed class SqliteConversationStore : IConversationStore
                 archived.Status = ConversationStatus.Archived;
                 archived.ActiveSessionId = null;
                 archived.UpdatedAt = updatedAt;
+                // #2131: the UPDATE above bumped the persisted revision, so the cached clone must
+                // track it. Leaving the stale version here hands the next reader a snapshot whose
+                // compare-and-swap can never succeed.
+                archived.Version = cached.Version + 1;
                 _cache.Set(conversationId.Value, archived);
             }
         }
         finally
         {
             conversationLock.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task ArchiveAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+        => _ = await TryArchiveAsync(conversationId, source, correlationId, actor, ct).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public async Task<bool> TryArchiveAsync(
+        ConversationId conversationId,
+        string source,
+        string? correlationId,
+        string actor,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        ArgumentException.ThrowIfNullOrWhiteSpace(actor);
+
+        using var activity = ActivitySource.StartActivity("conversation.archive", ActivityKind.Internal);
+        activity?.SetTag("botnexus.conversation.id", conversationId.Value);
+        activity?.SetTag("botnexus.conversation.archive_source", source);
+        activity?.SetTag("botnexus.conversation.correlation_id", correlationId);
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        // #3517: BOUNDED. See ArchiveLockTimeout - this overload is the janitor path and is called
+        // with CancellationToken.None, so the token cannot be the thing that ends the wait.
+        var conversationLock = await _conversationLocks
+            .AcquireAsync(conversationId.Value, ArchiveLockTimeout, ct)
+            .ConfigureAwait(false);
+        try
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await EnsureAuditSchemaAsync(connection, ct).ConfigureAwait(false);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var updatedAt = DateTimeOffset.UtcNow;
+
+            await using (var archive = connection.CreateCommand())
+            {
+                archive.Transaction = transaction;
+                archive.CommandText = """
+                    UPDATE conversations
+                    SET status = $status,
+                        active_session_id = NULL,
+                        updated_at = $updatedAt,
+                        version = version + 1
+                    WHERE id = $id AND status = $activeStatus
+                    """;
+                archive.Parameters.AddWithValue("$status", ConversationStatus.Archived.ToString());
+                archive.Parameters.AddWithValue("$activeStatus", ConversationStatus.Active.ToString());
+                archive.Parameters.AddWithValue("$updatedAt", updatedAt.ToString("O"));
+                archive.Parameters.AddWithValue("$id", conversationId.Value);
+                if (await archive.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 0)
+                {
+                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                    return false;
+                }
+            }
+
+            await using (var audit = connection.CreateCommand())
+            {
+                audit.Transaction = transaction;
+                audit.CommandText = """
+                    INSERT INTO conversation_audit
+                        (conversation_id, action, actor, source, correlation_id, previous_value, new_value, timestamp)
+                    VALUES ($conversationId, 'archived', $actor, $source, $correlationId, NULL, NULL, $timestamp)
+                    """;
+                audit.Parameters.AddWithValue("$conversationId", conversationId.Value);
+                audit.Parameters.AddWithValue("$actor", actor);
+                audit.Parameters.AddWithValue("$source", source);
+                audit.Parameters.AddWithValue("$correlationId", (object?)correlationId ?? DBNull.Value);
+                audit.Parameters.AddWithValue("$timestamp", updatedAt.ToString("O"));
+                await audit.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+
+            if (_cache.TryGet(conversationId.Value, out var cached))
+            {
+                var archived = CloneConversation(cached);
+                archived.Status = ConversationStatus.Archived;
+                archived.ActiveSessionId = null;
+                archived.UpdatedAt = updatedAt;
+                // #2131: keep the cached revision in step with the row bumped above.
+                archived.Version = cached.Version + 1;
+                _cache.Set(conversationId.Value, archived);
+            }
+
+            return true;
+        }
+        finally
+        {
+            conversationLock.Dispose();
+        }
+    }
+
+    private static async Task EnsureAuditSchemaAsync(SqliteConnection connection, CancellationToken ct)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TABLE IF NOT EXISTS conversation_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                source TEXT NOT NULL,
+                correlation_id TEXT,
+                previous_value TEXT,
+                new_value TEXT,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_audit_conversation_id
+                ON conversation_audit(conversation_id, timestamp DESC);
+            """;
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+        await using var tableInfo = connection.CreateCommand();
+        tableInfo.CommandText = "PRAGMA table_info(conversation_audit);";
+        var hasCorrelationId = false;
+        await using (var reader = await tableInfo.ExecuteReaderAsync(ct).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                hasCorrelationId |= string.Equals(reader.GetString(1), "correlation_id", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (hasCorrelationId)
+            return;
+
+        await using var migration = connection.CreateCommand();
+        migration.CommandText = "ALTER TABLE conversation_audit ADD COLUMN correlation_id TEXT";
+        try
+        {
+            await migration.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        catch (SqliteException ex) when (SqliteAdditiveMigration.IsDuplicateColumn(ex))
+        {
+            // Another process completed the additive migration after the schema probe.
         }
     }
 
@@ -462,7 +705,8 @@ public sealed class SqliteConversationStore : IConversationStore
                 UPDATE conversations
                 SET is_pinned = $pin,
                     pinned_at = $pinnedAt,
-                    updated_at = $now
+                    updated_at = $now,
+                    version = version + 1
                 WHERE id = $id
                 """;
             command.Parameters.AddWithValue("$pin", pin ? 1 : 0);
@@ -477,6 +721,8 @@ public sealed class SqliteConversationStore : IConversationStore
                 updated.IsPinned = pin;
                 updated.PinnedAt = pinnedAt;
                 updated.UpdatedAt = now;
+                // #2131: keep the cached revision in step with the row bumped above.
+                updated.Version = cached.Version + 1;
                 _cache.Set(conversationId.Value, updated);
             }
         }
@@ -484,6 +730,313 @@ public sealed class SqliteConversationStore : IConversationStore
         {
             conversationLock.Dispose();
         }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> AddBindingAsync(ConversationId conversationId, ChannelBinding binding, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(binding);
+        using var activity = ActivitySource.StartActivity("conversation.add_binding", ActivityKind.Internal);
+        activity?.SetTag("botnexus.conversation.id", conversationId.Value);
+        activity?.SetTag("botnexus.binding.id", binding.BindingId.Value);
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        var conversationLock = await AcquireConversationLockAsync(conversationId.Value, ct).ConfigureAwait(false);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+            if (!await ConversationExistsInTransactionAsync(connection, transaction, conversationId, ct).ConfigureAwait(false))
+                return false;
+
+            await using (var insert = connection.CreateCommand())
+            {
+                insert.Transaction = transaction;
+                insert.CommandText = """
+                    INSERT INTO conversation_bindings (binding_id, conversation_id, channel_type, channel_address, mode, threading_mode, display_prefix, bound_at, last_inbound_at, last_outbound_at)
+                    VALUES ($bindingId, $conversationId, $channelType, $channelAddress, $mode, $threadingMode, $displayPrefix, $boundAt, $lastInboundAt, $lastOutboundAt)
+                    """;
+                BindBindingParameters(insert, conversationId, binding);
+                await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await TouchInTransactionAsync(connection, transaction, conversationId, now, ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+
+            // Drop the cached aggregate so the next read reloads bindings from disk. Cheaper and
+            // safer than mutating a shared cached list under concurrency.
+            _cache.Remove(conversationId.Value);
+            return true;
+        }
+        finally
+        {
+            conversationLock.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RemoveBindingAsync(ConversationId conversationId, BindingId bindingId, CancellationToken ct = default)
+    {
+        using var activity = ActivitySource.StartActivity("conversation.remove_binding", ActivityKind.Internal);
+        activity?.SetTag("botnexus.conversation.id", conversationId.Value);
+        activity?.SetTag("botnexus.binding.id", bindingId.Value);
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        var conversationLock = await AcquireConversationLockAsync(conversationId.Value, ct).ConfigureAwait(false);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+            int affected;
+            await using (var delete = connection.CreateCommand())
+            {
+                delete.Transaction = transaction;
+                delete.CommandText = "DELETE FROM conversation_bindings WHERE conversation_id = $conversationId AND binding_id = $bindingId";
+                delete.Parameters.AddWithValue("$conversationId", conversationId.Value);
+                delete.Parameters.AddWithValue("$bindingId", bindingId.Value);
+                affected = await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            if (affected == 0)
+                return false;
+
+            await TouchInTransactionAsync(connection, transaction, conversationId, now, ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            _cache.Remove(conversationId.Value);
+            return true;
+        }
+        finally
+        {
+            conversationLock.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> MoveBindingAsync(ConversationId fromConversationId, ConversationId toConversationId, BindingId bindingId, CancellationToken ct = default)
+    {
+        using var activity = ActivitySource.StartActivity("conversation.move_binding", ActivityKind.Internal);
+        activity?.SetTag("botnexus.conversation.id", fromConversationId.Value);
+        activity?.SetTag("botnexus.binding.id", bindingId.Value);
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        // Distinct IDs can share a stripe. Acquire physical stripes once, in a global
+        // stripe order rather than ID order, avoiding self-deadlock and inversion.
+        using var conversationLocks = await _conversationLocks.AcquirePairAsync(
+            fromConversationId.Value, toConversationId.Value, ct).ConfigureAwait(false);
+        {
+            var now = DateTimeOffset.UtcNow;
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+            if (!await ConversationExistsInTransactionAsync(connection, transaction, toConversationId, ct).ConfigureAwait(false))
+                return false;
+
+            int affected;
+            await using (var move = connection.CreateCommand())
+            {
+                move.Transaction = transaction;
+                move.CommandText = "UPDATE conversation_bindings SET conversation_id = $to WHERE conversation_id = $from AND binding_id = $bindingId";
+                move.Parameters.AddWithValue("$to", toConversationId.Value);
+                move.Parameters.AddWithValue("$from", fromConversationId.Value);
+                move.Parameters.AddWithValue("$bindingId", bindingId.Value);
+                affected = await move.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            if (affected == 0)
+                return false;
+
+            await TouchInTransactionAsync(connection, transaction, fromConversationId, now, ct).ConfigureAwait(false);
+            await TouchInTransactionAsync(connection, transaction, toConversationId, now, ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            _cache.Remove(fromConversationId.Value);
+            _cache.Remove(toConversationId.Value);
+            return true;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<Conversation?> PatchMetadataAsync(ConversationId conversationId, ConversationMetadataPatch patch, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(patch);
+        using var activity = ActivitySource.StartActivity("conversation.patch_metadata", ActivityKind.Internal);
+        activity?.SetTag("botnexus.conversation.id", conversationId.Value);
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        var conversationLock = await AcquireConversationLockAsync(conversationId.Value, ct).ConfigureAwait(false);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+            var sets = new List<string>();
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            if (patch.Title.IsSet)
+            {
+                sets.Add("title = $title");
+                command.Parameters.AddWithValue("$title", patch.Title.Value);
+            }
+            if (patch.Purpose.IsSet)
+            {
+                sets.Add("purpose = $purpose");
+                command.Parameters.AddWithValue("$purpose", (object?)patch.Purpose.Value ?? DBNull.Value);
+            }
+            if (patch.Instructions.IsSet)
+            {
+                sets.Add("instructions = $instructions");
+                command.Parameters.AddWithValue("$instructions", (object?)patch.Instructions.Value ?? DBNull.Value);
+            }
+
+            // Even an empty patch bumps updated_at and returns the row, mirroring SaveAsync's touch.
+            // #2131: it also bumps the revision, so a whole-aggregate SaveAsync built from a
+            // snapshot read before this patch is rejected instead of reverting it.
+            sets.Add("updated_at = $now");
+            sets.Add("version = version + 1");
+            command.Parameters.AddWithValue("$now", now.ToString("O"));
+            command.Parameters.AddWithValue("$id", conversationId.Value);
+            command.CommandText = $"UPDATE conversations SET {string.Join(", ", sets)} WHERE id = $id";
+            var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            if (affected == 0)
+                return null;
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            _cache.Remove(conversationId.Value);
+            return await LoadConversationAsync(conversationId, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            conversationLock.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<Conversation?> PatchOverrideAsync(ConversationId conversationId, ConversationOverridePatch patch, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(patch);
+        if (patch.CompactionTokenCeiling.IsSet && patch.CompactionTokenCeiling.Value is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(patch), "CompactionTokenCeiling must be positive or null.");
+        using var activity = ActivitySource.StartActivity("conversation.patch_override", ActivityKind.Internal);
+        activity?.SetTag("botnexus.conversation.id", conversationId.Value);
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        var conversationLock = await AcquireConversationLockAsync(conversationId.Value, ct).ConfigureAwait(false);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+            var sets = new List<string>();
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            if (patch.Model.IsSet)
+            {
+                sets.Add("model_override = $model");
+                command.Parameters.AddWithValue("$model", (object?)patch.Model.Value ?? DBNull.Value);
+            }
+            if (patch.Thinking.IsSet)
+            {
+                sets.Add("thinking_override = $thinking");
+                command.Parameters.AddWithValue("$thinking", (object?)patch.Thinking.Value ?? DBNull.Value);
+            }
+            if (patch.ContextWindow.IsSet)
+            {
+                sets.Add("context_window_override = $context");
+                command.Parameters.AddWithValue("$context", patch.ContextWindow.Value.HasValue ? patch.ContextWindow.Value.Value : (object)DBNull.Value);
+            }
+            // #2523: the tool overlay rides the SAME narrow patch as the model overrides so a
+            // restriction cannot be clobbered by a concurrent whole-record save.
+            if (patch.CompactionTokenCeiling.IsSet)
+            {
+                sets.Add("compaction_token_ceiling = $ceiling");
+                command.Parameters.AddWithValue("$ceiling", (object?)patch.CompactionTokenCeiling.Value ?? DBNull.Value);
+            }
+            if (patch.ToolOverrideJson.IsSet)
+            {
+                sets.Add("tool_override_json = $toolOverride");
+                command.Parameters.AddWithValue("$toolOverride", (object?)patch.ToolOverrideJson.Value ?? DBNull.Value);
+            }
+
+            sets.Add("updated_at = $now");
+            sets.Add("version = version + 1");
+            command.Parameters.AddWithValue("$now", now.ToString("O"));
+            command.Parameters.AddWithValue("$id", conversationId.Value);
+            command.CommandText = $"UPDATE conversations SET {string.Join(", ", sets)} WHERE id = $id";
+            var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            if (affected == 0)
+                return null;
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            _cache.Remove(conversationId.Value);
+            return await LoadConversationAsync(conversationId, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            conversationLock.Dispose();
+        }
+    }
+
+    // Binds the ten binding columns onto an INSERT command. Shared by AddBindingAsync and the
+    // whole-record SaveConversationAsync path so parameter shape stays in one place.
+    private static void BindBindingParameters(SqliteCommand command, ConversationId conversationId, ChannelBinding binding)
+    {
+        command.Parameters.AddWithValue("$bindingId", binding.BindingId.Value);
+        command.Parameters.AddWithValue("$conversationId", conversationId.Value);
+        command.Parameters.AddWithValue("$channelType", binding.ChannelType.Value);
+        command.Parameters.AddWithValue("$channelAddress", binding.ChannelAddress.Value);
+        command.Parameters.AddWithValue("$mode", binding.Mode.ToString());
+        command.Parameters.AddWithValue("$threadingMode", binding.ThreadingMode.ToString());
+        command.Parameters.AddWithValue("$displayPrefix", (object?)binding.DisplayPrefix ?? DBNull.Value);
+        command.Parameters.AddWithValue("$boundAt", binding.BoundAt.ToString("O"));
+        command.Parameters.AddWithValue("$lastInboundAt", binding.LastInboundAt?.ToString("O") ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("$lastOutboundAt", binding.LastOutboundAt?.ToString("O") ?? (object)DBNull.Value);
+    }
+
+    // Bumps updated_at inside an existing transaction without a separate round-trip / lock.
+    private static async Task TouchInTransactionAsync(SqliteConnection connection, SqliteTransaction transaction, ConversationId conversationId, DateTimeOffset now, CancellationToken ct)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        // #2131: binding adds/removes/moves are conversation mutations, so they bump the revision
+        // too - a whole-aggregate save built before them would otherwise delete-and-recreate the
+        // binding set from its stale snapshot.
+        command.CommandText = "UPDATE conversations SET updated_at = $now, version = version + 1 WHERE id = $id";
+        command.Parameters.AddWithValue("$now", now.ToString("O"));
+        command.Parameters.AddWithValue("$id", conversationId.Value);
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads the currently committed #2131 revision for a conversation, used to report the losing
+    /// side of a compare-and-swap. Returns <c>0</c> when the row no longer exists.
+    /// </summary>
+    private static async Task<long> ReadVersionAsync(SqliteConnection connection, ConversationId conversationId, CancellationToken ct)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT version FROM conversations WHERE id = $id";
+        command.Parameters.AddWithValue("$id", conversationId.Value);
+        var value = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return value is null or DBNull ? 0L : Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    // Existence check bound to an in-flight transaction so it reads the transaction's own snapshot.
+    private static async Task<bool> ConversationExistsInTransactionAsync(SqliteConnection connection, SqliteTransaction transaction, ConversationId conversationId, CancellationToken ct)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT 1 FROM conversations WHERE id = $id LIMIT 1";
+        command.Parameters.AddWithValue("$id", conversationId.Value);
+        return await command.ExecuteScalarAsync(ct).ConfigureAwait(false) is not null;
     }
 
     /// <inheritdoc />
@@ -528,16 +1081,34 @@ public sealed class SqliteConversationStore : IConversationStore
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default)
+    public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(CancellationToken ct = default)
+        => GetSummariesCoreAsync(null, false, ct);
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<ConversationSummary>> GetSummariesAsync(
+        DateTimeOffset? activitySince, CancellationToken ct = default)
+        => GetSummariesCoreAsync(activitySince, true, ct);
+
+    // SQLite date functions lose sub-millisecond precision. The connection-local function
+    // compares UTC ticks, including legacy offset timestamps, without changing stored data.
+    private const string EffectiveActivitySql = """
+        max(activity_ticks(c.created_at), activity_ticks(c.updated_at),
+            coalesce((SELECT max(max(coalesce(activity_ticks(ab.last_inbound_at), activity_ticks(c.updated_at)),
+                                         coalesce(activity_ticks(ab.last_outbound_at), activity_ticks(c.updated_at))))
+                      FROM conversation_bindings ab WHERE ab.conversation_id = c.id), activity_ticks(c.updated_at)))
+        """;
+    private async Task<IReadOnlyList<ConversationSummary>> GetSummariesCoreAsync(
+        DateTimeOffset? activitySince, bool effectiveActivity, CancellationToken ct)
     {
         using var activity = ActivitySource.StartActivity("conversation.get_summaries", ActivityKind.Internal);
+        using var metric = _storeMetrics?.Start("conversation", "get_summaries");
 
         await EnsureCreatedAsync(ct).ConfigureAwait(false);
         await using var connection = CreateConnection();
         await connection.OpenAsync(ct).ConfigureAwait(false);
 
         await using var command = connection.CreateCommand();
-        command.CommandText = """
+        command.CommandText = $"""
             SELECT
                 c.id,
                 c.agent_id,
@@ -547,34 +1118,124 @@ public sealed class SqliteConversationStore : IConversationStore
                 c.status,
                 c.active_session_id,
                 c.created_at,
-                c.updated_at,
+                c.updated_at{(effectiveActivity ? $", {EffectiveActivitySql} AS effective_activity_ticks" : string.Empty)},
                 COUNT(b.binding_id) AS binding_count,
                 c.instructions,
                 c.kind,
+                -- #2340: project the provenance columns the summary mapper reads. `source` was
+                -- referenced in GROUP BY but never SELECTed (a latent #2300 gap - MapSummary's
+                -- tolerant GetOptionalString silently returned NULL, so every SQLite-backed summary
+                -- reported Source=Channel regardless of what was stored). Projecting both makes the
+                -- summary honest and is what lets a client filter hidden rows from a typed field.
+                c.source,
+                -- #2121: the minting registration / cron job id, so a client can attribute a listed
+                -- conversation without an extra per-feature list call.
+                c.source_id,
+                c.visibility,
                 c.is_pinned,
                 c.pinned_at
             FROM conversations c
             LEFT JOIN conversation_bindings b ON b.conversation_id = c.id
-            WHERE c.status = 'Active'
-            GROUP BY c.id, c.agent_id, c.title, c.purpose, c.is_default, c.status, c.active_session_id, c.created_at, c.updated_at, c.instructions, c.kind, c.is_pinned, c.pinned_at
-            ORDER BY c.is_pinned DESC, c.pinned_at DESC, c.updated_at DESC
+            WHERE c.status = 'Active' AND c.parent_conversation_id IS NULL{(activitySince is null ? string.Empty : $" AND {EffectiveActivitySql} >= $activitySince")}
+            GROUP BY c.id, c.agent_id, c.title, c.purpose, c.is_default, c.status, c.active_session_id, c.created_at, c.updated_at, c.instructions, c.kind, c.source, c.source_id, c.visibility, c.is_pinned, c.pinned_at
+            ORDER BY c.is_pinned DESC, c.pinned_at DESC, {(effectiveActivity ? "effective_activity_ticks" : "c.updated_at")} DESC
             """;
 
         var summaries = new List<ConversationSummary>();
-        var rosters = await LoadActiveParticipantRostersAsync(connection, ct).ConfigureAwait(false);
+        connection.CreateFunction<string?, long?>("activity_ticks", value => value is null ? null
+            : DateTimeOffset.Parse(value, System.Globalization.CultureInfo.InvariantCulture).UtcTicks, isDeterministic: true);
+        if (activitySince is not null)
+            command.Parameters.AddWithValue("$activitySince", activitySince.Value.UtcTicks);
+        var rosters = await LoadActiveParticipantRostersAsync(connection, ct, activitySince).ConfigureAwait(false);
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
             var conversationId = reader.GetString(0);
-            // #1627: the summary row ordinals live in ConversationRowMapper.MapSummary - the
+            // #1627: the summary row ordinals live in SqliteDataReaderExtensions.MapSummary - the
             // single source of truth shared with the full-conversation mapper. The roster is
             // resolved once via the batch query above (#1427) to avoid an N+1 participant lookup.
-            summaries.Add(ConversationRowMapper.MapSummary(
-                reader,
-                rosters.TryGetValue(conversationId, out var roster) ? roster : []));
+            var summary = reader.MapSummary(
+                rosters.TryGetValue(conversationId, out var roster) ? roster : []);
+            summaries.Add(effectiveActivity
+                ? summary with { UpdatedAt = new DateTimeOffset(reader.GetInt64(reader.GetOrdinal("effective_activity_ticks")), TimeSpan.Zero) }
+                : summary);
         }
 
+        metric?.Complete(summaries.Count);
         return summaries;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<ConversationRetentionCandidate>> GetRetentionCandidatesAsync(
+        ConversationSource? source = null,
+        CancellationToken ct = default)
+    {
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT id, agent_id, updated_at, is_pinned, source, source_id
+            FROM conversations
+            WHERE status = $status AND ($source IS NULL OR source = $source)
+            ORDER BY updated_at ASC
+            """;
+        command.Parameters.AddWithValue("$status", ConversationStatus.Active.ToString());
+        command.Parameters.AddWithValue("$source", source is null ? DBNull.Value : source.Value.ToString());
+
+        var candidates = new List<ConversationRetentionCandidate>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var sourceText = reader.GetString(4);
+            candidates.Add(new ConversationRetentionCandidate(
+                ConversationId.From(reader.GetString(0)),
+                AgentId.From(reader.GetString(1)),
+                DateTimeOffset.Parse(reader.GetString(2), System.Globalization.CultureInfo.InvariantCulture),
+                reader.GetInt64(3) != 0,
+                Enum.TryParse<ConversationSource>(sourceText, ignoreCase: true, out var parsedSource)
+                    ? parsedSource
+                    : ConversationSource.Channel,
+                reader.IsDBNull(5) ? null : reader.GetString(5)));
+        }
+
+        return candidates;
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<PendingAskUserCheckpoint>> GetPendingAskUserCheckpointsAsync(CancellationToken ct = default)
+    {
+        using var activity = ActivitySource.StartActivity("conversation.get_pending_ask_user_checkpoints", ActivityKind.Internal);
+        using var metric = _storeMetrics?.Start("conversation", "get_pending_ask_user_checkpoints");
+
+        await EnsureCreatedAsync(ct).ConfigureAwait(false);
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+
+        await using var command = connection.CreateCommand();
+        // #3660: filter in SQL and project two columns. Deliberately NOT routed through
+        // MaterializeOrderedAsync - that path is correct but hydrates the entire conversation
+        // aggregate for every id it is handed, which is exactly the cost this query removes.
+        // On the store that motivated the issue this reads 3 rows instead of 3,964.
+        // #3663: the WHERE clause is composed from PendingAskUserPredicate, the same constant the
+        // partial index is built from. SQLite silently declines a partial index whose WHERE does not
+        // subsume the query's, and that decline is invisible - the query still returns correct rows,
+        // just via a full scan. Sharing one string makes divergence impossible by construction.
+        command.CommandText =
+            $"SELECT id, pending_ask_user_json FROM conversations WHERE {PendingAskUserPredicate} ORDER BY updated_at DESC";
+
+        var checkpoints = new List<PendingAskUserCheckpoint>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            checkpoints.Add(new PendingAskUserCheckpoint(
+                ConversationId.From(reader.GetString(0)),
+                reader.GetString(1)));
+        }
+
+        activity?.SetTag("botnexus.conversation.pending_ask_user_count", checkpoints.Count);
+        metric?.Complete(checkpoints.Count);
+        return checkpoints;
     }
 
     /// <summary>
@@ -584,7 +1245,7 @@ public sealed class SqliteConversationStore : IConversationStore
     /// </summary>
     private static async Task<Dictionary<string, IReadOnlyList<ParticipantSummary>>> LoadActiveParticipantRostersAsync(
         SqliteConnection connection,
-        CancellationToken ct)
+        CancellationToken ct, DateTimeOffset? activitySince = null)
     {
         await using var command = connection.CreateCommand();
         command.CommandText = """
@@ -595,6 +1256,12 @@ public sealed class SqliteConversationStore : IConversationStore
             ORDER BY p.citizen_kind ASC, p.citizen_id ASC
             """;
 
+        if (activitySince is not null)
+        {
+            command.CommandText = command.CommandText.Replace("WHERE c.status = 'Active'",
+                $"WHERE c.status = 'Active' AND c.parent_conversation_id IS NULL AND {EffectiveActivitySql} >= $activitySince", StringComparison.Ordinal);
+            command.Parameters.AddWithValue("$activitySince", activitySince.Value.UtcTicks);
+        }
         var rosters = new Dictionary<string, List<ParticipantSummary>>(StringComparer.Ordinal);
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
@@ -606,8 +1273,8 @@ public sealed class SqliteConversationStore : IConversationStore
                 rosters[conversationId] = list;
             }
             // #1627: kind/id/role ordinals (offset past the leading conversation_id) live in
-            // ConversationRowMapper.MapParticipantSummary - one source of truth for this shape.
-            list.Add(ConversationRowMapper.MapParticipantSummary(reader, offset: 1));
+            // SqliteDataReaderExtensions.MapParticipantSummary - one source of truth for this shape.
+            list.Add(reader.MapParticipantSummary(offset: 1));
         }
 
         return rosters.ToDictionary(
@@ -630,9 +1297,13 @@ public sealed class SqliteConversationStore : IConversationStore
             await using var connection = CreateConnection();
             await connection.OpenAsync(ct).ConfigureAwait(false);
 
-            await using var walCommand = connection.CreateCommand();
-            walCommand.CommandText = "PRAGMA journal_mode=WAL;";
-            await walCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            // The conversation and session stores share this database in production. Both must
+            // apply the same filesystem-aware authority so initialization order cannot re-enable
+            // WAL on a network-mounted database.
+            await _journalModeMaintenance.ApplyJournalModeAsync(
+                connection,
+                connection.DataSource,
+                cancellationToken: ct).ConfigureAwait(false);
 
             await using var command = connection.CreateCommand();
             command.CommandText = """
@@ -650,7 +1321,10 @@ public sealed class SqliteConversationStore : IConversationStore
                     world_id TEXT NOT NULL DEFAULT '',
                     model_override TEXT,
                     thinking_override TEXT,
-                    context_window_override INTEGER
+                    context_window_override INTEGER,
+                    compaction_token_ceiling INTEGER,
+                    tool_override_json TEXT,
+                    version INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS conversation_bindings (
@@ -704,6 +1378,8 @@ public sealed class SqliteConversationStore : IConversationStore
             if (archived > 0)
                 _logger.LogInformation("Archived {Count} stale signalr:connection-id conversations (pre-v0.1.3 cleanup)", archived);
 
+            connection.Apply( CurrentSchemaVersion, Migrations);
+
             _initialized = true;
         }
         finally
@@ -714,6 +1390,13 @@ public sealed class SqliteConversationStore : IConversationStore
 
     private Task<IDisposable> AcquireConversationLockAsync(string conversationId, CancellationToken cancellationToken)
         => _conversationLocks.AcquireAsync(conversationId, cancellationToken);
+
+    /// <summary>
+    /// Test hook (#3517): takes the same conversation stripe the write paths take, so contention can
+    /// be created deterministically instead of by racing two real operations against each other.
+    /// </summary>
+    internal Task<IDisposable> AcquireConversationLockForTestAsync(string conversationId)
+        => _conversationLocks.AcquireAsync(conversationId, CancellationToken.None);
 
     // Additive column migrations for the `conversations` table. Table-driven and race-tolerant:
     // each entry is applied with a plain ALTER TABLE ... ADD COLUMN, and the "duplicate column
@@ -735,7 +1418,41 @@ public sealed class SqliteConversationStore : IConversationStore
         await using var indexCommand = connection.CreateCommand();
         indexCommand.CommandText = "CREATE INDEX IF NOT EXISTS idx_conversations_initiator ON conversations(initiator);";
         await indexCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+        // #2338: the top-level listing filters on parent_conversation_id IS NULL and the
+        // expand-a-nested-run lookup seeks by parent id, so both want this index.
+        await using var parentIndexCommand = connection.CreateCommand();
+        parentIndexCommand.CommandText =
+            "CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_conversation_id);";
+        await parentIndexCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+        // #3663: partial index for the startup pending-ask_user reconciliation lookup (#3660).
+        // On the store that motivated the issue the predicate matches 3 rows of 3,968, so the index
+        // holds 3 entries and the lookup costs O(pending) rather than O(conversations):
+        // SCAN conversations 7.48ms -> SCAN ... USING INDEX idx_conversations_pending_ask_user 0.01ms.
+        // Write amplification is confined to conversations that actually have a pending checkpoint,
+        // because a row outside the predicate is never entered into the index at all.
+        await using var pendingIndexCommand = connection.CreateCommand();
+        pendingIndexCommand.CommandText = PendingAskUserIndexDdl;
+        await pendingIndexCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// The single source of truth for the pending-ask_user filter. Used verbatim both in the
+    /// <see cref="GetPendingAskUserCheckpointsAsync"/> query and in the partial index's WHERE clause
+    /// so the index predicate always subsumes the query predicate (#3663 AC3).
+    /// </summary>
+    internal const string PendingAskUserPredicate =
+        "pending_ask_user_json IS NOT NULL AND pending_ask_user_json <> ''";
+
+    /// <summary>
+    /// Partial-index DDL for the pending-ask_user lookup. Idempotent, run on every open, so an
+    /// existing database acquires the index on next boot without a versioned migration step.
+    /// </summary>
+    internal const string PendingAskUserIndexName = "idx_conversations_pending_ask_user";
+
+    internal const string PendingAskUserIndexDdl =
+        $"CREATE INDEX IF NOT EXISTS {PendingAskUserIndexName} ON conversations(id) WHERE {PendingAskUserPredicate};";
 
     // Additive `conversations` columns in application order. The `kind` column maps NULL to
     // ConversationKind.HumanAgent on load; `world_id` is NOT NULL DEFAULT '' and lazy-backfilled
@@ -751,14 +1468,38 @@ public sealed class SqliteConversationStore : IConversationStore
         ("model_override", "ALTER TABLE conversations ADD COLUMN model_override TEXT;"),
         ("thinking_override", "ALTER TABLE conversations ADD COLUMN thinking_override TEXT;"),
         ("context_window_override", "ALTER TABLE conversations ADD COLUMN context_window_override INTEGER;"),
+        ("compaction_token_ceiling", "ALTER TABLE conversations ADD COLUMN compaction_token_ceiling INTEGER;"),
+        // #2523: per-session narrowing tool overlay, stored as opaque JSON.
+        ("tool_override_json", "ALTER TABLE conversations ADD COLUMN tool_override_json TEXT;"),
         ("initiator", "ALTER TABLE conversations ADD COLUMN initiator TEXT;"),
         // Phase 4 / F-3 discriminator: NULL maps to ConversationKind.HumanAgent on load.
         ("kind", "ALTER TABLE conversations ADD COLUMN kind TEXT;"),
+        // #2300/#2301 origination trigger: nullable so existing rows migrate without a rewrite;
+        // NULL maps to ConversationSource.Channel on load (the back-compat default).
+        ("source", "ALTER TABLE conversations ADD COLUMN source TEXT;"),
+        // #2121 originator identity: nullable so existing rows migrate without a rewrite. NULL
+        // maps to Conversation.SourceId = null on load ("originator not recorded"), which is what
+        // every pre-existing row - including pre-existing cron/webhook conversations - becomes.
+        ("source_id", "ALTER TABLE conversations ADD COLUMN source_id TEXT;"),
+        // #2340 visibility axis: nullable so existing rows migrate without a rewrite; NULL maps to
+        // ConversationVisibility.UserFacing on load (the back-compat default), so an upgrade never
+        // hides a conversation the user could previously see.
+        ("visibility", "ALTER TABLE conversations ADD COLUMN visibility TEXT;"),
         // Phase 9 / P9-A world discriminator (#613): NOT NULL DEFAULT '' so legacy INSERTs stay
         // valid; empty values are lazy-backfilled to the current world id on read.
         ("world_id", "ALTER TABLE conversations ADD COLUMN world_id TEXT NOT NULL DEFAULT '';"),
         ("is_pinned", "ALTER TABLE conversations ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;"),
-        ("pinned_at", "ALTER TABLE conversations ADD COLUMN pinned_at TEXT;")
+        ("pinned_at", "ALTER TABLE conversations ADD COLUMN pinned_at TEXT;"),
+        // #2338 nested-run edge: nullable so every existing row deserializes unchanged (NULL means
+        // "top-level conversation"). Indexed in EnsureConversationColumnsAsync because the listing
+        // filter (`parent_conversation_id IS NULL`) and the child lookup both key off it.
+        ("parent_conversation_id", "ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT;"),
+        ("spawning_tool_call_id", "ALTER TABLE conversations ADD COLUMN spawning_tool_call_id TEXT;"),
+        // #2131 optimistic-concurrency revision. NOT NULL DEFAULT 1 so every pre-existing row
+        // migrates to a valid starting revision without a rewrite, and so a row can never be at
+        // version 0 (which the store reserves for "aggregate was never loaded from a store" and
+        // therefore treats as an unconditional write).
+        ("version", "ALTER TABLE conversations ADD COLUMN version INTEGER NOT NULL DEFAULT 1;")
     };
 
     // Race-tolerant single-column migration. Probes PRAGMA table_info first (cheap, avoids a
@@ -789,8 +1530,7 @@ public sealed class SqliteConversationStore : IConversationStore
         {
             await alterCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == 1 &&
-                                         ex.Message.Contains("duplicate column", StringComparison.OrdinalIgnoreCase))
+        catch (SqliteException ex) when (SqliteAdditiveMigration.IsDuplicateColumn(ex))
         {
             // Cross-process first-boot race: another gateway instance ran EnsureCreatedAsync
             // between our PRAGMA-table_info read and this ALTER. _initLock only serialises within
@@ -921,7 +1661,7 @@ public sealed class SqliteConversationStore : IConversationStore
     {
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override
+            SELECT id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, source, source_id, visibility, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override, compaction_token_ceiling, tool_override_json, parent_conversation_id, spawning_tool_call_id, version
             FROM conversations
             WHERE id = $id
             """;
@@ -931,7 +1671,7 @@ public sealed class SqliteConversationStore : IConversationStore
         if (!await reader.ReadAsync(ct).ConfigureAwait(false))
             return null;
 
-        var conversation = ConversationRowMapper.MapConversation(reader, logger);
+        var conversation = reader.MapConversation(logger);
 
         await reader.DisposeAsync().ConfigureAwait(false);
         conversation.ChannelBindings = await LoadBindingsAsync(connection, conversation.ConversationId, ct).ConfigureAwait(false);
@@ -958,10 +1698,23 @@ public sealed class SqliteConversationStore : IConversationStore
 
         // Split cache hits from misses up front; only the misses hit the database, and they do
         // so in one batched pass rather than a per-row LoadConversationAsync fan-out.
+        //
+        // The materialised result is assembled into a LOCAL map (`resolved`) that is independent of
+        // the LRU cache's capacity — NOT re-read out of `_cache` after warming it (issue #2226). The
+        // cache (BoundedLruCache, DefaultConversationCacheCapacity = 1000) is a warm read-through, not
+        // a buffer sized to hold an entire result set. When `orderedIds.Count` exceeds the cache
+        // capacity (or the LRU churns under concurrent reads), each `_cache.Set` for a later id can
+        // evict an earlier id; a subsequent `_cache.TryGet(id)` rebuild loop then misses those
+        // evicted ids and silently drops them, so conversations past the ~1000th position flickered
+        // in and out of GET /api/conversations non-deterministically. Keeping the loaded rows in a
+        // local map decouples result membership from cache survival while still warming the cache.
+        var resolved = new Dictionary<string, Conversation>(orderedIds.Count, StringComparer.Ordinal);
         var missing = new List<string>();
         foreach (var id in orderedIds)
         {
-            if (!_cache.TryGet(id, out _))
+            if (_cache.TryGet(id, out var cached))
+                resolved[id] = cached;
+            else
                 missing.Add(id);
         }
 
@@ -969,14 +1722,17 @@ public sealed class SqliteConversationStore : IConversationStore
         {
             var loaded = await LoadConversationsByIdsAsync(connection, missing, ct).ConfigureAwait(false);
             foreach (var (id, conversation) in loaded)
+            {
                 _cache.Set(id, CloneConversation(conversation));
+                resolved[id] = conversation;
+            }
         }
 
         // An id present in the ordered set can legitimately vanish between the id-select in the
         // caller (ListAsync / ListForCitizenAsync) and this hydrate pass: a concurrent deleter —
         // notably the noop cron-session prune (issue #1754) or any DeleteAsync racing a live portal
         // poller — can remove the row after we captured its id but before LoadConversationsByIdsAsync
-        // ran. That row is simply absent from the batch load and never enters the cache. Treat it as
+        // ran. That row is simply absent from the batch load and never enters `resolved`. Treat it as
         // a concurrent delete and omit it from the list rather than throwing: a hard throw here turns
         // the whole GET /api/conversations request into a 500 (issue #1642 originally introduced the
         // throw). Omitting the deleted conversation is the correct read-side semantics for a delete
@@ -984,9 +1740,9 @@ public sealed class SqliteConversationStore : IConversationStore
         var result = new List<Conversation>(orderedIds.Count);
         foreach (var id in orderedIds)
         {
-            if (!_cache.TryGet(id, out var cached))
+            if (!resolved.TryGetValue(id, out var conversation))
                 continue;
-            result.Add(BackfillWorldId(CloneConversation(cached))!);
+            result.Add(BackfillWorldId(CloneConversation(conversation))!);
         }
 
         return result;
@@ -1014,7 +1770,7 @@ public sealed class SqliteConversationStore : IConversationStore
         {
             var inClause = BuildIdInClause(command, ids);
             command.CommandText = $"""
-                SELECT id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override
+                SELECT id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, source, source_id, visibility, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override, compaction_token_ceiling, tool_override_json, parent_conversation_id, spawning_tool_call_id, version
                 FROM conversations
                 WHERE id IN ({inClause})
                 """;
@@ -1022,7 +1778,7 @@ public sealed class SqliteConversationStore : IConversationStore
             await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
             while (await reader.ReadAsync(ct).ConfigureAwait(false))
             {
-                var conversation = ConversationRowMapper.MapConversation(reader, _logger);
+                var conversation = reader.MapConversation(_logger);
                 conversation.ChannelBindings = [];
                 conversation.Participants = [];
                 byId[conversation.ConversationId.Value] = conversation;
@@ -1060,7 +1816,7 @@ public sealed class SqliteConversationStore : IConversationStore
                     list = [];
                     bindingsById[conversationId] = list;
                 }
-                list.Add(ConversationRowMapper.MapBinding(reader, offset: 1));
+                list.Add(reader.MapBinding(offset: 1));
             }
         }
 
@@ -1085,7 +1841,7 @@ public sealed class SqliteConversationStore : IConversationStore
             {
                 var conversationId = reader.GetString(0);
                 if (!byId.ContainsKey(conversationId)
-                    || ConversationRowMapper.MapParticipant(reader, offset: 1, _logger) is not { } participant)
+                    || reader.MapParticipant(offset: 1, _logger) is not { } participant)
                 {
                     continue;
                 }
@@ -1144,7 +1900,7 @@ public sealed class SqliteConversationStore : IConversationStore
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
-            if (ConversationRowMapper.MapParticipant(reader, offset: 0, logger) is { } participant)
+            if (reader.MapParticipant(offset: 0, logger) is { } participant)
                 participants.Add(participant);
         }
 
@@ -1167,14 +1923,27 @@ public sealed class SqliteConversationStore : IConversationStore
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
-            bindings.Add(ConversationRowMapper.MapBinding(reader, offset: 0));
+            bindings.Add(reader.MapBinding(offset: 0));
         }
 
         return bindings;
     }
 
 
-    private static async Task SaveConversationAsync(SqliteConnection connection, Conversation conversation, bool upsert, CancellationToken ct)
+    /// <summary>
+    /// Writes the whole conversation aggregate. On the upsert path this is a compare-and-swap
+    /// against <see cref="Conversation.Version"/> (issue #2131): the row is only rewritten when its
+    /// committed revision still matches the revision the caller's snapshot was loaded at, so a
+    /// stale full-row save cannot silently clobber a pin / canvas / todo / override that a narrow
+    /// mutation committed after that read. Returns the new revision, or <c>null</c> when the CAS
+    /// guard rejected the write.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="expectedVersion"/> of <c>0</c> means the aggregate did not come out of a
+    /// store (freshly constructed), and the write is unconditional - construct-then-save call sites
+    /// keep working unchanged. Every persisted row is at revision 1 or higher.
+    /// </remarks>
+    private static async Task<long?> SaveConversationAsync(SqliteConnection connection, Conversation conversation, bool upsert, long expectedVersion, CancellationToken ct)
     {
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
 
@@ -1182,8 +1951,8 @@ public sealed class SqliteConversationStore : IConversationStore
         conversationCommand.Transaction = transaction;
         conversationCommand.CommandText = upsert
             ? """
-                INSERT INTO conversations (id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override)
-                VALUES ($id, $agentId, $title, $purpose, $isDefault, $status, $activeSessionId, $metadata, $createdAt, $updatedAt, $instructions, $canvasHtml, $initiator, $kind, $worldId, $isPinned, $pinnedAt, $todoJson, $pendingAskUserJson, $modelOverride, $thinkingOverride, $contextWindowOverride)
+                INSERT INTO conversations (id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, source, source_id, visibility, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override, compaction_token_ceiling, tool_override_json, parent_conversation_id, spawning_tool_call_id, version)
+                VALUES ($id, $agentId, $title, $purpose, $isDefault, $status, $activeSessionId, $metadata, $createdAt, $updatedAt, $instructions, $canvasHtml, $initiator, $kind, $source, $sourceId, $visibility, $worldId, $isPinned, $pinnedAt, $todoJson, $pendingAskUserJson, $modelOverride, $thinkingOverride, $contextWindowOverride, $compactionTokenCeiling, $toolOverrideJson, $parentConversationId, $spawningToolCallId, 1)
                 ON CONFLICT(id) DO UPDATE SET
                     agent_id = excluded.agent_id,
                     title = excluded.title,
@@ -1198,6 +1967,8 @@ public sealed class SqliteConversationStore : IConversationStore
                     canvas_html = excluded.canvas_html,
                     initiator = excluded.initiator,
                     kind = excluded.kind,
+                    source = excluded.source,
+                    visibility = excluded.visibility,
                     world_id = excluded.world_id,
                     is_pinned = excluded.is_pinned,
                     pinned_at = excluded.pinned_at,
@@ -1205,11 +1976,16 @@ public sealed class SqliteConversationStore : IConversationStore
                     pending_ask_user_json = excluded.pending_ask_user_json,
                     model_override = excluded.model_override,
                     thinking_override = excluded.thinking_override,
-                    context_window_override = excluded.context_window_override
+                    context_window_override = excluded.context_window_override,
+                    compaction_token_ceiling = excluded.compaction_token_ceiling,
+                    tool_override_json = excluded.tool_override_json,
+                    version = conversations.version + 1
+                WHERE $expectedVersion = 0 OR conversations.version = $expectedVersion
+                RETURNING version
                 """
             : """
-                INSERT INTO conversations (id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override)
-                VALUES ($id, $agentId, $title, $purpose, $isDefault, $status, $activeSessionId, $metadata, $createdAt, $updatedAt, $instructions, $canvasHtml, $initiator, $kind, $worldId, $isPinned, $pinnedAt, $todoJson, $pendingAskUserJson, $modelOverride, $thinkingOverride, $contextWindowOverride)
+                INSERT INTO conversations (id, agent_id, title, purpose, is_default, status, active_session_id, metadata, created_at, updated_at, instructions, canvas_html, initiator, kind, source, source_id, visibility, world_id, is_pinned, pinned_at, todo_json, pending_ask_user_json, model_override, thinking_override, context_window_override, compaction_token_ceiling, tool_override_json, parent_conversation_id, spawning_tool_call_id, version)
+                VALUES ($id, $agentId, $title, $purpose, $isDefault, $status, $activeSessionId, $metadata, $createdAt, $updatedAt, $instructions, $canvasHtml, $initiator, $kind, $source, $sourceId, $visibility, $worldId, $isPinned, $pinnedAt, $todoJson, $pendingAskUserJson, $modelOverride, $thinkingOverride, $contextWindowOverride, $compactionTokenCeiling, $toolOverrideJson, $parentConversationId, $spawningToolCallId, 1)
                 """;
         conversationCommand.Parameters.AddWithValue("$id", conversation.ConversationId.Value);
         conversationCommand.Parameters.AddWithValue("$agentId", conversation.AgentId.Value);
@@ -1225,6 +2001,12 @@ public sealed class SqliteConversationStore : IConversationStore
         conversationCommand.Parameters.AddWithValue("$canvasHtml", conversation.CanvasHtml is null ? (object)DBNull.Value : conversation.CanvasHtml);
         conversationCommand.Parameters.AddWithValue("$initiator", (object?)SerializeInitiator(conversation.Initiator) ?? DBNull.Value);
         conversationCommand.Parameters.AddWithValue("$kind", conversation.Kind.ToString());
+        conversationCommand.Parameters.AddWithValue("$source", conversation.Source.ToString());
+        // #2121: deliberately absent from the upsert's DO UPDATE SET list, exactly like the #2338
+        // parent edge - SourceId is an init-only creation fact, so a later SaveAsync must never be
+        // able to re-attribute a persisted conversation to a different registration or job.
+        conversationCommand.Parameters.AddWithValue("$sourceId", conversation.SourceId is null ? (object)DBNull.Value : conversation.SourceId);
+        conversationCommand.Parameters.AddWithValue("$visibility", conversation.Visibility.ToString());
         conversationCommand.Parameters.AddWithValue("$worldId", conversation.WorldId ?? string.Empty);
         conversationCommand.Parameters.AddWithValue("$isPinned", conversation.IsPinned ? 1 : 0);
         conversationCommand.Parameters.AddWithValue("$pinnedAt", conversation.PinnedAt.HasValue ? (object)conversation.PinnedAt.Value.ToString("O") : DBNull.Value);
@@ -1232,8 +2014,32 @@ public sealed class SqliteConversationStore : IConversationStore
         conversationCommand.Parameters.AddWithValue("$pendingAskUserJson", conversation.PendingAskUserJson is null ? (object)DBNull.Value : conversation.PendingAskUserJson);
         conversationCommand.Parameters.AddWithValue("$modelOverride", conversation.ModelOverride is null ? (object)DBNull.Value : conversation.ModelOverride);
         conversationCommand.Parameters.AddWithValue("$thinkingOverride", conversation.ThinkingOverride is null ? (object)DBNull.Value : conversation.ThinkingOverride);
+        conversationCommand.Parameters.AddWithValue("$compactionTokenCeiling", (object?)conversation.CompactionTokenCeiling ?? DBNull.Value);
         conversationCommand.Parameters.AddWithValue("$contextWindowOverride", conversation.ContextWindowOverride.HasValue ? conversation.ContextWindowOverride.Value : (object)DBNull.Value);
-        await conversationCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        conversationCommand.Parameters.AddWithValue("$toolOverrideJson", conversation.ToolOverrideJson is null ? (object)DBNull.Value : conversation.ToolOverrideJson);
+        // #2338: deliberately NOT in the upsert's DO UPDATE SET list - the parent edge and the
+        // spawning tool call are write-once creation facts (init-only on the model), so a later
+        // SaveAsync must never be able to re-parent a persisted conversation.
+        conversationCommand.Parameters.AddWithValue("$parentConversationId", conversation.ParentConversationId is null ? DBNull.Value : conversation.ParentConversationId.Value.Value);
+        conversationCommand.Parameters.AddWithValue("$spawningToolCallId", conversation.SpawningToolCallId is null ? (object)DBNull.Value : conversation.SpawningToolCallId);
+
+        long newVersion;
+        if (upsert)
+        {
+            conversationCommand.Parameters.AddWithValue("$expectedVersion", expectedVersion);
+            // RETURNING yields no row when the ON CONFLICT guard rejected the update, which is
+            // exactly the stale-save case. Abandoning the transaction (no commit) leaves the
+            // committed row - and the narrow mutation that bumped it - untouched.
+            var returned = await conversationCommand.ExecuteScalarAsync(ct).ConfigureAwait(false);
+            if (returned is null or DBNull)
+                return null;
+            newVersion = Convert.ToInt64(returned, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        else
+        {
+            await conversationCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            newVersion = 1;
+        }
 
         await using var deleteBindingsCommand = connection.CreateCommand();
         deleteBindingsCommand.Transaction = transaction;
@@ -1263,6 +2069,7 @@ public sealed class SqliteConversationStore : IConversationStore
         }
 
         await transaction.CommitAsync(ct).ConfigureAwait(false);
+        return newVersion;
     }
 
     private SqliteConnection CreateConnection()
@@ -1281,13 +2088,31 @@ public sealed class SqliteConversationStore : IConversationStore
             PendingAskUserJson = conversation.PendingAskUserJson,
             Initiator = conversation.Initiator,
             Kind = conversation.Kind,
+            Source = conversation.Source,
+            ParentConversationId = conversation.ParentConversationId,
+            SpawningToolCallId = conversation.SpawningToolCallId,
+            Visibility = conversation.Visibility,
             WorldId = conversation.WorldId,
             IsPinned = conversation.IsPinned,
             PinnedAt = conversation.PinnedAt,
             IsDefault = conversation.IsDefault,
             Status = conversation.Status,
+            // #2131: the per-conversation overrides were previously omitted from the clone, so
+            // SaveAsync - which persists a CLONE of the caller's aggregate - silently wrote NULL
+            // over a committed model/thinking/context override on every full save. Same class of
+            // clobber the CAS guard addresses, on the copy path rather than the SQL path.
+            ModelOverride = conversation.ModelOverride,
+            ThinkingOverride = conversation.ThinkingOverride,
+            ContextWindowOverride = conversation.ContextWindowOverride,
+            CompactionTokenCeiling = conversation.CompactionTokenCeiling,
+            // #2523: same reasoning - an overlay omitted from the clone would be NULLed by every
+            // full save, silently lifting a blast-radius restriction the operator set.
+            ToolOverrideJson = conversation.ToolOverrideJson,
             CreatedAt = conversation.CreatedAt,
             UpdatedAt = conversation.UpdatedAt,
+            // #2131: the revision travels with the snapshot so a caller that read a clone and
+            // saves it later is compare-and-swapped against the revision it actually read.
+            Version = conversation.Version,
             ActiveSessionId = conversation.ActiveSessionId,
             Metadata = CloneMetadata(conversation.Metadata),
             ChannelBindings = conversation.ChannelBindings.Select(binding => new ChannelBinding
@@ -1317,7 +2142,7 @@ public sealed class SqliteConversationStore : IConversationStore
     // Dictionary<string, object?> we fall back to an empty dictionary rather than letting the clone
     // (and therefore every list/cache-seed path that clones) abort. This method is static and has no
     // instance logger; the row is degraded silently to a safe default which is acceptable because the
-    // authoritative on-disk read path (ConversationRowMapper.DeserializeMetadata) already logs.
+    // authoritative on-disk read path (SqliteDataReaderExtensions.DeserializeMetadata) already logs.
     private static Dictionary<string, object?> CloneMetadata(IReadOnlyDictionary<string, object?> metadata)
     {
         try
@@ -1426,7 +2251,7 @@ public sealed class SqliteConversationStore : IConversationStore
     {
         await EnsureCreatedAsync(ct).ConfigureAwait(false);
 
-        await using var connection = new SqliteConnection(_connectionString);
+        await using var connection = CreateConnection();
         await connection.OpenAsync(ct).ConfigureAwait(false);
 
         await using var command = connection.CreateCommand();
@@ -1442,7 +2267,7 @@ public sealed class SqliteConversationStore : IConversationStore
     {
         await EnsureCreatedAsync(ct).ConfigureAwait(false);
 
-        await using var connection = new SqliteConnection(_connectionString);
+        await using var connection = CreateConnection();
         await connection.OpenAsync(ct).ConfigureAwait(false);
 
         await using var command = connection.CreateCommand();
@@ -1450,5 +2275,13 @@ public sealed class SqliteConversationStore : IConversationStore
         command.Parameters.AddWithValue("$id", conversationId.Value);
 
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+    private static void ValidateLifecycleState(Conversation conversation)
+    {
+        if (conversation.Status == ConversationStatus.Archived && conversation.ActiveSessionId is not null)
+        {
+            throw new InvalidOperationException(
+                $"Conversation '{conversation.ConversationId}' cannot be archived while an active session is assigned.");
+        }
     }
 }

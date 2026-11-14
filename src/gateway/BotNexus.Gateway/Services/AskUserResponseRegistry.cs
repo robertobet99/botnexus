@@ -9,10 +9,30 @@ namespace BotNexus.Gateway.Services;
 /// Tracks pending <c>ask_user</c> waits so channel responses can complete blocked tool calls
 /// without re-entering the session queue.
 /// </summary>
+/// <remarks>
+/// As of issue #2047 the registry also holds <em>rehydrated</em> entries: a durable pending prompt
+/// whose live waiter did not survive a restart is re-mapped here (via <see cref="Rehydrate"/>) so the
+/// channel interceptor still recognises inbound text as a response. Rehydrated entries carry no
+/// completion task and are deliberately not completable through <see cref="TryComplete"/>; the
+/// durable checkpoint service owns their resolution.
+/// </remarks>
 public sealed class AskUserResponseRegistry : IAskUserResponseRegistry, IDisposable
 {
     private readonly ConcurrentDictionary<string, PendingAskUserResponse> _pendingByRequestId = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _requestIdByConversation = new(StringComparer.Ordinal);
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>Uses system time for ordinary construction and dependency injection.</summary>
+    public AskUserResponseRegistry() : this(TimeProvider.System)
+    {
+    }
+
+    /// <summary>Allows timeout tests to control the timer scheduler without wall-clock waits.</summary>
+    public AskUserResponseRegistry(TimeProvider timeProvider)
+    {
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        _timeProvider = timeProvider;
+    }
 
     /// <inheritdoc />
     public (string RequestId, Task<AskUserResponse> Task) Register(ConversationId conversationId, TimeSpan? timeout)
@@ -44,12 +64,25 @@ public sealed class AskUserResponseRegistry : IAskUserResponseRegistry, IDisposa
 
             if (timeout is { } timeoutValue && timeoutValue > TimeSpan.Zero)
             {
-                pending.TimeoutCts = new CancellationTokenSource(timeoutValue);
+                pending.TimeoutCts = new CancellationTokenSource(timeoutValue, _timeProvider);
                 pending.TimeoutRegistration = pending.TimeoutCts.Token.Register(() => HandleTimeout(pending));
             }
 
             return (requestId, pending.Completion.Task);
         }
+    }
+
+    /// <inheritdoc />
+    public bool Rehydrate(ConversationId conversationId, string requestId)
+    {
+        if (string.IsNullOrWhiteSpace(requestId))
+            return false;
+
+        var conversationKey = NormalizeConversationId(conversationId);
+        // Only add the conversation->request mapping. Deliberately NOT adding a PendingAskUserResponse
+        // to _pendingByRequestId: a rehydrated prompt has no in-memory waiter to complete, so
+        // TryComplete must return false for it and the durable checkpoint service must own resolution.
+        return _requestIdByConversation.TryAdd(conversationKey, requestId.Trim());
     }
 
     /// <inheritdoc />

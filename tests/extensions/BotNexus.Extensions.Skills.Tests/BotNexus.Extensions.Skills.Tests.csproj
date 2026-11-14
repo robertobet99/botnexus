@@ -9,6 +9,7 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" />    <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="NSubstitute" />
     <PackageReference Include="TestableIO.System.IO.Abstractions.TestingHelpers" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
@@ -20,6 +21,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\src\extensions\BotNexus.Extensions.Skills\BotNexus.Extensions.Skills.csproj" />
+    <!-- Plugin skill discovery (#2684) is exercised through the plugin lifecycle record types. -->
+    <ProjectReference Include="..\..\..\src\extensions\BotNexus.Extensions.Plugins\BotNexus.Extensions.Plugins.csproj" />
   </ItemGroup>
 
 

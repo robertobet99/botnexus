@@ -32,7 +32,7 @@ public sealed class AgentPromptActionTests
             })
             .ReturnsAsync(createdSession);
 
-        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns((AgentDescriptor?)null);
+        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns(SoulDisabledDescriptor);
         var services = BuildServices(trigger.Object, registry.Object);
         var context = CreateContext(services, model: "openai/gpt-4.1");
 
@@ -60,7 +60,7 @@ public sealed class AgentPromptActionTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_SoulAgent_UsesSoulTrigger()
+    public async Task ExecuteAsync_SoulEnabledAgent_StillUsesCronTrigger()
     {
         var action = new AgentPromptAction();
         var cronTrigger = new Mock<IInternalTrigger>();
@@ -78,24 +78,226 @@ public sealed class AgentPromptActionTests
         registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns(descriptor);
         cronTrigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
         soulTrigger.SetupGet(value => value.Type).Returns(TriggerType.Soul);
-        soulTrigger.Setup(value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()))
-            .ReturnsAsync(SessionId.From("soul:agent-a:2026-05-08"));
+        cronTrigger.Setup(value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()))
+            .ReturnsAsync(SessionId.From("cron:job-1:run-1"));
 
         var services = BuildServices(cronTrigger.Object, soulTrigger.Object, registry.Object);
         var context = CreateContext(services);
 
         await action.ExecuteAsync(context);
 
-        soulTrigger.Verify(value =>
-            value.CreateSessionAsync(AgentId.From("agent-a"), "Ping from cron", It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()), Times.Once);
         cronTrigger.Verify(value =>
+            value.CreateSessionAsync(AgentId.From("agent-a"), "Ping from cron", It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()), Times.Once);
+        soulTrigger.Verify(value =>
             value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()), Times.Never);
+        context.SessionId!.Value.ShouldBe(SessionId.From("cron:job-1:run-1"));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_ForwardsTriggerReportedToolInvocationCount_ToTheExecutionContext()
+    {
+        // #2985: the scheduler's zero-tool rule can only fire if the count actually crosses the
+        // action seam. Without this forwarding the marker would be accepted, persisted, documented
+        // -- and completely inert, which is the most expensive way to ship a detection fix.
+        var action = new AgentPromptAction();
+        var trigger = new Mock<IInternalTrigger>();
+        var registry = new Mock<IAgentRegistry>();
+
+        trigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
+        trigger.Setup(value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()))
+            .Callback<AgentId, string, CancellationToken, InternalTriggerRequest?>((_, _, _, request) =>
+            {
+                // Stand in for the trigger writing back its turn's tool count.
+                if (request is not null)
+                    request.ToolInvocationCount = 0;
+            })
+            .ReturnsAsync(SessionId.From("cron:job-1:run-1"));
+        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns(SoulDisabledDescriptor);
+
+        var context = CreateContext(BuildServices(trigger.Object, registry.Object));
+
+        await action.ExecuteAsync(context);
+
+        context.ToolInvocationCount.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_ForwardsTriggerReportedCompletionDisposition()
+    {
+        var action = new AgentPromptAction();
+        var trigger = new Mock<IInternalTrigger>();
+        var registry = new Mock<IAgentRegistry>();
+        var completion = new RunCompletionSignal(
+            "IncompleteWithoutStopReason",
+            ["publish"],
+            null,
+            "Work remained actionable.",
+            null,
+            null,
+            null,
+            2);
+
+        trigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
+        trigger.Setup(value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()))
+            .Callback<AgentId, string, CancellationToken, InternalTriggerRequest?>((_, _, _, request) => request!.Completion = completion)
+            .ReturnsAsync(SessionId.From("cron:job-1:run-1"));
+        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns(SoulDisabledDescriptor);
+        var context = CreateContext(BuildServices(trigger.Object, registry.Object));
+
+        await action.ExecuteAsync(context);
+
+        context.RunCompletion.ShouldBe(completion);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenTriggerReportsNoToolCount_LeavesContextCountNull()
+    {
+        // #2985: null must stay null across the seam. If the action defaulted an unreported count
+        // to zero, every command/webhook-shaped run would look like a do-nothing run.
+        var action = new AgentPromptAction();
+        var trigger = new Mock<IInternalTrigger>();
+        var registry = new Mock<IAgentRegistry>();
+
+        trigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
+        trigger.Setup(value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()))
+            .ReturnsAsync(SessionId.From("cron:job-1:run-1"));
+        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns(SoulDisabledDescriptor);
+
+        var context = CreateContext(BuildServices(trigger.Object, registry.Object));
+
+        await action.ExecuteAsync(context);
+
+        context.ToolInvocationCount.ShouldBeNull();
+    }
+
+    // #3210: a registered agent whose soul is disabled. The action must keep dispatching this on
+    // TriggerType.Cron exactly as before - it is precisely the case that a null descriptor used to
+    // be indistinguishable from.
+    private static AgentDescriptor SoulDisabledDescriptor => new()
+    {
+        AgentId = AgentId.From("agent-a"),
+        DisplayName = "Agent A",
+        ModelId = "gpt-4.1",
+        ApiProvider = "copilot",
+        Soul = new SoulAgentConfig { Enabled = false }
+    };
+
+    private static IAgentRegistry RegistryReturning(AgentDescriptor? descriptor)
+    {
+        var registry = new Mock<IAgentRegistry>();
+        registry.Setup(value => value.Get(It.IsAny<AgentId>())).Returns(descriptor);
+        return registry.Object;
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenAgentIsNotRegistered_ThrowsClassifiedErrorAndDoesNotDispatch()
+    {
+        // #3210 AC1/AC2/AC5: an agent id that resolves to no descriptor must be classified BEFORE
+        // dispatch. Previously it fell through to TriggerType.Cron and failed opaquely inside the
+        // trigger, once per scheduled fire, forever.
+        var action = new AgentPromptAction();
+        var trigger = new Mock<IInternalTrigger>();
+        trigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
+
+        var context = CreateContext(BuildServices(trigger.Object, RegistryReturning(null)));
+
+        var ex = await Should.ThrowAsync<InvalidOperationException>(() => action.ExecuteAsync(context));
+
+        ex.Message.ShouldContain("agent-a");
+        ex.Message.ShouldContain("not registered");
+        // AC2: the recorded reason must state the recovery action, not just the symptom.
+        ex.Message.ShouldContain("Re-register");
+        ex.Message.ShouldContain("delete");
+        ex.Message.ShouldContain("reassign");
+
+        // AC5: no trigger may be invoked at all.
+        trigger.Verify(
+            value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()),
+            Times.Never);
+        context.SessionId.ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenAgentRegisteredWithSoulDisabled_StillDispatchesOnCronTrigger()
+    {
+        // #3210 AC3: a registered descriptor with Soul.Enabled == false is NOT the missing-agent
+        // case and must behave exactly as it did before the preflight existed.
+        var action = new AgentPromptAction();
+        var trigger = new Mock<IInternalTrigger>();
+        trigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
+        trigger.Setup(value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()))
+            .ReturnsAsync(SessionId.From("cron:job-1:run-1"));
+
+        var context = CreateContext(BuildServices(trigger.Object, RegistryReturning(SoulDisabledDescriptor)));
+
+        await action.ExecuteAsync(context);
+
+        trigger.Verify(
+            value => value.CreateSessionAsync(AgentId.From("agent-a"), "Ping from cron", It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenAgentRegistryIsUnregistered_DoesNotReportTheAgentAsMissing()
+    {
+        // #3210 AC4: IAgentRegistry absent from DI is "cannot know", not "agent missing". The run
+        // must proceed to dispatch on the cron trigger rather than fail with a false report.
+        var action = new AgentPromptAction();
+        var trigger = new Mock<IInternalTrigger>();
+        trigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
+        trigger.Setup(value => value.CreateSessionAsync(It.IsAny<AgentId>(), It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()))
+            .ReturnsAsync(SessionId.From("cron:job-1:run-1"));
+
+        var services = new ServiceCollection()
+            .AddSingleton<IInternalTrigger>(trigger.Object)
+            .BuildServiceProvider();
+
+        await action.ExecuteAsync(CreateContext(services));
+
+        trigger.Verify(
+            value => value.CreateSessionAsync(AgentId.From("agent-a"), "Ping from cron", It.IsAny<CancellationToken>(), It.IsAny<InternalTriggerRequest?>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_PublishesSchedulerSessionCallbackToCronTrigger()
+    {
+        var action = new AgentPromptAction();
+        var trigger = new Mock<IInternalTrigger>();
+        var expectedSession = SessionId.From("cron:job-1:run-1");
+        var published = new TaskCompletionSource<SessionId>(TaskCreationOptions.RunContinuationsAsynchronously);
+        trigger.SetupGet(value => value.Type).Returns(TriggerType.Cron);
+        trigger.Setup(value => value.CreateSessionAsync(
+                It.IsAny<AgentId>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>(),
+                It.IsAny<InternalTriggerRequest?>()))
+            .Returns(async (AgentId _, string _, CancellationToken ct, InternalTriggerRequest? request) =>
+            {
+                request.ShouldNotBeNull();
+                request!.SessionCreatedAsync.ShouldNotBeNull();
+                await request.SessionCreatedAsync(expectedSession, ct);
+                return expectedSession;
+            });
+
+        var context = CreateContext(BuildServices(trigger.Object, RegistryReturning(SoulDisabledDescriptor))) with
+        {
+            PersistSessionIdAsync = (sessionId, _) =>
+            {
+                published.TrySetResult(sessionId);
+                return Task.CompletedTask;
+            }
+        };
+
+        await action.ExecuteAsync(context);
+
+        (await published.Task.WaitAsync(TimeSpan.FromSeconds(5))).ShouldBe(expectedSession);
     }
 
     private static IServiceProvider BuildServices(IInternalTrigger trigger, IAgentRegistry? registry = null)
         => new ServiceCollection()
             .AddSingleton<IInternalTrigger>(trigger)
-            .AddSingleton(registry ?? Mock.Of<IAgentRegistry>())
+            .AddSingleton(registry ?? RegistryReturning(SoulDisabledDescriptor))
             .BuildServiceProvider();
 
     private static IServiceProvider BuildServices(IInternalTrigger trigger1, IInternalTrigger trigger2, IAgentRegistry registry)
@@ -141,7 +343,7 @@ public sealed class AgentPromptActionTests
             .Callback<AgentId, string, CancellationToken, InternalTriggerRequest?>((_, _, _, request) => capturedRequest = request)
             .ReturnsAsync(SessionId.From("cron:job-pinned:run-1"));
 
-        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns((AgentDescriptor?)null);
+        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns(SoulDisabledDescriptor);
         var services = BuildServices(trigger.Object, registry.Object);
 
         var context = new CronExecutionContext
@@ -192,7 +394,7 @@ public sealed class AgentPromptActionTests
                 return true;
             });
 
-        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns((AgentDescriptor?)null);
+        registry.Setup(value => value.Get(AgentId.From("agent-a"))).Returns(SoulDisabledDescriptor);
         var services = new ServiceCollection()
             .AddSingleton<IInternalTrigger>(trigger.Object)
             .AddSingleton(resolver.Object)

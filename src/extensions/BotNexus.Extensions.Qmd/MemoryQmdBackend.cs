@@ -1,5 +1,7 @@
+using BotNexus.Domain.Primitives;
 using BotNexus.Memory;
 using BotNexus.Memory.Models;
+using BotNexus.Gateway.Abstractions.Text;
 
 namespace BotNexus.Extensions.Qmd;
 
@@ -11,7 +13,7 @@ namespace BotNexus.Extensions.Qmd;
 public sealed class MemoryQmdBackend : IQmdBackend
 {
     private readonly ISharedMemoryStoreRegistry _registry;
-    private readonly string _agentId;
+    private readonly AgentId _agentId;
 
     internal const string StorePrefix = "memory:";
 
@@ -20,10 +22,10 @@ public sealed class MemoryQmdBackend : IQmdBackend
     /// </summary>
     /// <param name="registry">The shared memory store registry.</param>
     /// <param name="agentId">Agent ID used to filter readable stores.</param>
-    public MemoryQmdBackend(ISharedMemoryStoreRegistry registry, string agentId)
+    public MemoryQmdBackend(ISharedMemoryStoreRegistry registry, AgentId agentId)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
-        _agentId = agentId ?? throw new ArgumentNullException(nameof(agentId));
+        _agentId = agentId;
     }
 
     /// <inheritdoc />
@@ -73,7 +75,7 @@ public sealed class MemoryQmdBackend : IQmdBackend
         var storeName = remainder[..slashIndex];
         var entryId = remainder[(slashIndex + 1)..];
 
-        if (!_registry.CanRead(_agentId, storeName)) return null;
+        if (!_registry.CanRead(_agentId.Value, storeName)) return null;
 
         var memStore = _registry.GetStore(storeName);
         if (memStore is null) return null;
@@ -90,11 +92,19 @@ public sealed class MemoryQmdBackend : IQmdBackend
     }
 
     /// <inheritdoc />
+    public Task<string[]> GetSearchStoreNamesAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(_registry.GetReadableStores(_agentId.Value)
+            .Select(name => $"{StorePrefix}{name}").ToArray());
+    }
+
+    /// <inheritdoc />
     public async Task<QmdStoreInfo[]> GetStoresAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
-        var readableStores = _registry.GetReadableStores(_agentId);
+        var readableStores = _registry.GetReadableStores(_agentId.Value);
         var results = new List<QmdStoreInfo>();
 
         foreach (var storeName in readableStores)
@@ -143,10 +153,10 @@ public sealed class MemoryQmdBackend : IQmdBackend
                 ? store[StorePrefix.Length..]
                 : store;
 
-            return _registry.CanRead(_agentId, name) ? [name] : [];
+            return _registry.CanRead(_agentId.Value, name) ? [name] : [];
         }
 
-        return _registry.GetReadableStores(_agentId);
+        return _registry.GetReadableStores(_agentId.Value);
     }
 
     private static string ExtractTitle(MemoryEntry entry)
@@ -157,8 +167,7 @@ public sealed class MemoryQmdBackend : IQmdBackend
     }
 
     private static string Truncate(string text, int maxLength)
-    {
-        if (text.Length <= maxLength) return text;
-        return text[..maxLength] + "...";
-    }
+        // #2924: the single shared boundary policy - a title cut mid-cluster renders as a
+        // half-glyph, and this one is displayed verbatim in knowledge_search results.
+        => GraphemeSafeTruncation.Truncate(text, maxLength, "...")!;
 }

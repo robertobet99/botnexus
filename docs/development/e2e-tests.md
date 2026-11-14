@@ -14,8 +14,39 @@ then drives the Blazor portal with Playwright.
 
 Per test-run sandbox under `Path.GetTempPath()/botnexus-e2e/<runId>/`:
 
-1. `dotnet pack` the in-tree `BotNexus.Cli` as `99.99.99-e2e-<hash>` and
+1. `dotnet pack` the in-tree `BotNexus.Cli` into a per-run `pack/` directory and
    `dotnet tool install` it into a per-run `tool/` directory.
+
+   The pack stamps **`PackageVersion` only** - `99.99.99-e2e-<hash>`, which gives
+   `dotnet tool install --version` a unique per-run identity. MSBuild `Version` stays at
+   the repo's real assembly version. Setting `Version` to the synthetic stamp as well
+   (the pre-#3388 behaviour) propagated it through every `ProjectReference`, so the CLI
+   was compiled against `99.99.99.0` while its dependencies - copied from the shared
+   `src/**/bin/Release` tree that the runner and the fixture prebuild both write - carried
+   the repo version. The installed tool then died during `init` with
+   `Could not load file or assembly 'BotNexus.Agent.Providers.Core, Version=99.99.99.0'`.
+   It also forced a cold rebuild of the whole closure from inside a testhost, which was the
+   bulk of the fixture-startup cost attributed in #3314.
+
+   The pack now also runs under the same machine-wide mutex as the solution prebuild, and
+   the install layout is verified by name before any CLI verb runs, so a bind fault fails at
+   the step that produced it rather than as an opaque `exited 1` later.
+
+   **The same defect existed independently in `BotNexus.Integration.Cli.Tests` and was fixed by
+   #3237.** That project's `LocalCliInstallFixture` packs through `CliPackIsolation`, which was
+   still stamping the synthetic value as *both* `Version` and `PackageVersion` after #3388 fixed
+   the E2E copy. It produced the same intermittent
+   `Could not load file or assembly 'BotNexus.Agent.Providers.Core, Version=99.99.99.0'` during
+   `init`, reddening unrelated PRs. Two properties are involved and they are not interchangeable:
+
+   | Property | Correct value | Effect if stamped synthetically |
+   |---|---|---|
+   | `PackageVersion` | `99.99.99-<kind>-<hash>` | none — this is what gives `dotnet tool install --version` a per-run identity |
+   | `Version` | the repo assembly version (`Directory.Build.props`) | flows into every `ProjectReference`, recompiles the whole closure at a version nothing else on the machine carries, and the CLI then binds a dependency version the packaged copy may not have |
+
+   **If you add another pack-and-install fixture, stamp `PackageVersion` only.** The install-layout
+   guard must also expect the *repo* version rather than the pack stamp — expecting the synthetic
+   value is what left the #3243 guard silent on a genuinely broken layout.
 2. `botnexus init --target <home>` — fresh `BOTNEXUS_HOME`.
 3. `botnexus provider add --name integration-mock --api integration-mock
    --default-model integration-mock-echo --base-url <e2e-catalog.json>`.
@@ -24,7 +55,7 @@ Per test-run sandbox under `Path.GetTempPath()/botnexus-e2e/<runId>/`:
 5. `botnexus locations add <name> --type filesystem --path <tmp>` × 2.
 6. `botnexus config set world.id`, `world.displayName`,
    `extensions.enabled true`, `gateway.defaultAgentId`.
-7. `dotnet build BotNexus.slnx -c Release` (warmup so step 8 is fast).
+7. `dotnet build dirs.proj -c Release` (warmup so step 8 is fast).
 8. `botnexus gateway start --attached --source <repo> --target <home>
    --port <free>` — runs as a child subprocess for the test-suite lifetime.
 9. Poll `GET /health` until `200 OK` (max 3 minutes).
@@ -34,7 +65,7 @@ Per test-run sandbox under `Path.GetTempPath()/botnexus-e2e/<runId>/`:
 
 ```pwsh
 # One-time: install Chromium for Playwright.
-dotnet build BotNexus.slnx -c Release
+dotnet build dirs.proj -c Release
 pwsh tests/integration/BotNexus.Integration.E2E.Tests/bin/Debug/net10.0/playwright.ps1 install chromium
 
 # Run the suite.
@@ -56,6 +87,68 @@ Current keys:
 - `HELLO_WORLD` — short four-delta response, useful as a liveness probe.
 - `MULTI_DELTA` — ~14 deltas with ~80 ms inter-delta delay, used to exercise
   the portal's streaming-assembly path.
+
+## Fixture-success skips are a mass-vacuity generator (issue #2491)
+
+An xUnit **collection fixture** is constructed once for an entire collection. When
+every test class in that collection opens with `Skip.IfNot(fixture.Succeeded, …)`,
+a single provisioning fault flips one boolean and the whole collection converts
+itself into skips. The runner then prints `Passed!` and exits `0`.
+
+This is repo history, not a hypothesis. The `NewUserExperience` collection —
+23 test classes — went fully dark on `main` **twice**:
+
+| Cause | Fixed by |
+|---|---|
+| `botnexus init` seeds the `assistant` agent, so the provisioning loop's re-add exited non-zero | #2738 |
+| The fixture's solution prebuild raced concurrent test hosts (`CS2012` / `MSB3883`) | #2749 |
+
+Both times CI was green throughout and the E2E run reported
+*"No test matches the given testcase filter"*. Roughly 56 genuinely broken tests
+stayed hidden behind that green.
+
+### The rule
+
+Skipping is legitimate when a suite is genuinely opt-in on external
+infrastructure. The rule is that **a skip must never be the only signal**: every
+fixture whose success flag gates a collection must also be watched by a test that
+*asserts*. Use a plain `[Fact]` — never `[SkippableFact]`, and with no `Skip.`
+call in its body — so it fails loudly and by name when provisioning fails.
+
+`BotNexus.Integration.E2E.Tests/FixtureHealthTests.cs` is the reference shape;
+`BotNexus.Integration.ExtensionBoot.Tests/ExtensionBootFixtureHealthTests.cs` is
+the same pattern applied to the extension-boot gate.
+
+This is enforced by
+`BotNexus.Architecture.Tests/FixtureSuccessSkipArchitectureTests.cs`, which sweeps
+every tracked test source, finds each `ICollectionFixture<T>` and its boolean
+success flags, and fails when a flag gates tests via `Skip` without a
+corresponding asserting health test. It resolves one level of indirection, so
+hiding the gate behind a `private bool ShouldSkip() => !_fx.Succeeded;` helper
+does not evade it.
+
+### Recorded audit findings (AC4)
+
+| Fixture | Project | Status |
+|---|---|---|
+| `NewUserExperienceFixture` | `Integration.E2E.Tests` | Skip-gated, **watched** by `FixtureHealthTests` |
+| `ExtensionBootFixture` | `Integration.ExtensionBoot.Tests` | Was skip-gated via `ShouldSkip()` indirection with **no** health test — fixed here |
+| `CliInstallFixture` | `Integration.Cli.Tests` | Not skip-gated; asserts `InstallSucceeded` directly. Compliant. |
+| `LocalCliInstallFixture` | `Integration.Cli.Tests` | Not skip-gated; asserts `Succeeded` via `AssertFixture()`. Compliant. |
+| `CandidateGatewayFixture` | `Conversation.Tests` | Candidate in-process HTTP/SignalR seam; startup failures fail the collection, with no availability skips |
+
+Issue #4624 replaces the former developer-gateway probe with
+`WebApplicationFactory<Program>` and `TestServer`. The conversation project runs
+in ordinary CORE, using a disposable home, production in-memory stores and real
+HTTP/hub routing. Only out-of-scope agent execution is deterministic. It does not
+provide SQLite restart or socket-transport evidence. No connection is made to a
+running developer gateway, and no architecture exemption remains.
+
+Inspect the project's TRX: its tests must execute and pass with zero skips. The
+runner rejects the former `Dev gateway not running at` reason rather than
+certifying dormant conversation coverage. Aggregate CORE counts still distinguish
+executed tests from intentional credential/platform skips in other projects.
+Browser-emulated E2E quarantine (#3601) is independent of this in-process seam.
 
 ## Followup work (issue #598)
 

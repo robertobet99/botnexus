@@ -1,6 +1,4 @@
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
+using System.Text.Json;
 using BotNexus.Gateway.Abstractions.Security;
 using BotNexus.Gateway.Configuration;
 using Microsoft.Extensions.Logging;
@@ -40,7 +38,7 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
     /// Default browser origin permitted when no explicit <c>Gateway.Cors.AllowedOrigins</c>
     /// list is configured. Mirrors the CORS fallback in Program.cs.
     /// </summary>
-    private const string DefaultAllowedOrigin = "http://localhost:5005";
+    private const string DefaultAllowedOrigin = GatewayDefaults.LoopbackListenUrl;
 
     /// <summary>
     /// Feature flag gating the dev-mode browser-Origin enforcement (#1931). When the flag is
@@ -49,19 +47,35 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
     /// cannot lock a keyless user out of the UI on restart. The <c>doctor config</c> command
     /// surfaces a recommendation to enable it, and a future release will flip the default on.
     /// Lives under the <c>FeatureManagement</c> section of config.json.
+    /// <para>Aliases the single declaration in <see cref="FeatureFlags"/> (#2767); the name is not
+    /// re-spelled here, so it cannot drift from the inventory or from <c>doctor config</c>.</para>
     /// </summary>
-    public const string DevOriginEnforcementFeature = "GatewayDevOriginEnforcement";
+    public const string DevOriginEnforcementFeature = FeatureFlags.GatewayDevOriginEnforcement;
 
     /// <summary>The target reference reported on every auth handshake event.</summary>
     private const string GatewayTarget = "gateway";
 
     private readonly Lock _sync = new();
-    private IReadOnlyDictionary<string, GatewayCallerIdentity> _identitiesByApiKey;
+    private CredentialSnapshot _credentialSnapshot;
     private readonly IReadOnlyList<string>? _staticAllowedOrigins;
     private readonly IOptionsMonitor<PlatformConfig>? _platformConfig;
     private readonly IFeatureManager? _featureManager;
     private readonly ILogger<ApiKeyGatewayAuthHandler> _logger;
     private readonly ISecurityEventSink? _securityEvents;
+
+    /// <summary>
+    /// Latch ensuring the absent-flag notice (#2767 AC6) is emitted once per process rather than on
+    /// every authentication handshake. An int rather than a bool so it can be set with
+    /// <see cref="Interlocked.Exchange(ref int, int)"/> under concurrent handshakes.
+    /// </summary>
+    private int _absentFlagWarned;
+
+    /// <summary>
+    /// Feature flags captured from a snapshot <see cref="PlatformConfig"/> construction, where there
+    /// is no monitor to re-read. Without this the snapshot path could not tell an absent flag from a
+    /// configured one and would report every evaluation as unstated (#2767).
+    /// </summary>
+    private readonly Dictionary<string, JsonElement>? _staticFeatureFlags;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="ApiKeyGatewayAuthHandler"/> class.
@@ -89,7 +103,7 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
         _securityEvents = securityEvents;
         _featureManager = featureManager;
         _staticAllowedOrigins = null;
-        _identitiesByApiKey = BuildIdentityMap(apiKey, apiKeys: null);
+        _credentialSnapshot = BuildCredentialSnapshot(apiKey, apiKeys: null);
     }
 
     /// <summary>
@@ -110,7 +124,8 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
         _securityEvents = securityEvents;
         _featureManager = featureManager;
         _staticAllowedOrigins = ResolveAllowedOrigins(platformConfig.Gateway?.Cors?.AllowedOrigins);
-        _identitiesByApiKey = BuildIdentityMap(platformConfig.ApiKey, platformConfig.Gateway?.ApiKeys, platformConfig.Gateway?.Satellites);
+        _staticFeatureFlags = platformConfig.FeatureManagement;
+        _credentialSnapshot = BuildCredentialSnapshot(platformConfig.ApiKey, platformConfig.Gateway?.ApiKeys, platformConfig.Gateway?.Satellites);
     }
 
     /// <summary>
@@ -131,9 +146,10 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
         _securityEvents = securityEvents;
         _featureManager = featureManager;
         _staticAllowedOrigins = null;
-        _identitiesByApiKey = BuildIdentityMap(
+        _credentialSnapshot = BuildCredentialSnapshot(
             platformConfig.CurrentValue.ApiKey,
-            platformConfig.CurrentValue.Gateway?.ApiKeys);
+            platformConfig.CurrentValue.Gateway?.ApiKeys,
+            platformConfig.CurrentValue.Gateway?.Satellites);
     }
 
     /// <inheritdoc />
@@ -145,8 +161,17 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var identitiesByApiKey = GetIdentityMap();
+        var credentialSnapshot = GetCredentialSnapshot();
+        if (credentialSnapshot.HasInvalidPlaceholder)
+        {
+            _logger.LogError(
+                "Gateway API key configuration contains an explicit placeholder. Supply a valid key; remove all key settings only for intentional development mode.");
+            EmitOutcome(success: false, actorId: "invalid-configuration");
+            return GatewayAuthResult.Failure(
+                "Gateway API key configuration is invalid. Supply a non-placeholder key.");
+        }
 
+        var identitiesByApiKey = credentialSnapshot.IdentitiesByApiKey;
         if (identitiesByApiKey.Count == 0)
         {
             // DNS-rebind / CSRF hardening (#1931): in dev/no-key mode we still grant a full
@@ -216,6 +241,13 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
     /// to <c>false</c> when no feature manager is wired (e.g. tests or non-DI construction) so
     /// the guard is inert unless an operator explicitly opts in via the
     /// <see cref="DevOriginEnforcementFeature"/> flag.
+    /// <para>Every fallback here is deliberately fail-OPEN (guard disabled) and #2767 does not
+    /// change that: a security guard that keys off the Origin header can lock an operator out of
+    /// their own gateway, so it must degrade to inert rather than to enforcing. What #2767 adds is
+    /// that the fallback is no longer silent - the absent-from-config path now logs once, naming
+    /// the flag and the default applied, so the effective state is observable without reading
+    /// source. The logging is throttled to one emission per process because this runs on every
+    /// authentication handshake.</para>
     /// </summary>
     private async Task<bool> IsDevOriginEnforcementEnabledAsync()
     {
@@ -224,6 +256,13 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
 
         try
         {
+            // Read the raw configured value first so "absent" can be distinguished from an
+            // explicit false. IsEnabledAsync collapses both to false, which is precisely the
+            // indistinguishability #2767 exists to remove; the evaluated result below is still
+            // what decides the guard, so behaviour is unchanged.
+            if (!IsFlagPresentInConfiguration(DevOriginEnforcementFeature))
+                WarnFlagAbsentOnce();
+
             return await _featureManager.IsEnabledAsync(DevOriginEnforcementFeature).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -235,14 +274,50 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
         }
     }
 
-    private static Dictionary<string, GatewayCallerIdentity> BuildIdentityMap(
+    /// <summary>
+    /// Returns whether the flag carries an explicit value in configuration. Absence is the common
+    /// case the operator cannot otherwise observe (#2767 AC6).
+    /// </summary>
+    private bool IsFlagPresentInConfiguration(string feature)
+    {
+        var flags = _platformConfig?.CurrentValue?.FeatureManagement ?? _staticFeatureFlags;
+        return flags is not null && flags.ContainsKey(feature);
+    }
+
+    /// <summary>
+    /// Emits the absent-flag notice at most once per process. This sits on the authentication hot
+    /// path, so an unthrottled warning would drown the log and teach operators to filter it out -
+    /// the opposite of making the decision visible.
+    /// </summary>
+    private void WarnFlagAbsentOnce()
+    {
+        if (Interlocked.Exchange(ref _absentFlagWarned, 1) != 0)
+            return;
+
+        _logger.LogWarning(
+            "Feature flag '{Feature}' is absent from configuration; applying its default of {Default}. "
+            + "Dev-mode origin enforcement is therefore disabled. Run 'botnexus doctor config' to record "
+            + "an explicit decision, or 'botnexus config set {SectionName}.{FlagName} true' to enable it "
+            + "(add every origin you use to gateway.cors.allowedOrigins first, or you will be locked out).",
+            DevOriginEnforcementFeature,
+            FeatureFlags.DefaultFor(DevOriginEnforcementFeature),
+            FeatureFlags.SectionName,
+            DevOriginEnforcementFeature);
+    }
+
+    private static CredentialSnapshot BuildCredentialSnapshot(
         string? legacyApiKey,
         Dictionary<string, ApiKeyConfig>? apiKeys,
         Dictionary<string, SatelliteConfig>? satellites = null)
     {
         var map = new Dictionary<string, GatewayCallerIdentity>(StringComparer.Ordinal);
+        var hasInvalidPlaceholder = GatewayApiKeyRules.IsExplicitPlaceholder(legacyApiKey)
+            || (apiKeys?.Values.Any(key => GatewayApiKeyRules.IsExplicitPlaceholder(key.ApiKey)) ?? false)
+            || (satellites?.Values.Any(satellite =>
+                satellite.Enabled && GatewayApiKeyRules.IsExplicitPlaceholder(satellite.ApiKey)) ?? false);
 
-        if (!string.IsNullOrWhiteSpace(legacyApiKey))
+        if (!string.IsNullOrWhiteSpace(legacyApiKey) &&
+            !GatewayApiKeyRules.IsExplicitPlaceholder(legacyApiKey))
         {
             map[legacyApiKey] = new GatewayCallerIdentity
             {
@@ -258,8 +333,11 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
         {
             foreach (var (keyId, keyConfig) in apiKeys)
             {
-                if (string.IsNullOrWhiteSpace(keyConfig.ApiKey))
+                if (string.IsNullOrWhiteSpace(keyConfig.ApiKey) ||
+                    GatewayApiKeyRules.IsExplicitPlaceholder(keyConfig.ApiKey))
+                {
                     continue;
+                }
 
                 var callerId = !string.IsNullOrWhiteSpace(keyConfig.CallerId)
                     ? keyConfig.CallerId
@@ -284,8 +362,12 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
         {
             foreach (var (satId, satConfig) in satellites)
             {
-                if (!satConfig.Enabled || string.IsNullOrWhiteSpace(satConfig.ApiKey))
+                if (!satConfig.Enabled ||
+                    string.IsNullOrWhiteSpace(satConfig.ApiKey) ||
+                    GatewayApiKeyRules.IsExplicitPlaceholder(satConfig.ApiKey))
+                {
                     continue;
+                }
 
                 map[satConfig.ApiKey] = new GatewayCallerIdentity
                 {
@@ -299,26 +381,26 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
             }
         }
 
-        return map;
+        return new CredentialSnapshot(map, hasInvalidPlaceholder);
     }
 
-    private IReadOnlyDictionary<string, GatewayCallerIdentity> GetIdentityMap()
+    private CredentialSnapshot GetCredentialSnapshot()
     {
         if (_platformConfig is null)
-            return _identitiesByApiKey;
+            return _credentialSnapshot;
 
         try
         {
             var currentConfig = _platformConfig.CurrentValue;
-            var rebuilt = BuildIdentityMap(
+            var rebuilt = BuildCredentialSnapshot(
                 currentConfig.ApiKey,
                 currentConfig.Gateway?.ApiKeys,
                 currentConfig.Gateway?.Satellites);
 
             lock (_sync)
             {
-                _identitiesByApiKey = rebuilt;
-                return _identitiesByApiKey;
+                _credentialSnapshot = rebuilt;
+                return _credentialSnapshot;
             }
         }
         catch (OptionsValidationException ex)
@@ -330,10 +412,22 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
             _logger.LogError(
                 ex,
                 "Platform configuration reload is invalid; gateway authentication is using the last valid credential snapshot.");
+            if (ex.Failures.Any(failure =>
+                failure.Contains(GatewayApiKeyRules.PlaceholderValidationMarker, StringComparison.Ordinal)))
+            {
+                return new CredentialSnapshot(
+                    new Dictionary<string, GatewayCallerIdentity>(StringComparer.Ordinal),
+                    HasInvalidPlaceholder: true);
+            }
+
             lock (_sync)
-                return _identitiesByApiKey;
+                return _credentialSnapshot;
         }
     }
+
+    private sealed record CredentialSnapshot(
+        IReadOnlyDictionary<string, GatewayCallerIdentity> IdentitiesByApiKey,
+        bool HasInvalidPlaceholder);
 
     /// <summary>
     /// Enforces the browser-Origin allow-list used to guard the dev-mode admin grant against
@@ -455,7 +549,7 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
             var evt = SecurityEvent.AuthOutcome(
                 success ? "gateway.auth.accepted" : "gateway.auth.rejected",
                 success,
-                actor: new SecurityEventActor(SecurityActorKind.Node, HashActor(actorId)))
+                actor: new SecurityEventActor(SecurityActorKind.Node, ActorPseudonym.For(actorId)))
             with
             {
                 Target = new SecurityEventTarget(SecurityTargetKind.Gateway, GatewayTarget)
@@ -467,19 +561,5 @@ public sealed class ApiKeyGatewayAuthHandler : IGatewayAuthHandler
             // Observability must never break the auth path; swallow and log.
             _logger.LogWarning(ex, "Failed to record gateway auth security event (success={Success}).", success);
         }
-    }
-
-    /// <summary>
-    /// Hashes a caller id or presented credential to a short, opaque hex token so security events
-    /// carry a stable pseudonym instead of the raw value. SHA-256 truncated to 8 bytes is enough
-    /// for correlation; it is not reversible and never stores the plaintext.
-    /// </summary>
-    private static string HashActor(string id)
-    {
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(id ?? string.Empty));
-        var sb = new StringBuilder(16);
-        for (var i = 0; i < 8; i++)
-            sb.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
-        return sb.ToString();
     }
 }

@@ -14,6 +14,8 @@ public sealed class MainLayoutTests : IDisposable
     private readonly ClientStateStore _store;
     private readonly IAgentInteractionService _interaction;
     private readonly IPortalLoadService _portalLoad;
+    private readonly StubToolsHandler _toolsHandler;
+    private readonly StubNavOrderHandler _navOrderHandler;
 
     public MainLayoutTests()
     {
@@ -46,6 +48,14 @@ public sealed class MainLayoutTests : IDisposable
         _ctx.Services.AddSingleton(http);
         _ctx.Services.AddSingleton(new ExtensionFeatureService(restClient));
         _ctx.Services.AddSingleton(new CronApiClient(http));
+        _ctx.Services.AddSingleton(new SectionsApiClient(http));
+        _ctx.Services.AddSingleton(sp => new ConversationSectionsState(sp.GetRequiredService<SectionsApiClient>()));
+        _toolsHandler = new StubToolsHandler();
+        var toolsHttp = new HttpClient(_toolsHandler) { BaseAddress = new Uri("http://localhost/") };
+        _ctx.Services.AddSingleton(new ToolsApiClient(toolsHttp));
+        _navOrderHandler = new StubNavOrderHandler();
+        var navOrderHttp = new HttpClient(_navOrderHandler) { BaseAddress = new Uri("http://localhost/") };
+        _ctx.Services.AddSingleton(new NavOrderApiClient(navOrderHttp));
         _ctx.JSInterop.Mode = JSRuntimeMode.Loose;
     }
 
@@ -56,10 +66,47 @@ public sealed class MainLayoutTests : IDisposable
             .Add(c => c.Body, (Microsoft.AspNetCore.Components.RenderFragment)(_ => { })));
 
     [Fact]
+    public async Task Announcement_dismiss_button_has_contextual_accessible_name()
+    {
+        var cut = RenderLayout();
+        var announcementType = typeof(MainLayout).GetNestedType("Announcement", System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(announcementType);
+        var announcement = Activator.CreateInstance(
+            announcementType,
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic,
+            binder: null,
+            args: ["maintenance", "Fictional maintenance notice", "info"],
+            culture: null);
+        Assert.NotNull(announcement);
+        var announcementsField = typeof(MainLayout).GetField("_announcements", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(announcementsField);
+        var announcements = announcementsField.GetValue(cut.Instance) as System.Collections.IList;
+        Assert.NotNull(announcements);
+
+        await cut.InvokeAsync(() =>
+        {
+            announcements.Add(announcement);
+            cut.Render();
+        });
+
+        cut.Find("button.announcement-dismiss[aria-label='Dismiss announcement: Fictional maintenance notice']");
+    }
+
+    [Fact]
     public void Renders_app_shell_container()
     {
         var cut = RenderLayout();
         cut.Find(".app-shell");
+    }
+
+    [Fact]
+    public void Renders_explicit_mobile_view_link()
+    {
+        var cut = RenderLayout();
+
+        var link = cut.Find("[data-testid='mobile-view-link']");
+        link.TextContent.Trim().ShouldBe("Mobile view");
+        link.GetAttribute("href").ShouldBe("/mobile");
     }
 
     [Fact]
@@ -85,6 +132,10 @@ public sealed class MainLayoutTests : IDisposable
         await cut.InvokeAsync(() => cut.Find(".burger-btn").Click());
 
         cut.Find(".sidebar-open");
+        var setItemCall = _ctx.JSInterop.Invocations["localStorage.setItem"]
+            .Last(invocation => invocation.Arguments.Count == 2
+                && (string?)invocation.Arguments[0] == "botnexus-sidebar-open");
+        Assert.Equal("true", setItemCall.Arguments[1]);
     }
 
     [Fact]
@@ -96,6 +147,44 @@ public sealed class MainLayoutTests : IDisposable
         await cut.InvokeAsync(() => cut.Find(".burger-btn").Click());
 
         cut.Find(".sidebar-closed");
+        var setItemCall = _ctx.JSInterop.Invocations["localStorage.setItem"]
+            .Last(invocation => invocation.Arguments.Count == 2
+                && (string?)invocation.Arguments[0] == "botnexus-sidebar-open");
+        Assert.Equal("false", setItemCall.Arguments[1]);
+    }
+
+    [Theory]
+    [InlineData("configuration")]
+    [InlineData("agents")]
+    [InlineData("cron")]
+    public async Task Desktop_top_level_navigation_preserves_open_sidebar(string route)
+    {
+        var cut = RenderLayout();
+        await cut.InvokeAsync(() => cut.Find(".burger-btn").Click());
+        var nav = _ctx.Services.GetRequiredService<NavigationManager>();
+
+        await cut.InvokeAsync(() => nav.NavigateTo(route));
+
+        cut.Find(".sidebar-open");
+    }
+
+    [Fact]
+    public async Task Desktop_subnavigation_preserves_open_sidebar_and_does_not_write_preference()
+    {
+        var cut = RenderLayout();
+        await cut.InvokeAsync(() => cut.Find(".burger-btn").Click());
+        var writesBeforeNavigation = _ctx.JSInterop.Invocations["localStorage.setItem"]
+            .Count(invocation => invocation.Arguments.Count == 2
+                && (string?)invocation.Arguments[0] == "botnexus-sidebar-open");
+        var nav = _ctx.Services.GetRequiredService<NavigationManager>();
+
+        await cut.InvokeAsync(() => nav.NavigateTo("release-history"));
+
+        cut.Find(".sidebar-open");
+        var writesAfterNavigation = _ctx.JSInterop.Invocations["localStorage.setItem"]
+            .Count(invocation => invocation.Arguments.Count == 2
+                && (string?)invocation.Arguments[0] == "botnexus-sidebar-open");
+        Assert.Equal(writesBeforeNavigation, writesAfterNavigation);
     }
 
     [Fact]
@@ -148,7 +237,7 @@ public sealed class MainLayoutTests : IDisposable
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", []);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -162,7 +251,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Chat 1", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -176,7 +265,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Default Chat", true, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -190,7 +279,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Active Chat", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
         var conv = _store.GetAgent("a-1")!.Conversations["c-1"];
         conv.UnreadCount = 3;
 
@@ -206,8 +295,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Active Chat", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.SetActiveConversation("a-1", "c-1");
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", "c-1", SelectionSource.RouteNavigation);
 
         var cut = RenderLayout();
 
@@ -215,17 +303,19 @@ public sealed class MainLayoutTests : IDisposable
         Assert.NotNull(activeConv);
     }
 
+    /// <summary>
+    /// #2305 (epic #2300): a cron conversation is badged "Cron" and offers CLOSE (not archive)
+    /// purely because the SERVER stamped <c>source="Cron"</c>. No mutable flag, no id prefix.
+    /// </summary>
     [Fact]
-    public async Task Virtual_cron_conversation_shows_badge_and_close_button()
+    public async Task Cron_source_conversation_shows_badge_without_mutating_actions()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", [
-            new ConversationSummaryDto("c-1", "a-1", "General", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
+            new ConversationSummaryDto("c-1", "a-1", "General", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "HumanAgent", "Cron")
         ]);
-        _store.ActiveAgentId = "a-1";
-        var conv = _store.GetAgent("a-1")!.Conversations["c-1"];
-        conv.IsVirtualSession = true;
-        conv.VirtualSessionKind = "cron";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+        Assert.Equal(ConversationSource.Cron, _store.GetAgent("a-1")!.Conversations["c-1"].Source);
 
         var cut = RenderLayout();
 
@@ -233,24 +323,24 @@ public sealed class MainLayoutTests : IDisposable
         await cut.InvokeAsync(() => cut.Find("[data-testid='cron-group-toggle']").Click());
 
         Assert.Contains("Cron", cut.Markup);
-        var archiveBtn = cut.Find(".conversation-archive-btn");
-        Assert.Contains("✕", archiveBtn.TextContent);
-        Assert.Contains("Close conversation", archiveBtn.GetAttribute("title"));
+        Assert.Empty(cut.FindAll("[data-testid='conversation-actions-trigger']"));
     }
 
+    /// <summary>
+    /// #2340: hiding runtime-internal threads reads the first-class, server-stamped
+    /// <c>ConversationVisibility</c>. The <c>internal:</c> id-prefix probe this replaced is gone and
+    /// fenced; note the id here is deliberately a plain one, proving the hiding decision no longer
+    /// depends on the id text at all.
+    /// </summary>
     [Fact]
-    public void Virtual_internal_conversation_is_hidden_from_user_conversation_list()
+    public void Internal_hidden_conversation_is_hidden_from_user_conversation_list()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "General", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow),
-            new ConversationSummaryDto("c-2", "a-1", "Internal sub-agent", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
+            new ConversationSummaryDto("c-2", "a-1", "Internal sub-agent", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "HumanAgent", "Channel", "InternalHidden")
         ]);
-        _store.ActiveAgentId = "a-1";
-
-        var internalConversation = _store.GetAgent("a-1")!.Conversations["c-2"];
-        internalConversation.IsVirtualSession = true;
-        internalConversation.VirtualSessionKind = "internal";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -258,31 +348,56 @@ public sealed class MainLayoutTests : IDisposable
         Assert.DoesNotContain("Internal sub-agent", cut.Markup);
     }
 
+    /// <summary>
+    /// #2340 regression guard in the opposite direction: an <c>internal:</c>-shaped id with the
+    /// back-compat default visibility must now STAY visible. Under the deleted prefix probe this row
+    /// vanished purely because of how its id happened to be spelled - the silent failure mode that
+    /// motivated replacing the probe with a typed field.
+    /// </summary>
     [Fact]
-    public void Internal_prefix_conversation_is_hidden_from_user_conversation_list()
+    public void Internal_prefixed_id_with_default_visibility_is_still_listed()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "General", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow),
-            new ConversationSummaryDto("internal:sub-1", "a-1", "Internal routing thread", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
+            new ConversationSummaryDto("internal:sub-1", "a-1", "Legit id-shaped thread", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
         Assert.Contains("General", cut.Markup);
-        Assert.DoesNotContain("Internal routing thread", cut.Markup);
+        Assert.Contains("Legit id-shaped thread", cut.Markup);
+    }
+
+    /// <summary>
+    /// #2340: <c>InspectableReadOnly</c> is visible-but-not-writable, so it must still be LISTED.
+    /// Only <c>InternalHidden</c> removes a row; write gating is the independent job of
+    /// <c>ConversationRenderProjection</c>. Collapsing the two would silently hide audit views.
+    /// </summary>
+    [Fact]
+    public void Inspectable_read_only_conversation_is_still_listed()
+    {
+        _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
+        _store.SeedConversations("a-1", [
+            new ConversationSummaryDto("c-1", "a-1", "Observer view", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "HumanAgent", "Channel", "InspectableReadOnly")
+        ]);
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
+
+        var cut = RenderLayout();
+
+        Assert.Contains("Observer view", cut.Markup);
     }
 
     [Fact]
-    public void Internal_conversations_are_not_rendered_as_selectable_conversation_rows()
+    public void Internal_hidden_conversations_are_not_rendered_as_selectable_conversation_rows()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "General", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow),
-            new ConversationSummaryDto("internal:sub-1", "a-1", "Internal routing thread", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
+            new ConversationSummaryDto("c-2", "a-1", "Internal routing thread", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "HumanAgent", "Channel", "InternalHidden")
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -296,7 +411,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "General", true, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
         _store.GetAgent("a-1")!.SubAgents["sub-1"] = new SubAgentInfo
         {
             SubAgentId = "sub-1",
@@ -308,7 +423,7 @@ public sealed class MainLayoutTests : IDisposable
 
         var cut = RenderLayout();
         // WaitForState stabilises the first render, then await InvokeAsync so any subsequent
-        // async re-renders (e.g. isMobileView JS interop in OnAfterRenderAsync) complete and
+        // async re-renders from OnAfterRenderAsync complete and
         // event handler IDs are stable before we assert.
         cut.WaitForState(() => cut.FindAll(".agent-session-item").Count > 0);
         await cut.InvokeAsync(() => cut.Find(".agent-session-item").Click());
@@ -320,10 +435,20 @@ public sealed class MainLayoutTests : IDisposable
     [Fact]
     public void Read_only_agent_hides_new_conversation_button()
     {
-        _store.SeedAgents([new AgentSummary("sub-1", "Subagent")]);
+        // A genuine sub-agent observer entry (IMMUTABLE IsObserverAgent kind) can only become the
+        // active view via the explicit SubAgentView source (the store's anti-hijack guard rejects
+        // every other source onto a read-only agent). #2248: read-only is keyed on the immutable
+        // kind, never the mutable SessionType.
+        _store.UpsertAgent(new AgentState
+        {
+            AgentId = "sub-1",
+            DisplayName = "Subagent",
+            SessionType = "agent-subagent",
+            IsObserverAgent = true,
+            IsConnected = true
+        });
         _store.SeedConversations("sub-1", []);
-        _store.ActiveAgentId = "sub-1";
-        _store.GetAgent("sub-1")!.SessionType = "agent-subagent";
+        _store.SelectView("sub-1", string.Empty, SelectionSource.SubAgentView);
 
         var cut = RenderLayout();
 
@@ -331,40 +456,41 @@ public sealed class MainLayoutTests : IDisposable
     }
 
     [Fact]
-    public void Non_default_conversation_shows_archive_button()
+    public async Task Non_default_conversation_shows_archive_button()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "My Chat", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
-        var archiveBtn = cut.Find(".conversation-archive-btn");
-        Assert.Contains("🗑️", archiveBtn.TextContent);
-        Assert.Contains("Archive conversation", archiveBtn.GetAttribute("title"));
+        await cut.InvokeAsync(() => cut.Find("[data-testid='conversation-actions-trigger']").Click());
+        cut.WaitForAssertion(() =>
+            Assert.Equal("Archive", cut.Find("[data-action-id='archive']").TextContent.Trim()));
     }
 
     [Fact]
-    public void Default_conversation_hides_archive_button()
+    public async Task Default_conversation_hides_archive_button()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Default", true, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
-        Assert.Empty(cut.FindAll(".conversation-archive-btn"));
+        await cut.InvokeAsync(() => cut.Find("[data-testid='conversation-actions-trigger']").Click());
+        cut.WaitForAssertion(() => Assert.Empty(cut.FindAll("[data-action-id='archive']")));
     }
 
     [Fact]
     public void Sidebar_scroll_region_exists_within_nav()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -376,7 +502,7 @@ public sealed class MainLayoutTests : IDisposable
     public void Configuration_and_agents_links_are_outside_scroll_region()
     {
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -398,7 +524,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Chat 1", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -424,7 +550,7 @@ public sealed class MainLayoutTests : IDisposable
                     DateTimeOffset.UtcNow.AddMinutes(-i),
                     DateTimeOffset.UtcNow.AddMinutes(-i)))
                 .ToList());
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -471,7 +597,7 @@ public sealed class MainLayoutTests : IDisposable
         cut.Find(".agent-dropdown-select").Change("a-1");
 
         cut.WaitForAssertion(() =>
-            Assert.EndsWith("/chat/a-1/c-1", nav.Uri));
+            Assert.EndsWith("/agent/a-1", nav.Uri));
     }
 
     [Fact]
@@ -482,10 +608,10 @@ public sealed class MainLayoutTests : IDisposable
             new ConversationSummaryDto("c-1", "a-1", "First", true, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow),
             new ConversationSummaryDto("c-2", "a-1", "Second", false, "Active", null, 0, DateTimeOffset.UtcNow.AddMinutes(1), DateTimeOffset.UtcNow.AddMinutes(1))
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var nav = _ctx.Services.GetRequiredService<NavigationManager>();
-        nav.NavigateTo("http://localhost/chat/a-1/c-1");
+        nav.NavigateTo("http://localhost/agent/a-1/conversation/c-1");
 
         var cut = RenderLayout();
         // Wait for async renders to stabilize before clicking
@@ -495,11 +621,13 @@ public sealed class MainLayoutTests : IDisposable
             .Click());
 
         cut.WaitForAssertion(() =>
-            Assert.EndsWith("/chat/a-1/c-2", nav.Uri));
+            Assert.EndsWith("/agent/a-1/conversation/c-2", nav.Uri));
     }
 
-    [Fact]
-    public void In_app_selection_url_encodes_agent_and_conversation_ids()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task In_app_selection_url_encodes_agent_and_conversation_ids(bool deferRefresh)
     {
         const string agentId = "agent/x";
         const string conversationId = "conv/1 with space";
@@ -511,12 +639,49 @@ public sealed class MainLayoutTests : IDisposable
         var nav = _ctx.Services.GetRequiredService<NavigationManager>();
         nav.NavigateTo("http://localhost/chat");
 
-        var cut = RenderLayout();
-        cut.Find(".agent-dropdown-select").Change(agentId);
+        var refreshStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRefresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (deferRefresh)
+        {
+            _interaction.RefreshConversationsAsync(agentId).Returns(_ =>
+            {
+                refreshStarted.TrySetResult();
+                return releaseRefresh.Task;
+            });
+        }
 
-        var expectedSuffix = $"/chat/{Uri.EscapeDataString(agentId)}/{Uri.EscapeDataString(conversationId)}";
-        cut.WaitForAssertion(() =>
-            Assert.EndsWith(expectedSuffix, nav.Uri));
+        var cut = RenderLayout();
+        // Keep lookup and dispatch on the renderer, and retain the event handler's task.
+        // InvokeAsync(Action) with synchronous Change would discard that task.
+        var selection = cut.InvokeAsync(() => cut.Find(".agent-dropdown-select")
+            .TriggerEventAsync("onchange", new ChangeEventArgs { Value = agentId }));
+        if (deferRefresh)
+        {
+            try
+            {
+                await refreshStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                // Event completion must include the refresh awaited by OnAgentSelected.
+                selection.IsCompleted.ShouldBeFalse();
+                nav.Uri.ShouldBe("http://localhost/chat");
+            }
+            finally
+            {
+                releaseRefresh.TrySetResult();
+            }
+        }
+        await selection;
+
+        var expectedSuffix = $"/agent/{Uri.EscapeDataString(agentId)}";
+        Assert.EndsWith(expectedSuffix, nav.Uri);
+
+        var expectedConversationSuffix = $"{expectedSuffix}/conversation/{Uri.EscapeDataString(conversationId)}";
+        await cut.InvokeAsync(() =>
+        {
+            var conversation = cut.Find(".conversation-list-item-btn");
+            conversation.GetAttribute("href").ShouldBe(expectedConversationSuffix.TrimStart('/'));
+            return conversation.TriggerEventAsync("onclick", new Microsoft.AspNetCore.Components.Web.MouseEventArgs());
+        });
+        Assert.EndsWith(expectedConversationSuffix, nav.Uri);
     }
 
     [Fact]
@@ -533,7 +698,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-2", [
             new ConversationSummaryDto("c-2", "a-2", "Default", true, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -545,23 +710,24 @@ public sealed class MainLayoutTests : IDisposable
         var dropdown = cut.Find(".agent-dropdown-select");
         await cut.InvokeAsync(() => dropdown.Change("a-2"));
 
-        // Assert: SelectConversationAsync was called for Beta's auto-selected conversation.
-        // OnAgentSelected is async -- wrap in WaitForAssertion so bUnit waits for the async
-        // event handler to complete before asserting. Without this, the assertion can race
-        // the async continuation on slow CI runners and report a false negative (#828).
-        cut.WaitForAssertion(() => _interaction.Received(1).SelectConversationAsync("a-2", "c-2"));
+        // Agent selection navigates to an agent-only route. Home, not the layout, resolves and
+        // applies a conversation once that route is rendered.
+        await _interaction.DidNotReceive().SelectConversationAsync("a-2", Arg.Any<string>());
+        var nav = _ctx.Services.GetRequiredService<NavigationManager>();
+        Assert.EndsWith("/agent/a-2", nav.Uri);
     }
 
     [Fact]
     public void Sub_agents_in_store_are_not_shown_in_top_level_agent_dropdown()
     {
-        // A real agent and a sub-agent (IsReadOnly via SessionType=agent-subagent) are both in the store
+        // A real agent and a sub-agent (read-only via the IMMUTABLE IsObserverAgent kind) are both in the store
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.UpsertAgent(new AgentState
         {
             AgentId = "sub-xyz",
             DisplayName = "SubTask",
             SessionType = "agent-subagent",
+            IsObserverAgent = true,
             IsConnected = true
         });
 
@@ -581,6 +747,7 @@ public sealed class MainLayoutTests : IDisposable
             AgentId = "sub-xyz",
             DisplayName = "SubTask",
             SessionType = "agent-subagent",
+            IsObserverAgent = true,
             IsConnected = true
         });
 
@@ -590,36 +757,47 @@ public sealed class MainLayoutTests : IDisposable
     }
 
     [Fact]
-    public void AgentDropdown_Rendered_EvenWhenIsMobileIsTrue()
+    public async Task SubAgentSpawned_style_session_poisoning_keeps_user_agent_in_roster_and_selection_unchanged()
     {
-        // Desktop MainLayout always renders agent dropdown regardless of viewport width.
-        // Narrow viewport on desktop still uses MainLayout (not MobileLayout), so the
-        // agent list must remain visible.
+        // #2248 regression: a real user-agent conversation is active. An inbound sub-agent session
+        // event (RegisterSession agent-subagent, exactly what HandleSubAgentSpawned drives) lands and
+        // stamps the user agent's mutable SessionType. The user agent must STAY in the dropdown
+        // roster and the active-view selection must NOT revert.
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
-        _store.NotifyChanged();
-
-        // Simulate narrow viewport: chatScroll.isMobileView returns true
-        _ctx.JSInterop.Setup<bool>("chatScroll.isMobileView").SetResult(true);
+        _store.SeedConversations("a-1", [
+            new ConversationSummaryDto("c-1", "a-1", "General", true, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
+        ]);
+        _store.SelectView("a-1", "c-1", SelectionSource.UserClick);
 
         var cut = RenderLayout();
+        var agentBefore = _store.ActiveAgentId;
+        var convBefore = (_store as IDisplayedConversation)?.DisplayedConversationIdFor(_store.ActiveAgentId);
 
-        // Agent dropdown must still be present
-        Assert.NotEmpty(cut.FindAll("[data-testid='agent-select']"));
+        // Simulate the inbound SubAgentSpawned data churn: poison the user agent's SessionType.
+        await cut.InvokeAsync(() =>
+        {
+            _store.RegisterSession("a-1", "sess-poison", sessionType: "agent-subagent");
+            _store.NotifyChanged();
+        });
+
+        var options = cut.FindAll(".agent-dropdown-select option");
+        Assert.Contains(options, o => o.GetAttribute("value") == "a-1");
+        _store.ActiveAgentId.ShouldBe(agentBefore,
+            customMessage: "An inbound sub-agent session event must not revert the active agent (#2248).");
+        (_store as IDisplayedConversation)?.DisplayedConversationIdFor(_store.ActiveAgentId).ShouldBe(convBefore,
+            customMessage: "An inbound sub-agent session event must not revert the active conversation (#2248).");
     }
 
     [Fact]
-    public void AgentDropdown_Rendered_WhenIsMobileIsFalse()
+    public void AgentDropdown_Rendered_WithoutViewportDetection()
     {
-        // Desktop default: isMobileView returns false (default Loose mock behavior)
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.NotifyChanged();
 
-        _ctx.JSInterop.Setup<bool>("chatScroll.isMobileView").SetResult(false);
-
         var cut = RenderLayout();
 
-        // Dropdown should be visible on desktop
-        cut.Find(".agent-dropdown-select");
+        Assert.NotEmpty(cut.FindAll("[data-testid='agent-select']"));
+        _ctx.JSInterop.Invocations.ShouldNotContain(invocation => invocation.Identifier == "chatScroll.isMobileView");
     }
 
     [Fact]
@@ -631,7 +809,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "My Chat", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -643,22 +821,23 @@ public sealed class MainLayoutTests : IDisposable
     [Fact]
     public void Conversation_list_items_have_correct_href()
     {
-        // #699: the href must point to the routable /chat/{agentId}/{conversationId} path
-        // so the browser can open the conversation directly via right-click.
+        // #699 + #2247: the href must point to the canonical route-owned
+        // /agent/{agentId}/conversation/{conversationId} path so the browser can open the
+        // conversation directly via right-click, and refresh/back restore exactly that view.
         const string agentId = "a-1";
         const string convId = "c-1";
         _store.SeedAgents([new AgentSummary(agentId, "Alpha")]);
         _store.SeedConversations(agentId, [
             new ConversationSummaryDto(convId, agentId, "My Chat", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = agentId;
+        _store.SelectView(agentId, string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
         var anchor = cut.Find(".conversation-list-item-btn");
         var href = anchor.GetAttribute("href");
         Assert.NotNull(href);
-        Assert.Contains($"chat/{Uri.EscapeDataString(agentId)}/{Uri.EscapeDataString(convId)}", href);
+        Assert.Contains($"agent/{Uri.EscapeDataString(agentId)}/conversation/{Uri.EscapeDataString(convId)}", href);
     }
 
     [Fact]
@@ -682,21 +861,17 @@ public sealed class MainLayoutTests : IDisposable
     }
 
     [Fact]
-    public void Agent_dropdown_visible_even_when_viewport_is_narrow()
+    public void Agent_dropdown_stays_in_the_desktop_component_tree()
     {
-        // Simulate narrow viewport: chatScroll.isMobileView returns true
-        _ctx.JSInterop.Setup<bool>("chatScroll.isMobileView").SetResult(true);
-
         _store.SeedAgents([new AgentSummary("a-1", "Alpha")]);
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "General", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
-        // The agent dropdown must still be rendered in MainLayout even on narrow viewports
-        // because desktop users resize their browser but stay on MainLayout (not MobileLayout)
+        // CSS may reflow at a narrow width, but the desktop component tree remains unchanged.
         var select = cut.Find("[data-testid='agent-select']");
         Assert.NotNull(select);
     }
@@ -710,7 +885,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Chat 1", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -728,7 +903,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Chat 1", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -745,7 +920,7 @@ public sealed class MainLayoutTests : IDisposable
             new ConversationSummaryDto("c-recent", "a-1", "Recent Chat", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow),
             new ConversationSummaryDto("c-old", "a-1", "Old Chat", false, "Active", null, 0, DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow.AddDays(-30))
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -763,7 +938,7 @@ public sealed class MainLayoutTests : IDisposable
             new ConversationSummaryDto("c-today", "a-1", "Today Chat", false, "Active", null, 0, DateTimeOffset.Now, DateTimeOffset.Now),
             new ConversationSummaryDto("c-yesterday", "a-1", "Yesterday Chat", false, "Active", null, 0, DateTimeOffset.Now.AddDays(-2), DateTimeOffset.Now.AddDays(-2))
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
         await cut.InvokeAsync(() => cut.Find("[data-testid='conversation-filter-today']").Click());
@@ -781,7 +956,7 @@ public sealed class MainLayoutTests : IDisposable
             new ConversationSummaryDto("c-recent", "a-1", "Recent Chat", false, "Active", null, 0, DateTimeOffset.UtcNow.AddDays(-3), DateTimeOffset.UtcNow.AddDays(-3)),
             new ConversationSummaryDto("c-old", "a-1", "Old Chat", false, "Active", null, 0, DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow.AddDays(-30))
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
         await cut.InvokeAsync(() => cut.Find("[data-testid='conversation-filter-week']").Click());
@@ -798,7 +973,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-old", "a-1", "Old Chat", false, "Active", null, 0, DateTimeOffset.Now.AddDays(-30), DateTimeOffset.Now.AddDays(-30))
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
         await cut.InvokeAsync(() => cut.Find("[data-testid='conversation-filter-today']").Click());
@@ -817,7 +992,7 @@ public sealed class MainLayoutTests : IDisposable
             new ConversationSummaryDto("c-normal-old", "a-1", "Normal Old", false, "Active", null, 0, DateTimeOffset.Now.AddDays(-30), DateTimeOffset.Now.AddDays(-30)),
             new ConversationSummaryDto("c-pinned-old", "a-1", "Pinned Old", false, "Active", null, 0, DateTimeOffset.Now.AddDays(-30), DateTimeOffset.Now.AddDays(-30))
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
         _store.GetAgent("a-1")!.Conversations["c-pinned-old"].IsPinned = true;
 
         var cut = RenderLayout();
@@ -841,7 +1016,7 @@ public sealed class MainLayoutTests : IDisposable
             new ConversationSummaryDto("c-recent", "a-1", "Recent Chat", false, "Active", null, 0, DateTimeOffset.UtcNow.AddDays(-3), DateTimeOffset.UtcNow.AddDays(-3)),
             new ConversationSummaryDto("c-old", "a-1", "Old Chat", false, "Active", null, 0, DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow.AddDays(-30))
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
 
@@ -857,7 +1032,7 @@ public sealed class MainLayoutTests : IDisposable
         _store.SeedConversations("a-1", [
             new ConversationSummaryDto("c-1", "a-1", "Chat 1", false, "Active", null, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow)
         ]);
-        _store.ActiveAgentId = "a-1";
+        _store.SelectView("a-1", string.Empty, SelectionSource.UserClick);
 
         var cut = RenderLayout();
         await cut.InvokeAsync(() => cut.Find("[data-testid='conversation-filter-today']").Click());
@@ -866,5 +1041,445 @@ public sealed class MainLayoutTests : IDisposable
         var setItemCall = _ctx.JSInterop.Invocations["localStorage.setItem"]
             .Last(i => i.Arguments.Count == 2 && (string?)i.Arguments[0] == "botnexus-conversation-activity-filter");
         Assert.Equal("Today", setItemCall.Arguments[1]);
+    }
+
+    // ── Tools nav section (#2233, slice 2 of #2231) ─────────────────────────────────────────
+
+    [Fact]
+    public void Tools_section_header_is_rendered()
+    {
+        var cut = RenderLayout();
+        var link = cut.Find("[data-testid='nav-tools']");
+        Assert.Contains("Tools", link.TextContent);
+        Assert.Equal("tools", link.GetAttribute("href"));
+    }
+
+    [Fact]
+    public void Tools_section_renders_above_chat()
+    {
+        var cut = RenderLayout();
+
+        var markup = cut.Markup;
+        var toolsIndex = markup.IndexOf("data-testid=\"nav-tools\"", StringComparison.Ordinal);
+        var chatIndex = markup.IndexOf("href=\"chat\"", StringComparison.Ordinal);
+        Assert.True(toolsIndex >= 0 && chatIndex >= 0);
+        Assert.True(toolsIndex < chatIndex, "Tools section must render above the Chat link.");
+    }
+
+    // #2441: an empty Tools section must cost zero vertical space. The old placeholder row
+    // ("No tools configured") is not rendered at all, and neither is the sub-nav container.
+    [Fact]
+    public void Tools_section_renders_no_empty_state_row_when_no_tools()
+    {
+        _toolsHandler.SetTools("[]");
+
+        var cut = RenderLayout();
+
+        cut.WaitForAssertion(() => cut.Find("[data-testid='nav-tools']"));
+        Assert.Empty(cut.FindAll("[data-testid='tools-empty']"));
+        Assert.Empty(cut.FindAll("[data-testid='tools-subnav']"));
+        Assert.DoesNotContain("No tools configured", cut.Markup);
+    }
+
+    // #2441: with tools configured the list is collapsed by default behind a chevron toggle,
+    // matching the Scheduled group's persistence pattern.
+    [Fact]
+    public void Tools_section_is_collapsed_by_default_when_tools_exist()
+    {
+        _toolsHandler.SetTools("""
+            [ { "id": "t-1", "name": "Grafana", "url": "https://grafana", "icon": "", "order": 0 } ]
+            """);
+
+        var cut = RenderLayout();
+
+        cut.WaitForAssertion(() => cut.Find("[data-testid='tools-collapse-toggle']"));
+        Assert.Empty(cut.FindAll("[data-testid='tools-subnav']"));
+        Assert.Equal("false", cut.Find("[data-testid='tools-collapse-toggle']").GetAttribute("aria-expanded"));
+    }
+
+    [Fact]
+    public void Tools_section_expands_on_toggle_click()
+    {
+        _toolsHandler.SetTools("""
+            [ { "id": "t-1", "name": "Grafana", "url": "https://grafana", "icon": "", "order": 0 } ]
+            """);
+
+        var cut = RenderLayout();
+        cut.WaitForAssertion(() => cut.Find("[data-testid='tools-collapse-toggle']"));
+
+        cut.Find("[data-testid='tools-collapse-toggle']").Click();
+
+        cut.WaitForAssertion(() => cut.Find("[data-testid='tools-subnav']"));
+        Assert.Single(cut.FindAll("[data-testid='tools-subnav-item']"));
+    }
+
+    // #2441: the density preference is projected onto the app shell so the CSS token set switches.
+    [Fact]
+    public void App_shell_carries_compact_density_attribute_by_default()
+    {
+        var cut = RenderLayout();
+        Assert.Equal("compact", cut.Find(".app-shell").GetAttribute("data-density"));
+    }
+
+    [Fact]
+    public void App_shell_carries_classic_shell_attribute_by_default()
+    {
+        var cut = RenderLayout();
+        Assert.Equal("classic", cut.Find(".app-shell").GetAttribute("data-shell"));
+    }
+
+    [Fact]
+    public void Tools_section_renders_configured_tools_from_fake_source()
+    {
+        _toolsHandler.SetTools("""
+            [
+              { "id": "t-1", "name": "Grafana", "url": "https://grafana", "icon": "\uD83D\uDCC8", "order": 0 },
+              { "id": "t-2", "name": "Wiki", "url": "https://wiki", "icon": "", "order": 1 }
+            ]
+            """);
+
+        var cut = RenderLayout();
+
+        // #2441: the Tools sub-list is collapsed by default; expand it before asserting
+        // on its contents.
+        cut.WaitForAssertion(() => cut.Find("[data-testid='tools-collapse-toggle']"));
+        cut.Find("[data-testid='tools-collapse-toggle']").Click();
+
+        cut.WaitForAssertion(() =>
+            Assert.Equal(2, cut.FindAll("[data-testid='tools-subnav-item']").Count));
+        Assert.Contains("Grafana", cut.Markup);
+        Assert.Contains("Wiki", cut.Markup);
+    }
+
+    [Fact]
+    public void Tools_sub_items_link_to_tool_route()
+    {
+        _toolsHandler.SetTools("""
+            [ { "id": "t-1", "name": "Grafana", "url": "https://grafana", "icon": "", "order": 0 } ]
+            """);
+
+        var cut = RenderLayout();
+
+        // #2441: the Tools sub-list is collapsed by default; expand it before asserting
+        // on its contents.
+        cut.WaitForAssertion(() => cut.Find("[data-testid='tools-collapse-toggle']"));
+        cut.Find("[data-testid='tools-collapse-toggle']").Click();
+
+        cut.WaitForAssertion(() =>
+        {
+            var item = cut.Find("[data-testid='tools-subnav-item']");
+            Assert.Equal("tools/t-1", item.GetAttribute("href"));
+        });
+    }
+
+    [Fact]
+    public void Tools_sub_items_render_in_ascending_order()
+    {
+        _toolsHandler.SetTools("""
+            [
+              { "id": "t-b", "name": "Beta", "url": "https://b", "icon": "", "order": 5 },
+              { "id": "t-a", "name": "Alpha", "url": "https://a", "icon": "", "order": 1 }
+            ]
+            """);
+
+        var cut = RenderLayout();
+
+        // #2441: the Tools sub-list is collapsed by default; expand it before asserting
+        // on its contents.
+        cut.WaitForAssertion(() => cut.Find("[data-testid='tools-collapse-toggle']"));
+        cut.Find("[data-testid='tools-collapse-toggle']").Click();
+
+        cut.WaitForAssertion(() =>
+        {
+            var items = cut.FindAll("[data-testid='tools-subnav-item']");
+            Assert.Equal(2, items.Count);
+            Assert.Contains("Alpha", items[0].TextContent);
+            Assert.Contains("Beta", items[1].TextContent);
+        });
+    }
+
+    // -- Sidebar ordering model (#2236, slice 5 of #2231) -----------------------------------
+
+    [Fact]
+    public void Nav_renders_all_builtin_items_in_default_order()
+    {
+        var cut = RenderLayout();
+
+        var markup = cut.Markup;
+        int Idx(string needle) => markup.IndexOf(needle, StringComparison.Ordinal);
+
+        var activity = Idx("Activity");
+        var tools = Idx("data-testid=\"nav-tools\"");
+        var chat = Idx("href=\"chat\"");
+        var config = Idx("href=\"configuration\"");
+        var agents = Idx("href=\"agents\"");
+        var cron = Idx("data-testid=\"nav-cron-jobs\"");
+
+        Assert.True(activity >= 0 && tools >= 0 && chat >= 0 && config >= 0 && agents >= 0 && cron >= 0);
+        Assert.True(activity < tools, "Activity must precede Tools by default.");
+        Assert.True(tools < chat, "Tools must precede Chat by default.");
+        Assert.True(chat < config, "Chat must precede Configuration by default.");
+        Assert.True(config < agents, "Configuration must precede Agents by default.");
+        Assert.True(agents < cron, "Agents must precede Cron by default.");
+    }
+
+    [Fact]
+    public void Nav_default_order_places_tools_above_chat()
+    {
+        _navOrderHandler.SetOrder("[]");
+
+        var cut = RenderLayout();
+
+        var markup = cut.Markup;
+        var toolsIndex = markup.IndexOf("data-testid=\"nav-tools\"", StringComparison.Ordinal);
+        var chatIndex = markup.IndexOf("href=\"chat\"", StringComparison.Ordinal);
+        Assert.True(toolsIndex >= 0 && chatIndex >= 0);
+        Assert.True(toolsIndex < chatIndex, "Tools must render above Chat by default.");
+    }
+
+    [Fact]
+    public void Lowering_tools_order_moves_it_above_activity()
+    {
+        _navOrderHandler.SetOrder("""
+            [
+              { "key": "tools", "order": 5 },
+              { "key": "activity", "order": 10 },
+              { "key": "chat", "order": 30 },
+              { "key": "configuration", "order": 40 },
+              { "key": "skills", "order": 50 },
+              { "key": "agents", "order": 60 },
+              { "key": "cron", "order": 70 }
+            ]
+            """);
+
+        var cut = RenderLayout();
+
+        cut.WaitForAssertion(() =>
+        {
+            var markup = cut.Markup;
+            var tools = markup.IndexOf("data-testid=\"nav-tools\"", StringComparison.Ordinal);
+            var activity = markup.IndexOf("Activity", StringComparison.Ordinal);
+            var chat = markup.IndexOf("href=\"chat\"", StringComparison.Ordinal);
+            Assert.True(tools >= 0 && activity >= 0 && chat >= 0);
+            Assert.True(tools < activity, "Lowering Tools order must move it above Activity.");
+            Assert.True(tools < chat, "Tools must remain above Chat.");
+        });
+    }
+
+    [Fact]
+    public void Custom_order_can_move_chat_to_top()
+    {
+        _navOrderHandler.SetOrder("""
+            [
+              { "key": "chat", "order": 1 },
+              { "key": "activity", "order": 10 },
+              { "key": "tools", "order": 20 },
+              { "key": "configuration", "order": 40 },
+              { "key": "skills", "order": 50 },
+              { "key": "agents", "order": 60 },
+              { "key": "cron", "order": 70 }
+            ]
+            """);
+
+        var cut = RenderLayout();
+
+        cut.WaitForAssertion(() =>
+        {
+            var markup = cut.Markup;
+            var chat = markup.IndexOf("href=\"chat\"", StringComparison.Ordinal);
+            var activity = markup.IndexOf("Activity", StringComparison.Ordinal);
+            var tools = markup.IndexOf("data-testid=\"nav-tools\"", StringComparison.Ordinal);
+            Assert.True(chat >= 0 && activity >= 0 && tools >= 0);
+            Assert.True(chat < activity, "Chat override to order 1 must render above Activity.");
+            Assert.True(chat < tools, "Chat override to order 1 must render above Tools.");
+        });
+    }
+
+    [Fact]
+    public void Malformed_nav_order_falls_back_to_builtin_default_order()
+    {
+        _navOrderHandler.SetRaw("not json");
+
+        var cut = RenderLayout();
+
+        var markup = cut.Markup;
+        var tools = markup.IndexOf("data-testid=\"nav-tools\"", StringComparison.Ordinal);
+        var chat = markup.IndexOf("href=\"chat\"", StringComparison.Ordinal);
+        Assert.True(tools >= 0 && chat >= 0);
+        Assert.True(tools < chat, "Fallback default order must keep Tools above Chat.");
+    }
+
+    // -- Home nav entry (#2535) ---------------------------------------------------------------
+
+    [Fact]
+    public void Nav_renders_home_entry_pointing_at_the_root_route()
+    {
+        var cut = RenderLayout();
+
+        var home = cut.Find("[data-testid='nav-home']");
+        Assert.Equal("a", home.TagName, ignoreCase: true);
+        Assert.Contains("sidebar-nav-item", home.ClassName);
+        // Blazor resolves an empty href against the base href, i.e. the application root.
+        Assert.Equal(string.Empty, home.GetAttribute("href"));
+    }
+
+    [Fact]
+    public void Home_nav_contains_change_history_subnavigation()
+    {
+        var cut = RenderLayout();
+
+        var link = cut.Find("[data-testid='subnav-release-history']");
+        Assert.Equal("release-history", link.GetAttribute("href"));
+        Assert.Equal("Change history", link.TextContent.Trim());
+    }
+
+    [Fact]
+    public void Home_nav_entry_renders_first_in_default_order()
+    {
+        var cut = RenderLayout();
+
+        var markup = cut.Markup;
+        var home = markup.IndexOf("data-testid=\"nav-home\"", StringComparison.Ordinal);
+        var activity = markup.IndexOf("data-testid=\"nav-activity\"", StringComparison.Ordinal);
+        var tools = markup.IndexOf("data-testid=\"nav-tools\"", StringComparison.Ordinal);
+        Assert.True(home >= 0 && activity >= 0 && tools >= 0);
+        Assert.True(home < activity, "Home must render above Activity by default (#2535).");
+        Assert.True(home < tools, "Home must render above Tools by default (#2535).");
+    }
+
+    [Fact]
+    public void Root_route_marks_home_nav_entry_active()
+    {
+        var nav = _ctx.Services.GetRequiredService<NavigationManager>();
+        nav.NavigateTo("http://localhost/");
+
+        var cut = RenderLayout();
+
+        Assert.Contains("active", cut.Find("[data-testid='nav-home']").ClassName);
+    }
+
+    [Fact]
+    public void Root_route_does_not_mark_other_nav_entries_active()
+    {
+        var nav = _ctx.Services.GetRequiredService<NavigationManager>();
+        nav.NavigateTo("http://localhost/");
+
+        var cut = RenderLayout();
+
+        Assert.DoesNotContain("active", cut.Find("[data-testid='nav-activity']").ClassName);
+        Assert.DoesNotContain("active", cut.Find("a[href='chat']").ClassName);
+        Assert.DoesNotContain("active", cut.Find("a[href='configuration']").ClassName);
+        Assert.DoesNotContain("active", cut.Find("a[href='agents']").ClassName);
+    }
+
+    [Fact]
+    public void Non_root_route_does_not_mark_home_nav_entry_active()
+    {
+        var nav = _ctx.Services.GetRequiredService<NavigationManager>();
+        nav.NavigateTo("http://localhost/activity");
+
+        var cut = RenderLayout();
+
+        Assert.DoesNotContain("active", cut.Find("[data-testid='nav-home']").ClassName);
+        // Activity's own highlighting is unchanged by the addition of Home.
+        Assert.Contains("active", cut.Find("[data-testid='nav-activity']").ClassName);
+    }
+
+    [Fact]
+    public void Stored_nav_order_predating_home_still_surfaces_home_in_its_default_position()
+    {
+        // A user order persisted before #2535 has no "home" key at all. Home must still render, and
+        // at its default position (above Activity), not appended to the bottom of the nav.
+        _navOrderHandler.SetOrder("""
+            [
+              { "key": "activity", "order": 10 },
+              { "key": "tools", "order": 20 },
+              { "key": "chat", "order": 30 },
+              { "key": "configuration", "order": 40 },
+              { "key": "skills", "order": 50 },
+              { "key": "agents", "order": 60 },
+              { "key": "cron", "order": 70 }
+            ]
+            """);
+
+        var cut = RenderLayout();
+
+        cut.WaitForAssertion(() =>
+        {
+            var markup = cut.Markup;
+            var home = markup.IndexOf("data-testid=\"nav-home\"", StringComparison.Ordinal);
+            var activity = markup.IndexOf("data-testid=\"nav-activity\"", StringComparison.Ordinal);
+            var cron = markup.IndexOf("data-testid=\"nav-cron-jobs\"", StringComparison.Ordinal);
+            Assert.True(home >= 0, "A stored order predating #2535 must not drop the Home nav item.");
+            Assert.True(home < activity, "Home must be merged in at its default position, above Activity.");
+            Assert.True(home < cron, "Home must not be appended to the bottom of the nav.");
+        });
+    }
+
+    [Fact]
+    public void Home_nav_icon_is_distinct_from_the_agents_nav_icon()
+    {
+        var cut = RenderLayout();
+
+        // Nav glyphs are inline SVG from the generated icon set, so the marker is the icon's
+        // class rather than a codepoint. The point of the test is unchanged: two nav rows must
+        // not end up wearing the same icon.
+        var home = cut.Find("[data-testid='nav-home']").InnerHtml;
+        var agents = cut.Find("a[href='agents']").InnerHtml;
+        Assert.Contains("bn-icon-home", home);
+        Assert.DoesNotContain("bn-icon-agents", home);
+        Assert.Contains("bn-icon-agents", agents);
+    }
+
+    /// <summary>
+    /// Controllable fake nav-order source. Returns the JSON body configured via
+    /// <see cref="SetOrder"/> for GET /api/nav-order, defaulting to the built-in effective order.
+    /// </summary>
+    private sealed class StubNavOrderHandler : HttpMessageHandler
+    {
+        private string _json = """
+            [
+              { "key": "activity", "order": 10 },
+              { "key": "tools", "order": 20 },
+              { "key": "chat", "order": 30 },
+              { "key": "configuration", "order": 40 },
+              { "key": "skills", "order": 50 },
+              { "key": "agents", "order": 60 },
+              { "key": "cron", "order": 70 }
+            ]
+            """;
+
+        public void SetOrder(string json) => _json = json;
+
+        public void SetRaw(string raw) => _json = raw;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(_json, System.Text.Encoding.UTF8, "application/json")
+            };
+            return Task.FromResult(response);
+        }
+    }
+
+    /// <summary>
+    /// Controllable fake tools source. Returns the JSON body configured via <see cref="SetTools"/>
+    /// for GET /api/tools, defaulting to an empty list so the nav renders its empty state.
+    /// </summary>
+    private sealed class StubToolsHandler : HttpMessageHandler
+    {
+        private string _toolsJson = "[]";
+
+        public void SetTools(string json) => _toolsJson = json;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(_toolsJson, System.Text.Encoding.UTF8, "application/json")
+            };
+            return Task.FromResult(response);
+        }
     }
 }

@@ -48,14 +48,19 @@ public sealed class ModelsController : ControllerBase
                 : new[] { agent.ApiProvider };
 
             var agentModels = agentProviders
-                .SelectMany(currentProvider => _modelFilter.GetModelsForAgent(currentProvider, agent.AllowedModelIds))
-                .Select(model => new ModelInfo(
+                .SelectMany(currentProvider => _modelFilter.GetModelsForAgent(currentProvider, agent.AllowedModelIds)
+                    .Select(model => new ModelInfo(
                     Name: model.Name,
                     ModelId: model.Id,
                     Id: model.Id,
                     Provider: model.Provider,
                     SupportedThinkingLevels: model.SupportedThinkingLevels ?? [],
-                    SupportedContextSizes: model.SupportedContextSizes ?? []))
+                    SupportedContextSizes: model.SupportedContextSizes ?? [],
+                    ContextWindow: model.ContextWindow,
+                    MaxTokens: model.MaxTokens,
+                    ContextWindowSource: model.ContextWindowSource,
+                    MaxTokensSource: model.MaxTokensSource,
+                    ProviderInstance: currentProvider)))
                 .OrderBy(model => model.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
@@ -74,7 +79,11 @@ public sealed class ModelsController : ControllerBase
                 Id: model.Id,
                 Provider: model.Provider,
                 SupportedThinkingLevels: model.SupportedThinkingLevels ?? [],
-                SupportedContextSizes: model.SupportedContextSizes ?? []))
+                SupportedContextSizes: model.SupportedContextSizes ?? [],
+                ContextWindow: model.ContextWindow,
+                MaxTokens: model.MaxTokens,
+                ContextWindowSource: model.ContextWindowSource,
+                MaxTokensSource: model.MaxTokensSource))
             .OrderBy(model => model.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -111,11 +120,21 @@ public sealed class ModelsController : ControllerBase
 /// <param name="Provider">Provider name (e.g., github-copilot, anthropic, openai).</param>
 /// <param name="SupportedThinkingLevels">Wire-form thinking levels the model supports (empty when none).</param>
 /// <param name="SupportedContextSizes">Context-window sizes (tokens) the model supports.</param>
+/// <param name="ContextWindow">Registered context capacity in tokens, or null when unavailable.</param>
+/// <param name="MaxTokens">Registered maximum output tokens, or null when unavailable.</param>
+/// <param name="ContextWindowSource">Context declaration origin, not a provider-verification claim.</param>
+/// <param name="MaxTokensSource">Output declaration origin, not a provider-verification claim.</param>
+/// <param name="ProviderInstance">Provider instance used to obtain this agent-scoped choice; preserves authored aliases without conflating them with catalog provider names.</param>
 public sealed record ModelInfo(
     string Name,
     string ModelId,
     string Id,
     string Provider,
     IReadOnlyList<string> SupportedThinkingLevels,
-    IReadOnlyList<int> SupportedContextSizes
+    IReadOnlyList<int> SupportedContextSizes,
+    int? ContextWindow = null,
+    int? MaxTokens = null,
+    string? ContextWindowSource = null,
+    string? MaxTokensSource = null,
+    string? ProviderInstance = null
 );

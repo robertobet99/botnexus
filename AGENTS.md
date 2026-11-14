@@ -1,4 +1,4 @@
-﻿# Agent Guidelines for BotNexus
+# Agent Guidelines for BotNexus
 
 ## Platform / Runtime
 
@@ -6,22 +6,39 @@ BotNexus runs on **Windows and Linux**. All code, tests, scripts, and documentat
 
 ## Validation
 
-Azure Container Apps is the default authoritative validation path for every candidate:
+The authoritative repository gate is remote by default (#2158):
 
 ```powershell
-scripts/repo/Validate-PreCommit.ps1
+scripts/repo/Invoke-PreCommitValidation.ps1
 ```
 
-The command reuses a qualifying receipt only when it matches the exact candidate tree and base commit. Otherwise it runs strict remote validation: full solution build, impacted tests (including architecture and scenario safety nets), and Playwright. Do not repeat those build/tests locally after a qualifying receipt.
+With nothing configured this runs **remote** Azure Container Apps validation. Set
+`BOTNEXUS_VALIDATION_MODE` to `local` or `remote` to override; resolution checks process, user,
+then machine environment so user/machine settings work in spawned processes.
 
-When Azure is unavailable, opt into the serialized local equivalent explicitly:
+**Local validation is opt-in and must not be run on a host with a live gateway.** It spawns real
+gateway processes; when their parent dies the children survive, and because every gateway opens
+the shared cron store they claim scheduled jobs belonging to the live gateway and fail them. On
+2026-08-06 three such orphans - two of them 30+ hours old - starved the live gateway until the
+portal would not load. Choose it deliberately when remote infrastructure is genuinely unavailable,
+and say so:
 
 ```powershell
-scripts/repo/Validate-PreCommit.ps1 -LocalFallback
+$env:BOTNEXUS_VALIDATION_MODE = 'local'
+scripts/repo/Invoke-PreCommitValidation.ps1
 ```
 
-The lower-level `build.ps1`, `test.ps1`, and `test-impacted.ps1` scripts remain available for focused diagnosis, but they are not the standard pre-commit or pre-push gate.
+`-LocalFallback` remains a backward-compatible alias for local mode. The lower-level scripts remain focused diagnostic tools, not substitutes for the strict gate.
 
+**Stage → commit → validate.** Stage the intended changes, commit them on the isolated development branch, confirm that the candidate has no staged, unstaged or untracked source changes, then run the required validation. A local development commit may be unvalidated; it is not proof of success or permission to push. Fix validation failures in another commit and validate that candidate. Do not amend or add a commit after the qualifying final run without validating the resulting candidate again. The explicit strict gate reuses a successful receipt only when the actual content, HEAD, base, required mode and current validation approval match. Missing, malformed, failed, stale, expired or mismatched evidence fails closed. Keep required validation before every push and readiness claim. See `docs/development/validation-receipts.md`.
+
+## Documentation Standards
+
+When writing or reviewing documentation, follow the shared
+[Documentation standards](docs/development/documentation-standards.md) for audience, plain language,
+evidence, and review boundaries. Use [Documentation grooming](docs/development/documentation-grooming.md)
+for the existing checks. Apply the standard incrementally; it does not override document ownership,
+repository protections, or merge authorization.
 
 ## Document Ownership
 
@@ -73,29 +90,38 @@ All planning items (features, bugs, improvements, refactors) are tracked as **Gi
 2. **Run authoritative validation before every push.** This is not optional:
 
    ```shell
-   scripts/repo/Validate-PreCommit.ps1
+   scripts/repo/Invoke-PreCommitValidation.ps1
    ```
 
-   By default this invokes Azure Container Apps strict validation. A qualifying exact-content receipt bypasses redundant validation. Strict mode builds the full solution, runs impacted tests plus mandatory `Architecture.Tests` and `Scenarios.Tests` safety nets, and runs Playwright. Use `-LocalFallback` only when Azure is unavailable; the fallback is serialized per worktree.
+   By default this invokes remote Azure Container Apps validation; a qualifying exact-content receipt then bypasses redundant remote validation. Set `BOTNEXUS_VALIDATION_MODE=local` to explicitly select globally serialized local strict validation instead. Remote validation runs the complete fail-closed non-browser core suite. Browser-emulated E2E is temporarily quarantined under #3601 and remains available only through explicit diagnostic modes until its reliability review and re-entry criteria are satisfied.
 
    The lower-level `test-impacted.ps1 -DryRun` remains useful to preview impacted projects during diagnosis, but it is not an additional pre-push requirement after a qualifying remote receipt.
 
-3. **Zero failures required.** If any test fails, diagnose and fix the issue before proceeding. Do not commit code with failing tests.
+3. **Zero failures required before push or completion.** Local development commits may contain unvalidated work or an intentionally failing tests-first case. Mark that evidence honestly. If validation fails, fix the problem in another commit and validate again; do not push, publish as ready or mark the task complete until the required checks pass. Never weaken or skip assertions to obtain success.
 
 4. **Do not skip or disable tests** to make the suite pass. If a test is failing, the production code or the test itself must be fixed — not removed.
 
-5. **Do not use `--no-verify`** for code changes. The pre-commit hook verifies an exact-content strict Azure receipt or starts strict Azure validation itself. Strict mode includes the full build, impacted tests, mandatory architecture/scenario safety nets, and strict Playwright coverage; do not run `test-impacted.ps1` again after it passes.
+5. **Do not use `--no-verify`** for code changes. There is deliberately no pre-commit hook - commit-time local validation is banned, and `scripts/repo/install-hooks.ps1` activates only the `pre-push` `core.bare` guard (#1602). `--no-verify` therefore skips that guard, not a test gate. Run `scripts/repo/Invoke-PreCommitValidation.ps1` for the final candidate instead.
 
-6. **Do not run local `dotnet build` or `dotnet test` as the normal validation gate.** Use Azure validation to avoid worktree output collisions and development-host saturation. For focused diagnosis only, local commands may be used deliberately. If Azure is unavailable, `Validate-PreCommit.ps1 -LocalFallback` is the sole supported local gate; it serializes validation for the worktree and may use `--no-build` internally after its single build.
+6. **Local `dotnet build` is permitted and expected; local test execution is not.** Compile the projects you changed before spending a remote gate - `dotnet build` starts no test host and no gateway process, so it cannot leak, and it catches in about a second the compile errors that otherwise cost a full remote run. Never run `dotnet test`, `test-impacted.ps1`, or `Invoke-PreCommitValidation.ps1 -LocalFallback` on a host with a live gateway: a test host boots real gateway processes that survive their parent, claim scheduled jobs from the shared cron store, and starve the live gateway - that is the orphan-process leak #2158 exists to close. All ordinary test execution is remote and authoritative: `scripts/repo/Invoke-AzureBuildTest.ps1 -Mode core -WorktreePath <worktree>`. Browser-emulated E2E is excluded from ordinary validation while #3601 is reviewed; `-Mode full` and `-Mode playwright` are explicit diagnostics, not required gates or passing evidence for the quarantine. If the remote infrastructure is genuinely unavailable, `Invoke-PreCommitValidation.ps1 -ValidationMode local` (or the `-LocalFallback` alias) is the sole supported local gate; state that fallback explicitly whenever you use it.
 
-7. **If you introduce new behaviour**, add corresponding tests first (see rule 1).
+7. **Documentation-only changes do not run the test gate.** If a change touches nothing but `*.md`, `docs/**`, or `mkdocs.yml`, the required validation is the documentation build, not the ~12-minute remote test suite:
 
-8. **If you delete a class or service**, you MUST rewrite its tests for the replacement — not delete them.
+   ```powershell
+   npm ci          # first time only
+   npm run docs:build
+   ```
+
+   This is the same command `deploy-docs.yml` runs, it completes in about 20 seconds, and it is a real gate rather than a renderer - a broken relative link fails it with `[vitepress] N dead link(s) found.` and exit 1. CI agrees: `ci-build-test.yml` lists `docs/**` and `**/*.md` under `paths-ignore`, so a docs-only PR does not trigger the test workflow at all. Running the remote gate on such a change proves nothing about the diff and costs a container run. If a change touches docs **and** code, it is a code change - run the remote gate.
+
+8. **If you introduce new behaviour**, add corresponding tests first (see rule 1).
+
+9. **If you delete a class or service**, you MUST rewrite its tests for the replacement — not delete them.
    - Old class deleted → old test file deleted AND new test file created for the replacement
    - Tests are never net-deleted; they are migrated
    - A refactor that reduces test coverage is a regression
 
-9. **Component tests (bUnit) are mandatory** for all Blazor components. Every `.razor` component must have a corresponding test covering:
+10. **Component tests (bUnit) are mandatory** for all Blazor components. Every `.razor` component must have a corresponding test covering:
    - Rendering in default/empty state
    - Rendering with data
    - User interactions (clicks, input)
@@ -118,9 +144,9 @@ All test warnings will be treated as test failures once warnings-as-errors is en
 
 Before every `git push` on a PR branch:
 
-1. `scripts/repo/Validate-PreCommit.ps1` passes, or a qualifying receipt proves the exact candidate already passed strict Azure validation.
-2. Do not rerun local build/tests when that receipt qualifies.
-3. If Azure is unavailable, use the explicit serialized `-LocalFallback` path and report that evidence.
+1. `scripts/repo/Invoke-PreCommitValidation.ps1` passes in the selected mode, or remote mode finds a qualifying exact-content strict Azure receipt.
+2. Do not rerun build/tests when a qualifying remote receipt applies.
+3. Record the chosen validation mode and strict gate evidence.
 4. No `--no-verify` used on commits containing code changes.
 
 ### Worktree Policy
@@ -131,11 +157,13 @@ Before every `git push` on a PR branch:
   cd ../botnexus-wt-N
   ```
 
-- **Local `main` must always be clean.** After a worktree is merged and the PR closes:
-  ```bash
-  git worktree remove ../botnexus-wt-N
-  cd ../botnexus && git checkout main && git pull origin main
+- **Local `main` must always be clean.** After a worktree is merged and the PR closes,
+  remove the worktree through the hardened helper - never with a raw `git worktree remove`:
+  ```powershell
+  pwsh -NoProfile -File scripts/repo/Remove-Worktree.ps1 -WorktreePath ../botnexus-wt-N -DeleteBranch
+  cd ../botnexus; git checkout main; git pull origin main
   ```
+  Use the hardened helper `scripts/repo/Remove-Worktree.ps1`: it retries boundedly, returns a structured `locked` outcome when Windows file locks hold the directory, and never deletes the branch unless removal succeeded (issue #2104). Never chain `git worktree remove ...` straight into `git branch -d/-D ...` - on a failed removal that orphans the directory and strands the commits.
 
 - **If you find local changes on `main`:** Move them to a worktree immediately before continuing work:
   1. `git worktree add ../botnexus-recover -b <type>/<recovery-slug>`
@@ -147,7 +175,10 @@ Before every `git push` on a PR branch:
 
 - `../botnexus-wt-N` — dedicated worktree per issue/PR (N = GitHub issue number)
 - Branch naming: `<type>/<issue-number>-<short-slug>` (e.g. `fix/64-history-first-load`, `feat/128-gateway-plugins`)
-- PRs always target `main`; never branch off a feature branch
+- Ordinary PRs target `main` and never branch from another feature branch.
+- **Stacked PR exception:** use GitHub native stacked PRs only when a plan has at least two dependent, independently reviewable layers. The bottom layer targets `main`; each upper layer targets the branch immediately below it. Unrelated or independently mergeable issues remain separate `main`-based PRs.
+- Every stack layer keeps its own issue or explicit partial-work reason, worktree, validation evidence, title/body checks, and merge authorization. Merge bottom-up. A lower-layer change requires affected upper layers to be rebased and revalidated.
+- Use GitHub CLI 2.90.0+ with the official `github/gh-stack` extension for stack topology and cascading rebases. Do not hand-maintain PR bases when `gh stack` can do so.
 - `~/projects/botnexus` — always on `main`, clean and synced to `origin/main`
 
 ### PR Titles
@@ -175,16 +206,17 @@ chore(deps): bump Microsoft.Extensions.* to 10.0.1
 
 ## Build and test validation
 
-Use the remote container gate for normal candidate validation:
+Use the selected strict repository gate for normal candidate validation:
 
 ```shell
-scripts/repo/Validate-PreCommit.ps1
+scripts/repo/Invoke-PreCommitValidation.ps1
 ```
 
-A local `dotnet build` is diagnostic-only. Do not run local builds concurrently in the same worktree. When Azure is unavailable, use the explicit serialized fallback instead of hand-running build and test commands:
+A hand-run `dotnet build` is encouraged before validating - it is the cheapest way to catch a compile error, and it never starts a test host. It is not itself a validation gate. Remote is the default (#2158); select local explicitly only when the remote infrastructure is unavailable:
 
 ```shell
-scripts/repo/Validate-PreCommit.ps1 -LocalFallback
+$env:BOTNEXUS_VALIDATION_MODE = 'local'
+scripts/repo/Invoke-PreCommitValidation.ps1
 ```
 
 ### Build Warnings
@@ -205,6 +237,32 @@ Common properties and package versions are centralized — **do not duplicate th
 3. Only set properties in the csproj that differ from the defaults (e.g., `OutputType`, `RootNamespace`, `Description`).
 
 ## Code Practices
+
+### Strongly Typed IDs and Value Objects
+
+**A domain concept that has rules gets a type, not a `string`.** BotNexus uses [Vogen](https://github.com/SteveDunn/Vogen) source-generated value objects in `BotNexus.Domain.Primitives` for identifiers and constrained values. The canonical set is `AgentId`, `ConversationId`, `SessionId`, `UserId`, `RunId`, `JobId`, `ToolId`, `ToolName`, `WorkingDir`, `ConversationTitle`, and their siblings in that namespace.
+
+**Why.** Two `string` parameters of the same shape are silently interchangeable. `Foo(string agentId, string conversationId)` compiles perfectly when the arguments are swapped, and the failure surfaces much later as missing data rather than as a build error. A value object makes that swap a compile error, and moves validation from "every call site remembers to check" to "impossible to construct an invalid instance".
+
+**Rules:**
+
+- **Declare with the Vogen attribute, never hand-roll.** `[ValueObject<string>(conversions: Conversions.SystemTextJson)]` on a `readonly partial struct`. Vogen generates `From`, equality, `ToString` and the JSON converter. A hand-written `readonly record struct` with its own `Equals` and a bespoke `JsonConverter` is the pattern being retired - it drifts, and the analyser cannot see it.
+- **Provide `Validate` and `NormalizeInput`.** `Validate` returns `Validation.Invalid("<Type> cannot be ...")` with a message naming the type; `NormalizeInput` trims (and canonicalises case where the domain is case-insensitive, as `ToolName` and `ChannelKey` do). Normalising is what makes equality meaningful, because Vogen derives equality from the stored primitive.
+- **Never expose implicit conversions to or from the primitive.** An implicit operator reintroduces exactly the silent-substitution hole the type exists to close. Callers use `.From(value)` and `.Value` explicitly. This is enforced by `DomainArchitectureTests`.
+- **Validate what is structurally true, not what is momentarily true.** `WorkingDir` guarantees path *shape* (non-empty, no invalid characters, within the length ceiling) and deliberately does not promise the directory exists or is absolute - a value object cannot hold an invariant the filesystem can change underneath it. Containment and traversal safety stay with `PathUtils.ResolvePath` and `IPathValidator`.
+- **Reject blanks; do not substitute a default.** If a caller omits a title, that is the caller's decision to make explicitly (see `ConversationFactory`). Defaulting inside the value object lets an empty value travel and reappear as a placeholder far from its origin.
+- **Own the limit.** A max length belongs on the value object as a `public const`, and validators derive from it (`ConversationInputValidator.MaxTitleLength = ConversationTitle.MaxLength`). Restating the number in a second place is how the REST error message and the domain invariant become merely coincidentally equal.
+- **Use them in non-boundary code; convert at the boundary.** Controllers, DTOs, SQLite column reads and channel wire formats legitimately carry primitives - that is what a boundary is. Convert once on the way in, and pass the typed value everywhere below. The wire representation is unchanged either way: a Vogen `string` value object serialises as a bare JSON string.
+- **New value objects are pinned by `DomainArchitectureTests`** (`tests/architecture/BotNexus.Architecture.Tests/`). Add the Vogen-attribute and no-implicit-conversion assertions there when introducing one.
+- **The convention is ENFORCED, not merely documented (#3099).** `PrimitiveIdParameterFenceArchitectureTests` (`tests/architecture/BotNexus.Architecture.Tests/PrimitiveIdParameterFenceArchitectureTests.cs`) fails the validation gate when a new `string agentId`, `string conversationId` or `string sessionId` **parameter** is declared in non-boundary code, and its message names the value object to use instead. That class's doc comment carries the authoritative definition of "boundary" — controllers and their request/response DTOs, SQLite column reads, channel wire formats, CLI argument binding — so read it there rather than inferring it from the exemption list. The pre-existing population is frozen in `PrimitiveIdParameterBaseline.baseline`, which is **shrink-only**: adding a violation fails, and so does leaving a count high after fixing a site. When you convert a site, lower or delete its baseline line in the same change. The residual sweep of the frozen population is tracked by #3147.
+
+```csharp
+// GOOD - the swap below is a compile error
+public Task ArchiveAsync(AgentId agentId, ConversationId conversationId, CancellationToken ct);
+
+// BAD - compiles when the arguments are transposed, fails at runtime as "conversation not found"
+public Task ArchiveAsync(string agentId, string conversationId, CancellationToken ct);
+```
 
 ### Cross-Platform Path Handling
 
@@ -371,16 +429,16 @@ docs(planning): archive completed provider-routing spec
 test(domain): add missing edge case for session expiry
 ```
 
-## Configuration
+## Configuration authority review (#4324, #4564, #4567)
 
-The BotNexus development configuration file is located at:
+The target contract is SQLite-first: `config.sqlite` is the live configuration authority after verified cutover. `config.json` may be a legacy import, explicit export/rollback input, or marked generated projection; a generated projection is never a runtime read source. The cutover is not complete on `main` yet, so distinguish current compatibility behavior from the target contract rather than assuming the latter has shipped.
 
-```
-C:\Users\<ALIAS>\.botnexus\config.json
-```
+Before approving configuration-related changes, inspect the actual read/write path in **C#, executable scripts (including shell, PowerShell and Python), tests, and operator documentation**. Require ordinary startup, gateway/CLI commands, REST/Portal, agent tools and helpers to use the central home-rooted provider and canonical writer. Do not introduce a direct `config.json` read, file-existence gate, filename-shaped configuration identity, caller-selected backend switch, or JSON-first instruction merely because current fixtures or a generated projection contain the file. A `config.json` mention is not automatically a defect: migration, explicit import/export/rollback, projection generation, and isolated fixtures are legitimate when bounded and labelled. For a new configuration consumer, test SQLite-only operation with the projection absent, corrupt, and conflicting; ensure scripts and launch helpers receive the same scrutiny as C#.
 
-Use the BotNexus CLI to manage configuration:
+The first-stage architecture ratchet (#4603) scans production C# only. It is not evidence that non-C# helpers or documentation follow the authority contract. See #4134's `scripts/gateway-restart.sh` for the direct-JSON restart-address failure shape. File a concrete issue or blocking PR finding when a new leak is found; do not treat a green C# gate as clearance for other languages.
+
+Use the BotNexus CLI/API to manage live configuration; do not hand-edit a generated JSON projection. For a source checkout the CLI is invoked with:
 
 ```shell
-dotnet run --project src\gateway\BotNexus.Cli -- <command>
+dotnet run --project src/gateway/BotNexus.Cli -- <command>
 ```

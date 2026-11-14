@@ -1,19 +1,43 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!--
+      Extension assemblies are loaded into an isolated AssemblyLoadContext at runtime, so their
+      managed NuGet dependency closure must ship in the extension output/deploy directory. Library
+      projects do NOT copy transitive managed dependencies by default (only project-reference DLLs
+      and native runtimes land in bin), so the ALC cannot resolve a third-party managed dependency
+      that the host gateway does not already have loaded - it fails with FileNotFoundException at
+      load/dispose time and can crash the host. Copying the lock-file assembly closure fixes this.
+      Same class of defect as the ServiceBus adapter (#2001). See issue #2184.
+    -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />  
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\domain\BotNexus.Domain\BotNexus.Domain.csproj" />
+    <!--
+      Plugin skills are discovered at the global/shared precedence tier (#2684). The reference is
+      to the plugin LIFECYCLE types only: skill discovery asks the installed-plugin record which
+      skills directories exist and does nothing else with plugins. Reusing that record rather than
+      scanning the plugin root is what keeps unrecorded content out of agent context.
+    -->
+    <ProjectReference Include="..\BotNexus.Extensions.Plugins\BotNexus.Extensions.Plugins.csproj" />
     <ProjectReference Include="..\..\gateway\BotNexus.Yaml\BotNexus.Yaml.csproj" />
     <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Abstractions\BotNexus.Gateway.Abstractions.csproj" />
     <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Contracts\BotNexus.Gateway.Contracts.csproj" />
+    <ProjectReference Include="..\..\gateway\BotNexus.Gateway.Configuration\BotNexus.Gateway.Configuration.csproj" />
     <ProjectReference Include="..\..\agent\BotNexus.Agent.Providers.Core\BotNexus.Agent.Providers.Core.csproj" />
     <ProjectReference Include="..\..\persistence\BotNexus.Persistence.Sqlite\BotNexus.Persistence.Sqlite.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="BotNexus.Skills.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\Prompts\*.prompt.md" />
   </ItemGroup>
 
   <ItemGroup>

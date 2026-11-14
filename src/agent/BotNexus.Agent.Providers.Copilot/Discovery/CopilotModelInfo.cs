@@ -91,15 +91,32 @@ public sealed class CopilotModelSupports
 
     [JsonPropertyName("structured_outputs")]
     public bool StructuredOutputs { get; set; }
+
+    /// <summary>
+    /// Whether Copilot advertises the extended (long) context window for this model. Nullable on
+    /// purpose (#3364): <see langword="null"/> means the payload is SILENT and the family heuristic
+    /// decides, whereas an explicit <see langword="false"/> is a provider statement that the model
+    /// has one window only and must never be widened to a 1M tier it would reject.
+    /// </summary>
+    [JsonPropertyName("long_context")]
+    public bool? LongContext { get; set; }
 }
 
 public sealed class CopilotModelBilling
 {
+    /// <summary>
+    /// Gets whether Copilot explicitly classifies this as a premium model, or
+    /// <see langword="null"/> when discovery did not supply the field.
+    /// </summary>
     [JsonPropertyName("is_premium")]
-    public bool IsPremium { get; set; }
+    public bool? IsPremium { get; set; }
 
+    /// <summary>
+    /// Gets the provider-supplied premium-request multiplier, or
+    /// <see langword="null"/> when discovery did not supply one.
+    /// </summary>
     [JsonPropertyName("multiplier")]
-    public double Multiplier { get; set; }
+    public double? Multiplier { get; set; }
 
     [JsonPropertyName("restricted_to")]
     public List<string>? RestrictedTo { get; set; }

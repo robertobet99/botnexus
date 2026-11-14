@@ -4,11 +4,32 @@ namespace BotNexus.Extensions.Channels.SignalR.BlazorClient.Services;
 /// Scoped in-memory state store for the portal. Single source of truth for all agent,
 /// conversation, and message state. UI components subscribe to <see cref="OnChanged"/> to re-render.
 /// </summary>
-public sealed class ClientStateStore : IClientStateStore
+public sealed class ClientStateStore : IClientStateStore, IDisplayedConversation
 {
     private readonly Dictionary<string, AgentState> _agents = new();
     private readonly Dictionary<string, string> _sessionToAgent = new(); // sessionId → agentId
     private readonly Dictionary<string, AskUserPromptState> _pendingAskUserByConversation = new();
+
+    // #2243 hardening (folded from #2254): sub-agent ids marked read-only-for-navigation at SPAWN
+    // time, before any AgentState exists or its SessionType has been stamped. HandleSubAgentSpawned
+    // registers the sub-agent asynchronously — during the spawn-during-send window there is often no
+    // AgentState yet, or one still carrying the default "user-agent" SessionType, so a derived
+    // IsReadOnly flag reads false. Tracking the id at spawn makes the SelectView guard reject the
+    // switch independent of that SessionType-stamp ordering race. Explicit user "view sub-agent"
+    // interactions still bypass via SelectionSource.SubAgentView. This is defense-in-depth alongside
+    // the derived-IsReadOnly check in SelectView.
+    private readonly HashSet<string> _knownSubAgentIds = new(StringComparer.Ordinal);
+
+    // #2246: the SINGLE writable field describing the active view. Every read of the active agent /
+    // conversation is a projection of this; the sole mutation path is SelectView(...). There is no
+    // public setter, so an inbound event can no longer assign the active view out from under the user.
+    private ViewSelection _selection = ViewSelection.None;
+
+    // Set by inbound-event paths (history-404 drop, active-agent removal) when the current selection
+    // no longer points at a live target. The store does NOT auto-pick a replacement — the UI resolves
+    // a valid selection on its next render (#2246). This keeps inbound events data-only: they never
+    // mutate the active view themselves.
+    private bool _pendingSelectionInvalid;
 
     // High-frequency streaming deltas (content/thinking) route through NotifyChangedThrottled,
     // which coalesces a burst into at most one render per window so a long streamed response
@@ -34,7 +55,87 @@ public sealed class ClientStateStore : IClientStateStore
     public IReadOnlyDictionary<string, AgentState> Agents => _agents;
 
     /// <inheritdoc />
-    public string? ActiveAgentId { get; set; }
+    public string? ActiveAgentId =>
+        _selection.AgentId is { Length: > 0 } id ? id : null;
+
+    /// <inheritdoc />
+    public SelectionSource ActiveSelectionSource => _selection.Source;
+
+    /// <inheritdoc />
+    public bool PendingSelectionInvalid => _pendingSelectionInvalid;
+
+    /// <inheritdoc />
+    public void MarkSelectionInvalid() => _pendingSelectionInvalid = true;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// #2243 anti-hijack guard: a sub-agent read-only virtual session (<see cref="AgentState.IsReadOnly"/>)
+    /// must never become the active view except through an explicit user "view sub-agent" interaction,
+    /// which passes <see cref="SelectionSource.SubAgentView"/>. Every other source — SubAgentSpawned and
+    /// other streaming events routed here indirectly, route/state refreshes, reconnect recovery, bootstrap —
+    /// is rejected when the target is read-only, so the composer, the new-conversation button, and the
+    /// user's own conversation stay in place. This mirrors the SeedConversations guard that already stops
+    /// virtual sessions from auto-hijacking the active conversation tab.
+    /// #2246: this is the SOLE mutation path for the active view; there is no public setter.
+    /// </remarks>
+    public void SelectView(string agentId, string conversationId, SelectionSource source)
+    {
+        agentId ??= string.Empty;
+        conversationId ??= string.Empty;
+
+        // #2243/#2246/#2248 fold: a single, source-keyed anti-hijack guard. Reject the selection when
+        // it targets a sub-agent view UNLESS the caller explicitly asked for it via
+        // SelectionSource.SubAgentView. "Targets a sub-agent" is true when EITHER the id was marked
+        // at spawn time (_knownSubAgentIds, folded from #2254 — covers the race where no AgentState
+        // exists yet) OR the agent's IMMUTABLE IsReadOnly (IsObserverAgent) is already true. #2248
+        // makes IsReadOnly key on the immutable observer classification rather than the mutable
+        // SessionType, so a RegisterSession(agent-subagent) that poisons a REAL user agent's
+        // SessionType can NEVER cause a UserClick onto that user agent to be rejected here. Keying on
+        // intent source (#2246) + the spawn marker (#2254) + immutable kind (#2248) makes the guard
+        // independent of any SessionType-stamp ordering or poisoning.
+        if (source != SelectionSource.SubAgentView
+            && agentId.Length > 0
+            && (_knownSubAgentIds.Contains(agentId)
+                || (_agents.TryGetValue(agentId, out var target) && target.IsReadOnly)))
+        {
+            return;
+        }
+
+        var conversationBeingLeft = _selection.ConversationId;
+        if (conversationBeingLeft.Length > 0
+            && !string.Equals(conversationBeingLeft, conversationId, StringComparison.Ordinal))
+        {
+            ClearSteeringQueue(conversationBeingLeft);
+        }
+
+        _selection = new ViewSelection(agentId, conversationId, source);
+        _pendingSelectionInvalid = false;
+
+        // An explicit conversation belongs to this one view selection; no per-agent ambient
+        // conversation marker is maintained.
+        if (agentId.Length > 0 && conversationId.Length > 0
+            && _agents.TryGetValue(agentId, out var agent))
+        {
+            if (agent.Conversations.TryGetValue(conversationId, out var conv))
+            {
+                // #3212: unread clears precisely when the conversation BECOMES DISPLAYED, which is
+                // now true by construction -- _selection was just set to (agentId, conversationId)
+                // above, so the route-derived predicate answers true here. Asserting it through the
+                // predicate rather than by position keeps the store's unread logic and
+                // GatewayEventHandler's unread logic on the one visibility source (AC3).
+                if (IsConversationDisplayed(agentId, conversationId))
+                    conv.UnreadCount = 0;
+                agent.SessionId = conv.ActiveSessionId;
+            }
+        }
+    }
+
+    /// <inheritdoc />
+    public void MarkSubAgent(string subAgentId)
+    {
+        if (!string.IsNullOrEmpty(subAgentId))
+            _knownSubAgentIds.Add(subAgentId);
+    }
 
     /// <inheritdoc />
     public void SeedAgents(IEnumerable<AgentSummary> agents)
@@ -49,6 +150,7 @@ public sealed class ClientStateStore : IClientStateStore
                     DisplayName = a.DisplayName,
                     Emoji = a.Emoji,
                     Description = a.Description,
+                    Summary = a.Summary,
                     IsBuiltIn = a.IsBuiltIn,
                     IsConnected = true
                 };
@@ -58,6 +160,7 @@ public sealed class ClientStateStore : IClientStateStore
                 existing.DisplayName = a.DisplayName;
                 existing.Emoji = a.Emoji;
                 existing.Description = a.Description;
+                existing.Summary = a.Summary;
                 existing.IsBuiltIn = a.IsBuiltIn;
             }
         }
@@ -74,11 +177,12 @@ public sealed class ClientStateStore : IClientStateStore
     {
         if (_agents.TryGetValue(agent.AgentId, out var existing))
         {
-            // Merge metadata without destroying local-only state (Conversations,
-            // ActiveConversationId, SessionId, Messages, StreamState, etc.).
+            // Merge metadata without destroying local-only state (conversations, session,
+            // messages, stream state, etc.).
             existing.DisplayName = agent.DisplayName;
             existing.Emoji = agent.Emoji;
             existing.Description = agent.Description;
+            existing.Summary = agent.Summary;
             existing.IsConnected = agent.IsConnected;
         }
         else
@@ -93,8 +197,14 @@ public sealed class ClientStateStore : IClientStateStore
     public void RemoveAgent(string agentId)
     {
         _agents.Remove(agentId);
+        // #2246: inbound removal is data-only. Rather than auto-selecting a replacement (a view
+        // mutation), flag the selection invalid so the UI resolves a new active agent on its next
+        // render. This keeps the store's single view-writer contract intact.
         if (ActiveAgentId == agentId)
-            ActiveAgentId = _agents.Keys.FirstOrDefault();
+        {
+            _selection = ViewSelection.None;
+            _pendingSelectionInvalid = true;
+        }
         NotifyChanged();
     }
 
@@ -125,6 +235,10 @@ public sealed class ClientStateStore : IClientStateStore
                 existing.ActiveSessionId = dto.ActiveSessionId;
                 existing.CreatedAt = dto.CreatedAt;
                 existing.UpdatedAt = dto.UpdatedAt;
+
+                // Source/Kind/Visibility are deliberately NOT refreshed here: they are init-only,
+                // write-once signals (#2304, #2340). A conversation cannot change why it exists, who
+                // is in it, or whether a user may see it, so a refresh must never rewrite them.
             }
             else
             {
@@ -137,7 +251,12 @@ public sealed class ClientStateStore : IClientStateStore
                     Status = dto.Status,
                     ActiveSessionId = dto.ActiveSessionId,
                     CreatedAt = dto.CreatedAt,
-                    UpdatedAt = dto.UpdatedAt
+                    UpdatedAt = dto.UpdatedAt,
+                    // Immutable origin signal, seeded once straight from the server payload (#2304).
+                    Source = ConversationOrigin.ParseSource(dto.Source),
+                    Kind = ConversationOrigin.ParseKind(dto.Kind),
+                    // Immutable visibility signal, seeded once from the server payload (#2340).
+                    Visibility = ConversationOrigin.ParseVisibility(dto.Visibility)
                 };
             }
         }
@@ -145,21 +264,11 @@ public sealed class ClientStateStore : IClientStateStore
         // Remove conversations no longer in the list
         var incomingIds = incoming.Select(d => d.ConversationId).ToHashSet();
         foreach (var id in agent.Conversations
-                     .Where(kv => !incomingIds.Contains(kv.Key) && !kv.Value.IsVirtualSession)
+                     .Where(kv => !incomingIds.Contains(kv.Key) && !kv.Value.IsLocallySynthesised)
                      .Select(kv => kv.Key)
                      .ToList())
         {
             agent.Conversations.Remove(id);
-        }
-
-        // Auto-select a conversation if none is selected
-        if (agent.ActiveConversationId is null && agent.Conversations.Count > 0)
-        {
-            var defaultConv = agent.Conversations.Values.FirstOrDefault(c => c.IsDefault)
-                ?? agent.Conversations.Values.OrderByDescending(c => c.UpdatedAt).First();
-            agent.ActiveConversationId = defaultConv.ConversationId;
-            if (defaultConv.ActiveSessionId is not null)
-                agent.SessionId = defaultConv.ActiveSessionId;
         }
 
         agent.ConversationsLoaded = true;
@@ -180,27 +289,31 @@ public sealed class ClientStateStore : IClientStateStore
         return null;
     }
 
+    // ── #3212: route-derived visibility (IDisplayedConversation) ─────────────
+
     /// <inheritdoc />
-    public void SetActiveConversation(string agentId, string conversationId)
+    /// <remarks>
+    /// Answered from the single <see cref="ViewSelection"/> written by the route application path.
+    /// Both agent and conversation must match the rendered pane.
+    /// </remarks>
+    public bool IsConversationDisplayed(string? agentId, string? conversationId)
     {
-        if (!_agents.TryGetValue(agentId, out var agent))
-            return;
+        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(conversationId))
+            return false;
 
-        agent.ActiveConversationId = conversationId;
-
-        if (agent.Conversations.TryGetValue(conversationId, out var conv))
-        {
-            conv.UnreadCount = 0;
-            agent.SessionId = conv.ActiveSessionId;
-        }
-
-        NotifyChanged();
+        return string.Equals(_selection.AgentId, agentId, StringComparison.Ordinal)
+            && string.Equals(_selection.ConversationId, conversationId, StringComparison.Ordinal);
     }
 
     /// <inheritdoc />
-    public string? ActiveConversationId =>
-        ActiveAgentId is not null && _agents.TryGetValue(ActiveAgentId, out var a)
-            ? a.ActiveConversationId
+    public bool IsAgentDisplayed(string? agentId) =>
+        !string.IsNullOrWhiteSpace(agentId)
+        && string.Equals(_selection.AgentId, agentId, StringComparison.Ordinal);
+
+    /// <inheritdoc />
+    public string? DisplayedConversationIdFor(string? agentId) =>
+        IsAgentDisplayed(agentId) && _selection.ConversationId is { Length: > 0 } conversationId
+            ? conversationId
             : null;
 
     // ── Message operations ───────────────────────────────────────────────────
@@ -262,7 +375,7 @@ public sealed class ClientStateStore : IClientStateStore
         if (conv is null)
             return;
 
-        conv.StreamState.IsStreaming = streaming;
+        conv.StreamState.SetStreaming(streaming, "ClientStateStore.SetStreaming");
 
         // Only update agent-level IsStreaming if this is the active conversation
         // — prevents streaming state from bleeding into inactive conversations
@@ -270,7 +383,7 @@ public sealed class ClientStateStore : IClientStateStore
         {
             if (agent.Conversations.ContainsKey(conversationId))
             {
-                if (agent.ActiveConversationId == conversationId)
+                if (IsConversationDisplayed(agent.AgentId, conversationId))
                     agent.IsStreaming = streaming;
                 else if (streaming == false)
                     agent.IsStreaming = agent.Conversations.Values.Any(c => c.StreamState.IsStreaming);
@@ -309,20 +422,16 @@ public sealed class ClientStateStore : IClientStateStore
             // #1651: honour a role carried on the buffered content (PendingRole) so a
             // user-stamped agent-post commits as a user bubble. Null defaults to Assistant,
             // matching the pre-post-as-assistant behaviour of this flush.
-            var role = (conv.StreamState.PendingRole ?? string.Empty).Trim().ToLowerInvariant() switch
-            {
-                "" => "Assistant",
-                "user" => "User",
-                "assistant" => "Assistant",
-                var other => other,
-            };
+            // #3456: role normalisation is owned by MessageRole. Do not reintroduce a local
+            // switch here.
+            var role = MessageRole.Normalize(conv.StreamState.PendingRole);
             conv.AppendMessage(new ChatMessage(role, buffer ?? "", DateTimeOffset.UtcNow)
             {
                 ThinkingContent = thinking
             });
         }
 
-        conv.StreamState.Reset();
+        conv.StreamState.Reset("ClientStateStore.ResetStreaming");
 
         // Keep agent-level state in sync
         foreach (var agent in _agents.Values)
@@ -395,6 +504,16 @@ public sealed class ClientStateStore : IClientStateStore
         return conv?.PendingSteeringQueue ?? (IReadOnlyList<SteeringEntry>)[];
     }
 
+    /// <inheritdoc />
+    public void ClearSteeringQueue(string conversationId)
+    {
+        var conv = GetConversation(conversationId);
+        if (conv is null || conv.PendingSteeringQueue.Count == 0) return;
+
+        conv.PendingSteeringQueue.Clear();
+        NotifyChanged();
+    }
+
     // ── Session resolution ─────────────────────────────────────────────────────
 
     /// <inheritdoc />
@@ -406,13 +525,17 @@ public sealed class ClientStateStore : IClientStateStore
 
         // Cron sessions must not overwrite the active user-facing session or the active
         // conversation's ActiveSessionId. Doing so caused new user conversations to receive
-        // a cron: session ID prefix, because RefreshConversationsForAgentAsync iterates all
+        // a cron session ID, because RefreshConversationsForAgentAsync iterates all
         // sessions (including cron) and the last one processed would stamp agent.SessionId.
-        var isCron = string.Equals(sessionType, "cron", StringComparison.OrdinalIgnoreCase)
-            || (!string.IsNullOrWhiteSpace(sessionId) && sessionId.StartsWith("cron:", StringComparison.Ordinal));
+        //
+        // #2305: this is the SESSION's declared type as reported by the server on the
+        // RegisterSession call - not an inference of the CONVERSATION's origin from an id
+        // substring. The `cron:` session-id prefix probe that used to back this up is deleted;
+        // conversation origin comes only from the immutable server-stamped ConversationSource.
+        var isCron = string.Equals(sessionType, "cron", StringComparison.OrdinalIgnoreCase);
         if (isCron)
         {
-            // For cron sessions, only update the virtual conversation projection if it exists.
+            // For cron sessions, only update the locally-synthesised projection if it exists.
             // Never touch agent.SessionId or a real user conversation.
             if (channelType is not null)
                 agent.ChannelType ??= channelType;
@@ -436,25 +559,24 @@ public sealed class ClientStateStore : IClientStateStore
         // target a different conversation's (often idle) session. See steer-routing fix.
         if (conversationId is not null)
         {
-            if (agent.Conversations.TryGetValue(conversationId, out var ownerConv) && !ownerConv.IsVirtualSession)
+            if (agent.Conversations.TryGetValue(conversationId, out var ownerConv) && !ownerConv.IsLocallySynthesised)
                 ownerConv.ActiveSessionId = sessionId;
 
-            // Only the active conversation's session should drive the agent-global fallback.
-            if (string.Equals(conversationId, agent.ActiveConversationId, StringComparison.Ordinal))
+            // Only the displayed conversation's session should drive the agent-global fallback.
+            if (IsConversationDisplayed(agentId, conversationId))
                 agent.SessionId = sessionId;
 
             return;
         }
 
-        // Legacy single-establish path (conversationId unknown): bind to the active conversation.
-        // This is the #314 race fix — a freshly established session (e.g. from a SendMessage
-        // result) is immediately bound so MessageStart can resolve it before the REST refresh.
+        // Legacy single-establish path (conversationId unknown): bind only when the displayed
+        // route supplies an unambiguous conversation for this agent.
         agent.SessionId = sessionId;
-        if (agent.ActiveConversationId is not null &&
-            agent.Conversations.TryGetValue(agent.ActiveConversationId, out var activeConv) &&
-            !activeConv.IsVirtualSession)
+        if (DisplayedConversationIdFor(agentId) is { } displayedConversationId &&
+            agent.Conversations.TryGetValue(displayedConversationId, out var displayedConversation) &&
+            !displayedConversation.IsLocallySynthesised)
         {
-            activeConv.ActiveSessionId = sessionId;
+            displayedConversation.ActiveSessionId = sessionId;
         }
     }
 

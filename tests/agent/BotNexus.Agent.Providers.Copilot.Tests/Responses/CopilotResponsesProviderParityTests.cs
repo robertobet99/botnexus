@@ -29,6 +29,29 @@ public class CopilotResponsesProviderParityTests
         provider.Api.ShouldBe("github-copilot-responses");
     }
 
+    [Theory]
+    [InlineData(ThinkingLevel.Minimal, "none")]
+    [InlineData(ThinkingLevel.Low, "low")]
+    [InlineData(ThinkingLevel.Medium, "medium")]
+    [InlineData(ThinkingLevel.High, "high")]
+    [InlineData(ThinkingLevel.ExtraHigh, "xhigh")]
+    [InlineData(ThinkingLevel.Max, "max")]
+    public void MapThinkingLevel_PreservesTheFullGpt6CopilotResponsesLadder(
+        ThinkingLevel level,
+        string expected)
+    {
+        var model = BuildModel() with { Id = "gpt-6-sol" };
+
+        CopilotResponsesProvider.MapThinkingLevel(model, level).ShouldBe(expected);
+    }
+
+    [Fact]
+    public void MapThinkingLevel_PreservesMinimalForEarlierResponsesModels()
+    {
+        CopilotResponsesProvider.MapThinkingLevel(BuildModel(), ThinkingLevel.Minimal)
+            .ShouldBe("minimal");
+    }
+
     [Fact]
     public async Task Stream_Gpt55WithToolCatalogue_MatchesOpenAICopilotModeBody()
     {
@@ -68,17 +91,19 @@ public class CopilotResponsesProviderParityTests
     }
 
     [Fact]
-    public async Task Stream_Gpt56_RemovesCopilotChunkCrLf_WhilePreservingMarkdownNewlines()
+    public async Task Stream_Gpt56_AssemblesMarkdownNewlinesByteIdentically()
     {
+        // #3442: no CRLF prefixes on the fixture deltas - captures show Copilot does not send them.
+        // The property worth pinning is that genuine LF Markdown structure survives assembly.
         const string sse =
             "event: response.output_item.added\n" +
             "data: {\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
             "event: response.output_text.delta\n" +
-            "data: {\"item_id\":\"msg_1\",\"delta\":\"\\r\\nK\"}\n\n" +
+            "data: {\"item_id\":\"msg_1\",\"delta\":\"K\"}\n\n" +
             "event: response.output_text.delta\n" +
-            "data: {\"item_id\":\"msg_1\",\"delta\":\"\\r\\narthik\"}\n\n" +
+            "data: {\"item_id\":\"msg_1\",\"delta\":\"arthik\"}\n\n" +
             "event: response.output_text.delta\n" +
-            "data: {\"item_id\":\"msg_1\",\"delta\":\"\\r\\n\\n\\n- first\\n- second\"}\n\n" +
+            "data: {\"item_id\":\"msg_1\",\"delta\":\"\\n\\n- first\\n- second\"}\n\n" +
             "event: response.output_item.done\n" +
             "data: {\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
             "event: response.completed\n" +
@@ -102,7 +127,49 @@ public class CopilotResponsesProviderParityTests
     }
 
     [Fact]
-    public async Task Stream_PreGpt56_PreservesLeadingCrLfVerbatim()
+    public async Task Stream_Gpt56_MidWordSplitDeltas_ReassembleWithoutLosingTokenWhitespace()
+    {
+        // #3442: this test previously framed every fragment with repeated CRLF pairs and asserted
+        // the normalizer stripped them (#2119). Captures falsify that framing. What survives, and
+        // is the acceptance criterion of the refactor, is the mid-word-split invariant: a provider
+        // may split anywhere, including inside a word, so "Under" + "stood" + " now" must
+        // reassemble to "Understood now" with a genuine token-leading space intact.
+        const string sse =
+            "event: response.output_item.added\n" +
+            "data: {\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
+            "event: response.output_text.delta\n" +
+            "data: {\"item_id\":\"msg_1\",\"delta\":\"Under\"}\n\n" +
+            "event: response.output_text.delta\n" +
+            "data: {\"item_id\":\"msg_1\",\"delta\":\"stood\"}\n\n" +
+            "event: response.output_text.delta\n" +
+            "data: {\"item_id\":\"msg_1\",\"delta\":\" now\"}\n\n" +
+            "event: response.output_item.done\n" +
+            "data: {\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
+            "event: response.completed\n" +
+            "data: {\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n";
+
+        var handler = new RecordingHandler(_ => SseResponse(sse));
+        var provider = new CopilotResponsesProvider(
+            new HttpClient(handler),
+            NullLogger<CopilotResponsesProvider>.Instance);
+        var model = BuildModel() with { Id = "gpt-5.6-sol", Name = "gpt-5.6-sol" };
+
+        var result = await provider.Stream(
+                model,
+                BuildContext(),
+                new CopilotResponsesOptions { ApiKey = "test-copilot-token" })
+            .GetResultAsync()
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        result.Content.OfType<TextContent>().Single().Text.ShouldBe("Understood now");
+    }
+
+    // #3442 CONTRACT CHANGE, deliberately re-pinned rather than deleted. See the sibling comment
+    // in CopilotMessagesProviderParityTests. Mitm captures contain 0 raw CR bytes across 3,025
+    // Copilot deltas, so a leading CRLF that DOES arrive is model content, not transport framing,
+    // and must survive. The real corruption was our own separator injection (#3425, fixed #3428).
+    [Fact]
+    public async Task Stream_LeadingCrLf_IsPreservedAsContent_BecauseItIsNotTransportFraming()
     {
         const string sse =
             "event: response.output_text.delta\n" +
@@ -123,6 +190,30 @@ public class CopilotResponsesProviderParityTests
             .WaitAsync(TimeSpan.FromSeconds(10));
 
         result.Content.OfType<TextContent>().Single().Text.ShouldBe("\r\nintentional");
+    }
+
+    [Fact]
+    public async Task Stream_PreGpt56Model_InteriorCrLf_SurvivesAsContent()
+    {
+        const string sse =
+            "event: response.output_text.delta\n" +
+            "data: {\"item_id\":\"msg_1\",\"delta\":\"before\\r\\nafter\"}\n\n" +
+            "event: response.completed\n" +
+            "data: {\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n";
+
+        var handler = new RecordingHandler(_ => SseResponse(sse));
+        var provider = new CopilotResponsesProvider(
+            new HttpClient(handler),
+            NullLogger<CopilotResponsesProvider>.Instance);
+
+        var result = await provider.Stream(
+                BuildModel(),
+                BuildContext(),
+                new CopilotResponsesOptions { ApiKey = "test-copilot-token" })
+            .GetResultAsync()
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        result.Content.OfType<TextContent>().Single().Text.ShouldBe("before\r\nafter");
     }
 
     private static async Task<(RecordingHandler CopilotHandler, RecordingHandler OpenAIHandler)> DriveBothProvidersAsync()

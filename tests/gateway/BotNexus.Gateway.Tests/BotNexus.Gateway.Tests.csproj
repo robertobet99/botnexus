@@ -1,10 +1,20 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <!-- #3278: the export HTML renderer's inertness guarantee (no <script>, no remote asset
+         reference) is asserted by PARSING the produced document and walking its DOM. A string
+         match over the whole document would pass on a file that merely spells the tag
+         differently, so the test needs a real HTML parser. -->
+    <PackageReference Include="AngleSharp" />
+    <!-- Vogen is pinned PrivateAssets="all" in BotNexus.Domain so the generator cannot leak into
+         the Blazor WASM payload (#2329). This project asserts on Vogen types directly, so it
+         declares its own reference rather than relying on transitive flow. -->
+    <PackageReference Include="Vogen" />
     <PackageReference Include="coverlet.collector">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="Moq" />
     <PackageReference Include="NSubstitute" />
@@ -23,6 +33,10 @@
     <ProjectReference Include="..\..\..\src\extensions\BotNexus.Extensions.Channels.SignalR.BlazorClient\BotNexus.Extensions.Channels.SignalR.BlazorClient.csproj" />
     <ProjectReference Include="..\..\..\src\extensions\BotNexus.Extensions.Skills\BotNexus.Extensions.Skills.csproj" />
     <ProjectReference Include="..\..\..\src\gateway\BotNexus.Gateway.Channels\BotNexus.Gateway.Channels.csproj" />
+    <!-- #2855: the memory-embedding composition tests drive the REAL OpenAI-compatible embeddings
+         provider through a fake HTTP handler, per acceptance criterion 3. A stubbed provider would
+         prove the test double works and nothing about the request the platform emits. -->
+    <ProjectReference Include="..\..\..\src\agent\BotNexus.Agent.Providers.OpenAICompat\BotNexus.Agent.Providers.OpenAICompat.csproj" />
     <ProjectReference Include="..\..\..\src\extensions\BotNexus.Extensions.Channels.Tui\BotNexus.Extensions.Channels.Tui.csproj" />
     <ProjectReference Include="..\..\..\src\extensions\BotNexus.Extensions.Channels.Telegram\BotNexus.Extensions.Channels.Telegram.csproj" />
     <!--
@@ -49,5 +63,10 @@
     <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\Configs\**\*" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\Auth\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\..\BotNexus.Testing\SqlitePoolCleanup.cs" Link="Shared\SqlitePoolCleanup.cs" />
+    <Using Include="BotNexus.Testing" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
   </ItemGroup>
 </Project>

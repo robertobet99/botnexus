@@ -98,17 +98,23 @@ public class OpenAICompletionsProviderTests
     }
 
     [Fact]
-    public void MapStopReason_ContentFilter_MapsToErrorWithMessage()
+    public void MapStopReason_ContentFilter_MapsToSensitiveWithMessage()
     {
         // #1408: MapStopReason moved to the shared CompletionsStreamEngine in Providers.Core.
+        // #3296: the expected StopReason changed from Error to Sensitive. This test previously
+        // pinned the divergence itself -- Completions said Error for the same upstream condition
+        // the Responses parser normalized to Sensitive -- so correcting the mapping necessarily
+        // corrects the assertion. The message half is unchanged and still asserted, because it is
+        // the only place a filtered turn states why it stopped. Cross-API parity is covered by
+        // ContentFilterStopReasonParityTests in Providers.Core.Tests.
         var mapped = CompletionsStreamEngine.MapStopReason("content_filter");
 
-        mapped.StopReason.ShouldBe(StopReason.Error);
+        mapped.StopReason.ShouldBe(StopReason.Sensitive);
         mapped.ErrorMessage.ShouldBe("Content filtered by provider");
     }
 
     [Fact]
-    public void ConvertMessages_NonVisionModel_FiltersImageOnlyUserMessage()
+    public void ConvertMessages_NonVisionModel_FiltersImageOnlyUserMessageButExplainsTheDrop()
     {
         // #1540: converter unified into the public CompletionsMessageConverter in Providers.Core.
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -131,7 +137,15 @@ public class OpenAICompletionsProviderTests
             null, model, new Message[] { userWithOnlyImage }, new OpenAICompletionsCompat());
 
         converted.ShouldNotBeNull();
-        converted.ShouldBeEmpty();
+        // #2485 AC4: the image is still filtered (the model cannot receive it), but the message no
+        // longer vanishes without trace - it now carries the user-visible explanation instead of
+        // being dropped whole, which is precisely the silence this issue exists to remove.
+        converted.Count.ShouldBe(1);
+        var content = converted[0]!["content"]!.AsArray();
+        content.Count.ShouldBe(1);
+        content[0]!["type"]!.GetValue<string>().ShouldBe("text");
+        content[0]!["text"]!.GetValue<string>().ShouldContain("were not delivered");
+        content.Select(n => n!["type"]!.GetValue<string>()).ShouldNotContain("image_url");
     }
 
     [Fact]
@@ -153,6 +167,19 @@ public class OpenAICompletionsProviderTests
         var messages = new Message[]
         {
             new UserMessage(new UserMessageContent("hello \uD800 world"), timestamp),
+            // #3014: the originating tool call must be present, otherwise the tool result is an orphan
+            // and the shared MessageTransformer seam drops it before this converter sees it. The
+            // sanitization assertions below are unchanged; only the fixture became well-formed.
+            new AssistantMessage(
+                Content: [new ToolCallContent("call_1", "read_file", new Dictionary<string, object?>())],
+                Api: "openai-completions",
+                Provider: "openai",
+                ModelId: "gpt-4o",
+                Usage: Usage.Empty(),
+                StopReason: StopReason.ToolUse,
+                ErrorMessage: null,
+                ResponseId: null,
+                Timestamp: timestamp),
             new ToolResultMessage(
                 ToolCallId: "call_1",
                 ToolName: "read_file",
@@ -167,7 +194,63 @@ public class OpenAICompletionsProviderTests
         converted.ShouldNotBeNull();
         converted![0]!["content"]!.GetValue<string>().ShouldBe("sys  prompt");
         converted[1]!["content"]!.GetValue<string>().ShouldBe("hello  world");
-        converted[2]!["content"]!.GetValue<string>().ShouldBe("tool  output");
+        converted.Single(n => n!["role"]!.GetValue<string>() == "tool")!["content"]!
+            .GetValue<string>().ShouldBe("tool  output");
+    }
+
+    [Theory]
+    [InlineData("mistral-small-latest")]
+    [InlineData("devstral-small-latest")]
+    [InlineData("codestral-latest")]
+    [InlineData("pixtral-large-latest")]
+    [InlineData("open-mixtral-8x22b")]
+    public void ConvertMessages_MistralFamily_NormalizesMatchingToolCallIds(string modelId)
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var model = new LlmModel(
+            Id: modelId, Name: modelId, Api: "openai-completions", Provider: "custom",
+            BaseUrl: "https://example.test/v1", Reasoning: false, Input: ["text"],
+            Cost: new ModelCost(0, 0, 0, 0), ContextWindow: 32000, MaxTokens: 4096);
+        const string originalId = "toolu_01CBhTTz95qkd9LJMdC9sf8t";
+        Message[] messages =
+        [
+            new AssistantMessage(
+                [new ToolCallContent(originalId, "read", new Dictionary<string, object?>())],
+                "openai-completions", "custom", modelId, Usage.Empty(), StopReason.ToolUse,
+                null, null, timestamp),
+            new ToolResultMessage(originalId, "read", [new TextContent("ok")], false, timestamp)
+        ];
+
+        var converted = CompletionsMessageConverter.Convert(
+            null, model, messages, new OpenAICompletionsCompat());
+
+        converted[0]!["tool_calls"]![0]!["id"]!.GetValue<string>().ShouldBe("toolu01CB");
+        converted[1]!["tool_call_id"]!.GetValue<string>().ShouldBe("toolu01CB");
+    }
+
+    [Fact]
+    public void ConvertMessages_NonMistralModel_PreservesToolCallIds()
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var model = new LlmModel(
+            Id: "qwen-coder", Name: "Qwen", Api: "openai-completions", Provider: "custom",
+            BaseUrl: "https://example.test/v1", Reasoning: false, Input: ["text"],
+            Cost: new ModelCost(0, 0, 0, 0), ContextWindow: 32000, MaxTokens: 4096);
+        const string originalId = "call_with-punctuation!";
+        Message[] messages =
+        [
+            new AssistantMessage(
+                [new ToolCallContent(originalId, "read", new Dictionary<string, object?>())],
+                "openai-completions", "custom", model.Id, Usage.Empty(), StopReason.ToolUse,
+                null, null, timestamp),
+            new ToolResultMessage(originalId, "read", [new TextContent("ok")], false, timestamp)
+        ];
+
+        var converted = CompletionsMessageConverter.Convert(
+            null, model, messages, new OpenAICompletionsCompat());
+
+        converted[0]!["tool_calls"]![0]!["id"]!.GetValue<string>().ShouldBe(originalId);
+        converted[1]!["tool_call_id"]!.GetValue<string>().ShouldBe(originalId);
     }
 
     [Fact]

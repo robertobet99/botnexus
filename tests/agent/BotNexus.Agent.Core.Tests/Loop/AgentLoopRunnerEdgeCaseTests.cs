@@ -54,6 +54,15 @@ public class AgentLoopRunnerEdgeCaseTests
 
         attempts.ShouldBeGreaterThan(1, $"transient error '{errorMessage}' should trigger retry");
         result.OfType<AssistantAgentMessage>().ShouldContain(m => m.Content == "recovered");
+        var recoveryEvents = events.OfType<ProviderRecoveryEvent>().ToList();
+        recoveryEvents.Count(recovery => recovery.Stage == ProviderRecoveryStage.RetryScheduled).ShouldBe(2);
+        recoveryEvents.ShouldContain(recovery =>
+            recovery.Stage == ProviderRecoveryStage.Recovered
+            && recovery.Attempt == 3
+            && recovery.Provider == "test-provider");
+        recoveryEvents.All(recovery =>
+            recovery.ProviderError == null
+            && recovery.AuthProfile == null).ShouldBeTrue();
     }
 
     [Theory]
@@ -96,16 +105,25 @@ public class AgentLoopRunnerEdgeCaseTests
 
         var config = CreateConfig("max-retry-test");
         var context = new AgentContext(null, [], []);
+        var events = new List<AgentEvent>();
 
         var act = () => AgentLoopRunner.RunAsync(
             [new AgentUserMessage("test")],
             context,
             config,
-            _ => Task.CompletedTask,
+            evt => { events.Add(evt); return Task.CompletedTask; },
             CancellationToken.None);
 
         await act.ShouldThrowAsync<InvalidOperationException>();
         attempts.ShouldBe(4, "should exhaust all 4 retry attempts");
+        var exhausted = events.OfType<ProviderRecoveryEvent>()
+            .Where(recovery => recovery.Stage == ProviderRecoveryStage.Exhausted)
+            .ShouldHaveSingleItem();
+        exhausted.Attempt.ShouldBe(4);
+        exhausted.MaxAttempts.ShouldBe(4);
+        exhausted.Provider.ShouldBe("test-provider");
+        exhausted.ProviderError.ShouldBeNull();
+        exhausted.AuthProfile.ShouldBeNull();
     }
 
     // --- Context overflow compaction tests ---
@@ -138,6 +156,43 @@ public class AgentLoopRunnerEdgeCaseTests
 
         attempts.ShouldBe(2, "should retry after overflow compaction");
         result.OfType<AssistantAgentMessage>().ShouldContain(m => m.Content == "after-compaction");
+    }
+
+    [Fact]
+    public async Task RunAsync_CopilotResponsesInvalidRequestBodyOverflow_CompactsAndRetries()
+    {
+        var attempts = 0;
+        using var _ = RegisterProvider("copilot-responses-overflow-test", (_, _, _) =>
+        {
+            if (Interlocked.Increment(ref attempts) == 1)
+            {
+                throw new InvalidOperationException(
+                    "invalid_request_body: Your input exceeds the context window of this model. Please adjust your input and try again.");
+            }
+
+            return TestStreamFactory.CreateTextResponse("recovered");
+        });
+
+        var diagnostics = new List<string>();
+        var config = CreateConfig("copilot-responses-overflow-test") with
+        {
+            DiagnosticObserver = diagnostics.Add
+        };
+        var context = new AgentContext(
+            null,
+            Enumerable.Range(0, 20).Select(index => (AgentMessage)new AgentUserMessage($"message-{index}")).ToList(),
+            []);
+
+        var result = await AgentLoopRunner.RunAsync(
+            [new AgentUserMessage("trigger")],
+            context,
+            config,
+            _ => Task.CompletedTask,
+            CancellationToken.None);
+
+        attempts.ShouldBe(2);
+        result.OfType<AssistantAgentMessage>().ShouldContain(message => message.Content == "recovered");
+        diagnostics.ShouldContain(message => message.Contains("Reactive lossy context-overflow truncation", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -228,20 +283,20 @@ public class AgentLoopRunnerEdgeCaseTests
         return new AgentLoopConfig(
             Model: TestHelpers.CreateTestModel(apiId),
             LlmClient: TestHelpers.CreateLlmClient(),
-            ConvertToLlm: (messages, _) => Task.FromResult<IReadOnlyList<Message>>(
+            ProviderMessageTransformer: (messages, _) => Task.FromResult<IReadOnlyList<Message>>(
                 messages.OfType<AgentUserMessage>()
                     .Select(m => (Message)new BotNexus.Agent.Providers.Core.Models.UserMessage(
                         new UserMessageContent(m.Content),
                         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
                     .ToList()),
-            TransformContext: (messages, _) => Task.FromResult(messages),
-            GetApiKey: (_, _) => Task.FromResult<string?>(null),
-            GetSteeringMessages: null,
-            GetFollowUpMessages: null,
+            AgentContextTransformer: (messages, _) => Task.FromResult(messages),
+            ProviderExecutionOptionsProvider: (_, _) => Task.FromResult<ProviderExecutionOptions?>(null),
+            SteeringMessageProvider: null,
+            FollowUpMessageProvider: null,
             ToolExecutionMode: ToolExecutionMode.Sequential,
-            BeforeToolCall: null,
-            AfterToolCall: null,
-            GenerationSettings: new SimpleStreamOptions(),
+            ToolExecutionPolicy: null,
+            ToolResultTransformer: null,
+            GenerationSettings: new GenerationOptions(),
             MaxRetryDelayMs: 1); // Fast retries for tests
     }
 

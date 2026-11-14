@@ -7,7 +7,7 @@ namespace BotNexus.Memory.Tests.TestInfrastructure;
 
 internal sealed class MemoryStoreTestContext : IAsyncDisposable
 {
-    private MemoryStoreTestContext(string tempDirectory, string dbPath, SqliteMemoryStore store)
+    internal MemoryStoreTestContext(string tempDirectory, string dbPath, SqliteMemoryStore store)
     {
         TempDirectory = tempDirectory;
         DbPath = dbPath;
@@ -35,7 +35,8 @@ internal sealed class MemoryStoreTestContext : IAsyncDisposable
         string? sessionId = null,
         int? turnIndex = null,
         DateTimeOffset? createdAt = null,
-        string? metadataJson = null)
+        string? metadataJson = null,
+        DateTimeOffset? expiresAt = null)
     {
         return new MemoryEntry
         {
@@ -49,7 +50,7 @@ internal sealed class MemoryStoreTestContext : IAsyncDisposable
             Embedding = null,
             CreatedAt = createdAt ?? DateTimeOffset.UtcNow,
             UpdatedAt = null,
-            ExpiresAt = null,
+            ExpiresAt = expiresAt,
             IsArchived = false
         };
     }
@@ -57,21 +58,27 @@ internal sealed class MemoryStoreTestContext : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await Store.DisposeAsync();
-        SqliteConnection.ClearAllPools();
+
+        // Deliberately NOT SqliteConnection.ClearAllPools(): see SqlitePoolCleanup for why a
+        // process-global clear makes unrelated parallel tests fail with ObjectDisposedException.
+        SqlitePoolCleanup.ClearPoolFor(DbPath);
         if (Directory.Exists(TempDirectory))
         {
-            for (var attempt = 0; attempt < 5; attempt++)
-            {
-                try
+            await TestAwait.EventuallyAsync(
+                () =>
                 {
-                    Directory.Delete(TempDirectory, true);
-                    break;
-                }
-                catch (IOException) when (attempt < 4)
-                {
-                    await Task.Delay(50);
-                }
-            }
+                    try
+                    {
+                        Directory.Delete(TempDirectory, recursive: true);
+                        return true;
+                    }
+                    catch (IOException)
+                    {
+                        return false;
+                    }
+                },
+                $"temporary memory store directory '{TempDirectory}' to be deletable",
+                timeout: TimeSpan.FromSeconds(2));
         }
     }
 }

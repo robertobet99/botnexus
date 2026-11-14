@@ -1,0 +1,375 @@
+using BotNexus.Cli.Services;
+using Microsoft.Extensions.Logging.Abstractions;
+using NSubstitute;
+
+namespace BotNexus.Cli.Tests.Services;
+
+/// <summary>
+/// Pins the PID-file-less gateway discovery and the observed-outcome reporting introduced for
+/// issue #2772, and the #2369 never-signal-an-unidentified-process guarantee it must not weaken.
+///
+/// Every process here is an <see cref="IGatewayProcessHandle"/> fake: nothing is spawned,
+/// enumerated or signalled for real, so the security assertions are exact rather than incidental.
+/// </summary>
+public sealed class GatewayStopDiscoveryTests : IDisposable
+{
+    private readonly string _home;
+    private readonly IHealthChecker _healthChecker = Substitute.For<IHealthChecker>();
+
+    public GatewayStopDiscoveryTests()
+    {
+        _home = Path.Combine(Path.GetTempPath(), $"bn-2772-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_home);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (Directory.Exists(_home))
+                Directory.Delete(_home, recursive: true);
+        }
+        catch (IOException)
+        {
+        }
+    }
+
+    /// <summary>A scripted live process. Records whether it was signalled; never touches the OS.</summary>
+    private sealed class FakeProcessHandle(int id, string? executablePath, bool throwOnPath = false)
+        : IGatewayProcessHandle
+    {
+        public int Id { get; } = id;
+
+        public int KillCount { get; private set; }
+
+        public string? ExecutablePath =>
+            throwOnPath
+                ? throw new InvalidOperationException("access denied reading main module")
+                : executablePath;
+
+        public void Kill() => KillCount++;
+
+        public bool WaitForExit(int milliseconds) => true;
+    }
+
+    private sealed class GracefulProcessHandle(int id, string executablePath, params bool[] waitResults)
+        : IGatewayProcessHandle
+    {
+        private readonly Queue<bool> _waitResults = new(waitResults);
+
+        public int Id { get; } = id;
+        public string? ExecutablePath { get; } = executablePath;
+        public int GracefulStopCount { get; private set; }
+        public int KillCount { get; private set; }
+
+        public bool RequestGracefulStop()
+        {
+            GracefulStopCount++;
+            return true;
+        }
+
+        public void Kill() => KillCount++;
+
+        public bool WaitForExit(int milliseconds) => _waitResults.Dequeue();
+    }
+
+    private GatewayProcessManager NewManager(params IGatewayProcessHandle[] processes)
+        => new(
+            _healthChecker,
+            NullLogger<GatewayProcessManager>.Instance,
+            processEnumerator: () => processes);
+
+    private GatewayProcessManager NewManager(
+        Func<string?, string, CancellationToken, Task<bool>> plannedShutdownRequester,
+        params IGatewayProcessHandle[] processes)
+        => new(
+            _healthChecker,
+            NullLogger<GatewayProcessManager>.Instance,
+            processEnumerator: () => processes,
+            plannedShutdownRequester: plannedShutdownRequester);
+
+    /// <summary>The managed DLL path this deployment would launch. Never created on disk - discovery
+    /// is a path-identity comparison, not a file probe.</summary>
+    private string GatewayDll => Path.Combine(_home, "bin", "BotNexus.Gateway.Api.dll");
+
+    private string GatewayApphostExe => Path.Combine(_home, "bin", "BotNexus.Gateway.Api.exe");
+
+    private string PidFilePath => Path.Combine(_home, "gateway.pid");
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StopAsync_CarriesLiveLaunchIdentityBeforeProcessExits(bool graceful)
+    {
+        var image = GatewayApphostExe;
+        var gateway = new ExitingIdentityHandle(8181, image, graceful);
+        var result = await NewManager(gateway).StopAsync(_home, GatewayDll);
+        result.Success.ShouldBeTrue();
+        result.VerifiedGatewayBinaryPath.ShouldBe(image);
+        gateway.ExecutablePath.ShouldBeNull();
+    }
+
+    private sealed class ExitingIdentityHandle(int id, string image, bool graceful) : IGatewayProcessHandle
+    {
+        private bool _exited;
+        public int Id => id;
+        public string? ExecutablePath => _exited ? null : image;
+        public bool RequestGracefulStop() => graceful;
+        public void Kill() => _exited = true;
+        public bool WaitForExit(int milliseconds) { _exited = true; return true; }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("dotnet")]
+    [InlineData("foreign")]
+    [InlineData("deployment-A")]
+    public void RecoveryIdentity_IsLiveAndNeverSubstitutesRequestedDeployment(string? image)
+    {
+        var path = image switch
+        {
+            null => null,
+            "dotnet" => Path.Combine(_home, "dotnet.exe"),
+            "foreign" => Path.Combine(_home, "other.exe"),
+            _ => Path.Combine(_home, "deployment-A", "BotNexus.Gateway.Api.exe")
+        };
+        var observed = GatewayProcessManager.GetVerifiedGatewayBinaryPath(new FakeProcessHandle(8182, path));
+        observed.ShouldBe(image == "deployment-A" ? path : null);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // AC1: the two outcomes are distinguishable at the manager boundary.
+    // -------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task AC1_StopAsync_ReportsNotRunning_WhenNoPidFileAndNoDiscoverableProcess()
+    {
+        File.Exists(PidFilePath).ShouldBeFalse("the fixture must start with no PID file");
+
+        var manager = NewManager(new FakeProcessHandle(11, @"C:\windows\system32\notepad.exe"));
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        result.Outcome.ShouldBe(GatewayStopOutcome.NotRunning,
+            "nothing was found, so nothing was stopped - Success alone cannot express that (#2772)");
+    }
+
+    [Fact]
+    public async Task AC1_StopAsync_ReportsStopped_WhenALiveGatewayWasFoundAndKilled()
+    {
+        var gateway = new FakeProcessHandle(4242, GatewayDll);
+        var manager = NewManager(gateway);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        result.Outcome.ShouldBe(GatewayStopOutcome.Stopped);
+        gateway.KillCount.ShouldBe(1);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // AC2: discovery by binary path when there is no PID file at all.
+    // -------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task AC2_StopAsync_DiscoversAndKillsGateway_ByManagedDllPath_WithNoPidFile()
+    {
+        var gateway = new FakeProcessHandle(777, GatewayDll);
+        var manager = NewManager(
+            new FakeProcessHandle(1, @"C:\other\dotnet.exe"),
+            gateway);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        gateway.KillCount.ShouldBe(1, "the live gateway must be discovered without a PID file (#2772)");
+        result.Outcome.ShouldBe(GatewayStopOutcome.Stopped);
+        result.Message.ShouldNotBeNull();
+        result.Message!.ShouldContain("777");
+    }
+
+    [Fact]
+    public async Task AC2_StopAsync_DiscoversAndKillsGateway_ByApphostExeBesideTheDll()
+    {
+        // StartAsync prefers the native apphost, so the LIVE process image is the .exe even though
+        // the deployment identifies the gateway by its managed DLL path.
+        var apphost = new FakeProcessHandle(888, GatewayApphostExe);
+        var manager = NewManager(apphost);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        apphost.KillCount.ShouldBe(1, "the apphost beside the DLL is the same gateway binary");
+        result.Outcome.ShouldBe(GatewayStopOutcome.Stopped);
+    }
+
+    [Fact]
+    public void AC2_BuildGatewayPathCandidates_IncludesTheDllAndTheApphostBesideIt()
+    {
+        var candidates = GatewayProcessManager.BuildGatewayPathCandidates(GatewayDll);
+
+        candidates.ShouldContain(Path.GetFullPath(GatewayDll));
+        candidates.ShouldContain(GatewayApphostExe);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // AC3 (SECURITY, #2369): an unidentified process is NEVER signalled.
+    // -------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task PlannedStop_RequestsHostShutdownBeforeNativeSignals()
+    {
+        var gateway = new GracefulProcessHandle(900, GatewayDll, true);
+        var requestedUrl = string.Empty;
+        var manager = NewManager(
+            (_, url, _) =>
+            {
+                requestedUrl = url;
+                return Task.FromResult(true);
+            },
+            gateway);
+
+        var result = await manager.StopAsync(
+            _home,
+            GatewayDll,
+            CancellationToken.None,
+            "http://localhost:6123");
+
+        requestedUrl.ShouldBe("http://localhost:6123");
+        gateway.GracefulStopCount.ShouldBe(0);
+        gateway.KillCount.ShouldBe(0);
+        result.Message.ShouldNotBeNull().ShouldContain("gracefully");
+    }
+
+    [Fact]
+    public async Task PlannedStop_WhenHostRequestIsUnavailable_FallsBackToNativeGracefulSignal()
+    {
+        var gateway = new GracefulProcessHandle(9001, GatewayDll, true);
+        var manager = NewManager((_, _, _) => Task.FromResult(false), gateway);
+
+        var result = await manager.StopAsync(
+            _home,
+            GatewayDll,
+            CancellationToken.None,
+            "http://localhost:6123");
+
+        gateway.GracefulStopCount.ShouldBe(1);
+        gateway.KillCount.ShouldBe(0);
+        result.Outcome.ShouldBe(GatewayStopOutcome.Stopped);
+    }
+
+    [Fact]
+    public async Task AC5_StopAsync_RequestsGracefulStop_AndDoesNotKillWhenProcessExits()
+    {
+        var gateway = new GracefulProcessHandle(901, GatewayDll, true);
+        var manager = NewManager(gateway);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        gateway.GracefulStopCount.ShouldBe(1);
+        gateway.KillCount.ShouldBe(0);
+        result.Outcome.ShouldBe(GatewayStopOutcome.Stopped);
+    }
+
+    [Fact]
+    public async Task AC5_StopAsync_EscalatesAfterExplicitGracefulTimeout()
+    {
+        var gateway = new GracefulProcessHandle(902, GatewayDll, false, true);
+        var manager = new GatewayProcessManager(
+            _healthChecker,
+            NullLogger<GatewayProcessManager>.Instance,
+            gracefulStopTimeout: TimeSpan.FromSeconds(3),
+            processEnumerator: () => new[] { gateway });
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        gateway.GracefulStopCount.ShouldBe(1);
+        gateway.KillCount.ShouldBe(1);
+        var message = result.Message.ShouldNotBeNull();
+        message.ShouldContain("3");
+        message.ShouldContain("forced kill");
+    }
+
+    [Fact]
+    public async Task AC3_StopAsync_NeverKillsAForeignProcess()
+    {
+        var foreign = new FakeProcessHandle(101, @"C:\Program Files\Foreign\important.exe");
+        var manager = NewManager(foreign);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        foreign.KillCount.ShouldBe(0, "a foreign executable path is not the gateway and must never be signalled");
+        result.Outcome.ShouldBe(GatewayStopOutcome.NotRunning);
+    }
+
+    [Fact]
+    public async Task AC3_StopAsync_NeverKillsAProcessWhoseExecutablePathIsNull()
+    {
+        var unknown = new FakeProcessHandle(102, null);
+        var manager = NewManager(unknown);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        unknown.KillCount.ShouldBe(0, "an unreadable image path means unidentifiable, never 'assume gateway'");
+        result.Outcome.ShouldBe(GatewayStopOutcome.NotRunning);
+    }
+
+    [Fact]
+    public async Task AC3_StopAsync_NeverKillsAProcessWhoseExecutablePathThrows()
+    {
+        var denied = new FakeProcessHandle(103, null, throwOnPath: true);
+        var manager = NewManager(denied);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        denied.KillCount.ShouldBe(0, "access-denied on the module path must skip the process, not select it");
+        result.Outcome.ShouldBe(GatewayStopOutcome.NotRunning);
+    }
+
+    [Fact]
+    public async Task AC3_StopAsync_SkipsUnidentifiableProcessesAndStillFindsTheRealGateway()
+    {
+        var denied = new FakeProcessHandle(1, null, throwOnPath: true);
+        var nullPath = new FakeProcessHandle(2, null);
+        var foreign = new FakeProcessHandle(3, @"C:\Program Files\Foreign\important.exe");
+        var gateway = new FakeProcessHandle(4, GatewayDll);
+        var manager = NewManager(denied, nullPath, foreign, gateway);
+
+        var result = await manager.StopAsync(_home, GatewayDll, CancellationToken.None);
+
+        gateway.KillCount.ShouldBe(1);
+        denied.KillCount.ShouldBe(0);
+        nullPath.KillCount.ShouldBe(0);
+        foreign.KillCount.ShouldBe(0);
+        result.Outcome.ShouldBe(GatewayStopOutcome.Stopped);
+    }
+
+    [Fact]
+    public async Task AC3_StopAsync_DoesNotEnumerateOrKillAnything_WhenNoGatewayBinaryPathIsSupplied()
+    {
+        var gateway = new FakeProcessHandle(5, GatewayDll);
+        var manager = NewManager(gateway);
+
+        var result = await manager.StopAsync(_home, gatewayBinaryPath: null, CancellationToken.None);
+
+        gateway.KillCount.ShouldBe(0, "with no expected path there is nothing to positively identify against");
+        result.Outcome.ShouldBe(GatewayStopOutcome.NotRunning);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // IsRunning shares the same discovery, so the update skip path cannot disagree with stop.
+    // -------------------------------------------------------------------------------------
+
+    [Fact]
+    public void AC1_IsRunning_IsTrue_WhenGatewayIsDiscoverableByPathWithoutAPidFile()
+    {
+        var manager = NewManager(new FakeProcessHandle(9, GatewayDll));
+
+        manager.IsRunning(_home, GatewayDll).ShouldBeTrue();
+    }
+
+    [Fact]
+    public void AC1_IsRunning_IsFalse_WhenOnlyForeignProcessesAreAlive()
+    {
+        var manager = NewManager(new FakeProcessHandle(9, @"C:\other\foreign.exe"));
+
+        manager.IsRunning(_home, GatewayDll).ShouldBeFalse();
+    }
+}

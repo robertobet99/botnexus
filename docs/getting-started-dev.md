@@ -20,19 +20,23 @@ The single guide for building, running, and developing BotNexus from source. If 
 ```powershell
 git clone https://github.com/sytone/botnexus.git
 cd botnexus
-.\scripts\dev-loop.ps1
+.\scripts\dev-loop.ps1 -SkipTests
 ```
 
-That's it. `dev-loop.ps1` builds the full solution, runs Gateway tests, and starts the Gateway — stopping at the first failure.
+`dev-loop.ps1 -SkipTests` builds the solution and starts a development Gateway, stopping if the build fails. Without `-SkipTests`, the script runs local Gateway tests before startup; always include the switch for this workflow and use [remote validation](#running-tests) for tests.
+
+> Run this only on a dedicated development host without a live Gateway. `-SkipTests` suppresses tests, not Gateway startup; a different port alone does not isolate shared runtime state.
 
 The Gateway starts at `http://localhost:5005` with the WebUI at the root URL.
 
 > **First run?** BotNexus auto-creates `~/.botnexus/` with a default `config.json`. No manual setup needed.
 
-Install the pre-commit hook (once, after cloning):
+Install the versioned git hooks (once, after cloning). This activates the
+`pre-push` `core.bare` guard (#1602); there is deliberately no pre-commit hook,
+because commit-time local validation is banned:
 
 ```powershell
-.\scripts\install-pre-commit-hook.ps1
+.\scripts\repo\install-hooks.ps1
 ```
 
 ### Verify it's running
@@ -46,29 +50,13 @@ curl http://localhost:5005/health
 
 ## 2. Configure the Copilot provider
 
-Edit `~/.botnexus/config.json`:
+Use the CLI so the same setup works with JSON-backed and SQLite-backed homes:
 
-```json
-{
-  "gateway": {
-    "listenUrl": "http://localhost:5005",
-    "defaultAgentId": "assistant"
-  },
-  "providers": {
-    "copilot": {
-      "apiKey": "auth:copilot",
-      "baseUrl": "https://api.githubcopilot.com",
-      "defaultModel": "gpt-4.1"
-    }
-  },
-  "agents": {
-    "assistant": {
-      "provider": "copilot",
-      "model": "gpt-4.1",
-      "enabled": true
-    }
-  }
-}
+```powershell
+botnexus provider setup --provider github-copilot
+botnexus agent add assistant --provider github-copilot --model gpt-4.1
+botnexus config set gateway.defaultAgentId assistant
+botnexus validate
 ```
 
 On your first message to the agent, you'll see:
@@ -96,17 +84,17 @@ Key features:
 
 ## 4. Development workflow
 
-Use `dev-loop.ps1` for the edit → build → test → run cycle:
+Use `dev-loop.ps1 -SkipTests` for the local edit → build → run cycle on a dedicated development host. Run tests separately through the remote validation gate:
 
 ```powershell
-# Build + test + run (the standard workflow)
-.\scripts\dev-loop.ps1
+# Build + run, without local tests
+.\scripts\dev-loop.ps1 -SkipTests
 
-# Watch mode — auto-rebuild on source changes
-.\scripts\dev-loop.ps1 -Watch
+# Watch mode — auto-rebuild on source changes, without local tests
+.\scripts\dev-loop.ps1 -Watch -SkipTests
 
-# Custom port
-.\scripts\dev-loop.ps1 -Port 9090
+# Custom port, without local tests (not runtime-state isolation)
+.\scripts\dev-loop.ps1 -Port 9090 -SkipTests
 ```
 
 ### What changes need a restart?
@@ -115,30 +103,30 @@ Use `dev-loop.ps1` for the edit → build → test → run cycle:
 |---|---|
 | Agent definitions, models, enabled/disabled | No — hot-reloads in ~500ms |
 | Provider settings (API keys, base URLs) | No — hot-reloads |
-| Agent workspace files (`SOUL.md`, `IDENTITY.md`, etc.) | No — takes effect on next message |
+| Agent workspace prompt files (`SOUL.md`, `IDENTITY.md`, etc.) | In-process handles load these when created; editing a file does not refresh an existing handle on its next message |
 | `gateway.listenUrl` (port binding) | Yes |
 | Extension DLL additions | Yes |
 
 ### Running tests
 
 ```powershell
-# Full test suite (required before committing)
-dotnet test BotNexus.slnx --nologo --tl:off
+# Authoritative remote validation (required for code changes)
+scripts/repo/Invoke-PreCommitValidation.ps1
 
-# Specific test project
-dotnet test tests\gateway\BotNexus.Gateway.Tests
-
-# Specific test by name
-dotnet test BotNexus.slnx --filter "FullyQualifiedName~MyTestName"
+# Direct remote runner for a named worktree
+scripts/repo/Invoke-AzureBuildTest.ps1 -Mode core -WorktreePath <worktree>
 ```
 
-All tests must pass before committing. The pre-commit hook enforces this.
+All required tests must pass before pushing code changes. Test execution runs remotely - see
+[Validation](development/azure-build-test-runner.md). Do not run local `dotnet test` or select local validation on a host with a live Gateway. The `-SkipTests` development loop is not validation evidence. No git hook runs tests.
+
+For documentation-only changes, run `npm run docs:build` instead of the remote test gate.
 
 ---
 
 ## 5. Customize your agent
 
-Each agent gets a workspace at `~/.botnexus/agents/{agent-name}/`:
+With the default BotNexus home, each regular agent gets a workspace at `~/.botnexus/agents/{agent-name}/workspace/` (under `agents/{agent-name}/workspace/` if you configure a different home):
 
 | File | Purpose |
 |------|---------|
@@ -147,7 +135,7 @@ Each agent gets a workspace at `~/.botnexus/agents/{agent-name}/`:
 | `USER.md` | User preferences |
 | `MEMORY.md` | Long-term distilled knowledge |
 
-Edit these files to shape agent behavior. Changes take effect on the next message — no restart needed.
+Edit these files to shape agent behavior. In the current in-process implementation, configured workspace prompt files are read by `WorkspaceContextBuilder.BuildSystemPromptAsync` when `InProcessIsolationStrategy.CreateAsync` creates an agent handle. Subsequent messages reuse that handle's assembled prompt; a file edit alone does not make its contents appear on the next message. The updated files are read when a new handle is created. Do not confuse configuration hot reload with workspace prompt-file refresh.
 
 ### Add more agents
 
@@ -279,10 +267,13 @@ Override with `$env:BOTNEXUS_HOME = "C:\custom\path"`.
 
 Settings resolve in priority order (highest first):
 
-1. **Environment variables** — `BotNexus__Gateway__ListenUrl`, etc.
-2. **`~/.botnexus/config.json`** — User configuration
-3. **`appsettings.json`** — Project defaults
-4. **Code defaults** — Built-in constants
+1. **`~/.botnexus/config.json`** - User configuration
+2. **Environment variables** - the configuration path with `__` between levels and no prefix, e.g.
+   `gateway__listenUrl`. Read only where the key is absent from `config.json`, which is added to the
+   pipeline after the environment source. See
+   [Environment Variable Overrides](configuration.md#environment-variable-overrides).
+3. **`appsettings.json`** - Project defaults
+4. **Code defaults** - Built-in constants
 
 ### Environment variables
 
@@ -345,7 +336,7 @@ All scripts live in `scripts/`.
 | `dev-loop.ps1` | Build + test + run cycle | `-Watch`, `-Port`, `-SkipBuild`, `-SkipTests` |
 | `start-gateway.ps1` | Build and start the Gateway | `-Port`, `-SkipBuild` |
 | `export-openapi.ps1` | Export OpenAPI spec to `docs/api/openapi.json` | `-Port`, `-OutputPath`, `-SkipBuild` |
-| `install-pre-commit-hook.ps1` | Install Git pre-commit hook (run once) | — |
+| `repo/install-hooks.ps1` | Install versioned git hooks (run once) | - |
 
 ---
 
@@ -354,13 +345,13 @@ All scripts live in `scripts/`.
 | Symptom | Fix |
 |---|---|
 | `dotnet: command not found` | Install .NET 10+ SDK from https://dotnet.microsoft.com/download |
-| Build fails | `dotnet clean BotNexus.slnx; dotnet build BotNexus.slnx` |
-| Port 5005 already in use | `.\scripts\dev-loop.ps1 -Port 8080` |
+| Build fails | `dotnet clean dirs.proj; dotnet build dirs.proj` |
+| Port 5005 already in use | On a dedicated development host only: `.\scripts\dev-loop.ps1 -Port 8080 -SkipTests`. A different port does not isolate shared runtime state. |
 | Config file not found | Run the Gateway once — it auto-creates `~/.botnexus/` |
 | OAuth code expired | Send another message to trigger a fresh device code |
-| WebUI shows "Disconnected" | Restart: `.\scripts\dev-loop.ps1` |
+| WebUI shows "Disconnected" | Check the gateway first. On a dedicated development host, stop the previous development instance before running `.\scripts\dev-loop.ps1 -SkipTests`; do not start a second instance against a live home. |
 | Config changes ignored | Most settings hot-reload. `listenUrl` changes require restart. |
-| Tests fail | `dotnet clean BotNexus.slnx; dotnet build BotNexus.slnx --nologo --tl:off; dotnet test BotNexus.slnx --nologo --tl:off` |
+| Tests fail | `dotnet clean dirs.proj; dotnet build dirs.proj --nologo --tl:off; scripts/repo/Invoke-PreCommitValidation.ps1` |
 
 ---
 

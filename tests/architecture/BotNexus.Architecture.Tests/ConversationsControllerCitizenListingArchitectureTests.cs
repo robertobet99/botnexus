@@ -11,8 +11,9 @@ namespace BotNexus.Architecture.Tests;
 /// visibility" contract:
 /// <list type="bullet">
 ///   <item>
-///     <see cref="IConversationStore.GetSummariesAsync"/> has exactly one parameter
-///     (<see cref="CancellationToken"/>). A regression that re-adds an
+///     <see cref="IConversationStore.GetSummariesAsync"/> permits only the global legacy
+///     (<see cref="CancellationToken"/>) and Activity (<see cref="DateTimeOffset"/>?,
+///     <see cref="CancellationToken"/>) signatures. A regression that re-adds an
 ///     <c>AgentId?</c> overload would silently restore the pre-P9-G owner-only filter
 ///     and re-hide responder-side conversations from agents that joined but did not
 ///     initiate them — exactly the bug the phase fixed.
@@ -32,36 +33,63 @@ namespace BotNexus.Architecture.Tests;
 /// "every regex-based architecture fence must include a self-test" memory.
 /// </para>
 /// </remarks>
-public sealed class ConversationsControllerCitizenListingArchitectureTests
+public sealed class ConversationsControllerCitizenListingArchitectureTests : ArchitectureTest
 {
     [Fact]
-    public void GetSummariesAsync_HasOnlyParameterless_Overload()
+    public void GetSummariesAsync_HasOnlyLegacyAndActivity_Overloads()
     {
-        var iface = typeof(IConversationStore);
-        var overloads = iface.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        var signatures = typeof(IConversationStore).GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Where(m => m.Name == nameof(IConversationStore.GetSummariesAsync))
-            .ToList();
-
-        overloads.Count.ShouldBe(
-            1,
-            "P9-G contract: IConversationStore.GetSummariesAsync must have exactly one " +
-            "overload. A re-introduced AgentId? overload would silently restore the dead " +
-            "owner-only listing path that P9-G deleted.");
-
-        var parameters = overloads[0].GetParameters();
-        parameters.Length.ShouldBe(
-            1,
-            "P9-G contract: GetSummariesAsync must take only CancellationToken — " +
+            .Select(m => m.GetParameters().Select(p => p.ParameterType).ToArray());
+        HasOnlyGlobalSummarySignatures(signatures).ShouldBeTrue(
+            "P9-G contract: permit exactly (CancellationToken) and " +
+            "(DateTimeOffset?, CancellationToken). AgentId? and all other overloads are forbidden; " +
             "agent-relative listing belongs on ListForCitizenAsync.");
-        parameters[0].ParameterType.ShouldBe(
-            typeof(CancellationToken),
-            "P9-G contract: the sole parameter must be CancellationToken.");
     }
-
+    [Fact]
+    public void SummarySignatureFence_AcceptsOnlyTheExactPair_InEitherOrder()
+    {
+        Type[] legacy = [typeof(CancellationToken)];
+        Type[] activity = [typeof(DateTimeOffset?), typeof(CancellationToken)];
+        HasOnlyGlobalSummarySignatures([legacy, activity]).ShouldBeTrue();
+        HasOnlyGlobalSummarySignatures([activity, legacy]).ShouldBeTrue();
+    }
+    [Fact]
+    public void SummarySignatureFence_RejectsMissingDuplicateAgentAndOtherOverloads()
+    {
+        Type[] legacy = [typeof(CancellationToken)];
+        Type[] activity = [typeof(DateTimeOffset?), typeof(CancellationToken)];
+        Type[][][] invalid =
+        [
+            [],
+            [legacy],
+            [activity],
+            [legacy, legacy],
+            [activity, activity],
+            [legacy, activity, activity],
+            [legacy, activity, [typeof(BotNexus.Domain.Primitives.AgentId?), typeof(CancellationToken)]],
+            [legacy, [typeof(BotNexus.Domain.Primitives.AgentId?), typeof(CancellationToken)]],
+            [legacy, [typeof(DateTimeOffset), typeof(CancellationToken)]],
+            [legacy, [typeof(CancellationToken), typeof(DateTimeOffset?)]],
+            [legacy, [typeof(DateTimeOffset?)]],
+            [legacy, activity, []],
+            [legacy, activity, [typeof(string), typeof(CancellationToken)]]
+        ];
+        foreach (var signatures in invalid)
+            HasOnlyGlobalSummarySignatures(signatures).ShouldBeFalse(
+                "Only the exact legacy and Activity pair may pass the responder-visibility fence.");
+    }
+    private static bool HasOnlyGlobalSummarySignatures(IEnumerable<Type[]> signatures)
+    {
+        var overloads = signatures.ToArray();
+        return overloads.Length == 2 &&
+            overloads.Count(p => p.SequenceEqual(new[] { typeof(CancellationToken) })) == 1 &&
+            overloads.Count(p => p.SequenceEqual(new[] { typeof(DateTimeOffset?), typeof(CancellationToken) })) == 1;
+    }
     [Fact]
     public void NoProductionSourceFile_CallsGetSummariesAsync_OutsideAllowlist()
     {
-        var srcRoot = FindSourceRoot();
+        var srcRoot = Repository.SourceRoot;
         var violations = new List<string>();
 
         foreach (var path in EnumerateProductionCsFiles(srcRoot))
@@ -85,7 +113,7 @@ public sealed class ConversationsControllerCitizenListingArchitectureTests
     [Fact]
     public void CallAllowlist_OnlyContains_FilesThat_StillExist_AndStill_TripTheFence()
     {
-        var srcRoot = FindSourceRoot();
+        var srcRoot = Repository.SourceRoot;
         var stale = new List<string>();
 
         foreach (var relative in s_callAllowlist)
@@ -189,18 +217,6 @@ public sealed class ConversationsControllerCitizenListingArchitectureTests
             : full;
     }
 
-    private static string FindSourceRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !File.Exists(Path.Combine(current.FullName, "BotNexus.slnx")))
-        {
-            current = current.Parent;
-        }
-        current.ShouldNotBeNull("Could not locate repo root from " + AppContext.BaseDirectory);
-        var srcRoot = Path.Combine(current.FullName, "src");
-        Directory.Exists(srcRoot).ShouldBeTrue("Expected src/ under " + current.FullName);
-        return srcRoot;
-    }
 
     /// <summary>
     /// Removes single-line (<c>//</c>, <c>///</c>) and block (<c>/* … */</c>) C# comments

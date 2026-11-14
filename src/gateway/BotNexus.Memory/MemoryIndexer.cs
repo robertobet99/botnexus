@@ -5,6 +5,7 @@ using BotNexus.Domain.Primitives;
 using BotNexus.Memory.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using BotNexus.Domain.Text;
 
 namespace BotNexus.Memory;
 
@@ -69,6 +70,19 @@ public sealed class MemoryIndexer(
 
         var sessionEvent = BuildSessionEvent(session, agentId, sessionId);
 
+        // #2608: a sub-agent workspace reaped by the sweeper (#2237) has no agent directory,
+        // so its memory store cannot exist. Opening it yields SQLITE_CANTOPEN, which is
+        // permanently unrecoverable — retrying it burns the budget and logs an unactionable
+        // [ERR]. Skip before SQLite is reached. This is deliberately narrow: a store whose
+        // location DOES exist but is corrupt or unreadable still fails loudly and still retries.
+        if (!_storeFactory.StoreLocationExists(AgentId.From(agentId)))
+        {
+            _logger.LogDebug(
+                "Skipping memory indexing for session '{SessionId}': agent '{AgentId}' has no memory store location (workspace already reclaimed).",
+                sessionId, agentId);
+            return;
+        }
+
         try
         {
             var agentMemory = _agentMemoryFactory.Create(agentId);
@@ -77,7 +91,7 @@ public sealed class MemoryIndexer(
         catch (NotSupportedException)
         {
             // Provider not registered — fall back to direct store indexing
-            var store = _storeFactory.Create(agentId);
+            var store = _storeFactory.Create(AgentId.From(agentId));
             await store.InitializeAsync(cancellationToken).ConfigureAwait(false);
             await IndexSessionCoreAsync(session, AgentId.From(agentId), SessionId.From(sessionId), store, cancellationToken).ConfigureAwait(false);
         }
@@ -155,9 +169,19 @@ public sealed class MemoryIndexer(
                     SessionId = sessionId.Value,
                     TurnIndex = pendingTurnIndex,
                     SourceType = "conversation",
-                    // Strip LLM control / role-injection markup before persisting raw transcript
-                    // text to the searchable store — defends against memory-poisoning (#1560).
-                    Content = $"User: {MemoryContentSanitizer.Sanitize(pendingUser.Content)}\nAssistant: {MemoryContentSanitizer.Sanitize(entry.Content)}",
+                    // #2480: a conversation row is a verbatim user turn plus the agent's reply.
+                    // The user half is first-party owner input, so the pair is stamped `user`
+                    // rather than `agent` - the more conservative of the two halves wins.
+                    Provenance = MemoryProvenance.User,
+                    OriginSessionId = sessionId.Value,
+                                        // Strip LLM control / role-injection markup before persisting raw transcript
+                    // text to the searchable store - defends against memory-poisoning (#1560).
+                    // Then delimit through the single shared encoder so no user text can forge an
+                    // extra role record in the stored row (#2954). Sanitising is a markup concern;
+                    // encoding is a framing concern. Both are required.
+                    Content = TranscriptTurnFormat.Encode(
+                        UntrustedContentSanitizer.Sanitize(pendingUser.Content),
+                        UntrustedContentSanitizer.Sanitize(entry.Content)),
                     MetadataJson = null,
                     Embedding = null,
                     CreatedAt = entry.Timestamp,
@@ -207,6 +231,16 @@ public sealed class MemoryIndexer(
             {
                 var sessionEvent = BuildSessionEvent(session, agentId.Value, sessionId.Value);
 
+                // #2608: same skip as the live indexing path — a reaped agent directory is a
+                // normal outcome, not a backfill failure.
+                if (!storeFactory.StoreLocationExists(agentId))
+                {
+                    logger.LogDebug(
+                        "Skipping backfill for session '{SessionId}': agent '{AgentId}' has no memory store location (workspace already reclaimed).",
+                        sessionId, agentId);
+                    continue;
+                }
+
                 try
                 {
                     var agentMemory = agentMemoryFactory.Create(agentId.Value);
@@ -214,7 +248,7 @@ public sealed class MemoryIndexer(
                 }
                 catch (NotSupportedException)
                 {
-                    var store = storeFactory.Create(agentId.Value);
+                    var store = storeFactory.Create(agentId);
                     await store.InitializeAsync(ct).ConfigureAwait(false);
                     await IndexSessionCoreAsync(session, agentId, sessionId, store, ct).ConfigureAwait(false);
                 }

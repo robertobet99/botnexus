@@ -64,14 +64,24 @@ public sealed class ShellTool : IAgentTool
     public const int DefaultMaxTimeoutSeconds = 3600;
 
     private static readonly Lazy<string?> WindowsBashPath = new(FindBashExecutable);
+    private readonly LocalChildEnvironmentPolicy _environmentPolicy;
     private readonly string? _workingDirectory;
     private readonly int? _defaultTimeoutSeconds;
     private readonly int _maxTimeoutSeconds;
     private readonly ShellPreference _shellPreference;
     private readonly string[]? _shellCommand;
 
-    public ShellTool(string? workingDirectory = null, int? defaultTimeoutSeconds = 600, ShellPreference shellPreference = ShellPreference.Auto, string[]? shellCommand = null, int maxTimeoutSeconds = DefaultMaxTimeoutSeconds)
+    // Per-instance diagnostic seams order timer arm, child readiness, and exit observation.
+    // Defaults preserve the existing execution ordering and system clock.
+    internal Func<Process, Task> BeforeTimeoutArmAsync { get; init; }
+        = static _ => Task.CompletedTask;
+    internal TimeProvider ExecutionTimeProvider { get; init; } = TimeProvider.System;
+    internal Func<Process, CancellationToken, Task> WaitForProcessExitAsync { get; init; }
+        = static (process, token) => process.WaitForExitAsync(token);
+
+    public ShellTool(string? workingDirectory = null, int? defaultTimeoutSeconds = 600, ShellPreference shellPreference = ShellPreference.Auto, string[]? shellCommand = null, int maxTimeoutSeconds = DefaultMaxTimeoutSeconds, LocalChildEnvironmentPolicy? environmentPolicy = null)
     {
+        _environmentPolicy = environmentPolicy ?? LocalChildEnvironmentPolicy.Default;
         _workingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
             ? null
             : Path.GetFullPath(workingDirectory);
@@ -102,6 +112,12 @@ public sealed class ShellTool : IAgentTool
     /// doesn't kill legitimate long operations. The tool's own per-call timeout still applies.
     public TimeSpan? DefaultTimeout => TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// The per-call <c>timeout</c> argument is seconds. Declared explicitly because the executor no
+    /// longer infers a unit from the argument name (issue #2955).
+    /// </summary>
+    public ToolTimeoutArgument? TimeoutArgument => new("timeout", ToolTimeoutUnit.Seconds);
+
     public string Name => _shellPreference == ShellPreference.Pwsh
         ? "shell"
         : "bash";
@@ -111,13 +127,24 @@ public sealed class ShellTool : IAgentTool
         ? "Shell (PowerShell)"
         : "Bash";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Powerful, but its output is produced on the machine the agent already controls. Classification tracks the ORIGIN of the bytes, never the blast radius.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     /// <inheritdoc />
     public Tool Definition => new(
         Name,
         _shellPreference == ShellPreference.Pwsh
             ? "Execute a PowerShell command in the current working directory and return stdout/stderr. " +
-              "PowerShell gotchas (avoid ParserError): inside double-quoted strings wrap a variable followed by ':' as ${var} " +
-              "(or use single quotes); no backtick line-continuations; pass -Filter a single string, not an array; for " +
+              "This tool ALREADY RUNS PowerShell, so do not wrap your script in a nested 'pwsh -Command' - it is " +
+              "unnecessary, and with a DOUBLE-quoted argument the outer shell expands every $variable and mangles " +
+              "every @{} literal before the child pwsh sees them (such calls are rejected). If you genuinely must " +
+              "nest, single-quote the -Command argument or use 'pwsh -NoProfile -File tmp/script.ps1'. " +
+              "PowerShell gotchas (avoid ParserError): foreach/if/switch/while are STATEMENTS and cannot be piped from " +
+              "directly - wrap them in a subexpression, '$(foreach ($x in $xs) { ... }) | <cmd>', not " +
+              "'foreach ($x in $xs) { ... } | <cmd>' which fails with 'An empty pipe element is not allowed'; " +
+              "inside double-quoted strings wrap a variable followed by ':' as ${var} " +
+              "(or use single quotes); $PID is a read-only automatic variable, so use a name such as $processId for your own value; " +
+              "no backtick line-continuations; pass -Filter a single string, not an array; for " +
               "multi-line or complex scripts write a tmp/*.ps1 file and run it. Inline Python on Windows prints cp1252 by " +
               "default (UnicodeEncodeError on emoji/em-dash/box glyphs) -- set $env:PYTHONUTF8=1 or write a tmp/*.py file and " +
               "run 'python -X utf8 file.py'. Never pipe a here-string into an interpreter; write a temp file and execute it."
@@ -199,6 +226,48 @@ public sealed class ShellTool : IAgentTool
         }
 
         var invocation = BuildShellInvocation(command, _shellPreference, _shellCommand);
+
+        // Preflight inline pwsh/powershell -Command scripts: reject syntax errors (empty pipe
+        // elements, malformed ${...} references, unbalanced braces) BEFORE spawning a process so the
+        // agent gets an immediate, actionable rejection instead of a late runtime ParserError. Only
+        // inline -Command invocations are checked; -File invocations and non-PowerShell shells pass
+        // through untouched, and valid one-liners are never altered.
+        if (PowerShellPreflight.IsPowerShellExecutable(invocation.FileName)
+            && PowerShellPreflight.TryGetInlineScript(invocation.BaseArgs, invocation.Command, out var inlineScript))
+        {
+            PowerShellPreflight.ThrowIfInvalid(inlineScript);
+        }
+
+        // Same guard for inline `python -c` one-liners (issue #2417): unterminated string literals
+        // and unbalanced brackets are rejected before the interpreter is spawned.
+        if (PythonPreflight.IsPythonExecutable(invocation.FileName)
+            && PythonPreflight.TryGetInlineScript(invocation.BaseArgs, invocation.Command, out var inlinePyScript))
+        {
+            PythonPreflight.ThrowIfInvalid(inlinePyScript);
+        }
+        // Same guard for inline `node -e` one-liners (issue #2762): unterminated string/template
+        // literals and unbalanced brackets are rejected before the runtime is spawned.
+        if (NodePreflight.IsNodeExecutable(invocation.FileName)
+            && NodePreflight.TryGetInlineScript(invocation.BaseArgs, invocation.Command, out var inlineJsScript))
+        {
+            NodePreflight.ThrowIfInvalid(inlineJsScript);
+        }
+
+        // File-based `pwsh -File <path>` invocations (issue #2758): a missing script is reported by
+        // pwsh as an ARGUMENT-parsing error plus its generic usage banner, which names neither the
+        // skill nor any candidate. Resolve the target here and, when it is absent, name the skill and
+        // the closest existing wrapper names enumerated from the skill's scripts/ directory. A near
+        // match is only reported - never substituted for what the caller actually asked to run.
+        if (SkillScriptPreflight.TryGetFileTargetFromCommandLine(command, out var scriptTarget))
+        {
+            SkillScriptPreflight.ThrowIfMissing(ResolveAgainstWorkingDirectory(scriptTarget));
+        }
+
+        // #3569: before spawning anything, check whether this sub-agent's workspace was reclaimed
+        // mid-run. Without this the OS reports only "The directory name is invalid", which reads as
+        // a caller mistake and drives the agent to retry until its budget is gone.
+        ReclaimedWorkspacePreflight.ThrowIfReclaimed(_workingDirectory);
+
         // Combine the clamp warning (if any) with the shell-detection warning so both surface
         // on the tool result without threading two prefixes through every output build site.
         var warningPrefix = string.Concat(clampWarning, invocation.WarningPrefix);
@@ -221,6 +290,7 @@ public sealed class ShellTool : IAgentTool
 
         startInfo.ArgumentList.Add(invocation.Command);
 
+        LocalChildEnvironment.Apply(startInfo, _environmentPolicy);
         using var process = new Process { StartInfo = startInfo };
         if (!process.Start())
         {
@@ -259,8 +329,18 @@ public sealed class ShellTool : IAgentTool
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
+        try
+        {
+            await BeforeTimeoutArmAsync(process).ConfigureAwait(false);
+        }
+        catch
+        {
+            TryKill(process);
+            throw;
+        }
+
         using var timeoutCts = timeoutSeconds.HasValue
-            ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds.Value))
+            ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds.Value), ExecutionTimeProvider)
             : null;
         using var linkedCts = timeoutCts is null
             ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
@@ -268,7 +348,7 @@ public sealed class ShellTool : IAgentTool
 
         try
         {
-            await process.WaitForExitAsync(linkedCts.Token).ConfigureAwait(false);
+            await WaitForProcessExitAsync(process, linkedCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested != true)
         {
@@ -415,6 +495,7 @@ public sealed class ShellTool : IAgentTool
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+            LocalChildEnvironment.Apply(whereStartInfo);
             using var process = Process.Start(whereStartInfo);
             if (process is null)
             {
@@ -467,6 +548,7 @@ public sealed class ShellTool : IAgentTool
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+            LocalChildEnvironment.Apply(whereStartInfo);
             using var process = Process.Start(whereStartInfo);
             if (process is null)
             {
@@ -587,6 +669,27 @@ public sealed class ShellTool : IAgentTool
             JsonElement element => element.ToString(),
             _ => value.ToString() ?? throw new ArgumentException($"Argument '{key}' is invalid.")
         };
+    }
+
+    /// <summary>
+    /// Rebases a relative <c>-File</c> target onto the tool's working directory so the existence
+    /// probe in <see cref="SkillScriptPreflight"/> tests the same path the spawned process will,
+    /// rather than the gateway process's current directory (issue #2416's divergence, #2758's probe).
+    /// A rooted path is returned unchanged, and an unrebaseable path is returned as-is so the
+    /// preflight simply finds it and stays silent.
+    /// </summary>
+    private string ResolveAgainstWorkingDirectory(string path)
+    {
+        try
+        {
+            return Path.IsPathRooted(path) || string.IsNullOrWhiteSpace(_workingDirectory)
+                ? path
+                : Path.GetFullPath(path, _workingDirectory);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return path;
+        }
     }
 
     private static int ReadInt(object value, string key)

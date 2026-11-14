@@ -20,6 +20,28 @@ This guide helps you diagnose and resolve common issues with BotNexus.
 
 ## Build Failures
 
+### An update build fails after stopping the gateway
+
+`botnexus update` preserves the complete prior gateway output before building when it
+has confirmed that it stopped a running gateway. If the build fails, it verifies and
+restores that output at its original location, then makes one recovery start attempt
+using the same BotNexus home and gateway endpoint. Readiness is limited to 60 seconds.
+The update still returns the original nonzero build exit code, even if recovery succeeds.
+
+Automatic recovery is not attempted after cancellation, when no running gateway was
+found, or when shutdown was not confirmed. Missing dependencies or a missing, incomplete,
+or changed preserved copy also prevent recovery. Candidate files left by a partial build
+are never used as a substitute for verified prior output.
+
+1. Keep the build error and recovery messages; a recovery message does not mean the update succeeded.
+2. Run `botnexus gateway status` for the same installation to check whether recovery started the gateway.
+3. If recovery failed or was refused, inspect the gateway logs and fix the reported build or
+   preservation problem before retrying. Do not repeatedly start a process that may already be running.
+   A failed restore reports the preserved output path for manual investigation.
+
+This recovery covers gateway binaries and output content only. It does not undo source
+changes or roll back configuration, extensions, or database schemas.
+
 ### Error: SDK Not Found
 
 **Symptom:**
@@ -44,7 +66,7 @@ error : The SDK 'Microsoft.NET.Sdk' specified could not be found.
 error NU1301: Unable to load the service index for source https://api.nuget.org/v3/index.json
 ```
 
-**Cause:** Network issue or NuGet offline.
+**Cause:** Network issue, NuGet offline, or a feed that is permanently blocked by network policy.
 
 **Solution:**
 1. Check network connectivity
@@ -57,6 +79,8 @@ error NU1301: Unable to load the service index for source https://api.nuget.org/
    dotnet restore
    dotnet build
    ```
+
+**If nuget.org is blocked by policy rather than temporarily unreachable**, none of the above will help — clearing the cache and retrying cannot reach a feed you are not permitted to contact. See [Installing Without nuget.org Access](../guides/offline-install.md) for building the CLI from source, using an internal mirror, and a `nuget.config` that clears inherited sources so the platform build restores successfully.
 
 ### Error: Missing Project Reference
 
@@ -74,8 +98,8 @@ error CS0246: The type or namespace name 'BotNexus' could not be found
    ```
 2. Restore and rebuild:
    ```bash
-   dotnet restore BotNexus.slnx
-   dotnet build BotNexus.slnx
+  dotnet restore dirs.proj
+  dotnet build dirs.proj
    ```
 
 ### Error: Compilation Failed
@@ -121,7 +145,7 @@ Unhandled exception. System.IO.FileNotFoundException: Could not load file or ass
    ```
 2. Rebuild:
    ```bash
-   dotnet build BotNexus.slnx
+  dotnet build dirs.proj
    ```
 3. Run again:
    ```bash
@@ -149,6 +173,8 @@ Edit `~/.botnexus/config.json`:
   }
 }
 ```
+
+Any free port works; `5006` is an arbitrary example, not a second default.
 
 **Option 2: Kill the process using the port**
 
@@ -317,7 +343,7 @@ tail -f ~/.botnexus/logs/gateway.log | grep -i error
 ```
 
 **Reduce system prompt size:**
-- Remove unnecessary `systemPromptFiles`
+- Shorten or remove unnecessary content from standard workspace instruction files
 - Shorten prompt content
 
 **Reduce tool count:**
@@ -491,17 +517,18 @@ tail -f ~/.botnexus/logs/gateway.log
 **Increase SignalR timeout** (if applicable):
 ```json
 {
-  "channels": {
-    "webui": {
-      "type": "signalr",
-      "settings": {
-        "keepAliveIntervalSeconds": 15,
-        "clientTimeoutSeconds": 30
-      }
+  "gateway": {
+    "signalR": {
+      "keepAliveIntervalSeconds": 15,
+      "clientTimeoutIntervalSeconds": 60
     }
   }
 }
 ```
+
+These are gateway-wide SignalR hub settings, not per-channel ones. `clientTimeoutIntervalSeconds`
+is coerced up to at least twice `keepAliveIntervalSeconds`, so a single dropped ping cannot
+terminate the connection.
 
 ---
 
@@ -527,7 +554,7 @@ The entry carries the message, stack (where available), URL, and user-agent. You
 can also retrieve recent channel/render errors through the diagnostics API:
 
 ```bash
-curl http://localhost:5000/api/diagnostics/log-patterns?hours=1
+curl http://localhost:5005/api/diagnostics/log-patterns?hours=1
 ```
 
 **Notes:**
@@ -536,6 +563,26 @@ curl http://localhost:5000/api/diagnostics/log-patterns?hours=1
   still reports through the authenticated client).
 - A hard refresh (Ctrl+Shift+R) clears a stale cached build that can cause these
   errors after an update.
+
+**If a page loads an old build after an update**, check whether the root URL and a deep
+link disagree:
+
+```bash
+curl -s http://localhost:5005/ | grep -o 'dotnet\.[a-z0-9]*\.js'
+curl -s http://localhost:5005/configuration | grep -o 'dotnet\.[a-z0-9]*\.js'
+```
+
+Both should name the same runtime. If they differ, the browser is not at fault - the
+two URLs are genuinely being served different documents, and a hard refresh will only
+appear to fix it until the next deep link.
+
+That used to happen: the SPA fallback served an `index.html` read once at startup while
+`/` and `/index.html` read from disk, so every deep link booted whatever build was on
+disk when the gateway last started. Because the framework assets are content-hashed and
+served `immutable`, the browser then held the stale assemblies against URLs that no
+longer exist. The fallback now reads from disk and carries `no-cache` with an ETag like
+any other non-fingerprinted asset, so restarting the gateway is no longer part of
+deploying a UI change.
 
 ---
 
@@ -715,8 +762,8 @@ dotnet list package --include-transitive
 {
   "gateway": {
     "compaction": {
-      "maxMessagesBeforeCompaction": 50,
-      "retainLastMessages": 10
+      "tokenThresholdRatio": 0.4,
+      "preservedTurns": 3
     }
   }
 }
@@ -734,7 +781,7 @@ dotnet list package --include-transitive
 ```
 
 **Reduce system prompt size:**
-- Remove unused `systemPromptFiles`
+- Remove unused content from standard workspace instruction files
 - Shorten skill content
 
 ### High CPU Usage
@@ -783,7 +830,7 @@ tail -f ~/.botnexus/logs/gateway.log | grep -i mcp
 **Use faster model:**
 ```json
 {
-  "model": "gpt-4o-mini"  // or "claude-haiku-4.5"
+  "model": "gpt-4o-mini"  // or "claude-haiku-4-5-20251001"
 }
 ```
 
@@ -794,16 +841,8 @@ tail -f ~/.botnexus/logs/gateway.log | grep -i mcp
 }
 ```
 
-**Enable caching** (if provider supports):
-```json
-{
-  "providers": {
-    "anthropic": {
-      "enablePromptCaching": true
-    }
-  }
-}
-```
+Provider-side prompt caching is not exposed as a BotNexus configuration setting; there is no
+`providers.*` key that turns it on.
 
 ---
 
@@ -826,19 +865,25 @@ System.Globalization.CultureNotFoundException: Culture is not supported. (Parame
 
 **Cause:** .NET 10 on Linux attempts to resolve the locale from assembly metadata when SignalR enumerates hub methods. Generic type names (containing `` `1 ``) produce invalid culture identifiers, crashing `OnConnectedAsync` before the client can handshake.
 
-**Fix:** Run the gateway with globalization invariant mode:
+**Fix:** Run the gateway with globalization invariant mode. Prefer the native
+apphost executable (`BotNexus.Gateway.Api.exe`, or `BotNexus.Gateway.Api` on
+Linux) published next to the DLL — it gives the gateway a distinct process name
+so name-based `dotnet` process kills can't take it down (see #2199):
 ```bash
 export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
-dotnet BotNexus.Gateway.Api.dll --urls "http://0.0.0.0:5005"
+./BotNexus.Gateway.Api --urls "http://0.0.0.0:5005"
 ```
 
 Or set it permanently in your launch script / systemd service:
 ```ini
-# systemd service example
+# systemd service example — launch the apphost executable, not `dotnet <dll>`
 [Service]
 Environment="DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1"
-ExecStart=/home/user/.dotnet/dotnet /path/to/BotNexus.Gateway.Api.dll
+ExecStart=/path/to/BotNexus.Gateway.Api
 ```
+
+> If your published layout is framework-dependent and has no apphost, fall back
+> to `ExecStart=/home/user/.dotnet/dotnet /path/to/BotNexus.Gateway.Api.dll`.
 
 ---
 

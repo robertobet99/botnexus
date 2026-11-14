@@ -19,7 +19,6 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$solutionPath = Join-Path $repoRoot "BotNexus.slnx"
 $cliProject = Join-Path $repoRoot "src\gateway\BotNexus.Cli\BotNexus.Cli.csproj"
 $gatewayTestsPath = Join-Path $repoRoot "tests\gateway\BotNexus.Gateway.Tests"
 
@@ -61,7 +60,7 @@ try {
     }
     else {
         Write-Host "🚀 Starting Gateway via CLI at http://localhost:$Port"
-        dotnet run --project $cliProject --no-launch-profile -- serve gateway --path $repoRoot --port $Port
+        dotnet run --project $cliProject --no-launch-profile -- serve --source $repoRoot --port $Port
     }
 }
 catch {

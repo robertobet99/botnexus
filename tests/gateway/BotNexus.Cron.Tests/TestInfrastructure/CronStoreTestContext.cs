@@ -1,5 +1,4 @@
 using BotNexus.Domain.Primitives;
-using Microsoft.Data.Sqlite;
 using System.IO.Abstractions;
 
 namespace BotNexus.Cron.Tests.TestInfrastructure;
@@ -22,6 +21,20 @@ internal sealed class CronStoreTestContext : IAsyncDisposable
         var tempDirectory = Path.Combine(Path.GetTempPath(), "botnexus-cron-tests", Guid.NewGuid().ToString("N"));
         var dbPath = Path.Combine(tempDirectory, "cron.db");
         var store = new SqliteCronStore(dbPath, new FileSystem());
+        await store.InitializeAsync();
+        return new CronStoreTestContext(tempDirectory, dbPath, store);
+    }
+
+    /// <summary>
+    /// Creates a context whose store clamps the #2641 cost-rollup window to
+    /// <paramref name="retentionDays"/>, so the retention-reconciliation criterion (AC6) can be
+    /// exercised without waiting on the real retention service.
+    /// </summary>
+    public static async Task<CronStoreTestContext> CreateAsync(int retentionDays)
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "botnexus-cron-tests", Guid.NewGuid().ToString("N"));
+        var dbPath = Path.Combine(tempDirectory, "cron.db");
+        var store = new SqliteCronStore(dbPath, new FileSystem(), logger: null, retentionDaysAccessor: () => retentionDays);
         await store.InitializeAsync();
         return new CronStoreTestContext(tempDirectory, dbPath, store);
     }
@@ -49,21 +62,25 @@ internal sealed class CronStoreTestContext : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        SqliteConnection.ClearAllPools();
+        // NOT ClearAllPools(): that is process-global and kills sibling tests' live handles (#3324).
+        SqlitePoolCleanup.ClearPoolFor(DbPath);
         if (!Directory.Exists(TempDirectory))
             return;
 
-        for (var attempt = 0; attempt < 5; attempt++)
-        {
-            try
+        await TestAwait.EventuallyAsync(
+            () =>
             {
-                Directory.Delete(TempDirectory, recursive: true);
-                break;
-            }
-            catch (IOException) when (attempt < 4)
-            {
-                await Task.Delay(50);
-            }
-        }
+                try
+                {
+                    Directory.Delete(TempDirectory, recursive: true);
+                    return true;
+                }
+                catch (IOException)
+                {
+                    return false;
+                }
+            },
+            $"temporary cron store directory '{TempDirectory}' to be deletable",
+            timeout: TimeSpan.FromSeconds(2));
     }
 }

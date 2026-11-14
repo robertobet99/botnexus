@@ -44,8 +44,8 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     {
         // Arrange
         var supervisor = new DelayedStreamingSupervisor();
-        supervisor.RegisterAgent("agent-slow", TimeSpan.FromSeconds(3), "slow-response");
-        supervisor.RegisterAgent("agent-fast", TimeSpan.FromMilliseconds(100), "fast-response");
+        var slowAgent = supervisor.RegisterGatedAgent("agent-slow", "slow-response");
+        var fastAgent = supervisor.RegisterGatedAgent("agent-fast", "fast-response");
 
         await using var factory = CreateTestFactory(services =>
         {
@@ -60,14 +60,19 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
         await using var connection = await CreateStartedConnection(factory, cts.Token);
         await connection.InvokeAsync<JsonElement>("SubscribeAll", cts.Token);
 
-        var responses = new ConcurrentDictionary<string, (string Content, DateTimeOffset ReceivedAt)>();
+        // Arrival is recorded as a monotonic ordinal rather than a wall-clock timestamp:
+        // DateTimeOffset.UtcNow has ~15ms granularity on a contended runner, so two deltas that
+        // genuinely arrived in order can carry identical timestamps and make a strict-inequality
+        // ordering assertion flake (#3372). The ordinal is strictly increasing by construction.
+        var responses = new ConcurrentDictionary<string, (string Content, long Arrival)>();
+        var arrivalCounter = 0L;
 
         // Register handler BEFORE sending messages
         using var _ = connection.On<AgentStreamEvent>("ContentDelta", payload =>
         {
             if (payload.SessionId is { } sid && payload.ContentDelta is not null)
             {
-                responses.TryAdd(sid.Value, (payload.ContentDelta, DateTimeOffset.UtcNow));
+                responses.TryAdd(sid.Value, (payload.ContentDelta, Interlocked.Increment(ref arrivalCounter)));
             }
         });
 
@@ -81,12 +86,20 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
         slowSessionId.ShouldNotBeNullOrWhiteSpace();
         fastSessionId.ShouldNotBeNullOrWhiteSpace();
 
-        // Assert - Wait for both responses with timeout
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (responses.Count < 2 && DateTimeOffset.UtcNow < deadline && !cts.Token.IsCancellationRequested)
-        {
-            await Task.Delay(50, cts.Token);
-        }
+        await slowAgent.WaitForPromptStart;
+        await fastAgent.WaitForPromptStart;
+        fastAgent.ReleaseResponse();
+        await TestAwait.EventuallyAsync(
+            () => responses.ContainsKey(fastSessionId!),
+            "the explicitly released fast agent response to arrive",
+            cancellationToken: cts.Token);
+        responses.ShouldNotContainKey(slowSessionId!);
+
+        slowAgent.ReleaseResponse();
+        await TestAwait.EventuallyAsync(
+            () => responses.Count == 2,
+            "both explicitly released agent responses to arrive",
+            cancellationToken: cts.Token);
 
         responses.ShouldContainKey(slowSessionId!);
         responses.ShouldContainKey(fastSessionId!);
@@ -95,7 +108,7 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
         responses[fastSessionId!].Content.ShouldBe("fast-response");
 
         // CRITICAL: fast agent should respond before slow agent
-        responses[fastSessionId!].ReceivedAt.ShouldBeLessThan(responses[slowSessionId!].ReceivedAt);
+        responses[fastSessionId!].Arrival.ShouldBeLessThan(responses[slowSessionId!].Arrival);
     }
 
     /// <summary>
@@ -106,9 +119,9 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     {
         // Arrange
         var supervisor = new DelayedStreamingSupervisor();
-        supervisor.RegisterAgent("agent-slow", TimeSpan.FromSeconds(2), "slow-response");
-        supervisor.RegisterAgent("agent-medium", TimeSpan.FromSeconds(1), "medium-response");
-        supervisor.RegisterAgent("agent-fast", TimeSpan.FromMilliseconds(500), "fast-response");
+        var slowAgent = supervisor.RegisterGatedAgent("agent-slow", "slow-response");
+        var mediumAgent = supervisor.RegisterGatedAgent("agent-medium", "medium-response");
+        var fastAgent = supervisor.RegisterGatedAgent("agent-fast", "fast-response");
 
         await using var factory = CreateTestFactory(services =>
         {
@@ -124,13 +137,15 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
         await using var connection = await CreateStartedConnection(factory, cts.Token);
         await connection.InvokeAsync<JsonElement>("SubscribeAll", cts.Token);
 
-        var responses = new ConcurrentDictionary<string, (string Content, DateTimeOffset ReceivedAt)>();
+        // Monotonic arrival ordinal — see the note in SendMessage_TwoAgentsConcurrently_BothReceiveResponses (#3372).
+        var responses = new ConcurrentDictionary<string, (string Content, long Arrival)>();
+        var arrivalCounter = 0L;
 
         using var _ = connection.On<AgentStreamEvent>("ContentDelta", payload =>
         {
             if (payload.SessionId is { } sid && payload.ContentDelta is not null)
             {
-                responses.TryAdd(sid.Value, (payload.ContentDelta, DateTimeOffset.UtcNow));
+                responses.TryAdd(sid.Value, (payload.ContentDelta, Interlocked.Increment(ref arrivalCounter)));
             }
         });
 
@@ -143,12 +158,22 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
         var mediumSessionId = mediumResult.GetProperty("sessionId").GetString()!;
         var fastSessionId = fastResult.GetProperty("sessionId").GetString()!;
 
-        // Assert - Wait for all 3 responses
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (responses.Count < 3 && DateTimeOffset.UtcNow < deadline && !cts.Token.IsCancellationRequested)
-        {
-            await Task.Delay(50, cts.Token);
-        }
+        await Task.WhenAll(slowAgent.WaitForPromptStart, mediumAgent.WaitForPromptStart, fastAgent.WaitForPromptStart);
+        fastAgent.ReleaseResponse();
+        await TestAwait.EventuallyAsync(
+            () => responses.ContainsKey(fastSessionId),
+            "the explicitly released fast agent response to arrive",
+            cancellationToken: cts.Token);
+        mediumAgent.ReleaseResponse();
+        await TestAwait.EventuallyAsync(
+            () => responses.ContainsKey(mediumSessionId),
+            "the explicitly released medium agent response to arrive",
+            cancellationToken: cts.Token);
+        slowAgent.ReleaseResponse();
+        await TestAwait.EventuallyAsync(
+            () => responses.ContainsKey(slowSessionId),
+            "the explicitly released slow agent response to arrive",
+            cancellationToken: cts.Token);
 
         responses.Count().ShouldBe(3);
         responses.ShouldContainKey(slowSessionId);
@@ -156,8 +181,8 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
         responses.ShouldContainKey(fastSessionId);
 
         // Verify responses came in the right order (fastest first)
-        responses[fastSessionId].ReceivedAt.ShouldBeLessThan(responses[mediumSessionId].ReceivedAt);
-        responses[mediumSessionId].ReceivedAt.ShouldBeLessThan(responses[slowSessionId].ReceivedAt);
+        responses[fastSessionId].Arrival.ShouldBeLessThan(responses[mediumSessionId].Arrival);
+        responses[mediumSessionId].Arrival.ShouldBeLessThan(responses[slowSessionId].Arrival);
     }
 
     /// <summary>
@@ -169,8 +194,8 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     {
         // Arrange
         var supervisor = new DelayedStreamingSupervisor();
-        supervisor.RegisterAgent("agent-a", TimeSpan.FromSeconds(2), "response-a");
-        supervisor.RegisterAgent("agent-b", TimeSpan.FromMilliseconds(100), "response-b");
+        var agentA = supervisor.RegisterGatedAgent("agent-a", "response-a");
+        var agentB = supervisor.RegisterGatedAgent("agent-b", "response-b");
 
         await using var factory = CreateTestFactory(services =>
         {
@@ -186,40 +211,49 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
         await using var connection = await CreateStartedConnection(factory, cts.Token);
         await connection.InvokeAsync<JsonElement>("SubscribeAll", cts.Token);
 
-        var responses = new ConcurrentDictionary<string, (string Content, DateTimeOffset ReceivedAt)>();
+        // Monotonic arrival ordinal — see the note in SendMessage_TwoAgentsConcurrently_BothReceiveResponses (#3372).
+        var responses = new ConcurrentDictionary<string, (string Content, long Arrival)>();
+        var arrivalCounter = 0L;
 
         using var _ = connection.On<AgentStreamEvent>("ContentDelta", payload =>
         {
             if (payload.SessionId is { } sid && payload.ContentDelta is not null)
             {
-                responses.TryAdd(sid.Value, (payload.ContentDelta, DateTimeOffset.UtcNow));
+                responses.TryAdd(sid.Value, (payload.ContentDelta, Interlocked.Increment(ref arrivalCounter)));
             }
         });
 
         // Act
         var resultA = await connection.InvokeAsync<JsonElement>("SendMessage", "agent-a", "signalr", "start processing", (string?)null, cts.Token);
-        
-        // Wait 100ms to ensure agent-a is processing
-        await Task.Delay(100, cts.Token);
-        
+        await agentA.WaitForPromptStart;
         var resultB = await connection.InvokeAsync<JsonElement>("SendMessage", "agent-b", "signalr", "quick response", (string?)null, cts.Token);
+        await agentB.WaitForPromptStart;
 
         var sessionA = resultA.GetProperty("sessionId").GetString()!;
         var sessionB = resultB.GetProperty("sessionId").GetString()!;
 
-        // Assert - Wait for both responses
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (responses.Count < 2 && DateTimeOffset.UtcNow < deadline)
-        {
-            await Task.Delay(50, cts.Token);
-        }
+        agentB.ReleaseResponse();
+        await TestAwait.EventuallyAsync(
+            () => responses.ContainsKey(sessionB),
+            "agent B to respond while agent A remains blocked",
+            cancellationToken: cts.Token);
+        responses.ShouldNotContainKey(sessionA);
+
+        agentA.ReleaseResponse();
+        await TestAwait.EventuallyAsync(
+            () => responses.Count == 2,
+            "both single-connection agent responses to arrive",
+            cancellationToken: cts.Token);
 
         responses.Count().ShouldBe(2);
         responses[sessionA].Content.ShouldBe("response-a");
         responses[sessionB].Content.ShouldBe("response-b");
 
-        // Assert agent-b responded before agent-a (proves no serialization)
-        responses[sessionB].ReceivedAt.ShouldBeLessThan(responses[sessionA].ReceivedAt);
+        // Assert agent-b responded before agent-a (proves no serialization).
+        // agent-a is a 2s agent started first; agent-b is a 100ms agent started 100ms later. If the
+        // hub serialized per-connection work, b's delta could only arrive after a's, so a strictly
+        // lower arrival ordinal for b is exactly the non-serialization property.
+        responses[sessionB].Arrival.ShouldBeLessThan(responses[sessionA].Arrival);
     }
 
     /// <summary>
@@ -231,7 +265,7 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     {
         // Arrange
         var supervisor = new DelayedStreamingSupervisor();
-        supervisor.RegisterAgent("agent-reset", TimeSpan.FromMilliseconds(100), "reset-response");
+        supervisor.RegisterAgent("agent-reset", "reset-response");
 
         await using var factory = CreateTestFactory(services =>
         {
@@ -294,7 +328,7 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
 
         foreach (var agentId in agentIds)
         {
-            supervisor.RegisterAgent(agentId, TimeSpan.FromMilliseconds(200 + (agentIds.IndexOf(agentId) * 50)), $"response-{agentId}");
+            supervisor.RegisterAgent(agentId, $"response-{agentId}");
         }
 
         await using var factory = CreateTestFactory(services =>
@@ -332,12 +366,10 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
 
         var results = await Task.WhenAll(sendTasks);
 
-        // Assert - All agents should respond
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        while (responses.Count < agentCount && DateTimeOffset.UtcNow < deadline)
-        {
-            await Task.Delay(50, cts.Token);
-        }
+        await TestAwait.EventuallyAsync(
+            () => responses.Count == agentCount,
+            "all concurrently started agents to respond",
+            cancellationToken: cts.Token);
 
         responses.Count().ShouldBe(agentCount);
         
@@ -358,9 +390,16 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     {
         private readonly ConcurrentDictionary<string, DelayedStreamingHandle> _handles = new();
 
-        public DelayedStreamingHandle RegisterAgent(string agentId, TimeSpan responseDelay, string responseContent)
+        public DelayedStreamingHandle RegisterAgent(string agentId, string responseContent)
         {
-            var handle = new DelayedStreamingHandle(agentId, responseDelay, responseContent);
+            var handle = new DelayedStreamingHandle(agentId, responseContent, gated: false);
+            _handles[agentId] = handle;
+            return handle;
+        }
+
+        public DelayedStreamingHandle RegisterGatedAgent(string agentId, string responseContent)
+        {
+            var handle = new DelayedStreamingHandle(agentId, responseContent, gated: true);
             _handles[agentId] = handle;
             return handle;
         }
@@ -388,22 +427,28 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     private sealed class DelayedStreamingHandle : IAgentHandle
     {
         private readonly string _agentId;
-        private readonly TimeSpan _delay;
         private readonly string _content;
+        private readonly TaskCompletionSource? _responseRelease;
         private SessionId _sessionId;
         private readonly TaskCompletionSource _promptStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public DelayedStreamingHandle(string agentId, TimeSpan delay, string content)
+        public DelayedStreamingHandle(string agentId, string content, bool gated)
         {
             _agentId = agentId;
-            _delay = delay;
             _content = content;
+            _responseRelease = gated
+                ? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+                : null;
         }
 
         public AgentId AgentId => AgentId.From(_agentId);
         public SessionId SessionId => _sessionId;
         public bool IsRunning { get; private set; }
         public Task WaitForPromptStart => _promptStarted.Task;
+
+        public void ReleaseResponse()
+            => (_responseRelease ?? throw new InvalidOperationException("Agent response is not gated."))
+                .TrySetResult();
 
         public void SetSessionId(SessionId sessionId) => _sessionId = sessionId;
 
@@ -414,7 +459,7 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
             // Simulate LLM processing delay
             return Task.Run(async () =>
             {
-                await Task.Delay(_delay, ct);
+                await WaitForResponseReleaseAsync(ct);
                 IsRunning = false;
                 return new AgentResponse { Content = _content };
             }, ct);
@@ -432,8 +477,7 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
                 MessageId = Guid.NewGuid().ToString("N") 
             };
 
-            // Simulate LLM processing delay
-            await Task.Delay(_delay, ct);
+            await WaitForResponseReleaseAsync(ct);
 
             yield return new AgentStreamEvent 
             { 
@@ -450,18 +494,21 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
             IsRunning = false;
         }
 
-        public Task<AgentResponse> PromptAsync(UserMessage message, CancellationToken ct)
+        public Task<AgentResponse> PromptAsync(BotNexus.Gateway.Abstractions.Models.AgentUserMessage message, CancellationToken ct)
             => PromptAsync(message.Content, ct);
 
-        public IAsyncEnumerable<AgentStreamEvent> StreamAsync(UserMessage message, CancellationToken ct)
+        public IAsyncEnumerable<AgentStreamEvent> StreamAsync(BotNexus.Gateway.Abstractions.Models.AgentUserMessage message, CancellationToken ct)
             => StreamAsync(message.Content, ct);
 
         public Task AbortAsync(CancellationToken ct) { IsRunning = false; return Task.CompletedTask; }
         public Task InterruptAndSteerAsync(string message, CancellationToken ct = default) => throw new NotImplementedException();
         public Task SteerAsync(string message, CancellationToken ct) => Task.CompletedTask;
         public Task FollowUpAsync(string message, CancellationToken ct) => Task.CompletedTask;
-        public Task FollowUpAsync(AgentMessage message, CancellationToken ct) => Task.CompletedTask;
+        public Task FollowUpAsync(AgentTranscriptMessage message, CancellationToken ct) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private Task WaitForResponseReleaseAsync(CancellationToken cancellationToken)
+            => _responseRelease?.Task.WaitAsync(cancellationToken) ?? Task.CompletedTask;
     }
 
     /// <summary>
@@ -469,16 +516,14 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     /// </summary>
     private static async Task WaitForResponseCount(List<(string SessionId, string Content)> responses, int expectedCount, CancellationToken ct)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
-        while (deadline > DateTimeOffset.UtcNow && !ct.IsCancellationRequested)
-        {
-            lock (responses)
+        await TestAwait.EventuallyAsync(
+            () =>
             {
-                if (responses.Count >= expectedCount)
-                    return;
-            }
-            await Task.Delay(50, ct);
-        }
+                lock (responses)
+                    return responses.Count >= expectedCount;
+            },
+            $"{expectedCount} multi-agent response(s) to arrive",
+            cancellationToken: ct);
     }
 
     /// <summary>
@@ -529,10 +574,10 @@ public sealed class MultiAgentConcurrencyTests : IAsyncDisposable
     /// <summary>
     /// Creates and starts a SignalR hub connection for testing.
     /// </summary>
-    private static async Task<HubConnection> CreateStartedConnection(WebApplicationFactory<Program> factory, CancellationToken cancellationToken)
+    private static async Task<HubConnection> CreateStartedConnection(WebApplicationFactory<Program> factory, CancellationToken cancellationToken, [System.Runtime.CompilerServices.CallerMemberName] string testName = "")
     {
         var connection = CreateHubConnection(factory);
-        await connection.StartAsync(cancellationToken);
+        await HubFixtureGuard.StartGuardedAsync(connection, "MultiAgentConcurrencyTests", cancellationToken, testName: testName);
         return connection;
     }
 

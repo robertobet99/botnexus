@@ -29,14 +29,248 @@ public sealed class GatewayProcessManagerTests : IDisposable
     }
 
     [Fact]
+    public void ResolveLaunchTarget_PrefersApphostExe_WhenPresentNextToDll()
+    {
+        // Arrange: a fake published layout with an apphost exe next to the managed DLL.
+        var dllPath = Path.Combine(_testPidDirectory, "BotNexus.Gateway.Api.dll");
+        File.WriteAllText(dllPath, "managed");
+        var apphostName = OperatingSystem.IsWindows() ? "BotNexus.Gateway.Api.exe" : "BotNexus.Gateway.Api";
+        var apphostPath = Path.Combine(_testPidDirectory, apphostName);
+        File.WriteAllText(apphostPath, "native");
+        var options = new GatewayStartOptions(
+            ExecutablePath: dllPath,
+            Arguments: "--foo bar",
+            HomePath: _testPidDirectory,
+            HealthUrl: "http://localhost:6123/health");
+
+        // Act
+        var (fileName, arguments) = _manager.ResolveLaunchTarget(options);
+
+        // Assert: launch the apphost directly so the process name is NOT "dotnet" (issue #2199).
+        Assert.Equal(apphostPath, fileName);
+        Assert.DoesNotContain("dotnet", fileName, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("--foo bar", arguments);
+    }
+
+    [Fact]
+    public void ResolveLaunchTarget_FallsBackToDotnetHost_WhenNoApphostPresent()
+    {
+        // Arrange: only the managed DLL exists (framework-dependent, no native host).
+        var dllPath = Path.Combine(_testPidDirectory, "BotNexus.Gateway.Api.dll");
+        File.WriteAllText(dllPath, "managed");
+        var options = new GatewayStartOptions(
+            ExecutablePath: dllPath,
+            Arguments: "--foo bar",
+            HomePath: _testPidDirectory,
+            HealthUrl: "http://localhost:6123/health");
+
+        // Act
+        var (fileName, arguments) = _manager.ResolveLaunchTarget(options);
+
+        // Assert
+        Assert.Equal("dotnet", fileName);
+        Assert.Equal($"\"{dllPath}\" --foo bar", arguments);
+    }
+
+    [Fact]
+    public async Task StartAsync_UsesSixtySecondDefaultReadinessTimeoutAndEffectiveHealthUrl()
+    {
+        await using var child = new ControlledReadinessChild();
+        ConfigureReadiness(child, healthy: true);
+        var options = child.Options(_testPidDirectory, healthUrl: "http://localhost:6123/health");
+
+        var result = await child.StartAsync(_healthChecker, options).WaitAsync(TimeSpan.FromMinutes(2));
+
+        result.Success.ShouldBeTrue();
+        result.Pid.ShouldBe(await child.Ready);
+        child.HasExited.ShouldBeFalse();
+        await _healthChecker.Received(1).WaitForHealthyAsync(
+            "http://localhost:6123/health",
+            TimeSpan.FromSeconds(60),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task StartAsync_WhenProcessExitsDuringReadiness_FailsPromptlyWithExitCode()
+    {
+        await using var child = new ControlledReadinessChild();
+        var healthCheckStarted = ConfigurePendingReadiness(child);
+        var startTask = child.StartAsync(_healthChecker, child.Options(_testPidDirectory));
+        await healthCheckStarted.WaitAsync(TimeSpan.FromMinutes(2));
+
+        // The real child exits while health remains pending; exit must cancel that operation.
+        await child.ExitAsync(37);
+        var result = await startTask.WaitAsync(TimeSpan.FromMinutes(2));
+
+        result.Success.ShouldBeFalse();
+        result.Pid.ShouldBe(await child.Ready);
+        result.Message.ShouldNotBeNull();
+        result.Message.ShouldContain("exited");
+        result.Message.ShouldContain("exit code 37,");
+        child.HasExited.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task StartAsync_WhenProcessAliveButReadinessTimesOut_ReportsAliveAndUnhealthy()
+    {
+        await using var child = new ControlledReadinessChild();
+        ConfigureReadiness(child, healthy: false);
+        var options = child.Options(_testPidDirectory, TimeSpan.FromMilliseconds(50));
+
+        var result = await child.StartAsync(_healthChecker, options).WaitAsync(TimeSpan.FromMinutes(2));
+
+        result.Success.ShouldBeFalse();
+        result.Pid.ShouldBe(await child.Ready);
+        result.Message.ShouldNotBeNull();
+        result.Message.ShouldContain("alive");
+        result.Message.ShouldContain("not healthy");
+        child.HasExited.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task StartAsync_WhenReadinessIsCancelled_PropagatesCancellation()
+    {
+        await using var child = new ControlledReadinessChild();
+        var healthCheckStarted = ConfigurePendingReadiness(child);
+        using var cancellation = new CancellationTokenSource();
+        var startTask = child.StartAsync(_healthChecker, child.Options(_testPidDirectory), cancellation.Token);
+        await healthCheckStarted.WaitAsync(TimeSpan.FromMinutes(2));
+        child.HasExited.ShouldBeFalse();
+        await cancellation.CancelAsync();
+
+        var exception = await Should.ThrowAsync<OperationCanceledException>(
+            () => startTask.WaitAsync(TimeSpan.FromMinutes(2)));
+        exception.CancellationToken.IsCancellationRequested.ShouldBeTrue();
+        child.HasExited.ShouldBeFalse();
+    }
+
+    private void ConfigureReadiness(ControlledReadinessChild child, bool healthy)
+    {
+        _healthChecker.WaitForHealthyAsync(
+            Arg.Any<string>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(async call =>
+            {
+                _ = await child.Ready.WaitAsync(TimeSpan.FromMinutes(2), call.Arg<CancellationToken>());
+                return healthy;
+            });
+    }
+
+    private Task ConfigurePendingReadiness(ControlledReadinessChild child)
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _healthChecker.WaitForHealthyAsync(
+            Arg.Any<string>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(async call =>
+            {
+                _ = await child.Ready.WaitAsync(TimeSpan.FromMinutes(2), call.Arg<CancellationToken>());
+                started.SetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, call.Arg<CancellationToken>());
+                return false;
+            });
+        return started.Task;
+    }
+
+    [Fact]
+    public async Task StartAsync_ParallelReadinessAttempts_KeepEightChildrenAndPidFilesIsolated()
+    {
+        var allReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var remaining = 8;
+        var pids = await Task.WhenAll(Enumerable.Range(0, 8).Select(async index =>
+        {
+            using var test = new GatewayProcessManagerTests();
+            await using var child = new ControlledReadinessChild();
+            test._healthChecker.WaitForHealthyAsync(
+                Arg.Any<string>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+                .Returns(async call =>
+                {
+                    _ = await child.Ready.WaitAsync(TimeSpan.FromMinutes(2), call.Arg<CancellationToken>());
+                    if (Interlocked.Decrement(ref remaining) == 0)
+                        allReady.SetResult();
+                    // All eight children must be alive together before any readiness result is released.
+                    await allReady.Task.WaitAsync(TimeSpan.FromMinutes(2), call.Arg<CancellationToken>());
+                    return index % 2 == 0;
+                });
+            var result = await child.StartAsync(test._healthChecker, child.Options(test._testPidDirectory))
+                .WaitAsync(TimeSpan.FromMinutes(2));
+            var pid = await child.Ready;
+            result.Pid.ShouldBe(pid);
+            result.Success.ShouldBe(index % 2 == 0);
+            child.HasExited.ShouldBeFalse();
+            var recordText = await File.ReadAllTextAsync(test.GetPidFilePath());
+            GatewayPidFile.TryParse(recordText, out var record).ShouldBeTrue();
+            record.ShouldNotBeNull();
+            record.Pid.ShouldBe(pid);
+            if (!result.Success)
+            {
+                result.Message.ShouldNotBeNull();
+                result.Message.ShouldContain("alive");
+                result.Message.ShouldContain("not healthy");
+            }
+            return pid;
+        }));
+        pids.Distinct().Count().ShouldBe(8);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task ControlledReadinessChild_DisposalAfterEachReadinessOutcome_ReapsOwnedProcess(int outcome)
+    {
+        using var cancellation = new CancellationTokenSource();
+        using var process = await ExerciseOutcomeAsync();
+        process.HasExited.ShouldBeTrue();
+
+        async Task<Process> ExerciseOutcomeAsync()
+        {
+            await using var child = new ControlledReadinessChild();
+            _healthChecker.WaitForHealthyAsync(
+                Arg.Any<string>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+                .Returns(async call =>
+                {
+                    _ = await child.Ready.WaitAsync(TimeSpan.FromMinutes(2), call.Arg<CancellationToken>());
+                    if (outcome == 2)
+                        throw new InvalidOperationException("Injected readiness failure.");
+                    if (outcome == 3)
+                        await Task.Delay(Timeout.InfiniteTimeSpan, call.Arg<CancellationToken>());
+                    return outcome == 0;
+                });
+            var startTask = child.StartAsync(_healthChecker, child.Options(_testPidDirectory), cancellation.Token);
+            var pid = await child.Ready.WaitAsync(TimeSpan.FromMinutes(2));
+            var ownedProcess = Process.GetProcessById(pid);
+            try
+            {
+                if (outcome == 2)
+                    _ = await Should.ThrowAsync<InvalidOperationException>(() => startTask.WaitAsync(TimeSpan.FromMinutes(2)));
+                else if (outcome == 3)
+                {
+                    await cancellation.CancelAsync();
+                    _ = await Should.ThrowAsync<OperationCanceledException>(() => startTask.WaitAsync(TimeSpan.FromMinutes(2)));
+                }
+                else
+                    (await startTask.WaitAsync(TimeSpan.FromMinutes(2))).Success.ShouldBe(outcome == 0);
+                ownedProcess.HasExited.ShouldBeFalse();
+                return ownedProcess;
+            }
+            catch
+            {
+                ownedProcess.Dispose();
+                throw;
+            }
+        }
+    }
+
+    [Fact]
     public async Task StartAsync_WhenAlreadyRunning_ReturnsAlreadyRunningResult()
     {
-        // Write a PID file with the current process ID (which is definitely running)
-        var currentPid = Process.GetCurrentProcess().Id;
-        await WritePidFileAsync(currentPid);
+        // Write an identity-bearing PID file for the current process (definitely running).
+        var currentProcess = Process.GetCurrentProcess();
+        var currentPid = currentProcess.Id;
+        await WriteIdentityPidFileAsync(currentProcess);
 
         var options = new GatewayStartOptions(
-            ExecutablePath: "BotNexus.Gateway.Api.dll",
+            ExecutablePath: Path.Combine(_testPidDirectory, "must-not-launch.dll"),
             Arguments: null,
             HomePath: _testPidDirectory);
 
@@ -52,30 +286,30 @@ public sealed class GatewayProcessManagerTests : IDisposable
     [Fact]
     public async Task StartAsync_WhenStalePidExists_CleansAndStartsSuccessfully()
     {
-        // Write a PID file with a definitely-dead PID (99999)
-        await WritePidFileAsync(99999);
+        // A legacy bare PID is unverifiable even when it names a live process. Start must
+        // replace that stale record without signalling the unrelated process.
+        using var unrelatedProcess = Process.GetCurrentProcess();
+        await WritePidFileAsync(unrelatedProcess.Id);
 
         // PID file should be cleaned up before attempting to start
         var pidFilePath = GetPidFilePath();
         File.Exists(pidFilePath).ShouldBeTrue();
 
-        // Mock health checker to return false so the start doesn't actually succeed
-        _healthChecker.WaitForHealthyAsync(
-            Arg.Any<string>(),
-            Arg.Any<TimeSpan>(),
-            Arg.Any<CancellationToken>())
-            .Returns(false);
+        await using var child = new ControlledReadinessChild();
+        ConfigureReadiness(child, healthy: true);
+        var result = await child.StartAsync(_healthChecker, child.Options(_testPidDirectory))
+            .WaitAsync(TimeSpan.FromMinutes(2));
 
-        var options = new GatewayStartOptions(
-            ExecutablePath: "BotNexus.Gateway.Api.dll",
-            Arguments: null,
-            HomePath: _testPidDirectory);
-
-        var result = await _manager.StartAsync(options);
-
-        // The stale PID should have been cleaned up before starting
-        // The process may start but health check will fail
-        result.Success.ShouldBeFalse();
+        result.Success.ShouldBeTrue();
+        result.Pid.ShouldBe(await child.Ready);
+        child.HasExited.ShouldBeFalse();
+        var replacementText = await File.ReadAllTextAsync(pidFilePath);
+        GatewayPidFile.TryParse(replacementText, out var replacement).ShouldBeTrue();
+        replacement.ShouldNotBeNull();
+        replacement.Pid.ShouldBe(await child.Ready);
+        using var process = Process.GetProcessById(replacement.Pid);
+        GatewayPidFile.Verify(replacement, process).ShouldBe(GatewayIdentityMatch.Match);
+        unrelatedProcess.HasExited.ShouldBeFalse();
     }
 
     [Fact]
@@ -124,8 +358,8 @@ public sealed class GatewayProcessManagerTests : IDisposable
 
         try
         {
-            // Write the PID file
-            await WritePidFileAsync(process.Id);
+            // Write the PID file WITH identity so the kill is authorised (issue #2369).
+            await WriteIdentityPidFileAsync(process);
 
             var result = await _manager.StopAsync(_testPidDirectory);
 
@@ -169,7 +403,7 @@ public sealed class GatewayProcessManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task GetStatusAsync_WhenStalePidExists_CleansAndReturnsNotRunning()
+    public async Task GetStatusAsync_WhenStalePidExists_PreservesAndReturnsNotRunning()
     {
         // Write a PID file with a definitely-dead PID
         await WritePidFileAsync(99999);
@@ -181,15 +415,15 @@ public sealed class GatewayProcessManagerTests : IDisposable
         status.Uptime.ShouldBeNull();
         status.Message.ShouldNotBeNull();
         var message = status.Message ?? throw new InvalidOperationException("Expected status message.");
-        message.ShouldContain("stale PID");
+        message.ShouldContain("no longer exists");
 
-        // PID file should be cleaned up
+        // Status is diagnostic-only; lifecycle commands own cleanup.
         var pidFilePath = GetPidFilePath();
-        File.Exists(pidFilePath).ShouldBeFalse();
+        File.Exists(pidFilePath).ShouldBeTrue();
     }
 
     [Fact]
-    public async Task GetStatusAsync_WhenRunning_ReturnsPidAndUptime()
+    public async Task GetStatusAsync_WhenProcessHasExited_PreservesPidFile()
     {
         // Start a long-running dotnet process (which will pass the name check)
         var psi = new ProcessStartInfo
@@ -206,28 +440,14 @@ public sealed class GatewayProcessManagerTests : IDisposable
 
         try
         {
-            // Give process a moment to start
-            await Task.Delay(100);
+            await process.WaitForExitAsync();
 
-            await WritePidFileAsync(process.Id);
+            await WriteIdentityPidFileAsync(process);
 
             var status = await _manager.GetStatusAsync(_testPidDirectory);
 
-            // If process is still running, should be detected
-            if (!process.HasExited)
-            {
-                status.State.ShouldBe(GatewayState.Running);
-                status.Pid.ShouldBe(process.Id);
-                status.Uptime.ShouldNotBeNull();
-                status.Message.ShouldNotBeNull();
-                var message = status.Message ?? throw new InvalidOperationException("Expected status message.");
-                message.ShouldContain("Running");
-            }
-            else
-            {
-                // Process exited quickly - that's ok, it should be cleaned up
-                status.State.ShouldBe(GatewayState.NotRunning);
-            }
+            status.State.ShouldBe(GatewayState.NotRunning);
+            File.Exists(GetPidFilePath()).ShouldBeTrue();
         }
         finally
         {
@@ -252,7 +472,7 @@ public sealed class GatewayProcessManagerTests : IDisposable
         // dotnet --version exits immediately; use the current test process instead
         // as it is definitely alive and the name check accepts any dotnet process
         var currentProcess = Process.GetCurrentProcess();
-        await WritePidFileAsync(currentProcess.Id);
+        await WriteIdentityPidFileAsync(currentProcess);
 
         var status = await _manager.GetStatusAsync(_testPidDirectory);
 
@@ -276,9 +496,9 @@ public sealed class GatewayProcessManagerTests : IDisposable
         status.State.ShouldBe(GatewayState.NotRunning);
         status.Pid.ShouldBeNull();
 
-        // PID file should be cleaned up
+        // Status preserves stale diagnostic evidence for lifecycle commands.
         var pidFilePath = GetPidFilePath();
-        File.Exists(pidFilePath).ShouldBeFalse();
+        File.Exists(pidFilePath).ShouldBeTrue();
     }
 
     [Fact]
@@ -308,7 +528,28 @@ public sealed class GatewayProcessManagerTests : IDisposable
 
         try
         {
-            await WritePidFileAsync(process.Id);
+            await WriteIdentityPidFileAsync(process);
+
+            // #2825: wait until the spawned process is genuinely running before stopping it.
+            // StopAsync treats an absent process as "nothing to stop" and returns success, so
+            // on a loaded container - where Process.Start returns before the OS has scheduled
+            // the child - the override path was never reached and the test saw Success=true.
+            // That reported a product defect for a scheduling delay. The assertion below is
+            // unchanged: the override still must force the !exited path and yield a failure.
+            await TestAwait.EventuallyAsync(
+                () =>
+                {
+                    try
+                    {
+                        return !Process.GetProcessById(process.Id).HasExited;
+                    }
+                    catch (ArgumentException)
+                    {
+                        return false;
+                    }
+                },
+                $"spawned process {process.Id} to become visible to the operating system",
+                timeout: TimeSpan.FromSeconds(30));
 
             var result = await neverExitsManager.StopAsync(_testPidDirectory);
 
@@ -335,7 +576,7 @@ public sealed class GatewayProcessManagerTests : IDisposable
     {
         // Use the current process — always alive
         var currentProcess = Process.GetCurrentProcess();
-        await WritePidFileAsync(currentProcess.Id);
+        await WriteIdentityPidFileAsync(currentProcess);
 
         _manager.IsRunning(_testPidDirectory).ShouldBeTrue();
     }
@@ -402,9 +643,12 @@ public sealed class GatewayProcessManagerTests : IDisposable
         try
         {
             // Write current PID to alt target (process is running)
-            var currentPid = Process.GetCurrentProcess().Id;
+            var currentProcess = Process.GetCurrentProcess();
+            var currentPid = currentProcess.Id;
             var altPidPath = Path.Combine(altTarget, "gateway.pid");
-            await File.WriteAllTextAsync(altPidPath, currentPid.ToString());
+            await File.WriteAllTextAsync(
+                altPidPath,
+                GatewayPidFile.Serialize(GatewayPidFile.Capture(currentProcess)));
 
             // Status for alt target should find the process
             var altStatus = await _manager.GetStatusAsync(altTarget);
@@ -431,6 +675,23 @@ public sealed class GatewayProcessManagerTests : IDisposable
             Directory.CreateDirectory(directory);
         }
         await File.WriteAllTextAsync(pidFilePath, pid.ToString());
+    }
+
+    /// <summary>
+    /// Writes an identity-bearing PID file (the format produced by StartAsync since issue #2369),
+    /// which is what authorises stop/status to act on the PID.
+    /// </summary>
+    private async Task WriteIdentityPidFileAsync(Process process)
+    {
+        var pidFilePath = GetPidFilePath();
+        var directory = Path.GetDirectoryName(pidFilePath);
+        if (directory is not null && !Directory.Exists(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+        await File.WriteAllTextAsync(
+            pidFilePath,
+            GatewayPidFile.Serialize(GatewayPidFile.Capture(process)));
     }
 
     private string GetPidFilePath() => Path.Combine(_testPidDirectory, "gateway.pid");

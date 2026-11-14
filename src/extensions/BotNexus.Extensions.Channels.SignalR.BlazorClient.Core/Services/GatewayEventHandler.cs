@@ -19,6 +19,14 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
 
     private readonly IClientStateStore _store;
     private readonly GatewayHubConnection _hub;
+
+    // #3212: the ONLY visibility source this handler has. Every "is the user looking at this pane"
+    // decision -- unread counts, badge suppression, recovery-path bracket clearing -- goes through
+    // this route-derived predicate. The handler deliberately holds no ambient fallback of its own:
+    // the deleted per-agent conversation marker is a per-agent last-selected marker, not an answer about what
+    // is rendered, and consulting it made N agents simultaneously "active" while the browser showed
+    // exactly one. Do not reintroduce a read of it here.
+    private readonly IDisplayedConversation _displayed;
     private readonly ILogger<GatewayEventHandler> _logger;
     private readonly HashSet<string> _streamingWhenDisconnected = new();
 
@@ -34,12 +42,25 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     // When a snapshot-then-act pattern is needed the snapshot is taken under the lock and the async
     // work runs outside it -- the lock is never held across an await.
     private readonly object _stateGate = new();
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private long _runStateRevision;
+    private static readonly TimeSpan s_runStateReconciliationGrace = TimeSpan.FromSeconds(2);
 
-    public GatewayEventHandler(IClientStateStore store, GatewayHubConnection hub, ILogger<GatewayEventHandler> logger)
+    internal Func<TimeSpan, CancellationToken, Task> RunStateReconciliationDelay { get; set; } = Task.Delay;
+    internal Func<CancellationToken, Task<SubscribeAllResult>>? RunActivitySnapshotProvider { get; set; }
+    internal Task? LastRunStateReconciliation { get; private set; }
+
+    public GatewayEventHandler(
+        IClientStateStore store,
+        GatewayHubConnection hub,
+        ILogger<GatewayEventHandler> logger,
+        IDisplayedConversation displayed)
     {
         _store = store;
         _hub = hub;
         _logger = logger;
+        _displayed = displayed;
+        RunActivitySnapshotProvider = _hub.SubscribeAllAsync;
 
         _hub.OnConnected += HandleConnected;
         _hub.OnRunStarted += HandleRunStarted;
@@ -107,13 +128,13 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleRunStarted(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (convId is null) return;
 
         var conv = agent!.Conversations.GetValueOrDefault(convId);
         if (conv is null) return;
 
-        conv.StreamState.IsRunActive = true;
+        MarkRunActive(conv, agent, "RunStarted");
         // #1897/streaming-flash: RunStarted fires BEFORE the first MessageStart (which is what
         // normally calls ClearBuffers). Any residual Buffer/ThinkingBuffer left over from the
         // previous turn would otherwise be painted by ChatPanel's live streaming bubble the
@@ -123,10 +144,119 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         // the buffers when the run opens closes that window; MessageStart still clears again per
         // message, so this is purely defensive and cannot drop in-flight content.
         conv.StreamState.ClearBuffers();
+        _store.NotifyChanged();
+    }
+
+    /// <summary>Captures the live event revision before starting a subscribe RPC.</summary>
+    public long CaptureRunStateRevision() => Volatile.Read(ref _runStateRevision);
+
+    /// <summary>
+    /// Applies a subscribe snapshot only if no later live event changed the projection while the
+    /// RPC was in flight. A stale active snapshot must not resurrect an ended run, and a stale
+    /// empty snapshot must not clear a newly resumed continuation.
+    /// </summary>
+    public void TryApplyRunActivitySnapshot(IReadOnlyList<RunActivitySnapshot> activeRuns, long expectedRevision)
+    {
+        if (Volatile.Read(ref _runStateRevision) == expectedRevision)
+            ApplyRunActivitySnapshot(activeRuns);
+    }
+
+    /// <summary>
+    /// Reconciles whole-run activity from the server-owned subscribe snapshot. REST remains the
+    /// only session-roster writer; this applies only the live run bracket that persistence cannot
+    /// reconstruct.
+    /// </summary>
+    public void ApplyRunActivitySnapshot(IReadOnlyList<RunActivitySnapshot> activeRuns)
+    {
+        ArgumentNullException.ThrowIfNull(activeRuns);
+        Interlocked.Increment(ref _runStateRevision);
+
+        var activeConversations = new HashSet<(string AgentId, string ConversationId)>();
+        foreach (var snapshot in activeRuns)
+        {
+            var conversationId = snapshot.ConversationId;
+            if (string.IsNullOrWhiteSpace(conversationId)
+                && !_store.TryResolveConversationBySession(snapshot.AgentId, snapshot.SessionId, out conversationId))
+            {
+                continue;
+            }
+
+            if (conversationId is not null
+                && _store.GetAgent(snapshot.AgentId)?.Conversations.ContainsKey(conversationId) == true)
+            {
+                activeConversations.Add((snapshot.AgentId, conversationId));
+            }
+        }
+
+        foreach (var agent in _store.Agents.Values)
+        {
+            foreach (var conversation in agent.Conversations.Values)
+            {
+                var isRunActive = activeConversations.Contains((agent.AgentId, conversation.ConversationId));
+                conversation.StreamState.ApplyRunActivitySnapshot(isRunActive, "RunActivitySnapshot");
+            }
+
+            agent.IsStreaming = false;
+            agent.ProcessingStage = null;
+        }
+
+        foreach (var (agentId, conversationId) in activeConversations)
+        {
+            if (_store.GetAgent(agentId) is { } agent
+                && agent.Conversations.GetValueOrDefault(conversationId) is { } conversation)
+            {
+                MarkRunActive(conversation, agent, "RunActivitySnapshot");
+            }
+        }
+
+        _store.NotifyChanged();
+    }
+
+    private void MarkRunActive(ConversationState conversation, AgentState agent, string eventName)
+    {
+        Interlocked.Increment(ref _runStateRevision);
+        conversation.StreamState.SetRunActive(true, eventName);
         agent.IsStreaming = true;
         if (string.IsNullOrEmpty(agent.ProcessingStage))
             agent.ProcessingStage = "\U0001F916 Agent is working\u2026";
-        _store.NotifyChanged();
+    }
+
+    private void ScheduleRunStateReconciliation()
+    {
+        var expectedRevision = Volatile.Read(ref _runStateRevision);
+        LastRunStateReconciliation = ReconcileRunStateAfterGraceAsync(expectedRevision, _lifetimeCancellation.Token);
+    }
+
+    private async Task ReconcileRunStateAfterGraceAsync(long expectedRevision, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await RunStateReconciliationDelay(s_runStateReconciliationGrace, cancellationToken);
+            if (RunActivitySnapshotProvider is { } snapshotProvider)
+            {
+                var snapshot = await snapshotProvider(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                TryApplyRunActivitySnapshot(snapshot.ActiveRuns, expectedRevision);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The handler was disposed before the bounded reconciliation completed.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Run-state reconciliation failed; retaining the live event projection");
+        }
+    }
+
+    private void ScheduleRunStateReconciliationIfQuiescent(ConversationState conversation)
+    {
+        if (conversation.StreamState.IsRunActive
+            && !conversation.StreamState.IsStreaming
+            && conversation.StreamState.ActiveToolCalls.Count == 0)
+        {
+            ScheduleRunStateReconciliation();
+        }
     }
 
     /// <summary>
@@ -138,10 +268,58 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleRunEnded(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+        Interlocked.Increment(ref _runStateRevision);
+
+        // #2195: RunEnded is the authoritative idle signal that clears the turn-active bracket
+        // (Steer/Redirect/Follow Up/Stop). If it is missed or misrouted the input stays stuck on
+        // those controls until reload. The resolved ConversationId can be a stale/misrouted hint
+        // that does not map to any local conversation (GetValueOrDefault returns null), so clearing
+        // ONLY that conversation would silently no-op and leave the active conversation stuck.
+        // Harden the recovery: clear the resolved conversation when it exists, and always also clear
+        // the agent's active conversation bracket as a fallback so a null/mismatched hint can never
+        // strand the user.
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
+
+        var cleared = false;
         if (convId is not null && agent!.Conversations.GetValueOrDefault(convId) is { } conv)
         {
-            conv.StreamState.EndRun();
+            conv.StreamState.EndRun("RunEnded");
+            // Content belongs only to the event's conversation, never the displayed-pane recovery.
+            var notice = BotNexus.Gateway.Abstractions.Models.ToolResultBudgetNotice.Create(
+                evt.Completion?.StopReason,
+                evt.Completion?.GuardObservations?.Any(guard => guard.AbsoluteLimitReached) == true,
+                evt.Completion?.ToolResultBudget);
+            if (notice is not null && !conv.Messages.Any(message =>
+                message.Kind == BotNexus.Gateway.Abstractions.Models.ToolResultBudgetNotice.Kind
+                && message.AgentRunId == evt.AgentRunId))
+            {
+                conv.AppendMessage(new ChatMessage("System", notice, DateTimeOffset.UtcNow)
+                {
+                    Kind = BotNexus.Gateway.Abstractions.Models.ToolResultBudgetNotice.Kind,
+                    AgentRunId = evt.AgentRunId
+                });
+            }
+            // #2439: the run loop drains the follow-up queue BEFORE it can end (AgentLoopRunner
+            // seeds another turn from a drained follow-up and continues), so once RunEnded lands
+            // nothing can still be pending — whatever was queued was injected or discarded.
+            // RunEnded is therefore the honest, already-existing injection signal for the chip.
+            _store.ClearSteeringQueue(convId);
+            cleared = _displayed.IsConversationDisplayed(agentId, convId);
+        }
+
+        // #2195 recovery, now route-derived (#3212): the resolved conversation was unknown
+        // (misrouted hint) or was not the DISPLAYED one -- clear the displayed conversation's
+        // bracket so the portal reliably swaps back to Send. Keying this on the route means the
+        // recovery only ever touches the pane the user is actually looking at, instead of every
+        // agent's independently-remembered last selection.
+        if (!cleared
+            && _displayed.DisplayedConversationIdFor(agentId) is { } activeConvId
+            && agent!.Conversations.GetValueOrDefault(activeConvId) is { } activeConv)
+        {
+            activeConv.StreamState.EndRun("RunEnded");
+            // #2439: same defensive reasoning as the bracket — a misrouted hint must not strand
+            // a pending indicator the user can never clear.
+            _store.ClearSteeringQueue(activeConvId);
         }
 
         agent!.IsStreaming = false;
@@ -155,14 +333,14 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleMessageStart(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId);
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (convId is null) return;
 
         var conv = agent!.Conversations.GetValueOrDefault(convId);
         if (conv is null) return;
 
-        agent.IsStreaming = true;
-        conv.StreamState.IsStreaming = true;
+        MarkRunActive(conv, agent, "MessageStart");
+        conv.StreamState.SetStreaming(true, "MessageStart");
         conv.StreamState.ClearBuffers();
         agent.ProcessingStage = "🤖 Agent is responding…";
         _store.NotifyChanged();
@@ -171,12 +349,13 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleContentDelta(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId);
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (convId is null) return;
 
         var conv = agent!.Conversations.GetValueOrDefault(convId);
         if (conv is null) return;
 
+        MarkRunActive(conv, agent, "ContentDelta");
         conv.StreamState.AppendBuffer(evt.ContentDelta);
         // #1651: a non-streaming SendAsync fan-out can stamp the role the delivered content
         // should render under (e.g. an on-behalf-of-user kickoff carried as `user`). Record it
@@ -192,12 +371,13 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleThinkingDelta(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId);
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (convId is null) return;
 
         var conv = agent!.Conversations.GetValueOrDefault(convId);
         if (conv is null) return;
 
+        MarkRunActive(conv, agent, "ThinkingDelta");
         conv.StreamState.AppendThinking(evt.ThinkingContent);
         agent.ProcessingStage = "💭 Thinking…";
         _store.NotifyChangedThrottled();
@@ -206,12 +386,13 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleToolStart(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (convId is null) return;
 
         var conv = agent!.Conversations.GetValueOrDefault(convId);
         if (conv is null) return;
 
+        MarkRunActive(conv, agent, "ToolStart");
         var toolCallId = evt.ToolCallId ?? Guid.NewGuid().ToString("N");
         var argsJson = evt.ToolArgs is not null
             ? JsonSerializer.Serialize(evt.ToolArgs, s_jsonOptions)
@@ -226,6 +407,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         };
 
         conv.AppendMessage(msg);
+        var toolCallWasActive = conv.StreamState.ActiveToolCalls.ContainsKey(toolCallId);
         conv.StreamState.ActiveToolCalls[toolCallId] = new ActiveToolCall
         {
             ToolCallId = toolCallId,
@@ -233,8 +415,11 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             StartedAt = DateTimeOffset.UtcNow,
             MessageId = msg.Id
         };
+        if (!toolCallWasActive)
+            conv.StreamState.RecordActiveToolCallsChanged("ToolStart");
 
-        if (convId != agent.ActiveConversationId)
+        // #3212: unread is a VISIBILITY question, answered by the route-derived predicate.
+        if (!_displayed.IsConversationDisplayed(agentId, convId))
             conv.UnreadCount++;
         _store.NotifyChanged();
     }
@@ -242,7 +427,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleToolEnd(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (convId is null) return;
 
         var conv = agent!.Conversations.GetValueOrDefault(convId);
@@ -256,7 +441,8 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         {
             duration = DateTimeOffset.UtcNow - activeTool.StartedAt;
             messageId = activeTool.MessageId;
-            conv.StreamState.ActiveToolCalls.Remove(toolCallId);
+            if (conv.StreamState.ActiveToolCalls.Remove(toolCallId))
+                conv.StreamState.RecordActiveToolCallsChanged("ToolEnd");
         }
 
         if (messageId is not null)
@@ -277,6 +463,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
 
                 agent.ProcessingStage = agent.IsStreaming ? "🤖 Agent is responding…" : null;
                 _store.NotifyChanged();
+                ScheduleRunStateReconciliationIfQuiescent(conv);
                 return;
             }
         }
@@ -294,11 +481,14 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             ToolDuration = duration
         });
 
-        if (convId != agent.ActiveConversationId)
+        // #3212: unread is a VISIBILITY question, answered by the route-derived predicate.
+        if (!_displayed.IsConversationDisplayed(agentId, convId))
             conv.UnreadCount++;
 
         agent.ProcessingStage = agent.IsStreaming ? "🤖 Agent is responding…" : null;
         _store.NotifyChanged();
+
+        ScheduleRunStateReconciliationIfQuiescent(conv);
     }
 
     // Agents use this exact string to indicate they have nothing to say in a turn.
@@ -308,24 +498,14 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     // #1651: maps a pending stream role (carried on the ContentDelta.role field) to the
     // ChatMessage.Role string ChatPanel keys assistant-vs-user rendering off. A null/blank
     // pending role -- the default for every ordinary streamed reply -- resolves to "Assistant",
-    // preserving the pre-post-as-assistant behaviour. Mirrors AgentInteractionService.MapRole so
-    // the live-fan-out path and the history-replay path agree on the displayed role.
-    private static string ResolveFlushRole(string? pendingRole) =>
-        (pendingRole ?? string.Empty).Trim().ToLowerInvariant() switch
-        {
-            "" => "Assistant",
-            "user" => "User",
-            "assistant" => "Assistant",
-            "tool" => "Tool",
-            "error" => "Error",
-            "system" => "System",
-            var other => other,
-        };
+    // preserving the pre-post-as-assistant behaviour.
+    // #3456: role normalisation is owned by MessageRole. Do not reintroduce a local switch here.
+    private static string ResolveFlushRole(string? pendingRole) => MessageRole.Normalize(pendingRole);
 
     public void HandleMessageEnd(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (convId is null) return;
 
         var conv = agent!.Conversations.GetValueOrDefault(convId);
@@ -352,7 +532,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             });
         }
 
-        conv.StreamState.Reset();
+        conv.StreamState.Reset("MessageEnd");
         agent.IsStreaming = false;
         agent.ProcessingStage = null;
 
@@ -364,15 +544,24 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             // with a recent timestamp, creating noise for cron wakeups that had nothing to say (#773).
             conv.UpdatedAt = DateTimeOffset.UtcNow;
 
-            if (agent.AgentId != _store.ActiveAgentId)
+            // #3212: the agent badge is likewise route-derived -- it counts activity on agents
+            // whose pane is not the one being rendered.
+            if (!_displayed.IsAgentDisplayed(agent.AgentId))
                 agent.UnreadCount++;
 
-            if (convId != agent.ActiveConversationId)
+            // #3212: unread is a VISIBILITY question, answered by the route-derived predicate.
+            if (!_displayed.IsConversationDisplayed(agentId, convId))
                 conv.UnreadCount++;
         }
 
         _store.ClearPendingAskUser(convId);
         _store.NotifyChanged();
+
+        // A missing RunEnded leaves the whole-run bracket asserted. Once this per-message terminal
+        // edge reaches a quiescent state, give the normal next-step/RunEnded events a short grace
+        // period and then reconcile against the server-owned live-run snapshot. A genuinely active
+        // run remains active in that snapshot, preserving the no-false-idle contract.
+        ScheduleRunStateReconciliationIfQuiescent(conv);
 
         // Drain any conversation-list refreshes that were deferred during the stream
         // (e.g., conversation(action=new) called mid-turn -- issue #456).
@@ -382,14 +571,14 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleError(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
 
         if (convId is not null && agent!.Conversations.GetValueOrDefault(convId) is { } conv)
         {
             conv.AppendMessage(new ChatMessage("Error", evt.ErrorMessage ?? "An unknown error occurred.", DateTimeOffset.UtcNow));
             // An error is terminal for the loop (the runner emits RunEnded right after), so clear the
             // whole run bracket defensively in case the RunEnded event is missed.
-            conv.StreamState.EndRun();
+            conv.StreamState.EndRun("Error");
             _store.ClearPendingAskUser(convId);
         }
 
@@ -414,7 +603,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     public void HandleTurnInterrupted(AgentStreamEvent evt)
     {
         if (!ResolveAgent(evt.SessionId, out var agentId, out var agent, evt.ConversationId)) return;
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
 
         if (convId is not null && agent!.Conversations.GetValueOrDefault(convId) is { } conv)
         {
@@ -422,7 +611,9 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
                 evt.ErrorMessage ?? "The gateway was restarted while your last message was being processed.",
                 DateTimeOffset.UtcNow));
             // A gateway restart terminates the run; clear the whole run bracket (no RunEnded will arrive).
-            conv.StreamState.EndRun();
+            conv.StreamState.EndRun("TurnInterrupted");
+            // #2439: no RunEnded will arrive, so nothing else would ever clear a pending chip.
+            _store.ClearSteeringQueue(convId);
         }
 
         if (agent is not null)
@@ -447,18 +638,21 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         // Only take action if still streaming -- if MessageEnd already cleared it, this is a no-op.
         if (!agent.IsStreaming) return;
 
-        var convId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId)
-            ?? agent!.ActiveConversationId;
+        var convId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
+        ConversationState? conversation = null;
         if (convId is not null && agent.Conversations.GetValueOrDefault(convId) is { } conv)
         {
             // A tool-only turn may have buffered content (e.g. a partial NO_REPLY).
             // Clear it without adding a message -- the turn produced no user-visible output.
-            conv.StreamState.Reset();
+            conv.StreamState.Reset("TurnEnd");
+            conversation = conv;
         }
 
         agent.IsStreaming = false;
         agent.ProcessingStage = null;
         _store.NotifyChanged();
+        if (conversation is not null)
+            ScheduleRunStateReconciliationIfQuiescent(conversation);
 
         // Drain any deferred conversation refreshes (same as MessageEnd path).
         DrainPendingConversationRefreshes(agentId!);
@@ -473,7 +667,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
 
         var resolvedConversationId = prompt.ConversationId;
         if (string.IsNullOrWhiteSpace(resolvedConversationId))
-            resolvedConversationId = ResolveConversationId(agentId!, agent!, evt.SessionId, evt.ConversationId) ?? agent!.ActiveConversationId;
+            resolvedConversationId = ResolveConversationId(agentId!, evt.SessionId, evt.ConversationId);
         if (string.IsNullOrWhiteSpace(resolvedConversationId))
             return;
 
@@ -492,16 +686,20 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             // We can't remove from _sessionToAgent directly; re-registering with null clears it next time
             agent.SessionId = null;
 
-        if (agent.ActiveConversationId is not null &&
-            agent.Conversations.GetValueOrDefault(agent.ActiveConversationId) is { } conv)
+        // #3212: the recovery path clears the bracket for the conversation the user is actually
+        // LOOKING AT, resolved from the route, not the agent's ambient last-selected marker.
+        if (_displayed.DisplayedConversationIdFor(payload.AgentId) is { } displayedConvId &&
+            agent.Conversations.GetValueOrDefault(displayedConvId) is { } conv)
         {
-            conv.StreamState.EndRun();
+            conv.StreamState.EndRun("SessionReset");
             // Do NOT clear conv.Messages or set HistoryLoaded=false.
             // Session reset clears the agent's context window — it does not
             // erase conversation history. The portal should keep showing all
             // prior messages with a visual divider marking the new session.
             conv.AppendMessage(new ChatMessage("System", "--- New session started ---", DateTimeOffset.UtcNow));
             _store.ClearPendingAskUser(conv.ConversationId);
+            // #2439: a reset context window cannot contain the queued follow-up. Clear the chip.
+            _store.ClearSteeringQueue(conv.ConversationId);
         }
 
         agent.ActiveToolCalls.Clear();
@@ -517,7 +715,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
     {
         if (!ResolveAgent(payload.SessionId, out var agentId, out var agent, payload.ConversationId)) return;
         // PR1.5 (#682): SubAgentSignalRBridge stamps payload.ConversationId — prefer it.
-        var convId = ResolveConversationId(agentId!, agent!, payload.SessionId, payload.ConversationId);
+        var convId = ResolveConversationId(agentId!, payload.SessionId, payload.ConversationId);
 
         agent.SubAgents[payload.SubAgentId] = new SubAgentInfo
         {
@@ -533,7 +731,9 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         };
 
         // Register sub-agent's own session
+        _store.MarkSubAgent(payload.SubAgentId);
         _store.RegisterSession(payload.SubAgentId, payload.SubAgentId);
+        SetObserverStatus(payload.SubAgentId, SubAgentObserverStatus.Running);
 
         if (convId is not null && agent.Conversations.GetValueOrDefault(convId) is { } conv)
         {
@@ -557,6 +757,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             sub.CompletedAt = payload.CompletedAt;
             sub.ResultSummary = payload.ResultSummary;
         }
+        SetObserverStatus(payload.SubAgentId, SubAgentObserverStatus.Completed);
 
         if (convId is not null && agent.Conversations.GetValueOrDefault(convId) is { } conv)
         {
@@ -580,6 +781,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             sub.CompletedAt = payload.CompletedAt;
             sub.ResultSummary = payload.ResultSummary;
         }
+        SetObserverStatus(payload.SubAgentId, SubAgentObserverStatus.Failed);
 
         if (convId is not null && agent.Conversations.GetValueOrDefault(convId) is { } conv)
         {
@@ -602,6 +804,7 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             sub.Status = "Killed";
             sub.CompletedAt = payload.CompletedAt;
         }
+        SetObserverStatus(payload.SubAgentId, SubAgentObserverStatus.Killed);
 
         if (convId is not null && agent.Conversations.GetValueOrDefault(convId) is { } conv)
         {
@@ -611,6 +814,12 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         }
 
         _store.NotifyChanged();
+    }
+
+    private void SetObserverStatus(string subAgentId, SubAgentObserverStatus status)
+    {
+        if (_store.GetAgent(subAgentId) is { IsObserverAgent: true } observer)
+            observer.ObserverStatus = status;
     }
 
     // ── Steering feedback ──────────────────────────────────────────────────
@@ -634,14 +843,17 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         if (agent is null)
         {
             // Fallback: find agent owning this session
-            agent = _store.Agents.Values.FirstOrDefault(a =>
-                a.ActiveConversationSessionId == payload.SessionId ||
-                a.SessionId == payload.SessionId);
+            agent = _store.Agents.Values.FirstOrDefault(candidate =>
+                candidate.Conversations.Values.Any(conversation =>
+                    string.Equals(conversation.ActiveSessionId, payload.SessionId, StringComparison.Ordinal))
+                || candidate.SessionId == payload.SessionId);
         }
 
         if (agent is null) return;
 
-        convId ??= agent.ActiveConversationId;
+        // #3212: steering feedback that names no conversation is DROPPED rather than attributed to
+        // the agent's ambient last-selected conversation, which could paint a "Steering injected"
+        // chip into a conversation that never asked for one.
         if (convId is null || !agent.Conversations.TryGetValue(convId, out var conv)) return;
 
         if (payload.Kind == SteeringFeedbackKind.Injected)
@@ -743,11 +955,15 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         foreach (var agent in _store.Agents.Values)
             agent.IsConnected = true;
 
+        SubscribeAllResult? subscribeResult = null;
+        var subscribeRevision = CaptureRunStateRevision();
         try
         {
-            var result = await _hub.SubscribeAllAsync();
-            foreach (var session in result.Sessions)
-                _store.RegisterSession(session.AgentId, session.SessionId, session.ChannelType, session.SessionType, session.ConversationId);
+            // Re-join the hub groups. Session roster loading remains REST-owned (#2541); the
+            // subscribe response contributes only the authoritative live-run snapshot.
+            var snapshotProvider = RunActivitySnapshotProvider ?? _hub.SubscribeAllAsync;
+            subscribeResult = await snapshotProvider(cancellationToken);
+            await _hub.SubscribeAgentsAsync([.. _store.Agents.Keys]);
         }
         catch (Exception ex)
         {
@@ -772,16 +988,32 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
                 agent.IsStreaming = false;
                 agent.ProcessingStage = null;
 
-                if (agent.ActiveConversationId is not null &&
-                    agent.Conversations.GetValueOrDefault(agent.ActiveConversationId) is { } conv)
+                // #3212: reconnect recovery repairs the pane the user is LOOKING AT, resolved from
+                // the route. For every other agent the stale stream state is already cleared above
+                // via IsStreaming/ProcessingStage; there is no rendered buffer to reconcile.
+                if (_displayed.DisplayedConversationIdFor(agentId) is { } displayedConvId &&
+                    agent.Conversations.GetValueOrDefault(displayedConvId) is { } conv)
                 {
-                    conv.StreamState.Reset();
+                    conv.StreamState.Reset("ReconnectRecovery");
                     // Force history reload so the UI fetches server-persisted state.
                     // HandleMessageEnd never committed the buffer to Messages (#759).
                     conv.HistoryLoaded = false;
                 }
             }
         }
+
+        // Apply the server snapshot AFTER clearing stale buffers. Otherwise this reconnect's
+        // legacy false-active repair would immediately overwrite an authoritative active result.
+        if (subscribeResult is not null)
+            TryApplyRunActivitySnapshot(subscribeResult.ActiveRuns, subscribeRevision);
+
+        // #2439: pending steering/follow-up entries are purely client-side optimism. After a
+        // reconnect the client cannot confirm whether the gateway still holds them, and there is
+        // no query that would tell it. A pending indicator that cannot be verified must not
+        // persist — fail toward clearing across every known conversation.
+        foreach (var agent in _store.Agents.Values)
+            foreach (var conversationId in agent.Conversations.Keys)
+                _store.ClearSteeringQueue(conversationId);
 
         _store.NotifyChanged();
     }
@@ -821,7 +1053,21 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
         return false;
     }
 
-    private string? ResolveConversationId(string agentId, AgentState agent, string? sessionId, string? conversationIdHint = null)
+    /// <summary>
+    /// Resolves the conversation an inbound event belongs to, using ONLY information the event
+    /// itself carries: the stamped conversation id, or the session-to-conversation binding.
+    /// </summary>
+    /// <remarks>
+    /// #3212 deleted the trailing <c>?? agent.ambient conversation state</c> attribution fallback that used
+    /// to close this method. That fallback attributed an event which named no conversation to
+    /// whichever conversation the agent happened to have selected last -- an arbitrary target that
+    /// could append another conversation's messages, tool cards and errors into the one on screen.
+    /// #3065 (closed) guarantees every conversation-scoped inbound event carries a conversation id,
+    /// so the fallback has no legitimate input left: an event that still cannot name its conversation
+    /// is a defect upstream and is now DROPPED (this returns null and every caller returns early)
+    /// rather than misattributed. Do not restore it.
+    /// </remarks>
+    private string? ResolveConversationId(string agentId, string? sessionId, string? conversationIdHint = null)
     {
         // PR1.5 (#682): SignalR stamps ConversationId on stream payloads so the client
         // does not need a session→conversation lookup at all. Prefer the hint when set;
@@ -830,7 +1076,8 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
             return conversationIdHint;
         if (_store.TryResolveConversationBySession(agentId, sessionId, out var convId))
             return convId;
-        return agent.ActiveConversationId;
+        // #3212: no ambient fallback. See the remarks above -- an unattributable event is dropped.
+        return null;
     }
 
     private string? ResolveSubAgentConversationId(string agentId, AgentState agent, SubAgentEventPayload payload)
@@ -935,6 +1182,8 @@ public sealed class GatewayEventHandler : IGatewayEventHandler, IDisposable
 
     public void Dispose()
     {
+        _lifetimeCancellation.Cancel();
+        _lifetimeCancellation.Dispose();
         _hub.OnConnected -= HandleConnected;
         _hub.OnRunStarted -= HandleRunStarted;
         _hub.OnMessageStart -= HandleMessageStart;

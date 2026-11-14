@@ -7,6 +7,7 @@ using BotNexus.Gateway.Abstractions.Agents;
 using BotNexus.Gateway.Abstractions.Models;
 using BotNexus.Agent.Providers.Core.Models;
 using BotNexus.Agent.Providers.Core.Registry;
+using BotNexus.Gateway.Configuration;
 
 namespace BotNexus.Gateway.Tools;
 
@@ -17,11 +18,15 @@ public sealed class UpdateAgentTool(
     IAgentRegistry agentRegistry,
     IAgentConfigurationWriter configurationWriter,
     IEnumerable<IAgentChangeNotifier> changeNotifiers,
-    ApiProviderRegistry? apiProviderRegistry = null,
-    ModelRegistry? modelRegistry = null) : IAgentTool
+    ModelRegistry? modelRegistry = null,
+    AgentId? callerAgentId = null,
+    AgentSummaryOptions? summaryOptions = null) : IAgentTool
 {
     public string Name => "update_agent";
     public string Label => "Update Agent";
+
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Returns a locally generated update confirmation.</summary>
+    public string ContentSource => ToolContentSource.Local;
 
     public Tool Definition => new(
         Name,
@@ -42,17 +47,21 @@ public sealed class UpdateAgentTool(
                   "type": "string",
                   "description": "New description."
                 },
+                "summary": {
+                  "type": "string",
+                  "description": "Agent-maintained summary of what you are currently doing. You may set this only on YOUR OWN agent id; setting it on another agent is refused. Pass an empty string to clear it."
+                },
                 "emoji": {
                   "type": "string",
                   "description": "New emoji."
                 },
                 "modelId": {
                   "type": "string",
-                  "description": "New LLM model identifier."
+                  "description": "New LLM model identifier. Must be registered for the agent's apiProvider. Persisted as 'model' in config.json."
                 },
                 "apiProvider": {
                   "type": "string",
-                  "description": "New API provider key."
+                  "description": "New provider instance key as registered in the model registry (e.g., 'github-copilot', 'anthropic') - NOT an API contract name such as 'github-copilot-messages'. Persisted as 'provider' in config.json."
                 },
                 "systemPrompt": {
                   "type": "string",
@@ -96,6 +105,10 @@ public sealed class UpdateAgentTool(
         if (string.IsNullOrWhiteSpace(id))
             return Error("Parameter 'id' is required.");
 
+        // #2136: reserved sub-agent archetype ids are not real named agents and cannot be updated.
+        if (BotNexus.Gateway.Agents.BuiltInArchetypes.IsReserved(id))
+            return Error($"Agent ID '{id}' is a reserved sub-agent archetype and cannot be updated as a named agent.");
+
         var agentId = AgentId.From(id);
         var existing = agentRegistry.Get(agentId);
         if (existing is null)
@@ -107,16 +120,43 @@ public sealed class UpdateAgentTool(
             updated = updated with { DisplayName = dn };
         if (arguments.ContainsKey("description"))
             updated = updated with { Description = ReadString(arguments, "description") };
+
+        // #3596: the summary is agent-owned, so writes are self-only. The check is a policy denial
+        // on the ARGUMENT, not on the whole call - every other field keeps its existing reach, and
+        // an unattributed caller (no caller id supplied, i.e. a non-agent host) cannot use this
+        // field to reach any agent at all.
+        if (arguments.ContainsKey("summary"))
+        {
+            if (callerAgentId is not { } caller
+                || !string.Equals(caller.Value, agentId.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                return Error(
+                    $"Policy denial: 'summary' may only be updated by the agent it belongs to. "
+                    + $"Caller '{callerAgentId?.Value ?? "(unattributed)"}' cannot write the summary of agent '{id}'.");
+            }
+
+            var rawSummary = ReadString(arguments, "summary");
+            var maxLength = summaryOptions?.MaxLength ?? AgentSummaryOptions.DefaultMaxLength;
+            if (rawSummary is not null && rawSummary.Length > maxLength)
+            {
+                // Refused, never truncated: a silently cut summary reads as a complete statement
+                // and the agent has no signal that its words were altered.
+                return Error(
+                    $"Summary is {rawSummary.Length} characters; the maximum is {maxLength}. "
+                    + "Shorten it and call again; it was not saved.");
+            }
+
+            // `with` (not in-place assignment) because `updated` may still alias the registry's
+            // live descriptor here, and #2065 requires persistence to succeed before any runtime
+            // state changes.
+            updated = updated with { Summary = string.IsNullOrWhiteSpace(rawSummary) ? null : rawSummary };
+        }
         if (arguments.ContainsKey("emoji"))
             updated = updated with { Emoji = ReadString(arguments, "emoji") };
         if (arguments.ContainsKey("modelId") && ReadString(arguments, "modelId") is { } mid)
             updated = updated with { ModelId = mid };
         if (arguments.ContainsKey("apiProvider") && ReadString(arguments, "apiProvider") is { } ap)
-        {
-            if (apiProviderRegistry is not null && apiProviderRegistry.Get(ap) is null)
-                return Error($"Unknown API provider '{ap}'. Available providers: {string.Join(", ", apiProviderRegistry.GetAll().Select(p => p.Api))}.");
             updated = updated with { ApiProvider = ap };
-        }
         if (arguments.ContainsKey("systemPrompt"))
             updated = updated with { SystemPrompt = ReadString(arguments, "systemPrompt") };
         if (arguments.ContainsKey("toolIds"))
@@ -132,14 +172,29 @@ public sealed class UpdateAgentTool(
             updated = updated with { ContextWindow = cw is > 0 ? cw : null };
         }
 
+        // #2649: the same shared preflight create_agent uses, applied to the MERGED descriptor so a
+        // provider-only or model-only edit that breaks the pair is caught too. One routine, two
+        // tools - they cannot drift into different notions of a valid provider.
+        if (BotNexus.Gateway.Agents.AgentModelPreflight.ValidateResolvable(updated, modelRegistry) is { } preflightError)
+            return Error(preflightError);
+
         // #1705: validate the resulting thinking/context defaults against the (possibly newly
         // selected) model before persisting; reject unsupported combinations.
         var capabilityErrors = BotNexus.Gateway.Agents.AgentDescriptorValidator.ValidateModelCapabilities(updated, modelRegistry);
         if (capabilityErrors.Count > 0)
             return Error(string.Join(" ", capabilityErrors));
 
+        // #2065: persist the candidate config BEFORE mutating the runtime registry so a disk
+        // failure cannot leave runtime state inconsistent with config.json.
+        try
+        {
+            await configurationWriter.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return Error($"Failed to persist agent configuration; agent was not updated: {ex.Message}");
+        }
         agentRegistry.Update(agentId, updated);
-        await configurationWriter.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
 
         foreach (var notifier in changeNotifiers)
         {

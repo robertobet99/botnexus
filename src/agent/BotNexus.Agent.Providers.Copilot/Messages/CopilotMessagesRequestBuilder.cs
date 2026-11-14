@@ -46,7 +46,7 @@ internal static class CopilotMessagesRequestBuilder
                 new Dictionary<string, object?>
                 {
                     ["type"] = "text",
-                    ["text"] = UnicodeSanitizer.SanitizeSurrogates(systemPrompt),
+                    ["text"] = systemPrompt.SanitizeSurrogates(),
                     ["cache_control"] = cacheControl
                 }
             });
@@ -122,6 +122,12 @@ internal static class CopilotMessagesRequestBuilder
 
         if (options?.Temperature.HasValue == true && copilotOpts?.ThinkingEnabled != true)
             body["temperature"] = options.Temperature.Value;
+
+        if (options?.ToolChoiceMode == BotNexus.Agent.Providers.Core.ToolChoice.None)
+        {
+            body.Remove("tools");
+            body["tool_choice"] = new JsonObject { ["type"] = "none" };
+        }
 
         return body;
     }

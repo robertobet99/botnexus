@@ -3,14 +3,21 @@ namespace BotNexus.Cli.Services;
 /// <summary>
 /// Configuration options for starting a gateway process.
 /// </summary>
-/// <param name="ExecutablePath">Path to the dotnet executable or BotNexus.Gateway.Api.dll.</param>
+/// <param name="ExecutablePath">Path to the gateway launch target. Prefer the native apphost executable
+/// (BotNexus.Gateway.Api.exe) so the gateway has a distinct process name; the CLI falls back to the
+/// dotnet host with BotNexus.Gateway.Api.dll when no apphost is present. See <see cref="GatewayProcessManager"/>.</param>
 /// <param name="Arguments">Optional command-line arguments to pass to the gateway process.</param>
 /// <param name="Attached">If true, run in foreground for debugging; if false (default), run detached in a new console window.</param>
+/// <param name="HomePath">BotNexus home directory where the PID file is written.</param>
+/// <param name="HealthUrl">Effective gateway health endpoint. Callers should derive this from the requested listen URL.</param>
+/// <param name="ReadinessTimeout">Maximum cold-start readiness interval; defaults to 60 seconds.</param>
 public record GatewayStartOptions(
     string ExecutablePath,
     string? Arguments = null,
     bool Attached = false,
-    string? HomePath = null   // BotNexus home — PID file written here. Defaults to ~/.botnexus.
+    string? HomePath = null,
+    string? HealthUrl = null,
+    TimeSpan? ReadinessTimeout = null
 );
 
 /// <summary>
@@ -26,13 +33,39 @@ public record GatewayStartResult(
 );
 
 /// <summary>
+/// What a stop attempt actually observed. <see cref="GatewayStopResult.Success"/> alone cannot
+/// express this: "I killed a live gateway" and "I could not find one" were previously both
+/// <c>Success: true</c>, so callers rendered "Gateway stopped" for a no-op (issue #2772).
+/// </summary>
+public enum GatewayStopOutcome
+{
+    /// <summary>A gateway process was observed alive and then observed gone.</summary>
+    Stopped,
+
+    /// <summary>No gateway process could be found. Nothing was signalled.</summary>
+    NotRunning,
+
+    /// <summary>A gateway was found but could not be stopped.</summary>
+    Failed
+}
+
+/// <summary>
 /// Result of a gateway stop operation.
 /// </summary>
-/// <param name="Success">True if the gateway was stopped successfully.</param>
+/// <param name="Success">True when the gateway is not running as a result of this call - i.e.
+/// <see cref="GatewayStopOutcome.Stopped"/> or <see cref="GatewayStopOutcome.NotRunning"/>. It is
+/// deliberately NOT a synonym for "a process was killed"; use <paramref name="Outcome"/> for that.</param>
 /// <param name="Message">Diagnostic message describing the result.</param>
+/// <param name="Outcome">What was actually observed. Defaults to <see cref="GatewayStopOutcome.Stopped"/>
+/// only so existing two-argument construction keeps compiling; every production call site states it.</param>
+/// <param name="VerifiedGatewayBinaryPath">Live launch image observed before stopping, not the requested
+/// deployment or PID-file metadata. Null means the deployment identity could not be established;
+/// callers must not use this stop to authorize binary recovery.</param>
 public record GatewayStopResult(
     bool Success,
-    string? Message
+    string? Message,
+    GatewayStopOutcome Outcome = GatewayStopOutcome.Stopped,
+    string? VerifiedGatewayBinaryPath = null
 );
 
 /// <summary>

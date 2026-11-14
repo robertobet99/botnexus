@@ -1,0 +1,359 @@
+using System.CommandLine;
+using System.IO.Abstractions;
+using System.Text.Json.Nodes;
+using BotNexus.Cli;
+using BotNexus.Cli.Commands;
+using BotNexus.Gateway.Configuration;
+
+namespace BotNexus.Cli.Tests;
+
+public sealed class PersistentAgentWorkspaceReconcilerTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), "botnexus-doctor-agents-" + Guid.NewGuid().ToString("N"));
+
+    public PersistentAgentWorkspaceReconcilerTests() => Directory.CreateDirectory(_root);
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_root))
+            Directory.Delete(_root, true);
+    }
+
+    [Fact]
+    public void BuildPlan_ClassifiesRegisteredOrphanedMixedAndEmptyDirectories()
+    {
+        var agents = Path.Combine(_root, "agents");
+        Directory.CreateDirectory(Path.Combine(agents, "REGISTERED"));
+        Directory.CreateDirectory(Path.Combine(agents, "orphan"));
+        var config = new PlatformConfig
+        {
+            Agents = new(StringComparer.OrdinalIgnoreCase)
+            {
+                [" registered "] = new(),
+                ["disabled"] = new() { Enabled = false },
+                ["defaults"] = new()
+            }
+        };
+
+        var plan = new PersistentAgentWorkspaceReconciler().BuildPlan(agents, config);
+
+        plan.Count.ShouldBe(2);
+        plan.Single(x => x.DirectoryName == "REGISTERED").IsOrphaned.ShouldBeFalse();
+        plan.Single(x => x.DirectoryName == "orphan").IsOrphaned.ShouldBeTrue();
+        new PersistentAgentWorkspaceReconciler().BuildPlan(Path.Combine(_root, "missing"), config).ShouldBeEmpty();
+    }
+
+    [Theory]
+    [InlineData("doctor")]
+    [InlineData("doctor --cleanup-orphans")]
+    [InlineData("doctor agents")]
+    [InlineData("doctor agents --cleanup-orphans")]
+    public void Build_AcceptsBareAndDedicatedAgentCommandShapes(string commandLine)
+    {
+        var verbose = new Option<bool>("--verbose");
+        var target = new Option<string?>("--target");
+        var root = new RootCommand();
+        root.AddGlobalOption(verbose);
+        root.AddGlobalOption(target);
+        root.AddCommand(new DoctorCommand().Build(verbose, target));
+
+        root.Parse(commandLine).Errors.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void ResolveAgentsRoot_HonorsConfiguredDirectoryRelativeToTarget()
+    {
+        var configured = PersistentAgentWorkspaceReconciler.ResolveAgentsRoot(_root, "custom/agents");
+        configured.ShouldBe(Path.GetFullPath(Path.Combine(_root, "custom", "agents")));
+        PersistentAgentWorkspaceReconciler.ResolveAgentsRoot(_root, null).ShouldBe(Path.Combine(Path.GetFullPath(_root), "agents"));
+    }
+
+    [Fact]
+    public void DeleteOrphans_DeletesOnlyOrphansInsideRoot()
+    {
+        var agents = Path.Combine(_root, "agents");
+        var registered = Directory.CreateDirectory(Path.Combine(agents, "registered")).FullName;
+        var orphan = Directory.CreateDirectory(Path.Combine(agents, "orphan")).FullName;
+        var plan = new[]
+        {
+            new PersistentAgentWorkspaceEntry("registered", registered, false, false),
+            new PersistentAgentWorkspaceEntry("orphan", orphan, true, false)
+        };
+
+        new PersistentAgentWorkspaceReconciler().DeleteOrphans(agents, plan);
+
+        Directory.Exists(registered).ShouldBeTrue();
+        Directory.Exists(orphan).ShouldBeFalse();
+    }
+
+    [Fact]
+    public void DeleteOrphans_RejectsPathOutsideRoot()
+    {
+        var agents = Directory.CreateDirectory(Path.Combine(_root, "agents")).FullName;
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside")).FullName;
+        var plan = new[] { new PersistentAgentWorkspaceEntry("outside", outside, true, false) };
+        Should.Throw<InvalidOperationException>(() => new PersistentAgentWorkspaceReconciler().DeleteOrphans(agents, plan));
+        Directory.Exists(outside).ShouldBeTrue();
+    }
+
+    [Fact]
+    public void DeleteOrphans_RejectsNestedDirectoryEvenWhenItIsInsideRoot()
+    {
+        var agents = Directory.CreateDirectory(Path.Combine(_root, "agents")).FullName;
+        var nested = Directory.CreateDirectory(Path.Combine(agents, "registered", "nested")).FullName;
+        var plan = new[] { new PersistentAgentWorkspaceEntry("nested", nested, true, false) };
+
+        Should.Throw<InvalidOperationException>(() => new PersistentAgentWorkspaceReconciler().DeleteOrphans(agents, plan));
+
+        Directory.Exists(nested).ShouldBeTrue();
+    }
+
+    [Fact]
+    public void DeleteOrphans_RechecksReparsePointAtDeletionTime()
+    {
+        var agents = Directory.CreateDirectory(Path.Combine(_root, "agents")).FullName;
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside")).FullName;
+        var link = Path.Combine(agents, "orphan");
+        try { Directory.CreateSymbolicLink(link, outside); }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+        {
+            return;
+        }
+        var plan = new[] { new PersistentAgentWorkspaceEntry("orphan", link, true, false) };
+
+        Should.Throw<InvalidOperationException>(() => new PersistentAgentWorkspaceReconciler().DeleteOrphans(agents, plan));
+
+        Directory.Exists(outside).ShouldBeTrue();
+    }
+
+    [Fact]
+    public void DeleteOrphans_ValidatesEntireBatchBeforeDeletingAnything()
+    {
+        var agents = Directory.CreateDirectory(Path.Combine(_root, "agents")).FullName;
+        var safeOrphan = Directory.CreateDirectory(Path.Combine(agents, "a-safe-orphan")).FullName;
+        var unsafeOrphan = Directory.CreateDirectory(Path.Combine(agents, "z-unsafe-orphan")).FullName;
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside")).FullName;
+        var link = Path.Combine(unsafeOrphan, "nested-link");
+        try { Directory.CreateSymbolicLink(link, outside); }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+        {
+            return;
+        }
+
+        var plan = new[]
+        {
+            new PersistentAgentWorkspaceEntry("a-safe-orphan", safeOrphan, true, false),
+            new PersistentAgentWorkspaceEntry("z-unsafe-orphan", unsafeOrphan, true, false)
+        };
+
+        Should.Throw<InvalidOperationException>(() => new PersistentAgentWorkspaceReconciler().DeleteOrphans(agents, plan));
+
+        Directory.Exists(safeOrphan).ShouldBeTrue();
+        Directory.Exists(unsafeOrphan).ShouldBeTrue();
+        Directory.Exists(outside).ShouldBeTrue();
+    }
+
+    [Fact]
+    public void BuildPlan_MarksReparsePointAsUnsafe()
+    {
+        var agents = Directory.CreateDirectory(Path.Combine(_root, "agents")).FullName;
+        var outside = Directory.CreateDirectory(Path.Combine(_root, "outside")).FullName;
+        var link = Path.Combine(agents, "linked-orphan");
+        try { Directory.CreateSymbolicLink(link, outside); }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+        {
+            return;
+        }
+
+        var entry = new PersistentAgentWorkspaceReconciler().BuildPlan(agents, new PlatformConfig()).Single();
+        entry.IsOrphaned.ShouldBeTrue();
+        entry.IsUnsafeLink.ShouldBeTrue();
+        Should.Throw<InvalidOperationException>(() => new PersistentAgentWorkspaceReconciler().DeleteOrphans(agents, [entry]));
+    }
+
+    [Fact]
+    public void BuildPlan_ReportsSizeAndNewestContentTimestampForEachDirectory()
+    {
+        var agents = Path.Combine(_root, "agents");
+        var orphan = Directory.CreateDirectory(Path.Combine(agents, "orphan", "data")).FullName;
+        File.WriteAllText(Path.Combine(orphan, "memory.sqlite"), new string('x', 2048));
+        var newest = new DateTime(2026, 7, 5, 12, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(Path.Combine(orphan, "memory.sqlite"), newest);
+
+        var entry = new PersistentAgentWorkspaceReconciler().BuildPlan(agents, new PlatformConfig()).Single();
+
+        entry.SizeBytes.ShouldBe(2048);
+        entry.NewestContentUtc.ShouldBe(newest);
+    }
+
+    [Fact]
+    public void DeleteOrphans_RefusesDirectoryWhoseIdIsRegisteredEvenIfMarkedOrphaned()
+    {
+        var agents = Directory.CreateDirectory(Path.Combine(_root, "agents")).FullName;
+        var registered = Directory.CreateDirectory(Path.Combine(agents, "keeper")).FullName;
+        var config = new PlatformConfig
+        {
+            Agents = new(StringComparer.OrdinalIgnoreCase) { ["keeper"] = new() }
+        };
+
+        // The caller has mis-classified a REGISTERED agent as an orphan. Deletion is irreversible,
+        // so the reconciler must re-derive registration itself rather than trust the flag.
+        var plan = new[] { new PersistentAgentWorkspaceEntry("keeper", registered, true, false, 0, null) };
+
+        Should.Throw<InvalidOperationException>(
+            () => new PersistentAgentWorkspaceReconciler().DeleteOrphans(agents, plan, config));
+
+        Directory.Exists(registered).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task ExecuteAgentsAsync_NonInteractiveDoesNotDeleteWithoutOptIn()
+    {
+        var agents = Path.Combine(_root, "agents");
+        var orphan = Directory.CreateDirectory(Path.Combine(agents, "orphan")).FullName;
+        await File.WriteAllTextAsync(Path.Combine(_root, "config.json"), "{}");
+
+        var result = await new DoctorCommand().ExecuteAgentsAsync(_root, false, false, CancellationToken.None);
+
+        result.ShouldBe(1);
+        Directory.Exists(orphan).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task ExecuteAgentsAsync_InteractiveDeclineDoesNotDelete()
+    {
+        var orphan = Directory.CreateDirectory(Path.Combine(_root, "agents", "orphan")).FullName;
+        await File.WriteAllTextAsync(Path.Combine(_root, "config.json"), "{}");
+
+        var result = await new DoctorCommand().ExecuteAgentsAsync(_root, false, true, CancellationToken.None, _ => false);
+
+        result.ShouldBe(1);
+        Directory.Exists(orphan).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task ExecuteAgentsAsync_ExplicitCleanupDeletesOrphanFromConfiguredRoot()
+    {
+        var custom = Path.Combine(_root, "custom-agents");
+        var orphan = Directory.CreateDirectory(Path.Combine(custom, "orphan")).FullName;
+        await File.WriteAllTextAsync(Path.Combine(_root, "config.json"), "{\"gateway\":{\"agentsDirectory\":\"custom-agents\"}}");
+
+        var result = await new DoctorCommand().ExecuteAgentsAsync(_root, true, false, CancellationToken.None);
+
+        result.ShouldBe(0);
+        Directory.Exists(orphan).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task ExecuteAgentsAsync_InteractiveApproveDeletesOrphan()
+    {
+        var orphan = Directory.CreateDirectory(Path.Combine(_root, "agents", "orphan")).FullName;
+        await File.WriteAllTextAsync(Path.Combine(_root, "config.json"), "{}");
+
+        var result = await new DoctorCommand().ExecuteAgentsAsync(_root, false, true, CancellationToken.None, _ => true);
+
+        result.ShouldBe(0);
+        Directory.Exists(orphan).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task ExecuteAgentsAsync_RegisteredWorkspaceIsNeverDeleted()
+    {
+        var registered = Directory.CreateDirectory(Path.Combine(_root, "agents", "keeper")).FullName;
+        await File.WriteAllTextAsync(Path.Combine(_root, "config.json"), "{\"agents\":{\"keeper\":{}}}");
+
+        var result = await new DoctorCommand().ExecuteAgentsAsync(_root, true, false, CancellationToken.None);
+
+        result.ShouldBe(0);
+        Directory.Exists(registered).ShouldBeTrue();
+    }
+
+    /// <summary>
+    /// Regression for issue #3700: a disabled agent is still a declared agent, so its workspace must
+    /// survive cleanup. The genuinely absent agent in the same batch keeps the test non-vacuous - it
+    /// cannot pass by deleting nothing at all.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAgentsAsync_DisabledAgentWorkspaceSurvivesWhileAbsentAgentIsDeleted()
+    {
+        var disabled = Directory.CreateDirectory(Path.Combine(_root, "agents", "dormant")).FullName;
+        var absent = Directory.CreateDirectory(Path.Combine(_root, "agents", "gone")).FullName;
+        await File.WriteAllTextAsync(
+            Path.Combine(_root, "config.json"),
+            "{\"agents\":{\"dormant\":{\"enabled\":false}}}");
+
+        var result = await new DoctorCommand().ExecuteAgentsAsync(_root, true, false, CancellationToken.None);
+
+        result.ShouldBe(0);
+        Directory.Exists(disabled).ShouldBeTrue();
+        Directory.Exists(absent).ShouldBeFalse();
+    }
+
+    /// <summary>
+    /// The command must reconcile against effective configuration, not just config.json. A
+    /// store-only disabled declaration protects its workspace while a genuinely absent workspace in
+    /// the same batch is deleted. The prompt names that effective authority.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAgentsAsync_StoreOnlyDisabledAgentSurvivesWhileAbsentAgentIsDeleted()
+    {
+        var disabled = Directory.CreateDirectory(Path.Combine(_root, "agents", "dormant")).FullName;
+        var absent = Directory.CreateDirectory(Path.Combine(_root, "agents", "gone")).FullName;
+        var configPath = Path.Combine(_root, "config.json");
+        var fileSystem = new FileSystem();
+        var storePath = ConfigStoreBootstrap.ResolveStorePath(configPath, fileSystem);
+        await ConfigStoreBootstrap.PopulateAsync(
+            storePath,
+            JsonNode.Parse("""{"agents":{"dormant":{"enabled":false}}}""")!.AsObject());
+
+        string? prompt = null;
+        try
+        {
+            var result = await new DoctorCommand().ExecuteAgentsAsync(
+                _root,
+                cleanupOrphans: false,
+                interactive: true,
+                CancellationToken.None,
+                message =>
+                {
+                    prompt = message;
+                    return true;
+                });
+
+            result.ShouldBe(0);
+            Directory.Exists(disabled).ShouldBeTrue();
+            Directory.Exists(absent).ShouldBeFalse();
+            var observedPrompt = prompt.ShouldNotBeNull();
+            observedPrompt.ShouldContain("effective agent configuration");
+            observedPrompt.ShouldNotContain("config.json");
+        }
+        finally
+        {
+            ConfigStoreBootstrap.ReleaseConnections(storePath);
+        }
+    }
+
+    /// <summary>
+    /// Issue #3700 at the classification layer: orphaned means "absent from effective agent
+    /// configuration", not "not currently enabled".
+    /// </summary>
+    [Fact]
+    public void BuildPlan_TreatsDisabledAgentAsRegisteredAndAbsentAgentAsOrphaned()
+    {
+        var agents = Path.Combine(_root, "agents");
+        Directory.CreateDirectory(Path.Combine(agents, "dormant"));
+        Directory.CreateDirectory(Path.Combine(agents, "gone"));
+        var config = new PlatformConfig
+        {
+            Agents = new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["dormant"] = new() { Enabled = false }
+            }
+        };
+
+        var plan = new PersistentAgentWorkspaceReconciler().BuildPlan(agents, config);
+
+        plan.Single(x => x.DirectoryName == "dormant").IsOrphaned.ShouldBeFalse();
+        plan.Single(x => x.DirectoryName == "gone").IsOrphaned.ShouldBeTrue();
+    }
+}

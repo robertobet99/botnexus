@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using BotNexus.Agent.Core.ExtensionPoints.RunCompletion;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core.Models;
@@ -18,8 +19,9 @@ namespace BotNexus.Gateway.Tools;
 /// persisted on the conversation row (<see cref="Conversation.TodoJson"/>, added in step 1),
 /// not as free-text prose. This is the structural complement to the <c>&lt;tool_use&gt;</c>
 /// anti-narration trip-wire (#1463): narration cannot flip a checkbox; only a real tool result can.
-/// The model's job each turn becomes "advance ONE item from <c>[ ]</c> to <c>[x]</c>", and step 4
-/// couples a <c>done</c> transition to a same-turn accomplishing tool result so it has teeth.
+/// The list is a working plan, not a per-turn budget - an agent advances as many items as it can in a
+/// turn and revises the list as it learns - and step 4 couples a <c>done</c> transition to a same-turn
+/// accomplishing tool result so the anti-fabrication rule has teeth.
 /// </remarks>
 public sealed class TodoTool(
     ConversationId? conversationId,
@@ -86,13 +88,22 @@ public sealed class TodoTool(
     public string Name => "todo";
     public string Label => "Todo";
 
+    /// <summary>Content source classification for turn-taint accumulation (#2519). The agent's own checklist state.</summary>
+    public string ContentSource => ToolContentSource.Local;
+
     public Tool Definition => new(
         Name,
-        "Manage a per-conversation todo list so a multi-step plan lives as structured, persisted state rather than prose. "
-        + "Use action='write' to replace the whole list, 'update' to change one item by id (text and/or status), "
-        + "'list' to read the current items, and 'clear' to empty it. Item status is one of pending|in_progress|done|cancelled. "
-        + "A todo item is only legitimately marked 'done' when the work was actually accomplished by a tool result this turn -- "
-        + "narration does not flip a checkbox. The list persists on the conversation across sessions and survives compaction.",
+        "Manage a per-conversation execution checklist the agent keeps for itself to track what it is doing across "
+        + "a loop or set of loops, so it does not lose track of the outcome, the remaining steps, or its interactions with the user. "
+        + "Use it to break the current request into detailed, resumable steps for sequencing, checkpoints, retries, "
+        + "validation, deployment, and handoff. The checklist survives context compaction, interruption, and session continuation. "
+        + "This is the agent's own working memory of its plan, not a durable or user-facing task system of record. "
+        + "If the user tracks work in an external system (for example a task manager, issue tracker, or work-item system), that system "
+        + "remains the source of truth for ownership, priority, due dates, and cross-session reporting; one such item may map to many todo items. "
+        + "Do not substitute this list for that durable, assigned, or user-visible work, and do not push every implementation step back into an external system unless it independently needs long-term tracking there. "
+        + "Use action='write' to replace the whole list, 'update' to change one item by id, 'list' to read it, and 'clear' to empty it. "
+        + "Status is pending|in_progress|done|cancelled. "
+        + "Mark an item done only after the corresponding work is verified by a tool result this turn; narration does not flip a checkbox.",
         ToolSchema);
 
     public Task<IReadOnlyDictionary<string, object?>> PrepareArgumentsAsync(
@@ -173,7 +184,10 @@ public sealed class TodoTool(
             });
         }
 
-        await SaveListAsync(conversation, items, cancellationToken).ConfigureAwait(false);
+        // 'write' replaces the whole list, so the desired items do not depend on prior todo state.
+        // The recompute delegate still receives the fresh aggregate so a retry rebases onto whatever
+        // else a concurrent writer committed (#2131).
+        await SaveListAsync(conversation, _ => items, cancellationToken).ConfigureAwait(false);
         return Text($"Todo list set with {items.Count} item(s).\n{Render(items)}");
     }
 
@@ -208,7 +222,8 @@ public sealed class TodoTool(
                 CreatedAt = now,
                 UpdatedAt = now,
             });
-            await SaveListAsync(conversation, items, cancellationToken).ConfigureAwait(false);
+            await SaveListAsync(conversation, source => AppendItem(source, id, newText, newStatusRaw, now), cancellationToken)
+                .ConfigureAwait(false);
             return Text($"Appended new todo item '{id}'.\n{Render(items)}");
         }
 
@@ -218,7 +233,8 @@ public sealed class TodoTool(
             existing.Status = NormalizeStatus(newStatusRaw);
         existing.UpdatedAt = now;
 
-        await SaveListAsync(conversation, items, cancellationToken).ConfigureAwait(false);
+        await SaveListAsync(conversation, source => ApplyUpdate(source, id, newText, newStatusRaw, now), cancellationToken)
+            .ConfigureAwait(false);
         return Text($"Updated todo item '{id}'.\n{Render(items)}");
     }
 
@@ -242,20 +258,76 @@ public sealed class TodoTool(
         if (conversation is null)
             return Text("Conversation not found.");
 
-        await SaveListAsync(conversation, [], cancellationToken).ConfigureAwait(false);
+        await SaveListAsync(conversation, _ => [], cancellationToken).ConfigureAwait(false);
         return Text("Todo list cleared.");
     }
 
-    private async Task SaveListAsync(Conversation conversation, IReadOnlyList<TodoItem> items, CancellationToken cancellationToken)
+    /// <summary>
+    /// Re-applies the caller's 'update' intent to whatever todo list is currently committed. Used as
+    /// the recompute delegate so a concurrency retry re-derives the item set from fresh state rather
+    /// than replaying the snapshot the tool originally read (#2131).
+    /// </summary>
+    private static List<TodoItem> ApplyUpdate(Conversation source, string id, string? newText, string? newStatusRaw, DateTimeOffset now)
     {
-        var json = items.Count == 0
-            ? null
-            : JsonSerializer.Serialize(new TodoDocument { Items = [.. items] }, TodoJsonOptions);
+        var items = Parse(source.TodoJson);
+        var existing = items.FirstOrDefault(i => string.Equals(i.Id, id, StringComparison.Ordinal));
+        if (existing is null)
+            return AppendItem(source, id, newText, newStatusRaw, now);
 
-        // Persist via SaveAsync, which holds the store's per-conversation write lock -- the existing
-        // write protection. Use a record `with` so the cached/loaded instance is not mutated in place.
-        var updated = conversation with { TodoJson = json };
-        await _conversationStore!.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+        if (!string.IsNullOrEmpty(newText))
+            existing.Text = newText;
+        if (!string.IsNullOrWhiteSpace(newStatusRaw))
+            existing.Status = NormalizeStatus(newStatusRaw);
+        existing.UpdatedAt = now;
+        return items;
+    }
+
+    /// <summary>
+    /// Re-applies the caller's 'append a new item' intent onto the currently committed todo list.
+    /// </summary>
+    private static List<TodoItem> AppendItem(Conversation source, string id, string? newText, string? newStatusRaw, DateTimeOffset now)
+    {
+        var items = Parse(source.TodoJson);
+        if (items.Any(i => string.Equals(i.Id, id, StringComparison.Ordinal)))
+            return ApplyUpdate(source, id, newText, newStatusRaw, now);
+
+        items.Add(new TodoItem
+        {
+            Id = id,
+            Text = newText ?? string.Empty,
+            Status = NormalizeStatus(newStatusRaw),
+            CreatedAt = now,
+            UpdatedAt = now,
+        });
+        return items;
+    }
+
+    private async Task SaveListAsync(
+        Conversation conversation,
+        Func<Conversation, IReadOnlyList<TodoItem>> recompute,
+        CancellationToken cancellationToken)
+    {
+        string? json = null;
+
+        // Persist via SaveAsync, which holds the store's per-conversation write lock. Since #2471
+        // that save is also compare-and-swap guarded, so it can lose a race with a concurrent
+        // narrow write (a pin, a canvas key). Route through the shared bounded retry helper, which
+        // re-reads and re-runs `recompute` against the FRESH aggregate -- replaying the stale one
+        // would clobber the other writer's columns. Use a record `with` so the cached/loaded
+        // instance is never mutated in place.
+        _ = await ConversationSaveRetry.SaveWithRetryAsync(
+            _conversationStore!,
+            _conversationId!.Value,
+            conversation,
+            source =>
+            {
+                var items = recompute(source);
+                json = items.Count == 0
+                    ? null
+                    : JsonSerializer.Serialize(new TodoDocument { Items = [.. items] }, TodoJsonOptions);
+                return source with { TodoJson = json };
+            },
+            cancellationToken).ConfigureAwait(false);
 
         // Fan the change out to live transports (e.g. the portal Todo panel) after the write commits.
         // Best-effort: a broadcast failure must not fail the tool call. Mirrors the canvas notify path.
@@ -294,6 +366,39 @@ public sealed class TodoTool(
             // Tolerate a corrupt/legacy payload rather than throwing on a hot tool path.
             return [];
         }
+    }
+
+    /// <summary>
+    /// Evaluates persisted checklist state at the authoritative run-finalization boundary.
+    /// A pending ask-user record is the only stop disposition this storage model can prove today;
+    /// free-text assistant claims never park the run.
+    /// </summary>
+    internal static RunCompletionDecision EvaluateRunCompletion(Conversation? conversation)
+    {
+        if (conversation is null)
+            return RunCompletionDecision.Completed;
+
+        var openItemIds = Parse(conversation.TodoJson)
+            .Where(item => item.Status is "pending" or "in_progress")
+            .Select(item => item.Id)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToList();
+        if (openItemIds.Count == 0)
+            return RunCompletionDecision.Completed;
+
+        if (!string.IsNullOrWhiteSpace(conversation.PendingAskUserJson))
+        {
+            return RunCompletionDecision.Parked(
+                RunStopReason.UserInput,
+                openItemIds,
+                "A pending ask_user request is persisted on the conversation.",
+                "user",
+                "the pending ask_user request receives a response");
+        }
+
+        return RunCompletionDecision.Continue(
+            openItemIds,
+            "The current conversation has pending or in-progress execution-checklist items and no structured stop disposition.");
     }
 
     private static string NormalizeStatus(string? status)

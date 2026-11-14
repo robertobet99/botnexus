@@ -1,7 +1,12 @@
 using System.Reflection;
+using BotNexus.Agent.Providers.Core;
+using BotNexus.Agent.Providers.Core.Models;
+using BotNexus.Gateway.Abstractions.Providers;
 using BotNexus.Gateway.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using NSubstitute;
+using System.IO.Abstractions;
 using System.IO.Abstractions.TestingHelpers;
 
 namespace BotNexus.Gateway.Tests;
@@ -165,6 +170,257 @@ public sealed class GatewayAuthManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task NamedProviderAuthReference_ResolvesCredentialAndEndpointFromSameProfile()
+    {
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, """
+                                             {
+                                               "copilot-work-auth": {
+                                                 "type": "token",
+                                                 "refresh": "unused",
+                                                 "access": "work-access-key",
+                                                 "expires": 4102444800000,
+                                                 "endpoint": "https://api.enterprise.githubcopilot.com"
+                                               }
+                                             }
+                                             """);
+        var manager = CreateManager(new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["copilot-work"] = new()
+                {
+                    Type = "github-copilot",
+                    ApiKey = "auth:copilot-work-auth"
+                }
+            }
+        });
+
+        (await manager.GetApiKeyAsync("copilot-work")).ShouldBe("work-access-key");
+        manager.GetApiEndpoint("copilot-work").ShouldBe("https://api.enterprise.githubcopilot.com");
+    }
+
+    [Theory]
+    [InlineData("auth:")]
+    [InlineData("auth:   ")]
+    [InlineData("auth:missing-entry")]
+    public async Task GetApiKeyAsync_WhenDeclaredAuthReferenceCannotResolve_DoesNotAdmitAmbientCredential(
+        string declaredReference)
+    {
+        SetEnvironmentVariable("OPENAI_API_KEY", "ambient-openai-key");
+        var manager = CreateManager(new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["openai"] = new()
+                {
+                    ApiKey = declaredReference
+                }
+            }
+        });
+
+        var apiKey = await manager.GetApiKeyAsync("openai");
+
+        apiKey.ShouldBe(string.Empty);
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenDeclaredAuthReferenceHasEmptyAccess_DoesNotAdmitAmbientCredential()
+    {
+        SetEnvironmentVariable("OPENAI_API_KEY", "ambient-openai-key");
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, """
+                                             {
+                                               "declared-entry": {
+                                                 "type": "token",
+                                                 "refresh": "unused",
+                                                 "access": "",
+                                                 "expires": 4102444800000,
+                                                 "endpoint": "https://provider.test"
+                                               }
+                                             }
+                                             """);
+        var manager = CreateManager(new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["openai"] = new()
+                {
+                    ApiKey = "auth:declared-entry"
+                }
+            }
+        });
+
+        var apiKey = await manager.GetApiKeyAsync("openai");
+
+        apiKey.ShouldBe(string.Empty);
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenDeclaredAuthReferenceRefreshFails_ReportsFaultWithoutAmbientFallback()
+    {
+        SetEnvironmentVariable("OPENAI_API_KEY", "ambient-openai-key");
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, """
+                                             {
+                                               "declared-entry": {
+                                                 "type": "oauth",
+                                                 "refresh": "refresh-token",
+                                                 "access": "stale-access",
+                                                 "expires": 1,
+                                                 "endpoint": "https://provider.test"
+                                               }
+                                             }
+                                             """);
+        var observer = new CapturingObserver();
+        var manager = CreateManager(
+            new PlatformConfig
+            {
+                Providers = new Dictionary<string, ProviderConfig>
+                {
+                    ["openai"] = new()
+                    {
+                        ApiKey = "auth:declared-entry"
+                    }
+                }
+            },
+            healthObserver: observer,
+            refreshEntry: (_, _) => throw new HttpRequestException("refresh failed"));
+
+        var apiKey = await manager.GetApiKeyAsync("openai");
+
+        apiKey.ShouldBe(string.Empty);
+        var record = observer.Records.ShouldHaveSingleItem();
+        record.Provider.ShouldBe("declared-entry");
+        record.Outcome.Status.ShouldBe(ProviderCredentialStatus.RefreshFailed);
+    }
+
+    [Fact]
+    public async Task CreateExecutionOptionsAsync_WhenDeclaredAuthReferenceCannotResolve_PreservesBlankSentinel()
+    {
+        SetEnvironmentVariable("OPENAI_API_KEY", "ambient-openai-key");
+        var manager = CreateManager(new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["openai"] = new()
+                {
+                    ApiKey = "auth:missing-entry"
+                }
+            }
+        });
+
+        var options = await manager.CreateExecutionOptionsAsync("openai");
+
+        options.ApiKey.ShouldBe(string.Empty);
+        ProviderCredentialResolver.Resolve("openai", options.ApiKey).Source.ShouldBe(CredentialSource.Declared);
+    }
+
+    [Fact]
+    public async Task CreateExecutionOptionsAsync_AppliesIdleTimeout_AndPreservesBaseOptions()
+    {
+        var manager = CreateManager(new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["openai"] = new() { ApiKey = "resolved-key", StreamIdleTimeoutMs = 12_345 }
+            }
+        });
+        var headers = new Dictionary<string, string> { ["x-test"] = "preserved" };
+        var baseOptions = new ProviderExecutionOptions
+        {
+            Headers = headers,
+            Transport = Transport.WebSocket,
+            MaxRetryDelayMs = 4321,
+            StreamSetupTimeoutMs = 9876
+        };
+
+        var options = await manager.CreateExecutionOptionsAsync("OPENAI", baseOptions);
+
+        options.ShouldNotBeSameAs(baseOptions);
+        options.ApiKey.ShouldBe("resolved-key");
+        options.StreamIdleTimeoutMs.ShouldBe(12_345);
+        options.Headers.ShouldBeSameAs(headers);
+        options.Transport.ShouldBe(Transport.WebSocket);
+        options.MaxRetryDelayMs.ShouldBe(4321);
+        options.StreamSetupTimeoutMs.ShouldBe(9876);
+    }
+
+    [Fact]
+    public async Task CreateExecutionOptionsAsync_ExplicitIdleTimeout_IsNotOverwritten()
+    {
+        var manager = CreateManager(new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["openai"] = new() { StreamIdleTimeoutMs = 12_345 }
+            }
+        });
+
+        var options = await manager.CreateExecutionOptionsAsync(
+            "openai",
+            new ProviderExecutionOptions { StreamIdleTimeoutMs = 0 });
+
+        options.StreamIdleTimeoutMs.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenDeclaredAuthReferenceRefreshIsCancelled_PropagatesCancellation()
+    {
+        await _fileSystem.File.WriteAllTextAsync(_authFilePath, """
+                                             {
+                                               "declared-entry": {
+                                                 "type": "oauth",
+                                                 "refresh": "refresh-token",
+                                                 "access": "stale-access",
+                                                 "expires": 1,
+                                                 "endpoint": "https://provider.test"
+                                               }
+                                             }
+                                             """);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var manager = CreateManager(
+            new PlatformConfig
+            {
+                Providers = new Dictionary<string, ProviderConfig>
+                {
+                    ["openai"] = new()
+                    {
+                        ApiKey = "auth:declared-entry"
+                    }
+                }
+            },
+            refreshEntry: (_, token) => Task.FromCanceled<GatewayAuthManager.AuthEntry>(token));
+
+        await Should.ThrowAsync<OperationCanceledException>(async () =>
+            await manager.GetApiKeyAsync("openai", cancellation.Token));
+    }
+
+    [Theory]
+    [InlineData("GH_TOKEN")]
+    [InlineData("GITHUB_TOKEN")]
+    public async Task GetApiKeyAsync_WhenCopilotAuthReferenceIsMissing_DoesNotAdmitGitHubAmbientCredential(
+        string ambientVariable)
+    {
+        SetEnvironmentVariable("COPILOT_GITHUB_TOKEN", null);
+        SetEnvironmentVariable("GH_TOKEN", null);
+        SetEnvironmentVariable("GITHUB_TOKEN", null);
+        SetEnvironmentVariable(ambientVariable, "ambient-github-key");
+        var manager = CreateManager(new PlatformConfig
+        {
+            Providers = new Dictionary<string, ProviderConfig>
+            {
+                ["github-copilot"] = new()
+                {
+                    ApiKey = "auth:missing-entry"
+                }
+            }
+        });
+
+        var apiKey = await manager.GetApiKeyAsync("github-copilot");
+
+        apiKey.ShouldBe(string.Empty);
+    }
+
+    [Fact]
     public async Task GetApiKeyAsync_WhenPlatformConfigUsesAuthCopilotPrefix_ResolvesGithubCopilotEntry()
     {
         SetEnvironmentVariable("OPENAI_API_KEY", null);
@@ -309,6 +565,213 @@ public sealed class GatewayAuthManagerTests : IDisposable
             .ShouldBe("https://api.githubcopilot.com/mcp");
     }
 
+    // ---- #3673: out-of-process credential rotation must be observed without a restart ----
+
+    private const string RotationTemplate = """
+                                            {
+                                              "openai": {
+                                                "type": "token",
+                                                "refresh": "unused",
+                                                "access": "TOKENVALUE",
+                                                "expires": 4102444800000,
+                                                "endpoint": "https://api.openai.test"
+                                              }
+                                            }
+                                            """;
+
+    private static string AuthJsonWithToken(string token) => RotationTemplate.Replace("TOKENVALUE", token);
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenAuthFileRewrittenOutOfProcess_ReturnsRotatedToken()
+    {
+        // The rotation case from #3673: `botnexus provider login` rewrites auth.json while the
+        // gateway is running. The cache used to latch on the first load, so the revoked token was
+        // served until a restart. Same manager instance throughout - no restart is simulated.
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("stale-token-aaa"));
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, new DateTime(2026, 8, 29, 15, 40, 0, DateTimeKind.Utc));
+
+        var manager = CreateManager(new PlatformConfig());
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("stale-token-aaa");
+
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("rotated-token-bbb"));
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, new DateTime(2026, 8, 29, 15, 47, 28, DateTimeKind.Utc));
+
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("rotated-token-bbb");
+    }
+
+    [Fact]
+    public void GetApiEndpoint_WhenAuthFileRewrittenOutOfProcess_ReturnsRotatedEndpoint()
+    {
+        // The endpoint override rides the same cache, so it must rotate too.
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("stale-token-aaa"));
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, new DateTime(2026, 8, 29, 15, 40, 0, DateTimeKind.Utc));
+
+        var manager = CreateManager(new PlatformConfig());
+        manager.GetApiEndpoint("openai").ShouldBe("https://api.openai.test");
+
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("stale-token-aaa").Replace("https://api.openai.test", "https://rotated.openai.test"));
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, new DateTime(2026, 8, 29, 15, 47, 28, DateTimeKind.Utc));
+
+        manager.GetApiEndpoint("openai").ShouldBe("https://rotated.openai.test");
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenAuthFileUnchanged_ReadsFileOnlyOnce()
+    {
+        // Acceptance criterion 6 requires the read count itself, rather than inferring it from
+        // unchanged returned content. The wrapper delegates storage and stat behavior to the real
+        // in-memory filesystem while counting only full auth-file reads.
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("first-token-aaaa"));
+        var frozenStamp = new DateTime(2026, 8, 29, 15, 40, 0, DateTimeKind.Utc);
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, frozenStamp);
+
+        var readCount = 0;
+        var countingFile = Substitute.For<IFile>();
+        countingFile.Exists(Arg.Any<string>())
+            .Returns(call => _fileSystem.File.Exists(call.Arg<string>()));
+        countingFile.ReadAllText(Arg.Any<string>())
+            .Returns(call =>
+            {
+                readCount++;
+                return _fileSystem.File.ReadAllText(call.Arg<string>());
+            });
+
+        var fileInfoFactory = Substitute.For<IFileInfoFactory>();
+        fileInfoFactory.New(Arg.Any<string>())
+            .Returns(call => _fileSystem.FileInfo.New(call.Arg<string>()));
+
+        var countingFileSystem = Substitute.For<IFileSystem>();
+        countingFileSystem.File.Returns(countingFile);
+        countingFileSystem.FileInfo.Returns(fileInfoFactory);
+
+        var manager = CreateManager(new PlatformConfig(), fileSystem: countingFileSystem);
+
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("first-token-aaaa");
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("first-token-aaaa");
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("first-token-aaaa");
+        readCount.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task InvalidateCache_WhenStatIsUnchanged_ForcesReread()
+    {
+        // The explicit seam a 401/403 handler uses: it must override the stat-based shortcut, so the
+        // stamp is deliberately held fixed here to prove invalidation - not mtime - did the work.
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("first-token-aaaa"));
+        var frozenStamp = new DateTime(2026, 8, 29, 15, 40, 0, DateTimeKind.Utc);
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, frozenStamp);
+
+        var manager = CreateManager(new PlatformConfig());
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("first-token-aaaa");
+
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("second-token-bbb"));
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, frozenStamp);
+
+        manager.InvalidateCache();
+
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("second-token-bbb");
+    }
+
+    [Fact]
+    public async Task GetApiKeyAsync_WhenAuthFileAppearsAfterFirstResolution_PicksItUp()
+    {
+        // A first-login-after-start rotation: the absent->present transition is a signature change
+        // too, so the freshly written credential must be visible without a restart.
+        SetEnvironmentVariable("OPENAI_API_KEY", null);
+        var manager = CreateManager(new PlatformConfig());
+        (await manager.GetApiKeyAsync("openai")).ShouldBeNull();
+
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("post-login-token"));
+
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("post-login-token");
+    }
+
+    [Fact]
+    public async Task InvokeWithAuthRetryAsync_WhenProviderReturns403_InvalidatesOnceAndRetriesOnce()
+    {
+        // Acceptance criterion 1 and 3. The stat is held FIXED across the rotation so that only an
+        // explicit invalidation can make the second attempt see the new credential - if the retry
+        // were relying on mtime granularity this test would hand it the stale token and fail.
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("stale-token-aaaa"));
+        var frozenStamp = new DateTime(2026, 8, 29, 15, 40, 0, DateTimeKind.Utc);
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, frozenStamp);
+        var manager = CreateManager(new PlatformConfig());
+
+        var keysSeen = new List<string?>();
+        var result = await manager.InvokeWithAuthRetryAsync(
+            "openai",
+            (apiKey, _) =>
+            {
+                keysSeen.Add(apiKey);
+                if (keysSeen.Count == 1)
+                {
+                    // The out-of-process rotation lands between the two attempts, with the file's
+                    // observable stat deliberately unchanged.
+                    _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("fresh-token-bbbb"));
+                    _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, frozenStamp);
+                    throw new ProviderAuthenticationException("forbidden", 403, "openai");
+                }
+
+                return Task.FromResult("ok");
+            });
+
+        result.ShouldBe("ok");
+        keysSeen.Count.ShouldBe(2);
+        keysSeen[0].ShouldBe("stale-token-aaaa");
+        keysSeen[1].ShouldBe("fresh-token-bbbb");
+    }
+
+    [Fact]
+    public async Task InvokeWithAuthRetryAsync_WhenProviderIsPersistently403_DoesNotLoop()
+    {
+        // Acceptance criteria 2 and 4: the retry is structural, not a policy, so a provider that
+        // never recovers is called exactly twice and the second failure surfaces unmodified.
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("stale-token-aaaa"));
+        var manager = CreateManager(new PlatformConfig());
+
+        var attempts = 0;
+        var failure = await Should.ThrowAsync<ProviderAuthenticationException>(async () =>
+            await manager.InvokeWithAuthRetryAsync<string>(
+                "openai",
+                (_, _) =>
+                {
+                    attempts++;
+                    throw new ProviderAuthenticationException($"forbidden #{attempts}", 403, "openai");
+                }));
+
+        attempts.ShouldBe(2);
+        // The SECOND failure is what reaches the caller - not a rethrow of the first, and not a
+        // wrapper that would hide the provider's own message.
+        failure.Message.ShouldBe("forbidden #2");
+    }
+
+    [Fact]
+    public async Task InvokeWithAuthRetryAsync_WhenProviderReturns500_DoesNotInvalidateOrRetry()
+    {
+        // Acceptance criterion 5. A non-auth fault must not spend an invalidation: proven by
+        // rotating the file behind a frozen stat and showing a later resolution still sees the
+        // stale value, which is only true if no invalidation happened.
+        _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("stale-token-aaaa"));
+        var frozenStamp = new DateTime(2026, 8, 29, 15, 40, 0, DateTimeKind.Utc);
+        _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, frozenStamp);
+        var manager = CreateManager(new PlatformConfig());
+
+        var attempts = 0;
+        await Should.ThrowAsync<HttpRequestException>(async () =>
+            await manager.InvokeWithAuthRetryAsync<string>(
+                "openai",
+                (_, _) =>
+                {
+                    attempts++;
+                    _fileSystem.File.WriteAllText(_authFilePath, AuthJsonWithToken("fresh-token-bbbb"));
+                    _fileSystem.File.SetLastWriteTimeUtc(_authFilePath, frozenStamp);
+                    throw new HttpRequestException("HTTP 500: upstream exploded");
+                }));
+
+        attempts.ShouldBe(1);
+        (await manager.GetApiKeyAsync("openai")).ShouldBe("stale-token-aaaa");
+    }
+
     public void Dispose()
     {
         foreach (var (name, value) in _originalEnvironmentVariables)
@@ -318,10 +781,27 @@ public sealed class GatewayAuthManagerTests : IDisposable
             _fileSystem.Directory.Delete(_rootPath, recursive: true);
     }
 
-    private GatewayAuthManager CreateManager(PlatformConfig platformConfig, bool usePrimaryAuthPath = true)
+    private GatewayAuthManager CreateManager(
+        PlatformConfig platformConfig,
+        bool usePrimaryAuthPath = true,
+        IProviderHealthObserver? healthObserver = null,
+        Func<GatewayAuthManager.AuthEntry, CancellationToken, Task<GatewayAuthManager.AuthEntry>>? refreshEntry = null,
+        IFileSystem? fileSystem = null)
     {
         var monitor = new StaticOptionsMonitor<PlatformConfig>(platformConfig);
-        var manager = new GatewayAuthManager(monitor, NullLogger<GatewayAuthManager>.Instance, _fileSystem);
+        var effectiveFileSystem = fileSystem ?? _fileSystem;
+        var manager = refreshEntry is null
+            ? new GatewayAuthManager(
+                monitor,
+                NullLogger<GatewayAuthManager>.Instance,
+                effectiveFileSystem,
+                healthObserver ?? NullProviderHealthObserver.Instance)
+            : new GatewayAuthManager(
+                monitor,
+                NullLogger<GatewayAuthManager>.Instance,
+                effectiveFileSystem,
+                healthObserver ?? NullProviderHealthObserver.Instance,
+                refreshEntry);
         var authPathField = typeof(GatewayAuthManager).GetField("_authFilePath", BindingFlags.NonPublic | BindingFlags.Instance);
         var legacyAuthPathField = typeof(GatewayAuthManager).GetField("_legacyAuthFilePath", BindingFlags.NonPublic | BindingFlags.Instance);
         authPathField.ShouldNotBeNull();
@@ -329,6 +809,20 @@ public sealed class GatewayAuthManagerTests : IDisposable
         authPathField!.SetValue(manager, usePrimaryAuthPath ? _authFilePath : Path.Combine(_rootPath, "missing-auth.json"));
         legacyAuthPathField!.SetValue(manager, _legacyAuthFilePath);
         return manager;
+    }
+
+    private sealed class CapturingObserver : IProviderHealthObserver
+    {
+        public List<(string Provider, ProviderCredentialOutcome Outcome)> Records { get; } = [];
+
+        public Task RecordAsync(
+            string providerId,
+            ProviderCredentialOutcome outcome,
+            CancellationToken cancellationToken = default)
+        {
+            Records.Add((providerId, outcome));
+            return Task.CompletedTask;
+        }
     }
 
     private void SetEnvironmentVariable(string name, string? value)

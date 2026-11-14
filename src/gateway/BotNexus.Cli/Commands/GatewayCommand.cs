@@ -11,10 +11,19 @@ namespace BotNexus.Cli.Commands;
 internal sealed class GatewayCommand
 {
     private readonly IGatewayProcessManager _processManager;
+    private readonly Func<IOsServiceManager?> _serviceManagerFactory;
 
     public GatewayCommand(IGatewayProcessManager processManager)
+        : this(processManager, OsServiceManagerFactory.Create)
+    {
+    }
+
+    internal GatewayCommand(
+        IGatewayProcessManager processManager,
+        Func<IOsServiceManager?> serviceManagerFactory)
     {
         _processManager = processManager;
+        _serviceManagerFactory = serviceManagerFactory;
     }
 
     public Command Build(Option<bool> verboseOption, Option<string?> targetOption)
@@ -49,13 +58,18 @@ internal sealed class GatewayCommand
         });
 
         // Stop command
-        var stopCommand = new Command("stop", "Stop the gateway process");
+        var stopCommand = new Command("stop", "Stop the gateway process")
+        {
+            sourceOption
+        };
         stopCommand.SetHandler(async context =>
         {
+            var source = context.ParseResult.GetValueForOption(sourceOption);
             var target = context.ParseResult.GetValueForOption(targetOption);
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
+            var repoRoot = CliPaths.ResolveSource(source);
             var home = CliPaths.ResolveTarget(target);
-            context.ExitCode = await StopAsync(home, verbose, context.GetCancellationToken());
+            context.ExitCode = await StopAsync(repoRoot, home, verbose, context.GetCancellationToken());
         });
 
         // Status command
@@ -107,11 +121,18 @@ internal sealed class GatewayCommand
             context.ExitCode = await InstallServiceAsync(repoRoot, home, port, verbose, context.GetCancellationToken());
         });
 
-        var uninstallCommand = new Command("uninstall", "Stop and remove the gateway OS service");
+        var uninstallCommand = new Command("uninstall", "Stop and remove the gateway OS service")
+        {
+            sourceOption
+        };
         uninstallCommand.SetHandler(async context =>
         {
+            var source = context.ParseResult.GetValueForOption(sourceOption);
+            var target = context.ParseResult.GetValueForOption(targetOption);
             var verbose = context.ParseResult.GetValueForOption(verboseOption);
-            context.ExitCode = await UninstallServiceAsync(verbose, context.GetCancellationToken());
+            var repoRoot = CliPaths.ResolveSource(source);
+            var home = CliPaths.ResolveTarget(target);
+            context.ExitCode = await UninstallServiceAsync(repoRoot, home, verbose, context.GetCancellationToken());
         });
 
         command.AddCommand(installCommand);
@@ -138,7 +159,7 @@ internal sealed class GatewayCommand
 
         if (!File.Exists(gatewayDll))
         {
-            AnsiConsole.MarkupLine($"[red]✗[/] Release build not found at: [dim]{Markup.Escape(gatewayDll)}[/]");
+            AnsiConsole.MarkupLine($"[red]✗[/] Release build not found at: [dim]{CliText.SafeDisplay(gatewayDll)}[/]");
             return 1;
         }
 
@@ -154,14 +175,17 @@ internal sealed class GatewayCommand
             AnsiConsole.WriteLine();
         }
 
-        ServeCommand.DeployExtensions(repoRoot, home, verbose);
+        await ServeCommand.ReconcileLifecycleAsync(repoRoot, home, verbose, cancellationToken, "gateway");
 
-        var gatewayUrl = $"http://localhost:{port}";
+        // The gateway binds gateway.listenUrl when one is configured, overriding the --urls
+        // argument below, so probe where it will actually listen rather than where we asked.
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(port, home);
         var options = new GatewayStartOptions(
             ExecutablePath: gatewayDll,
             Arguments: $"--urls \"{gatewayUrl}\" --environment Development",
             Attached: false,
-            HomePath: home
+            HomePath: home,
+            HealthUrl: $"{gatewayUrl}/health"
         );
 
         GatewayStartResult result;
@@ -193,8 +217,8 @@ internal sealed class GatewayCommand
             {
                 var content =
                     $"[green]✓[/] Running  [dim]PID:[/] [yellow]{result.Pid.Value}[/]\n\n" +
-                    $"[dim]URL:[/]   [green]{Markup.Escape(gatewayUrl)}[/]\n" +
-                    $"[dim]Logs:[/]  [dim]{Markup.Escape(logsPath)}[/]\n" +
+                    $"[dim]URL:[/]   [green]{CliText.SafeDisplay(gatewayUrl)}[/]\n" +
+                    $"[dim]Logs:[/]  [dim]{CliText.SafeDisplay(logsPath)}[/]\n" +
                     $"[dim]Stop:[/]  [dim]botnexus gateway stop[/]";
                 var panel = new Panel(content)
                 {
@@ -207,8 +231,8 @@ internal sealed class GatewayCommand
             else
             {
                 AnsiConsole.MarkupLine($"[green]✓[/] Gateway started (PID [yellow]{result.Pid.Value}[/])");
-                AnsiConsole.MarkupLine($"  URL:  [green]{Markup.Escape(gatewayUrl)}[/]");
-                AnsiConsole.MarkupLine($"  Logs: [dim]{Markup.Escape(logsPath)}[/]");
+                AnsiConsole.MarkupLine($"  URL:  [green]{CliText.SafeDisplay(gatewayUrl)}[/]");
+                AnsiConsole.MarkupLine($"  Logs: [dim]{CliText.SafeDisplay(logsPath)}[/]");
                 AnsiConsole.MarkupLine($"  Stop: [dim]botnexus gateway stop[/]");
             }
 
@@ -217,7 +241,7 @@ internal sealed class GatewayCommand
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]✗[/] Failed to start gateway: {Markup.Escape(result.Message ?? "Unknown error")}");
+            AnsiConsole.MarkupLine($"[red]✗[/] Failed to start gateway: {CliText.SafeDisplay(result.Message ?? "Unknown error")}");
             return 1;
         }
     }
@@ -235,7 +259,7 @@ internal sealed class GatewayCommand
 
         if (!File.Exists(gatewayDll))
         {
-            AnsiConsole.MarkupLine($"[red]✗[/] Release build not found at: [dim]{Markup.Escape(gatewayDll)}[/]");
+            AnsiConsole.MarkupLine($"[red]✗[/] Release build not found at: [dim]{CliText.SafeDisplay(gatewayDll)}[/]");
             return 1;
         }
 
@@ -257,16 +281,18 @@ internal sealed class GatewayCommand
             return 1;
         }
 
-        ServeCommand.DeployExtensions(repoRoot, home, verbose);
+        await ServeCommand.ReconcileLifecycleAsync(repoRoot, home, verbose, cancellationToken, "gateway");
 
-        var gatewayUrl = $"http://localhost:{port}";
+        // The gateway binds gateway.listenUrl when one is configured, overriding the --urls
+        // argument below, so probe where it will actually listen rather than where we asked.
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(port, home);
         var lastExitCode = 0;
 
         while (true)
         {
             AnsiConsole.WriteLine();
             AnsiConsole.Write(new Rule("[bold blue]BotNexus Gateway[/]") { Justification = Justify.Left });
-            AnsiConsole.MarkupLine($"  [dim]URL:[/]         [green]{Markup.Escape(gatewayUrl)}[/]");
+            AnsiConsole.MarkupLine($"  [dim]URL:[/]         [green]{CliText.SafeDisplay(gatewayUrl)}[/]");
             AnsiConsole.MarkupLine("  [dim]Environment:[/] Development");
             AnsiConsole.MarkupLine("  Press [yellow]Ctrl+C[/] to stop the gateway.");
             AnsiConsole.WriteLine();
@@ -285,8 +311,13 @@ internal sealed class GatewayCommand
             using var process = System.Diagnostics.Process.Start(psi)
                 ?? throw new InvalidOperationException("Failed to start Gateway process.");
 
-            await process.WaitForExitAsync(cancellationToken);
-            lastExitCode = process.ExitCode;
+            lastExitCode = await ForegroundGatewayLifecycle.WaitForExitAsync(
+                process,
+                _processManager,
+                home,
+                gatewayDll,
+                gatewayUrl,
+                cancellationToken);
 
             AnsiConsole.WriteLine();
             AnsiConsole.MarkupLine($"[dim]Gateway exited (code [yellow]{lastExitCode}[/]).[/]");
@@ -301,9 +332,16 @@ internal sealed class GatewayCommand
         return lastExitCode;
     }
 
-    private async Task<int> StopAsync(string home, bool verbose, CancellationToken cancellationToken)
+    internal static string ResolveGatewayBinaryPath(string repoRoot)
+        => Path.Combine(repoRoot, "src", "gateway", "BotNexus.Gateway.Api", "bin", "Release", "net10.0", "BotNexus.Gateway.Api.dll");
+
+    private async Task<int> StopAsync(string repoRoot, string home, bool verbose, CancellationToken cancellationToken)
     {
         var interactive = AnsiConsole.Profile.Capabilities.Interactive;
+        var gatewayBinary = ResolveGatewayBinaryPath(repoRoot);
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(
+            fallbackPort: 5005,
+            homePath: home);
         GatewayStopResult result;
 
         if (interactive)
@@ -314,30 +352,36 @@ internal sealed class GatewayCommand
                 .SpinnerStyle(Style.Parse("blue"))
                 .StartAsync("Stopping gateway...", async ctx =>
                 {
-                    capturedResult = await _processManager.StopAsync(home, cancellationToken);
+                    capturedResult = await _processManager.StopAsync(home, gatewayBinary, cancellationToken, gatewayUrl);
                 });
             result = capturedResult;
         }
         else
         {
-            result = await _processManager.StopAsync(home, cancellationToken);
+            result = await _processManager.StopAsync(home, gatewayBinary, cancellationToken, gatewayUrl);
         }
 
-        if (result.Success)
+        if (result.Outcome == GatewayStopOutcome.Stopped)
         {
-            AnsiConsole.MarkupLine($"[green]✓[/] {Markup.Escape(result.Message ?? "Gateway stopped")}");
+            AnsiConsole.MarkupLine($"[green]✓[/] {CliText.SafeDisplay(result.Message ?? "Gateway stopped")}");
             return 0;
         }
-        else
-        {
-            AnsiConsole.MarkupLine($"[red]✗[/] {Markup.Escape(result.Message ?? "Failed to stop gateway")}");
-            return 1;
-        }
+
+        var message = result.Message ?? (result.Outcome == GatewayStopOutcome.NotRunning
+            ? "No running gateway could be identified"
+            : "Failed to stop gateway");
+        AnsiConsole.MarkupLine($"[red]✗[/] {CliText.SafeDisplay(message)}");
+        return 1;
     }
 
     private async Task<int> StatusAsync(string home, bool verbose, CancellationToken cancellationToken)
     {
         var interactive = AnsiConsole.Profile.Capabilities.Interactive;
+        var repoRoot = CliPaths.ResolveSource(explicitSource: null);
+        var gatewayBinaryPath = ResolveGatewayBinaryPath(repoRoot);
+        var healthUrl = GatewayProbeUrlResolver.ResolveFromHome(
+            fallbackPort: 5005,
+            homePath: home) + "/health";
         GatewayStatus status;
 
         if (interactive)
@@ -348,13 +392,13 @@ internal sealed class GatewayCommand
                 .SpinnerStyle(Style.Parse("blue"))
                 .StartAsync("Checking gateway status...", async ctx =>
                 {
-                    capturedStatus = await _processManager.GetStatusAsync(home, cancellationToken);
+                    capturedStatus = await _processManager.GetStatusAsync(home, gatewayBinaryPath, healthUrl, cancellationToken);
                 });
             status = capturedStatus;
         }
         else
         {
-            status = await _processManager.GetStatusAsync(home, cancellationToken);
+            status = await _processManager.GetStatusAsync(home, gatewayBinaryPath, healthUrl, cancellationToken);
         }
 
         AnsiConsole.WriteLine();
@@ -425,7 +469,7 @@ internal sealed class GatewayCommand
                 {
                     AnsiConsole.MarkupLine("[dim]● Gateway is not running[/]");
                     if (verbose && !string.IsNullOrWhiteSpace(status.Message))
-                        AnsiConsole.MarkupLine($"  [dim]{Markup.Escape(status.Message)}[/]");
+                        AnsiConsole.MarkupLine($"  [dim]{CliText.SafeDisplay(status.Message)}[/]");
                 }
                 return 0;
 
@@ -433,7 +477,7 @@ internal sealed class GatewayCommand
             default:
                 AnsiConsole.MarkupLine($"[yellow]●[/] Gateway state is unknown");
                 if (!string.IsNullOrWhiteSpace(status.Message))
-                    AnsiConsole.MarkupLine($"  [dim]{Markup.Escape(status.Message)}[/]");
+                    AnsiConsole.MarkupLine($"  [dim]{CliText.SafeDisplay(status.Message)}[/]");
                 return 1;
         }
     }
@@ -441,6 +485,10 @@ internal sealed class GatewayCommand
     private async Task<int> RestartAsync(string repoRoot, string home, int port, bool verbose, CancellationToken cancellationToken)
     {
         var interactive = AnsiConsole.Profile.Capabilities.Interactive;
+        var gatewayBinary = ResolveGatewayBinaryPath(repoRoot);
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(
+            fallbackPort: port,
+            homePath: home);
 
         // Stop
         GatewayStopResult stopResult;
@@ -452,20 +500,29 @@ internal sealed class GatewayCommand
                 .SpinnerStyle(Style.Parse("blue"))
                 .StartAsync("Stopping gateway...", async ctx =>
                 {
-                    capturedStop = await _processManager.StopAsync(home, cancellationToken);
+                    capturedStop = await _processManager.StopAsync(home, gatewayBinary, cancellationToken, gatewayUrl);
                 });
             stopResult = capturedStop;
         }
         else
         {
             AnsiConsole.MarkupLine("[blue][[gateway]][/] Stopping gateway...");
-            stopResult = await _processManager.StopAsync(home, cancellationToken);
+            stopResult = await _processManager.StopAsync(home, gatewayBinary, cancellationToken, gatewayUrl);
         }
 
-        if (stopResult.Success)
+        if (stopResult.Outcome == GatewayStopOutcome.Stopped)
+        {
             AnsiConsole.MarkupLine("[green]✓[/] Gateway stopped");
+        }
+        else if (stopResult.Outcome == GatewayStopOutcome.NotRunning)
+        {
+            AnsiConsole.MarkupLine("[dim]○ Gateway is not running[/]");
+        }
         else
-            AnsiConsole.MarkupLine($"[yellow]⚠[/] Stop result: {Markup.Escape(stopResult.Message ?? "unknown")}");
+        {
+            AnsiConsole.MarkupLine($"[red]✗[/] Stop failed: {CliText.SafeDisplay(stopResult.Message ?? "unknown")}");
+            return 1;
+        }
 
         await Task.Delay(1000, cancellationToken);
 
@@ -498,50 +555,65 @@ internal sealed class GatewayCommand
         var gatewayDll = Path.Combine(repoRoot, "src", "gateway", "BotNexus.Gateway.Api", "bin", "Release", "net10.0", "BotNexus.Gateway.Api.dll");
         if (!File.Exists(gatewayDll))
         {
-            AnsiConsole.MarkupLine($"[red]\u2717[/] Release build not found at: [dim]{Markup.Escape(gatewayDll)}[/]");
+            AnsiConsole.MarkupLine($"[red]\u2717[/] Release build not found at: [dim]{CliText.SafeDisplay(gatewayDll)}[/]");
             AnsiConsole.MarkupLine("[dim]Run 'dotnet build -c Release' first.[/]");
             return 1;
         }
 
-        var result = await manager.InstallAsync(gatewayDll, home, port, cancellationToken);
+        var serviceExecutable = GatewayProcessManager.ResolveApphostPath(gatewayDll) ?? gatewayDll;
+        var result = await manager.InstallAsync(serviceExecutable, home, port, cancellationToken);
 
         if (result.Success)
         {
-            AnsiConsole.MarkupLine($"[green]\u2713[/] {Markup.Escape(result.Message)}");
+            AnsiConsole.MarkupLine($"[green]\u2713[/] {CliText.SafeDisplay(result.Message)}");
             if (verbose)
             {
                 AnsiConsole.MarkupLine($"  [dim]Manager:[/] {manager.ServiceManagerName}");
-                AnsiConsole.MarkupLine($"  [dim]Binary:[/]  {Markup.Escape(gatewayDll)}");
-                AnsiConsole.MarkupLine($"  [dim]Home:[/]    {Markup.Escape(home)}");
+                AnsiConsole.MarkupLine($"  [dim]Binary:[/]  {CliText.SafeDisplay(serviceExecutable)}");
+                AnsiConsole.MarkupLine($"  [dim]Home:[/]    {CliText.SafeDisplay(home)}");
                 AnsiConsole.MarkupLine($"  [dim]Port:[/]    {port}");
             }
             return 0;
         }
 
-        AnsiConsole.MarkupLine($"[red]\u2717[/] {Markup.Escape(result.Message)}");
+        AnsiConsole.MarkupLine($"[red]\u2717[/] {CliText.SafeDisplay(result.Message)}");
         return 1;
     }
 
-    private static async Task<int> UninstallServiceAsync(bool verbose, CancellationToken cancellationToken)
+    private async Task<int> UninstallServiceAsync(
+        string repoRoot,
+        string home,
+        bool verbose,
+        CancellationToken cancellationToken)
     {
-        var manager = OsServiceManagerFactory.Create();
+        var manager = _serviceManagerFactory();
         if (manager is null)
         {
             AnsiConsole.MarkupLine("[red]\u2717[/] OS service management is not supported on this platform.");
             return 1;
         }
 
-        AnsiConsole.MarkupLine($"[blue][[gateway]][/] Removing {manager.ServiceManagerName} service...");
+        var gatewayBinary = ResolveGatewayBinaryPath(repoRoot);
+        var gatewayUrl = GatewayProbeUrlResolver.ResolveFromHome(
+            fallbackPort: GatewayDefaults.ListenPort,
+            homePath: home);
 
-        var result = await manager.UninstallAsync(cancellationToken);
+        AnsiConsole.MarkupLine($"[blue][[gateway]][/] Stopping gateway before removing {manager.ServiceManagerName} service...");
+        var lifecycle = new GatewayServiceLifecycle(_processManager);
+        var result = await lifecycle.StopAndRemoveAsync(
+            manager,
+            home,
+            gatewayBinary,
+            gatewayUrl,
+            cancellationToken);
 
         if (result.Success)
         {
-            AnsiConsole.MarkupLine($"[green]\u2713[/] {Markup.Escape(result.Message)}");
+            AnsiConsole.MarkupLine($"[green]\u2713[/] {CliText.SafeDisplay(result.Message)}");
             return 0;
         }
 
-        AnsiConsole.MarkupLine($"[red]\u2717[/] {Markup.Escape(result.Message)}");
+        AnsiConsole.MarkupLine($"[red]\u2717[/] {CliText.SafeDisplay(result.Message)}");
         return 1;
     }
 }

@@ -16,6 +16,7 @@ The BotNexus platform uses **Serilog** for structured logging and **OpenTelemetr
 6. [Local Development Setup](#local-development-setup)
 7. [Adding New Spans](#adding-new-spans)
 8. [Troubleshooting](#troubleshooting)
+9. [Client Disconnects Are Not Errors](#client-disconnects-are-not-errors)
 
 ---
 
@@ -471,9 +472,126 @@ logger.LogInformation("Processing started");  // This log is correlated with the
 
 ---
 
+## Client Disconnects Are Not Errors
+
+A client going away mid-request is routine, not a server fault, and BotNexus keeps it out of the
+`ERR` channel so that channel stays worth reading. Two seams enforce this, one per transport:
+
+| Transport | Seam | Behaviour on client abort |
+|---|---|---|
+| HTTP | `RequestCancellationMiddleware` (#2387) | Absorbs the cancellation, logs at `Debug`, responds `499 Client Closed Request` |
+| SignalR hub | `ConnectionAbortHubFilter` (#3679) | Absorbs the cancellation, logs at `Debug`, returns no completion |
+
+Both seams thread the request/connection cancellation token all the way down to the store, which is
+deliberate — an abandoned client should not keep a SQLite read alive. What they change is only the
+*severity* of the resulting `OperationCanceledException`.
+
+**Neither seam is a blanket catch.** Each attributes the cancellation to the client only when the
+exception's own token matches the abort token, or when no other token was signalled at all. An
+internal timeout, a distinct linked token, or any non-cancellation exception is rethrown untouched
+and still surfaces at `Error` with its stack attached. That distinction is what keeps a genuine
+session-store outage visible: before #3679, a normal portal reconnect produced an `ERR` line
+byte-identical to a real `SqliteSessionStore` failure.
+
+`ConnectionAbortHubFilter` is registered as a **global** hub filter for `GatewayHub`, so every hub
+verb that passes `Context.ConnectionAborted` into a store call is covered by the one seam and no
+new verb has to remember to opt in.
+
+To see these events during diagnosis, drop the log level to `Debug`; the absorbed aborts are
+recorded, not discarded.
+
+---
+
 ## Further Reading
 
 - [OpenTelemetry .NET Documentation](https://opentelemetry.io/docs/instrumentation/net/)
 - [Serilog Documentation](https://github.com/serilog/serilog/wiki)
 - [Jaeger Getting Started](https://www.jaegertracing.io/docs/getting-started/)
 - [BotNexus Architecture](architecture/overview.md)
+
+## Provider HTTP Request/Response Auditing
+
+When a provider returns an unexpected response (empty content, refusal, or transport error),
+BotNexus can log the full HTTP-level exchange with each model provider (Anthropic, OpenAI,
+Copilot, and every adapter that flows through the shared provider `HttpClient`). This is
+implemented by `ProviderLoggingHandler`, a `DelegatingHandler` registered on the shared
+`"BotNexus"` typed `HttpClient` (see issue #453).
+
+### Enabling
+
+Auditing is **off by default**. Enable it with the gateway config flag:
+
+```json
+{
+  "Gateway": {
+    "EnableProviderRequestLogging": true
+  }
+}
+```
+
+or via the CLI:
+
+```bash
+botnexus config set gateway.enableProviderRequestLogging true
+```
+
+The handler also self-gates on `LogLevel.Debug`: even when the flag is on, nothing is emitted
+unless the `BotNexus.Agent.Providers.Core.Logging.ProviderLoggingHandler` category is at
+`Debug` (or lower). This keeps bodies out of `Info`-level production logs by construction.
+Raise the level the same way:
+
+```bash
+botnexus config set gateway.logLevel Debug
+```
+
+### Toggling on a running gateway
+
+Both settings take effect **at runtime — no restart required** (issue #3282). The handler is
+attached to the provider `HttpClient` unconditionally and re-reads
+`gateway.enableProviderRequestLogging` on every request, while `gateway.logLevel` drives a Serilog
+`LoggingLevelSwitch` that is updated from an `IOptionsMonitor<PlatformConfig>.OnChange`
+subscription. This makes capture-and-revert practical for live diagnosis, and lets an agent enable
+auditing to debug a provider problem without restarting the platform:
+
+```bash
+# capture
+botnexus config set gateway.enableProviderRequestLogging true
+botnexus config set gateway.logLevel Debug
+
+# ...reproduce the problem, then revert
+botnexus config set gateway.enableProviderRequestLogging false
+botnexus config set gateway.logLevel Information
+```
+
+Leave auditing off in normal operation: request bodies contain the full system prompt and tool
+schemas, so `Debug` capture is verbose and should be short-lived.
+
+### What is logged
+
+| Direction | Fields |
+|-----------|--------|
+| Outbound request | HTTP method, URL, headers (auth headers redacted by name), request body |
+| Inbound response (non-streamed) | Status code, elapsed ms, best-effort token `usage` object, response body |
+| Inbound response (streamed, `text/event-stream`) | Status code, headers, elapsed ms only — the SSE body is **never** buffered |
+| On transport error | Elapsed ms, method, URL, error message |
+
+### Redaction (always applied)
+
+Two independent layers protect secrets and both run unconditionally whenever the handler logs:
+
+1. **Header-name redaction** — `x-api-key`, `Authorization`, and `Proxy-Authorization` are
+   replaced with `[REDACTED]` before their values are ever formatted.
+2. **Body/text redaction** — request bodies, response bodies, and the rendered header string
+   are passed through the gateway's shared `SecretRedactor` (the same redactor expanded in
+   #2222), so any API key, bearer token, or provider key shape that leaks into a body is
+   scrubbed too.
+
+Bodies are truncated to 4 KB in the log to keep entries manageable.
+
+### Streaming safety
+
+Streaming responses are detected by `text/event-stream` content type and are **never**
+buffered — the provider reads the live stream, so buffering the body would break streaming.
+For streamed calls only the status, headers, and duration are logged; per-token `usage` for
+streamed responses arrives inside SSE events and is a documented follow-up (the handler does
+not parse provider-specific SSE frames).

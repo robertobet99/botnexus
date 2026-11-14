@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using BotNexus.Agent.Core.Tools;
 using BotNexus.Extensions.Mcp.Protocol;
 
 namespace BotNexus.Extensions.Mcp.Transport;
@@ -46,13 +47,19 @@ public sealed class StdioMcpTransport : IMcpTransport
         _inheritEnv = inheritEnv;
     }
 
-    /// <inheritdoc />
-    public Task ConnectAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Builds the <see cref="ProcessStartInfo"/> the MCP server subprocess is started with.
+    /// <para>
+    /// Extracted from <see cref="ConnectAsync"/> so the environment block the child actually receives
+    /// can be asserted on without spawning a process (#2892). Environment overrides are applied through
+    /// the shared <see cref="ProcessEnvironment.Merge"/> seam rather than an ad-hoc loop, so the
+    /// platform casing rule is owned in one place instead of re-derived per spawn site.
+    /// </para>
+    /// </summary>
+    internal ProcessStartInfo BuildStartInfo()
     {
-        ct.ThrowIfCancellationRequested();
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        var (fileName, processArgs) = ResolveCommand(_command, _args);
+        var launch = ResolveCommand(_command, _args);
+        var fileName = launch.FileName;
 
         var startInfo = new ProcessStartInfo
         {
@@ -69,10 +76,9 @@ public sealed class StdioMcpTransport : IMcpTransport
             startInfo.WorkingDirectory = _workingDirectory;
         }
 
-        foreach (var arg in processArgs)
-        {
-            startInfo.ArgumentList.Add(arg);
-        }
+        // Never loop over the argument list by hand here: a Windows .cmd/.bat shim resolves to a
+        // RAW cmd.exe line that must not be re-escaped through ArgumentList (#3642).
+        launch.ApplyArgumentsTo(startInfo);
 
         // When inheritEnv is false, clear inherited environment so the subprocess
         // only sees explicitly configured variables.
@@ -83,11 +89,22 @@ public sealed class StdioMcpTransport : IMcpTransport
 
         if (_env is not null)
         {
-            foreach (var (key, value) in _env)
-            {
-                startInfo.Environment[key] = ResolveEnvValue(value);
-            }
+            // Shared merge seam: an override must replace the inherited variable of the same
+            // name under the platform casing rule, not sit alongside it (#2892). Placeholder
+            // resolution rides along as the merge's value projection, not a second loop.
+            ProcessEnvironment.Merge(startInfo.Environment, _env, valueTransform: ResolveEnvValue);
         }
+
+        return startInfo;
+    }
+
+    /// <inheritdoc />
+    public Task ConnectAsync(CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var startInfo = BuildStartInfo();
 
         _process = new Process { StartInfo = startInfo };
         if (!_process.Start())
@@ -167,6 +184,12 @@ public sealed class StdioMcpTransport : IMcpTransport
         throw new InvalidOperationException("Response queue was signaled but no message available.");
     }
 
+    /// <summary>
+    /// Default grace window allowed for the child to exit after its stdin is closed,
+    /// before the process tree is force-killed.
+    /// </summary>
+    internal static readonly TimeSpan DefaultTerminationGrace = TimeSpan.FromSeconds(1);
+
     /// <inheritdoc />
     public async Task DisconnectAsync(CancellationToken ct = default)
     {
@@ -185,7 +208,52 @@ public sealed class StdioMcpTransport : IMcpTransport
             catch (OperationCanceledException) { }
         }
 
+        await TerminateProcessAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Terminates the spawned MCP server process using a bounded graceful-then-force sequence:
+    /// close stdin so a well-behaved server can exit on its own, wait at most
+    /// <paramref name="graceWindow"/>, then <c>Kill(entireProcessTree: true)</c>.
+    /// A child that ignores its stdin closing is therefore force-killed rather than leaked
+    /// (issue #2723). This method never throws.
+    /// </summary>
+    /// <param name="graceWindow">Grace period allowed after stdin close. Defaults to one second.</param>
+    public async Task TerminateProcessAsync(TimeSpan? graceWindow = null)
+    {
+        var process = _process;
+        if (process is null)
+        {
+            return;
+        }
+
+        // Graceful signal: closing stdin is how a well-behaved stdio MCP server learns to shut down.
+        try
+        {
+            _writer?.Close();
+        }
+        catch { }
+
+        var grace = graceWindow ?? DefaultTerminationGrace;
+        if (grace > TimeSpan.Zero)
+        {
+            try
+            {
+                using var graceCts = new CancellationTokenSource(grace);
+                await process.WaitForExitAsync(graceCts.Token).ConfigureAwait(false);
+            }
+            catch { }
+        }
+
         TryKillProcess();
+
+        // Bounded wait so callers observe a genuinely dead process rather than a pending kill.
+        try
+        {
+            using var killCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await process.WaitForExitAsync(killCts.Token).ConfigureAwait(false);
+        }
+        catch { }
     }
 
     /// <inheritdoc />
@@ -208,7 +276,7 @@ public sealed class StdioMcpTransport : IMcpTransport
             catch { }
         }
 
-        TryKillProcess();
+        await TerminateProcessAsync().ConfigureAwait(false);
         _readLoopCts?.Dispose();
         _process?.Dispose();
     }
@@ -331,63 +399,13 @@ public sealed class StdioMcpTransport : IMcpTransport
     /// <summary>
     /// Resolves command and arguments, handling Windows .cmd/.bat shims.
     /// </summary>
-    internal static (string FileName, IReadOnlyList<string> Args) ResolveCommand(
-        string command, IReadOnlyList<string> args)
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return (command, args);
-
-        var resolved = ResolveWindowsExecutable(command);
-        if (resolved is not null && IsWindowsBatchFile(resolved))
-        {
-            var cmdArgs = new List<string> { "/d", "/s", "/c", BuildCmdCommandLine(resolved, args) };
-            return (Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe", cmdArgs);
-        }
-
-        return (resolved ?? command, args);
-    }
-
-    private static string? ResolveWindowsExecutable(string command)
-    {
-        if (Path.HasExtension(command))
-            return command;
-
-        string[] extensions = [".exe", ".cmd", ".bat"];
-        var pathDirs = (Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
-            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var ext in extensions)
-        {
-            var candidate = command + ext;
-            foreach (var dir in pathDirs)
-            {
-                var fullPath = Path.Combine(dir, candidate);
-                if (File.Exists(fullPath))
-                    return fullPath;
-            }
-        }
-
-        return null;
-    }
-
-    private static bool IsWindowsBatchFile(string path)
-    {
-        var ext = Path.GetExtension(path).ToLowerInvariant();
-        return ext is ".cmd" or ".bat";
-    }
-
-    private static string BuildCmdCommandLine(string command, IReadOnlyList<string> args)
-    {
-        var parts = new List<string> { QuoteForCmd(command) };
-        foreach (var arg in args)
-            parts.Add(QuoteForCmd(arg));
-        return string.Join(' ', parts);
-    }
-
-    private static string QuoteForCmd(string arg)
-    {
-        if (!arg.Contains(' ') && !arg.Contains('"'))
-            return arg;
-        return $"\"{arg.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
-    }
+    /// <remarks>
+    /// Delegates to the shared <see cref="WindowsShimLaunch"/> seam. This method used to carry a
+    /// private copy of the PATH probe and the cmd.exe quoting rules; that copy assembled the
+    /// <c>/d /s /c</c> payload as a fourth <see cref="ProcessStartInfo.ArgumentList"/> entry, which
+    /// .NET then CRT-escaped into <c>\"</c> - so every npx-launched stdio MCP server on Windows
+    /// failed to start (#3642). One seam, so the two copies cannot drift apart again.
+    /// </remarks>
+    internal static ProcessLaunch ResolveCommand(string command, IReadOnlyList<string> args)
+        => WindowsShimLaunch.Resolve(command, args);
 }

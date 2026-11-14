@@ -1,5 +1,6 @@
 // ToolResultTrimmer.cs
 using BotNexus.Domain.Primitives;
+using BotNexus.Domain.Text;
 using BotNexus.Gateway.Abstractions.Models;
 
 namespace BotNexus.Gateway.Sessions;
@@ -93,12 +94,13 @@ public sealed class ToolResultTrimmer
 
     private bool ShouldTrim(SessionEntry entry, int turnAge)
     {
-        // Only trim tool result entries (not tool-start entries which have ToolArgs).
+        // Only trim tool result entries (not tool-start entries).
         if (!entry.Role.Equals(MessageRole.Tool))
             return false;
 
-        // Don't trim tool-start entries (they have ToolArgs set).
-        if (entry.ToolArgs is not null)
+        // Don't trim tool-start entries. #2906: both rows carry ToolArgs now, so the
+        // discriminator is the typed row kind (with a legacy ToolArgs fallback).
+        if (entry.IsToolStartRow())
             return false;
 
         // Already a tombstone — skip.
@@ -119,9 +121,11 @@ public sealed class ToolResultTrimmer
 
     private SessionEntry CreateTombstone(SessionEntry original, int turnAge)
     {
-        var preview = original.Content.Length > _options.TombstonePreviewChars
-            ? original.Content[.._options.TombstonePreviewChars]
-            : original.Content;
+        // #3187: bound through the single shared boundary policy. The tombstone REPLACES the
+        // original tool result in session history and the original content is discarded, so a raw
+        // UTF-16 range slice that split a surrogate pair would leave the mangled preview as the
+        // only surviving copy. SafeTruncate returns the original reference when nothing is cut.
+        var preview = TextTruncation.SafeTruncate(original.Content, _options.TombstonePreviewChars)!;
 
         var toolName = original.ToolName ?? "unknown";
         var tombstoneContent = $"{TombstoneMarker} — {toolName}, {original.Content.Length} chars, produced {turnAge} turns ago]\n{preview}…";

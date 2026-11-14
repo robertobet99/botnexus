@@ -1,9 +1,13 @@
 using BotNexus.Agent.Core.Configuration;
 using BotNexus.Agent.Core.Diagnostics;
+using BotNexus.Agent.Core.ExtensionPoints.Messages;
+using BotNexus.Agent.Core.ExtensionPoints.RunCompletion;
+using BotNexus.Agent.Core.ExtensionPoints.ToolResults;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
 using BotNexus.Agent.Providers.Core;
 using BotNexus.Agent.Providers.Core.Models;
+using BotNexus.Agent.Providers.Core.Resilience;
 using BotNexus.Agent.Providers.Core.Utilities;
 
 namespace BotNexus.Agent.Core.Loop;
@@ -31,13 +35,23 @@ public static class AgentLoopRunner
     /// Emits AgentStartEvent, TurnStartEvent, then MessageStart/End for each prompt,
     /// then enters the main loop. Used by Agent.PromptAsync.
     /// </remarks>
-    public static async Task<IReadOnlyList<AgentMessage>> RunAsync(
+    public static Task<IReadOnlyList<AgentMessage>> RunAsync(
+        IReadOnlyList<AgentMessage> prompts,
+        AgentContext context,
+        AgentLoopConfig config,
+        Func<AgentEvent, Task> emit,
+        CancellationToken cancellationToken)
+        => ExecuteAdmittedAsync(config, emit, cancellationToken,
+            (admitted, sink) => RunAsyncCore(prompts, context, admitted, sink, cancellationToken));
+
+    private static async Task<IReadOnlyList<AgentMessage>> RunAsyncCore(
         IReadOnlyList<AgentMessage> prompts,
         AgentContext context,
         AgentLoopConfig config,
         Func<AgentEvent, Task> emit,
         CancellationToken cancellationToken)
     {
+        AgentLoopConfig.ValidateToolResultBudget(config.MaxToolResults);
         cancellationToken.ThrowIfCancellationRequested();
 
         var runStartIndex = context.Messages.Count;
@@ -71,6 +85,89 @@ public static class AgentLoopRunner
     }
 
     /// <summary>
+    /// Executes exactly one provider turn. This path deliberately bypasses steering, follow-up,
+    /// compaction, completion continuation, leaked-tool recovery, and tool dispatch.
+    /// </summary>
+    /// <param name="prompt">The sole message appended before the provider call.</param>
+    /// <param name="context">The existing conversation context; its tool set is ignored.</param>
+    /// <param name="config">Provider conversion and generation settings.</param>
+    /// <param name="emit">The event sink for the one-turn lifecycle.</param>
+    /// <param name="cancellationToken">The absolute caller deadline.</param>
+    /// <returns>The prompt and the single assistant response.</returns>
+    public static Task<IReadOnlyList<AgentMessage>> RunSingleProviderTurnAsync(
+        AgentMessage prompt,
+        AgentContext context,
+        AgentLoopConfig config,
+        Func<AgentEvent, Task> emit,
+        CancellationToken cancellationToken)
+        => ExecuteAdmittedAsync(config, emit, cancellationToken,
+            (admitted, sink) => RunSingleProviderTurnAsyncCore(prompt, context, admitted, sink, cancellationToken));
+
+    private static async Task<IReadOnlyList<AgentMessage>> RunSingleProviderTurnAsyncCore(
+        AgentMessage prompt,
+        AgentContext context,
+        AgentLoopConfig config,
+        Func<AgentEvent, Task> emit,
+        CancellationToken cancellationToken)
+    {
+        AgentLoopConfig.ValidateToolResultBudget(config.MaxToolResults);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var startedAt = DateTimeOffset.UtcNow;
+        var messages = context.Messages.ToList();
+
+        await emit(new AgentStartEvent(startedAt)).ConfigureAwait(false);
+        await emit(new TurnStartEvent(startedAt)).ConfigureAwait(false);
+        await emit(new MessageStartEvent(prompt, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+        messages.Add(prompt);
+        await emit(new MessageEndEvent(prompt, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+
+        var capacityGuard = new ToolNonProgressGuard(
+            config.ToolProgressPolicy ?? DefaultToolProgressPolicy.EvaluateAsync, config.GuardEvidenceObserver,
+            config.MaxToolResults, config.AgentRunId, config.ToolCapacityObserver);
+        var transformed = config.AgentContextTransformer is null
+            ? messages
+            : (await config.AgentContextTransformer(messages, cancellationToken).ConfigureAwait(false)).ToList();
+        var providerContext = await ContextConverter.ToProviderContext(
+                new AgentContext(context.SystemPrompt, transformed, []),
+                config.ProviderMessageTransformer,
+                cancellationToken)
+            .ConfigureAwait(false);
+        providerContext = await ProjectRequestContextAsync(providerContext, capacityGuard.Capacity, config, cancellationToken)
+            .ConfigureAwait(false);
+        var executionOptions = await config.ProviderExecutionOptionsProvider(config.Model.Provider, cancellationToken)
+            .ConfigureAwait(false);
+        var generationOptions = config.GenerationSettings with { CancellationToken = cancellationToken, ToolChoiceMode = ToolChoice.None };
+        var stream = config.LlmClient.StreamSimple(config.Model, providerContext, generationOptions, executionOptions);
+        var messageCountBeforeAssistant = messages.Count;
+        var assistant = await StreamAccumulator
+            .AccumulateAsync(stream, emit, cancellationToken, messages)
+            .ConfigureAwait(false);
+        if (messages.Count > messageCountBeforeAssistant)
+            messages[^1] = assistant;
+        else
+            messages.Add(assistant);
+
+        await emit(new TurnEndEvent(assistant, [], DateTimeOffset.UtcNow)).ConfigureAwait(false);
+        var endedAt = DateTimeOffset.UtcNow;
+        var metrics = new RunMetricsAccumulator(startedAt);
+        metrics.IncrementTurns();
+        metrics.AddTokens(assistant.Usage?.InputTokens, assistant.Usage?.OutputTokens);
+        var completion = assistant.FinishReason switch
+        {
+            StopReason.Aborted => new RunCompletionResult(
+                RunCompletionStatus.Cancelled, [], RunStopReason.Cancellation, assistant.ErrorMessage),
+            StopReason.Error => new RunCompletionResult(
+                RunCompletionStatus.Failed, [], Detail: assistant.ErrorMessage),
+            _ => RunCompletionResult.Completed
+        };
+        IReadOnlyList<AgentMessage> runMessages = new List<AgentMessage> { prompt, assistant };
+        await emit(new AgentEndEvent(runMessages, metrics.ToMetrics(endedAt), endedAt, completion))
+            .ConfigureAwait(false);
+        return runMessages;
+    }
+
+    /// <summary>
     /// Continue an agent loop from the current context without adding a new message.
     /// </summary>
     /// <param name="context">The current agent context.</param>
@@ -84,18 +181,27 @@ public static class AgentLoopRunner
     /// </para>
     /// <para>
     /// <strong>Important:</strong> The last message in context must convert to a user or tool result message
-    /// via ConvertToLlm. If it doesn't, the LLM provider will reject the request.
+    /// via ProviderMessageTransformer. If it doesn't, the LLM provider will reject the request.
     /// </para>
     /// <para>
     /// Throws InvalidOperationException if the last message is from the assistant.
     /// </para>
     /// </remarks>
-    public static async Task<IReadOnlyList<AgentMessage>> ContinueAsync(
+    public static Task<IReadOnlyList<AgentMessage>> ContinueAsync(
+        AgentContext context,
+        AgentLoopConfig config,
+        Func<AgentEvent, Task> emit,
+        CancellationToken cancellationToken)
+        => ExecuteAdmittedAsync(config, emit, cancellationToken,
+            (admitted, sink) => ContinueAsyncCore(context, admitted, sink, cancellationToken));
+
+    private static async Task<IReadOnlyList<AgentMessage>> ContinueAsyncCore(
         AgentContext context,
         AgentLoopConfig config,
         Func<AgentEvent, Task> emit,
         CancellationToken cancellationToken)
     {
+        AgentLoopConfig.ValidateToolResultBudget(config.MaxToolResults);
         cancellationToken.ThrowIfCancellationRequested();
         if (context.Messages.Count == 0)
         {
@@ -119,6 +225,47 @@ public static class AgentLoopRunner
         return newMessages;
     }
 
+    private static async Task<IReadOnlyList<AgentMessage>> ExecuteAdmittedAsync(
+        AgentLoopConfig config, Func<AgentEvent, Task> emit, CancellationToken cancellationToken,
+        Func<AgentLoopConfig, Func<AgentEvent, Task>, Task<IReadOnlyList<AgentMessage>>> execute)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var id = config.AgentRunId ?? AgentRunId.Create();
+        var ended = false;
+        var started = false;
+        IReadOnlyList<GuardObservation> observedGuards = [];
+        var priorGuardObserver = config.GuardEvidenceObserver;
+        async Task Sink(AgentEvent evt)
+        {
+            if (evt is AgentStartEvent) started = true;
+            if (evt is AgentEndEvent) ended = true;
+            await emit(evt with { AgentRunId = id }).ConfigureAwait(false);
+        }
+        try
+        {
+            return await execute(config with
+            {
+                AgentRunId = id,
+                GuardEvidenceObserver = guards =>
+                {
+                    observedGuards = guards;
+                    priorGuardObserver?.Invoke(guards);
+                }
+            }, Sink).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (config.AgentRunId is null && started && !ended)
+        {
+            var cancelled = ex is OperationCanceledException && cancellationToken.IsCancellationRequested;
+            var failure = new AssistantAgentMessage(string.Empty,
+                FinishReason: cancelled ? StopReason.Aborted : StopReason.Error,
+                ErrorMessage: ex.Message, Timestamp: DateTimeOffset.UtcNow);
+            await Sink(new AgentEndEvent([failure], null, DateTimeOffset.UtcNow,
+                new RunCompletionResult(cancelled ? RunCompletionStatus.Cancelled : RunCompletionStatus.Failed,
+                    [], cancelled ? RunStopReason.Cancellation : null, ex.Message) { GuardObservations = observedGuards })).ConfigureAwait(false);
+            throw;
+        }
+    }
+
     private static async Task RunLoopAsync(
         AgentContext currentContext,
         List<AgentMessage> newMessages,
@@ -130,7 +277,20 @@ public static class AgentLoopRunner
         bool firstTurn)
     {
         var messages = currentContext.Messages.ToList();
+        using var toolResultContextLease = new ToolResultContextLease();
         IReadOnlyList<AgentMessage> followUpSeed = [];
+        var completionContinuationAttempts = 0;
+        RunCompletionDecision? lastCompletionDecision = null;
+        var nonProgressGuard = new ToolNonProgressGuard(
+            config.ToolProgressPolicy ?? DefaultToolProgressPolicy.EvaluateAsync, config.GuardEvidenceObserver,
+            config.MaxToolResults, config.AgentRunId, config.ToolCapacityObserver);
+
+        // #2519: taint accumulation is scoped to the whole RUN, not to each provider turn. The
+        // laundering path this closes is inherently multi-turn - the model fetches a page on one
+        // turn, reasons about it on the next, and calls memory_save on a third - so a per-turn
+        // window would be clean again by the time the write happens and would enforce nothing.
+        // Monotonic within the scope: nothing here can clear an accumulated taint.
+        using var taintScope = TurnTaintScope.Begin();
 
         // Post-turn claim auditor (#1600, #1661): each completed turn is audited against the
         // tools that executed ON THAT TURN, so a no-tool fabrication turn is flagged even
@@ -140,18 +300,11 @@ public static class AgentLoopRunner
 
         while (true)
         {
-            // #1710: re-check auto-compaction at the top of every outer iteration. A single long
-            // dispatch (cron / autonomous follow-up loop) can blow past the token threshold mid-run;
-            // pre-turn ShouldCompact at the gateway never sees it, so the transcript grew unbounded
-            // until provider overflow. The hook compacts off-loop and resyncs history; best-effort so
-            // a compactor failure never aborts the run.
-            await MaybeCompactAsync(config, cancellationToken).ConfigureAwait(false);
-
             var pendingMessages = followUpSeed.Count > 0
                 ? followUpSeed.ToList()
                 : (config.SkipInitialSteeringPoll
                     ? []
-                    : (await GetMessagesAsync(config.GetSteeringMessages, cancellationToken).ConfigureAwait(false)).ToList());
+                    : (await GetMessagesAsync(config.SteeringMessageProvider, cancellationToken).ConfigureAwait(false)).ToList());
             config = config with { SkipInitialSteeringPoll = false };
             followUpSeed = [];
 
@@ -167,6 +320,23 @@ public static class AgentLoopRunner
             while (hasMoreToolCalls || pendingMessages.Count > 0 || deferredMessages.Count > 0)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                // #1710/#4302: give every provider turn a durable compaction opportunity. This
+                // boundary is after the preceding tool batch and its result persistence have fully
+                // completed, but before the next provider context is built, so it cannot split an
+                // assistant-call/tool-result pair. It also covers the first turn and outer-loop
+                // follow-ups without a second cadence path. When compaction applies, replace the
+                // live in-memory snapshot so the provider sees the summary and retained tail rather
+                // than the stale pre-compaction tool chain (#4121).
+                var refreshedContext = await MaybeCompactAsync(config, cancellationToken).ConfigureAwait(false);
+                if (refreshedContext is not null)
+                {
+                    NotifyContextReplaced(refreshedContext.Tools);
+                    currentContext = refreshedContext;
+                    messages = refreshedContext.Messages.ToList();
+                    DiagnosticNotification.Report(config.DiagnosticObserver,
+                        "Proactive durable compaction applied before the next provider turn; live context resynchronized.");
+                }
 
                 // Release deferred (defer-while-busy) messages only once the original run is idle:
                 // no more tool calls in flight and nothing else already queued for this turn.
@@ -195,15 +365,19 @@ public static class AgentLoopRunner
 
                 pendingMessages.Clear();
 
-                var streamOptions = await BuildStreamOptionsAsync(config, cancellationToken).ConfigureAwait(false);
+                var generationOptions = config.GenerationSettings with { CancellationToken = cancellationToken };
+                var executionOptions = await config.ProviderExecutionOptionsProvider(config.Model.Provider, cancellationToken).ConfigureAwait(false);
                 var messageCountBeforeAssistant = messages.Count;
                 var assistantMessage = await ExecuteWithRetryAsync(
                         messages,
                         currentContext.SystemPrompt,
                         currentContext.Tools,
                         config,
-                        streamOptions,
+                        generationOptions,
+                        executionOptions,
                         emit,
+                        toolResultContextLease,
+                        nonProgressGuard,
                         cancellationToken)
                     .ConfigureAwait(false);
 
@@ -218,15 +392,23 @@ public static class AgentLoopRunner
 
                 newMessages.Add(assistantMessage);
 
-                // #1709: opus (via github-copilot) sometimes leaks a tool call as invoke/tool_use
+                // #1709 / #2432: some Copilot transports deliver a tool call as invoke/tool_use
                 // XML in the assistant TEXT channel with a non-ToolUse finish reason, so the
                 // continuation guard below never dispatches it. Recover such leaked calls before the
                 // guard: parse the markup into real tool calls, strip it from the text, and promote
-                // the turn to ToolUse. Behaviour-preserving for a genuine ToolUse turn or any turn
-                // with no recoverable markup. Complements the Tier 1 sanitizer (#1699) that only
-                // strips the markup for delivery.
-                if (assistantMessage.FinishReason != StopReason.ToolUse
-                    && assistantMessage.ToolCalls is not { Count: > 0 })
+                // the turn to ToolUse. Complements the Tier 1 sanitizer (#1699) that only strips the
+                // markup for delivery.
+                //
+                // #2432: this now fires from a DECLARED capability rather than speculatively for
+                // every provider. Before, every provider in the platform paid a regex scan of every
+                // assistant turn -- and, worse, risked having genuine prose containing well-formed
+                // invoke markup rewritten into an executed tool call -- to compensate for one
+                // transport's defect. Providers that declare RecoversLeakedToolCallMarkup keep the
+                // recovery behaviour for successful Stop turns; everyone else gets their text
+                // left alone. Never promote an unsuccessful terminal into executable tool calls.
+                if (assistantMessage.FinishReason == StopReason.Stop
+                    && assistantMessage.ToolCalls is not { Count: > 0 }
+                    && config.LlmClient.GetCapabilities(config.Model).RecoversLeakedToolCallMarkup)
                 {
                     var recovery = LeakedToolCallRecovery.Recover(assistantMessage.Content);
                     if (recovery.RecoveredCalls.Count > 0)
@@ -241,13 +423,34 @@ public static class AgentLoopRunner
                         newMessages[newMessages.Count - 1] = assistantMessage;
                     }
                 }
+                // #3296: StopReason.Sensitive is deliberately NOT part of this early-return.
+                // Content filtering is a safety outcome, not an infrastructure failure, so a
+                // filtered turn settles through the ordinary turn-completion path and its
+                // TurnEndEvent/AgentEndEvent carry the normal metrics and tool-result list. It
+                // still cannot continue the run: tool dispatch below is gated on ToolUse, so a
+                // filtered turn sets hasMoreToolCalls = false and the loop exits at the next
+                // boundary unless the caller has genuinely queued more work.
                 if (assistantMessage.FinishReason is StopReason.Error or StopReason.Aborted)
                 {
                     metrics.IncrementTurns();
                     metrics.AddTokens(assistantMessage.Usage?.InputTokens, assistantMessage.Usage?.OutputTokens);
                     await emit(new TurnEndEvent(assistantMessage, [], DateTimeOffset.UtcNow)).ConfigureAwait(false);
                     var endTime = DateTimeOffset.UtcNow;
-                    await emit(new AgentEndEvent(messages.Skip(runStartIndex).ToList(), metrics.ToMetrics(endTime), endTime)).ConfigureAwait(false);
+                    var status = assistantMessage.FinishReason == StopReason.Aborted
+                        ? RunCompletionStatus.Cancelled
+                        : RunCompletionStatus.Failed;
+                    var stopReason = assistantMessage.FinishReason == StopReason.Aborted
+                        ? RunStopReason.Cancellation
+                        : (RunStopReason?)null;
+                    await emit(new AgentEndEvent(
+                        messages.Skip(runStartIndex).ToList(),
+                        metrics.ToMetrics(endTime),
+                        endTime,
+                        new RunCompletionResult(
+                            status,
+                            [],
+                            stopReason,
+                            assistantMessage.ErrorMessage) { GuardObservations = nonProgressGuard.Evidence })).ConfigureAwait(false);
                     return;
                 }
 
@@ -286,6 +489,19 @@ public static class AgentLoopRunner
                 metrics.AddTokens(assistantMessage.Usage?.InputTokens, assistantMessage.Usage?.OutputTokens);
                 metrics.AddToolCalls(toolResults.Count);
 
+                if (hasMoreToolCalls && nonProgressGuard.WouldReachAbsoluteLimit(toolResults.Count))
+                {
+                    // Count the whole retained batch before boundary callbacks can cancel or
+                    // stall. ObserveAsync's hard-edge path invokes no progress-policy callback.
+                    var budget = await nonProgressGuard.ObserveAsync(
+                        assistantMessage.ToolCalls!, toolResults, cancellationToken).ConfigureAwait(false);
+                    nonProgressGuard.Record(budget, "terminal");
+                    await FinalizeBudgetAsync(messages, newMessages, currentContext, config, emit,
+                        metrics, budget, nonProgressGuard.Capacity, nonProgressGuard.Evidence, lastCompletionDecision, completionContinuationAttempts,
+                        assistantMessage, toolResults, turnToolNames, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
                 await emit(new TurnEndEvent(assistantMessage, toolResults, DateTimeOffset.UtcNow))
                     .ConfigureAwait(false);
 
@@ -294,8 +510,64 @@ public static class AgentLoopRunner
                 // "back" a later no-tool fabrication turn for the whole run.
                 await AuditClaimsAsync(config, assistantMessage, turnToolNames, emit).ConfigureAwait(false);
 
-                var drained = (await GetMessagesAsync(config.GetSteeringMessages, cancellationToken).ConfigureAwait(false))
+                var nonProgress = hasMoreToolCalls
+                    ? await nonProgressGuard.ObserveAsync(
+                            assistantMessage.ToolCalls!,
+                            toolResults,
+                            cancellationToken)
+                        .ConfigureAwait(false)
+                    : null;
+                if (nonProgress is { WarningReady: true })
+                {
+                    nonProgressGuard.Record(nonProgress, "warning");
+                    var guidance = BuildNonProgressGuidance(nonProgress);
+                    var feedback = new BotNexus.Agent.Core.Types.UserMessage(guidance);
+                    await emit(new MessageStartEvent(feedback, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+                    messages.Add(feedback);
+                    newMessages.Add(feedback);
+                    await emit(new MessageEndEvent(feedback, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+                }
+
+                var drained = (await GetMessagesAsync(config.SteeringMessageProvider, cancellationToken).ConfigureAwait(false))
                     .ToList();
+                if (drained.Any(message => message is BotNexus.Agent.Core.Types.UserMessage { DeferWhileBusy: false }))
+                {
+                    nonProgressGuard.Reset();
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var hasUserSteer = drained.Any(message => message is BotNexus.Agent.Core.Types.UserMessage { DeferWhileBusy: false });
+                if (nonProgress is { ShouldStop: true } && !hasUserSteer)
+                {
+                    // Preserve the assistant call and all of its tool results in the transcript,
+                    // then stop as incomplete instead of converting repeated no-progress into success.
+                    nonProgressGuard.Record(nonProgress, "terminal");
+                    var detail = BuildNonProgressStopDetail(nonProgress);
+                    try
+                    {
+                        config.DiagnosticObserver?.Invoke(detail);
+                    }
+                    catch
+                    {
+                        // Diagnostics are advisory and cannot change the terminal disposition.
+                    }
+
+                    var endTime = DateTimeOffset.UtcNow;
+                    await emit(new AgentEndEvent(
+                        messages.Skip(runStartIndex).ToList(),
+                        metrics.ToMetrics(endTime),
+                        endTime,
+                        new RunCompletionResult(
+                            RunCompletionStatus.Parked,
+                            ["tool-non-progress"],
+                            RunStopReason.ToolNonProgress,
+                            Detail: detail,
+                            Evidence: $"Repeated {nonProgress.Kind} tool outcomes without observable progress.",
+                            ContinuationOwner: "user",
+                            WakeCondition: "Provide new direction or resume after changing the underlying state.") { GuardObservations = nonProgressGuard.Evidence }))
+                        .ConfigureAwait(false);
+                    return;
+                }
 
                 // #1845: a defer-while-busy message (memory flush) that lands mid-flight is pulled
                 // out of this turn's injection set and held until the loop reaches idle. Only the
@@ -305,18 +577,303 @@ public static class AgentLoopRunner
                 pendingMessages = drained;
             }
 
-            var followUps = await GetMessagesAsync(config.GetFollowUpMessages, cancellationToken).ConfigureAwait(false);
+            // #2478: pre-flight abort check at the exact point the pending-message drain decides
+            // whether to START a fresh loop iteration. Every other ThrowIfCancellationRequested in
+            // this file guards work INSIDE a turn; none of them guarded the decision to begin a new
+            // one from a queued follow-up. Without this, a follow-up enqueued through the #2438
+            // enqueue-then-verify-then-reclaim seam could be drained and dispatched after its
+            // originating request was already cancelled, starting a run nothing holds a
+            // cancellation handle for.
+            //
+            // The check runs BEFORE GetMessagesAsync deliberately: the drain is destructive, and
+            // draining under a cancelled token would remove the message from the queue and then
+            // abort at the next in-loop check, losing it silently - precisely the defect #2388
+            // describes. Aborting first leaves the follow-up pending, so it stays reclaimable via
+            // Agent.TryReclaimFollowUp / PendingMessageQueue.TryRemove and the gateway boundary can
+            // re-deliver it on the normal send path. The cancellation itself surfaces through the
+            // existing reporting surface: Agent.RunAsync catches this OperationCanceledException and
+            // emits the aborted AssistantAgentMessage plus AgentEndEvent. No new cancellation model,
+            // no new event type, no silent drop.
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var followUps = await GetMessagesAsync(config.FollowUpMessageProvider, cancellationToken).ConfigureAwait(false);
             if (followUps.Count > 0)
             {
                 followUpSeed = followUps;
                 continue;
             }
 
+            if (config.RunCompletionPolicy is not null)
+            {
+                lastCompletionDecision = ValidateCompletionDecision(
+                    await config.RunCompletionPolicy(cancellationToken).ConfigureAwait(false));
+                if (lastCompletionDecision.Status == RunCompletionStatus.Working)
+                {
+                    if (completionContinuationAttempts >= config.EffectiveMaxCompletionContinuations)
+                    {
+                        break;
+                    }
+
+                    completionContinuationAttempts++;
+                    followUpSeed = [BuildCompletionContinuation(lastCompletionDecision, completionContinuationAttempts)];
+                    continue;
+                }
+            }
+
             break;
         }
 
+        var completion = BuildCompletionResult(lastCompletionDecision, completionContinuationAttempts) with { GuardObservations = nonProgressGuard.Evidence };
         var endTime2 = DateTimeOffset.UtcNow;
-        await emit(new AgentEndEvent(messages.Skip(runStartIndex).ToList(), metrics.ToMetrics(endTime2), endTime2)).ConfigureAwait(false);
+        await emit(new AgentEndEvent(
+            messages.Skip(runStartIndex).ToList(),
+            metrics.ToMetrics(endTime2),
+            endTime2,
+            completion)).ConfigureAwait(false);
+    }
+
+    private static async Task FinalizeBudgetAsync(
+        List<AgentMessage> messages, List<AgentMessage> newMessages, AgentContext context,
+        AgentLoopConfig config, Func<AgentEvent, Task> emit, RunMetricsAccumulator metrics,
+        ToolNonProgressObservation observation, ToolCapacitySnapshot capacity, IReadOnlyList<GuardObservation> guardObservations,
+        RunCompletionDecision? priorDecision,
+        int continuationAttempts, AssistantAgentMessage boundaryMessage,
+        IReadOnlyList<ToolResultAgentMessage> boundaryResults, IReadOnlySet<string> boundaryToolNames,
+        CancellationToken cancellationToken)
+    {
+        var evidence = new ToolResultBudgetEvidence(config.MaxToolResults, observation.TotalResults,
+            observation.TotalResults - config.MaxToolResults);
+        var detail = $"Tool result budget exhausted (absolute-tool-result-limit): {evidence.ExecutedResults} executed results, limit {evidence.Limit}, overshoot {evidence.Overshoot}. " +
+            "The entire batch is retained. Work remains incomplete; no side effects will be retried automatically.";
+        // One absolute deadline also bounds lifecycle listeners. Caller cancellation ends generation,
+        // but cannot prevent the controlled message/end notifications from persisting the decision.
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var summaryCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+        var summaryToken = summaryCancellation.Token;
+        var summaryMessages = new List<AgentMessage>();
+        AssistantAgentMessage? assistant = null;
+        AssistantAgentMessage? emittedSummary = null;
+        var assistantEndEmitted = false;
+
+        void ThrowIfSummaryCancelled()
+        {
+            // The deadline's WaitAsync callback can resume this lane before cancellation
+            // propagates to the linked token. Consult the source tokens before any work.
+            deadline.Token.ThrowIfCancellationRequested();
+            cancellationToken.ThrowIfCancellationRequested();
+            summaryToken.ThrowIfCancellationRequested();
+        }
+
+        // A provider may ignore ToolChoice.None. No summary call is executable, so neither
+        // streaming observers nor transcript consumers may see it as an attempted dispatch.
+        // Copy snapshots rather than mutating provider-owned partials; retain text and usage.
+        static AssistantAgentMessage SanitizeSummary(AssistantAgentMessage message) => message with
+        {
+            ToolCalls = null,
+            ContentBlocks = message.ContentBlocks?.Where(block => block is not ToolCallContent).ToList()
+        };
+
+        async Task EmitSummaryAsync(AgentEvent evt)
+        {
+            ThrowIfSummaryCancelled();
+            evt = evt switch
+            {
+                MessageStartEvent { Message: AssistantAgentMessage message } start => start with { Message = SanitizeSummary(message) },
+                MessageUpdateEvent update => update with
+                {
+                    Message = SanitizeSummary(update.Message), ToolCallId = null, ToolName = null, ArgumentsDelta = null
+                },
+                MessageEndEvent { Message: AssistantAgentMessage message } end => end with { Message = SanitizeSummary(message) },
+                _ => evt
+            };
+            // MessageEnd may have reached Agent.ProcessEvent before a listener fails or stalls.
+            // Do not append that same assistant a second time during controlled terminalization.
+            if (evt is MessageEndEvent { Message: AssistantAgentMessage completed })
+            {
+                assistantEndEmitted = true;
+                emittedSummary = completed;
+            }
+            await emit(evt).WaitAsync(summaryToken).ConfigureAwait(false);
+        }
+
+        async Task EmitTerminalAsync(AgentEvent evt)
+        {
+            try
+            {
+                // Invoke even after the deadline: the synchronous state transition precedes
+                // listener waits. Never allow callback cancellation to escape this terminal lane.
+                await emit(evt).WaitAsync(deadline.Token).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Only this already-decided budget finalizer isolates authoritative callbacks.
+            }
+        }
+
+        // Preserve completed-turn ordering and emit once, inside the already-decided lane.
+        // A failed/stalled boundary listener cannot replace Parked with cancellation or failure.
+        await EmitTerminalAsync(new TurnEndEvent(boundaryMessage, boundaryResults, DateTimeOffset.UtcNow))
+            .ConfigureAwait(false);
+        await AuditClaimsAsync(config, boundaryMessage, boundaryToolNames, EmitTerminalAsync).ConfigureAwait(false);
+
+        try
+        {
+            ThrowIfSummaryCancelled();
+            var steering = await GetMessagesAsync(config.SteeringMessageProvider, summaryToken)
+                .WaitAsync(summaryToken).ConfigureAwait(false);
+            foreach (var message in steering)
+            {
+                await EmitSummaryAsync(new MessageStartEvent(message, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+                messages.Add(message);
+                newMessages.Add(message);
+                await EmitSummaryAsync(new MessageEndEvent(message, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+            }
+            var prompt = new BotNexus.Agent.Core.Types.UserMessage(
+                "[Tool result budget] " + detail +
+                " Summarize existing evidence, prior failures and unresolved work only. Do not claim completion or request tools.");
+            await EmitSummaryAsync(new TurnStartEvent(DateTimeOffset.UtcNow)).ConfigureAwait(false);
+            await EmitSummaryAsync(new MessageStartEvent(prompt, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+            messages.Add(prompt);
+            newMessages.Add(prompt);
+            await EmitSummaryAsync(new MessageEndEvent(prompt, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+            // Abandoned transformers and producers must never hold either live run list.
+            var isolatedContext = messages.ToList();
+            var transformed = config.AgentContextTransformer is null ? isolatedContext
+                : (await config.AgentContextTransformer(isolatedContext, summaryToken).WaitAsync(summaryToken).ConfigureAwait(false)).ToList();
+            var providerContext = await ContextConverter.ToProviderContext(
+                new AgentContext(context.SystemPrompt, transformed, []), config.ProviderMessageTransformer, summaryToken)
+                .WaitAsync(summaryToken).ConfigureAwait(false);
+            providerContext = await ProjectRequestContextAsync(providerContext, capacity, config, summaryToken)
+                .WaitAsync(summaryToken).ConfigureAwait(false);
+            var execution = await config.ProviderExecutionOptionsProvider(config.Model.Provider, summaryToken)
+                .WaitAsync(summaryToken).ConfigureAwait(false);
+            var generation = config.GenerationSettings with
+            {
+                CancellationToken = summaryToken,
+                MaxTokens = Math.Clamp(config.GenerationSettings.MaxTokens ?? 1024, 1, 1024),
+                ToolChoiceMode = ToolChoice.None,
+                Reasoning = null,
+                ThinkingBudgets = null
+            };
+            // The deadline bounds asynchronous work, not synchronous user code invoked to
+            // obtain a stream. Providers/callbacks must return promptly; do not spawn orphan
+            // invocations to pretend that synchronous code can be forcibly interrupted.
+            ThrowIfSummaryCancelled();
+            var stream = config.LlmClient.StreamSimple(config.Model, providerContext, generation, execution);
+            // Do not race the accumulator itself against WaitAsync: its emitter and channel reads
+            // observe cancellation, so it fully unwinds before its isolated partial is inspected.
+            assistant = await StreamAccumulator.AccumulateAsync(stream, EmitSummaryAsync, summaryToken, summaryMessages)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            detail += ex is OperationCanceledException ? " Summary cancelled or timed out." : " Summary generation failed.";
+            if (!assistantEndEmitted && summaryMessages.LastOrDefault() is AssistantAgentMessage partial)
+            {
+                assistant = partial with
+                {
+                    FinishReason = ex is OperationCanceledException ? StopReason.Aborted : StopReason.Error,
+                    ErrorMessage = "Budget summary interrupted.",
+                    ToolCalls = null,
+                    ContentBlocks = partial.ContentBlocks?.Where(block => block is not ToolCallContent).ToList()
+                };
+            }
+            else
+            {
+                assistant = summaryMessages.LastOrDefault() as AssistantAgentMessage;
+            }
+        }
+        if (assistant is not null)
+        {
+            // Accumulator return/partial storage is independent of the sanitized event surface,
+            // including result-only and failed-listener paths. Keep terminal messages identical.
+            assistant = emittedSummary ?? SanitizeSummary(assistant);
+            messages.Add(assistant);
+            newMessages.Add(assistant);
+            metrics.IncrementTurns();
+            metrics.AddTokens(assistant.Usage?.InputTokens, assistant.Usage?.OutputTokens);
+            if (!assistantEndEmitted)
+                await EmitTerminalAsync(new MessageEndEvent(assistant, DateTimeOffset.UtcNow)).ConfigureAwait(false);
+            await EmitTerminalAsync(new TurnEndEvent(assistant, [], DateTimeOffset.UtcNow)).ConfigureAwait(false);
+        }
+        var open = (priorDecision?.OpenItemIds ?? []).Append("tool-result-budget").Distinct().ToArray();
+        var end = DateTimeOffset.UtcNow;
+        await EmitTerminalAsync(new AgentEndEvent(newMessages.ToArray(), metrics.ToMetrics(end), end,
+            new RunCompletionResult(RunCompletionStatus.Parked, open, RunStopReason.ToolResultBudget,
+                detail, detail, "user", "Review retained evidence and explicitly start a new run with new direction.",
+                continuationAttempts, evidence) { GuardObservations = guardObservations })).ConfigureAwait(false);
+    }
+
+    private static string BuildNonProgressGuidance(ToolNonProgressObservation observation)
+        => observation.Guidance
+            ?? "[Tool progress guard] Repeated tool calls produced no observable progress. Check for new state or evidence, change the approach, or ask the user for direction instead of repeating the same operation.";
+
+    private static string BuildNonProgressStopDetail(ToolNonProgressObservation observation)
+        => $"Tool non-progress guard stopped the loop after {observation.ConsecutiveCount} consecutive {observation.Kind} outcomes. " +
+            "Executed tool results are retained. The run is incomplete; provide new direction or change the underlying state before resuming.";
+
+    private static RunCompletionDecision ValidateCompletionDecision(RunCompletionDecision decision)
+    {
+        if (decision.Status != RunCompletionStatus.Parked)
+        {
+            return decision;
+        }
+
+        var hasValidReason = decision.StopReason is { } reason && Enum.IsDefined(reason);
+        var hasStructuredEvidence = !string.IsNullOrWhiteSpace(decision.Evidence)
+            && !string.IsNullOrWhiteSpace(decision.ContinuationOwner)
+            && !string.IsNullOrWhiteSpace(decision.WakeCondition);
+        if (hasValidReason && hasStructuredEvidence)
+        {
+            return decision;
+        }
+
+        return RunCompletionDecision.Continue(
+            decision.OpenItemIds,
+            "The host reported parked work without a complete structured stop disposition; " +
+            "a reason, evidence, continuation owner, and wake condition are all required.");
+    }
+
+    private static BotNexus.Agent.Core.Types.UserMessage BuildCompletionContinuation(RunCompletionDecision decision, int attempt)
+    {
+        var openItems = decision.OpenItemIds.Count == 0
+            ? "(identities unavailable)"
+            : string.Join(", ", decision.OpenItemIds);
+        var detail = string.IsNullOrWhiteSpace(decision.Detail) ? string.Empty : $"\nEvaluator detail: {decision.Detail}";
+        return new BotNexus.Agent.Core.Types.UserMessage(
+            $"[Runtime completion gate: continuation {attempt}]\n" +
+            "The prior assistant response was progress, not successful completion. " +
+            "Continue the same authorized loop now. Do not repeat the progress summary.\n" +
+            $"Open actionable checklist items: {openItems}.{detail}");
+    }
+
+    private static RunCompletionResult BuildCompletionResult(
+        RunCompletionDecision? decision,
+        int continuationAttempts)
+    {
+        if (decision is null || decision.Status == RunCompletionStatus.Completed)
+        {
+            return RunCompletionResult.Completed with { ContinuationAttempts = continuationAttempts };
+        }
+
+        if (decision.Status == RunCompletionStatus.Parked)
+        {
+            return new RunCompletionResult(
+                RunCompletionStatus.Parked,
+                decision.OpenItemIds,
+                decision.StopReason,
+                decision.Detail,
+                decision.Evidence,
+                decision.ContinuationOwner,
+                decision.WakeCondition,
+                continuationAttempts);
+        }
+
+        return new RunCompletionResult(
+            RunCompletionStatus.IncompleteWithoutStopReason,
+            decision.OpenItemIds,
+            Detail: decision.Detail,
+            ContinuationAttempts: continuationAttempts);
     }
 
     /// <summary>
@@ -343,7 +900,16 @@ public static class AgentLoopRunner
 
         // Only audit a real, completed user-facing message. Error/abort placeholders are
         // surfaced through their own paths and are not narration to verify.
-        if (turnMessage.FinishReason is StopReason.Error or StopReason.Aborted)
+        //
+        // #3296: a content-filtered turn (StopReason.Sensitive) is excluded for the same reason.
+        // The provider truncated or suppressed the text as a safety decision, so whatever survived
+        // is a fragment of an intent the model never got to finish, not a claim it is asserting.
+        // Auditing it would generate unbacked-claim noise about text the model was prevented from
+        // completing. This exclusion is deliberate, not inherited: before #3296 the Completions
+        // content_filter arm mapped to StopReason.Error and was excluded by the Error clause below,
+        // so remapping it to Sensitive would otherwise have silently pulled filtered turns INTO the
+        // auditor as a side effect of a mapping fix.
+        if (turnMessage.FinishReason is StopReason.Error or StopReason.Aborted or StopReason.Sensitive)
         {
             return;
         }
@@ -357,32 +923,8 @@ public static class AgentLoopRunner
         await emit(new ClaimAuditEvent(result, turnMessage, DateTimeOffset.UtcNow)).ConfigureAwait(false);
     }
 
-    private static async Task<SimpleStreamOptions> BuildStreamOptionsAsync(
-        AgentLoopConfig config,
-        CancellationToken cancellationToken)
-    {
-        var options = CloneOptions(config.GenerationSettings, cancellationToken);
-        var apiKey = await config.GetApiKey(config.Model.Provider, cancellationToken).ConfigureAwait(false);
-        if (!string.IsNullOrWhiteSpace(apiKey))
-        {
-            options = options with { ApiKey = apiKey };
-        }
-
-        return options;
-    }
-
-    private static SimpleStreamOptions CloneOptions(SimpleStreamOptions source, CancellationToken cancellationToken)
-    {
-        return source with
-        {
-            CancellationToken = cancellationToken,
-            Headers = source.Headers is null ? null : new Dictionary<string, string>(source.Headers),
-            Metadata = source.Metadata is null ? null : new Dictionary<string, object>(source.Metadata),
-        };
-    }
-
     private static async Task<IReadOnlyList<AgentMessage>> GetMessagesAsync(
-        GetMessagesDelegate? getMessages,
+        AgentMessageProvider? getMessages,
         CancellationToken cancellationToken)
     {
         if (getMessages is null)
@@ -418,30 +960,107 @@ public static class AgentLoopRunner
         }
     }
 
-    /// <summary>
-    /// Best-effort mid-loop auto-compaction (#1710). Awaits <see cref="AgentLoopConfig.MaybeCompactAsync"/>
-    /// when configured so a long dispatch re-checks the compaction threshold between outer iterations.
-    /// A failure is swallowed so the loop continues; cancellation propagates.
-    /// </summary>
-    private static async Task MaybeCompactAsync(AgentLoopConfig config, CancellationToken cancellationToken)
+    private static void NotifyContextReplaced(IReadOnlyList<IAgentTool> tools)
     {
-        if (config.MaybeCompactAsync is null)
+        foreach (var tool in tools)
         {
-            return;
+            if (tool is IContextReplacementAwareTool contextAwareTool)
+                contextAwareTool.OnContextReplaced();
+        }
+    }
+
+    /// <summary>
+    /// Mid-loop auto-compaction (#1710/#4121/#4379). Awaits
+    /// <see cref="AgentLoopConfig.ContextCompactionService"/> and returns a replacement context when the
+    /// persisted session changed. Required compaction failures fail closed; cancellation propagates.
+    /// </summary>
+    private static async Task<AgentContext?> MaybeCompactAsync(AgentLoopConfig config, CancellationToken cancellationToken)
+    {
+        if (config.ContextCompactionService is null)
+        {
+            return null;
         }
 
         try
         {
-            await config.MaybeCompactAsync(cancellationToken).ConfigureAwait(false);
+            return await config.ContextCompactionService(cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
             throw;
         }
-        catch
+        catch (ProactiveCompactionException)
         {
-            // Compaction is best-effort: a failure must never abort the run.
+            throw;
         }
+        catch (Exception ex)
+        {
+            // Hosts that have not declared compaction required retain the historical best-effort
+            // behavior. A host that crossed its threshold uses ProactiveCompactionException instead,
+            // which is deliberately not swallowed above (#4379).
+            if (config.DiagnosticObserver is { } observer)
+                DiagnosticNotification.Report(observer,
+                    $"Proactive durable compaction failed before a provider turn; continuing with the existing bounded overflow recovery. {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Computes the wall-clock delay before a transient-failure retry (#3035).
+    /// <para>
+    /// Two defects motivated extracting this. First, the delay was <em>purely deterministic</em>, so every
+    /// agent throttled by the shared provider endpoint at the same instant slept for an identical interval
+    /// and woke in lockstep, re-triggering the throttle - a self-inflicted thundering herd. Bounded
+    /// one-sided jitter from <see cref="AgentLoopConfig.RetryRandomnessProvider"/> desynchronises them.
+    /// </para>
+    /// <para>
+    /// Second, a server-supplied <c>Retry-After</c> was honoured <em>verbatim with no ceiling at all</em>,
+    /// so one malformed or hostile header could park a turn for hours. It is now clamped to the same
+    /// ceiling as the local backoff. Jitter is applied to the local backoff only: a <c>Retry-After</c> is
+    /// an explicit server instruction, and stretching it past what the server asked for would be the
+    /// caller second-guessing the provider. The clamp is applied <em>after</em> jitter so the ceiling is a
+    /// true hard bound rather than one the jitter can overshoot.
+    /// </para>
+    /// Internal rather than private so the schedule can be asserted directly at both pinned bounds of the
+    /// randomness source; the awaited delay alone cannot distinguish jitter applied from jitter removed.
+    /// </summary>
+    /// <param name="backoffMs">The current un-jittered exponential backoff (500/1000/2000...).</param>
+    /// <param name="retryAfter">The server-supplied <c>Retry-After</c>, when the provider sent one.</param>
+    /// <param name="config">Supplies the ceiling and the randomness seam.</param>
+    internal static int ComputeRetryDelayMs(int backoffMs, TimeSpan? retryAfter, AgentLoopConfig config)
+    {
+        var ceiling = config.EffectiveMaxRetryDelayMs;
+
+        double candidate;
+        if (retryAfter is { } after)
+        {
+            // A negative Retry-After is nonsense; floor it at zero rather than producing a negative delay.
+            candidate = Math.Max(0d, after.TotalMilliseconds);
+        }
+        else
+        {
+            var random = (config.RetryRandomnessProvider ?? RetryJitter.DefaultRandomSource)();
+            candidate = RetryJitter.ApplyMs(backoffMs, random);
+        }
+
+        return (int)Math.Min(candidate, ceiling);
+    }
+
+    private static async Task<Context> ProjectRequestContextAsync(
+        Context context, ToolCapacitySnapshot capacity, AgentLoopConfig config, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var request = new ProviderRequestContext(capacity);
+        var section = await (config.ProviderRequestContextProvider ?? DefaultProviderRequestContextProvider.RenderAsync)(request, cancellationToken)
+            .ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(section))
+            section = await DefaultProviderRequestContextProvider.RenderAsync(request, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        // Copy only the provider message list. Never expose this dynamic section to transforms,
+        // stored run lists, result leases, compaction or the cache-stable system prefix.
+        return context with { Messages = [.. context.Messages, new BotNexus.Agent.Providers.Core.Models.UserMessage(
+            new UserMessageContent(section ?? throw new InvalidOperationException("Missing default capacity section.")),
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) { IsRequestOnlyContext = true }] };
     }
 
     private static async Task<AssistantAgentMessage> ExecuteWithRetryAsync(
@@ -449,61 +1068,235 @@ public static class AgentLoopRunner
         string? systemPrompt,
         IReadOnlyList<IAgentTool> tools,
         AgentLoopConfig config,
-        SimpleStreamOptions streamOptions,
+        GenerationOptions generationOptions,
+        ProviderExecutionOptions? executionOptions,
         Func<AgentEvent, Task> emit,
+        ToolResultContextLease toolResultContextLease,
+        ToolNonProgressGuard nonProgressGuard,
         CancellationToken cancellationToken)
     {
         const int maxAttempts = 4;
         var attempt = 0;
         var backoffMs = 500;
         var overflowRecovered = false;
+        var authenticationRecovered = false;
+        var recoveryIncidentId = Guid.NewGuid();
+        var recoveryScope = new ProviderRecoveryScope(config.Model.Provider, config.AuthProfile ?? string.Empty);
+        var pendingRecoveryObservations = new System.Collections.Concurrent.ConcurrentQueue<ProviderRecoveryObservation>();
+
+        Task EmitRecoveryAsync(ProviderRecoveryObservation observation)
+            => emit(new ProviderRecoveryEvent(observation, DateTimeOffset.UtcNow));
+
+        ProviderRecoveryObservation AttemptObservation(
+            ProviderRecoveryStage stage,
+            int currentAttempt,
+            TimeSpan? delay = null)
+        {
+            var snapshot = config.RecoveryCoordinator?.GetSnapshot(recoveryScope)
+                ?? new ProviderRecoverySnapshot(ProviderRecoveryState.Closed, 0, 0, 0, 0, null);
+            return new ProviderRecoveryObservation(
+                stage,
+                recoveryScope.Provider,
+                snapshot.State,
+                snapshot.Generation,
+                snapshot.InFlightCalls,
+                snapshot.QueuedCalls,
+                snapshot.NextProbeAt,
+                currentAttempt,
+                maxAttempts,
+                delay);
+        }
+
+        // #3015: the suspension's payoff. A provider + auth profile already known to be exhausted is
+        // short-circuited BEFORE the first provider call, so a wedged credential costs zero
+        // round-trips per turn rather than one. Without this read the registry would be a write-only
+        // record and the "subsequent turns short-circuit" half of the issue would be unimplemented.
+        // Only the exhaustion lane ever writes here, so a transient overload can never trip it.
+        if (config.SuspensionRegistry is not null
+            && config.SuspensionRegistry.IsSuspended(config.Model.Provider, config.AuthProfile ?? string.Empty))
+        {
+            throw new ProviderExhaustedException(config.Model.Provider);
+        }
 
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Re-run transforms per attempt so context overflow compaction is visible.
-            var transformedMessages = config.TransformContext is null
-                ? messages
-                : await config.TransformContext(messages, cancellationToken).ConfigureAwait(false);
+            // Re-run transforms per attempt so context overflow compaction is visible. Typed
+            // stored-result detail remains leased across retries; only a successful assistant
+            // continuation commits the offered batch and makes later requests receipt-only.
+            var toolResultProjection = toolResultContextLease.Project(messages);
+            var transformedMessages = config.AgentContextTransformer is null
+                ? toolResultProjection.Messages
+                : await config.AgentContextTransformer(toolResultProjection.Messages, cancellationToken).ConfigureAwait(false);
             var transformedContext = new AgentContext(systemPrompt, transformedMessages, tools);
             var providerContext = await ContextConverter.ToProviderContext(
                     transformedContext,
-                    config.ConvertToLlm,
+                    config.ProviderMessageTransformer,
                     cancellationToken)
+                .ConfigureAwait(false);
+            providerContext = await ProjectRequestContextAsync(providerContext, nonProgressGuard.Capacity, config, cancellationToken)
                 .ConfigureAwait(false);
 
             var messageCountBeforeStream = messages.Count;
+            ProviderRecoveryLease? recoveryLease = null;
             try
             {
-                var stream = config.LlmClient.StreamSimple(config.Model, providerContext, streamOptions);
-                return await StreamAccumulator.AccumulateAsync(stream, emit, cancellationToken, messages).ConfigureAwait(false);
+                if (config.RecoveryCoordinator is not null)
+                {
+                    recoveryLease = await config.RecoveryCoordinator.AcquireAsync(
+                            recoveryScope,
+                            recoveryIncidentId,
+                            config.RecoveryAdmissionTimeout ?? TimeSpan.FromMilliseconds(config.EffectiveMaxRetryDelayMs),
+                            cancellationToken,
+                            pendingRecoveryObservations.Enqueue)
+                        .ConfigureAwait(false);
+                    while (pendingRecoveryObservations.TryDequeue(out var observation))
+                    {
+                        await EmitRecoveryAsync(observation).ConfigureAwait(false);
+                    }
+                }
+
+                var stream = config.LlmClient.StreamSimple(config.Model, providerContext, generationOptions, executionOptions);
+                var attemptFailure = new ProviderAttemptFailure();
+                var assistantMessage = await StreamAccumulator
+                    .AccumulateAsync(stream, emit, cancellationToken, messages, attemptFailure)
+                    .ConfigureAwait(false);
+                if (assistantMessage.FinishReason == StopReason.Error
+                    && ContextOverflowDetector.IsContextOverflow(assistantMessage.ErrorMessage)
+                    && !overflowRecovered)
+                {
+                    recoveryLease?.ReportNonTransientFailure();
+                    RestoreMessagesAfterFailedStream(messages, messageCountBeforeStream);
+                    overflowRecovered = true;
+                    DiagnosticNotification.Report(config.DiagnosticObserver,
+                        "Reactive lossy context-overflow truncation applied after terminal provider overflow; this is not durable compaction.");
+                    var compacted = CompactForOverflow(messages);
+                    messages.Clear();
+                    messages.AddRange(compacted);
+                    continue;
+                }
+
+                var providerFailed = assistantMessage.FinishReason is StopReason.Error or StopReason.Aborted;
+                if (providerFailed)
+                {
+                    if (attemptFailure.DiagnosticDetail is { } detail)
+                        DiagnosticNotification.Report(config.DiagnosticObserver, detail);
+                    if (attemptFailure.Classification == ProviderFailureClass.Transient)
+                        recoveryLease?.ReportTransientFailure(null);
+                    else
+                        recoveryLease?.ReportNonTransientFailure();
+                    // Unsafe-to-replay partials still carry authoritative exhaustion evidence.
+                    // Keep their transcript while protecting subsequent turns on this profile.
+                    if (attemptFailure.Classification == ProviderFailureClass.Exhausted)
+                        config.SuspensionRegistry?.Suspend(
+                            config.Model.Provider,
+                            config.AuthProfile ?? string.Empty,
+                            ProviderSuspensionRegistry.DefaultDuration,
+                            assistantMessage.ErrorMessage ?? "Provider exhausted after partial output.");
+                }
+                else
+                {
+                    recoveryLease?.ReportSuccess();
+                }
+                if (attempt > 0 && !providerFailed)
+                {
+                    await EmitRecoveryAsync(AttemptObservation(ProviderRecoveryStage.Recovered, attempt + 1))
+                        .ConfigureAwait(false);
+                }
+
+                var consumptionOutcome = assistantMessage.FinishReason switch
+                {
+                    StopReason.Stop or StopReason.ToolUse => ToolResultConsumptionOutcome.Success,
+                    StopReason.Sensitive => ToolResultConsumptionOutcome.ContentFiltered,
+                    StopReason.Aborted => ToolResultConsumptionOutcome.Cancelled,
+                    _ => ToolResultConsumptionOutcome.ProviderFailure,
+                };
+                toolResultContextLease.Complete(toolResultProjection, consumptionOutcome);
+                return assistantMessage;
             }
             catch (Exception ex) when (ContextOverflowDetector.IsContextOverflow(ex) && !overflowRecovered)
             {
+                recoveryLease?.ReportNonTransientFailure();
                 RestoreMessagesAfterFailedStream(messages, messageCountBeforeStream);
                 overflowRecovered = true;
+                DiagnosticNotification.Report(config.DiagnosticObserver,
+                    "Reactive lossy context-overflow truncation applied after provider rejection; this is not durable compaction.");
                 var compacted = CompactForOverflow(messages);
                 messages.Clear();
                 messages.AddRange(compacted);
                 continue;
             }
-            catch (Exception ex) when (IsTransientError(ex) && attempt < maxAttempts - 1)
+            catch (ProviderAuthenticationException) when
+                (!authenticationRecovered && config.CredentialInvalidationService is not null)
+            {
+                recoveryLease?.ReportNonTransientFailure();
+                RestoreMessagesAfterFailedStream(messages, messageCountBeforeStream);
+                authenticationRecovered = true;
+                await config.CredentialInvalidationService(config.Model.Provider, cancellationToken)
+                    .ConfigureAwait(false);
+                executionOptions = await config.ProviderExecutionOptionsProvider(config.Model.Provider, cancellationToken)
+                    .ConfigureAwait(false);
+                continue;
+            }
+            catch (Exception ex) when (ClassifyFailure(ex) == ProviderFailureClass.Exhausted)
+            {
+                if (ex is ProviderInBandFailureException inBand)
+                    DiagnosticNotification.Report(config.DiagnosticObserver, inBand.DiagnosticDetail);
+                recoveryLease?.ReportNonTransientFailure();
+                // #3015 -- the non-transient exhaustion lane. Quota exhausted / billing disabled /
+                // credential rejected will not clear by waiting, so spending the remaining three
+                // attempts plus 500+1000+2000ms of backoff buys exactly the same answer three more
+                // times. Fail after this ONE attempt and remember the condition, scoped to the
+                // provider + auth profile, so the next turn short-circuits instead of re-paying the
+                // full discovery cost. A transient failure never reaches here: Classify checks the
+                // transient table FIRST, so a provider overload keeps its retries and -- critically --
+                // cannot cool a perfectly healthy auth profile.
+                RestoreMessagesAfterFailedStream(messages, messageCountBeforeStream);
+                config.SuspensionRegistry?.Suspend(
+                    config.Model.Provider,
+                    config.AuthProfile ?? string.Empty,
+                    ProviderSuspensionRegistry.DefaultDuration,
+                    ex.Message);
+                if (config.DiagnosticObserver is { } observer)
+                    DiagnosticNotification.Report(observer,
+                        $"Provider '{config.Model.Provider}' reported non-transient exhaustion; " +
+                        $"failing after one attempt and suspending this auth profile. {ex.Message}");
+                throw;
+            }
+            catch (Exception ex) when (ClassifyFailure(ex) == ProviderFailureClass.Transient && attempt < maxAttempts - 1)
             {
                 RestoreMessagesAfterFailedStream(messages, messageCountBeforeStream);
+                if (ex is ProviderInBandFailureException inBand)
+                    DiagnosticNotification.Report(config.DiagnosticObserver, inBand.DiagnosticDetail);
                 var retryAfterDelay = (ex as ProviderRateLimitException)?.RetryAfter;
-                var delayMs = retryAfterDelay is not null
-                    ? (int)retryAfterDelay.Value.TotalMilliseconds
-                    : config.MaxRetryDelayMs is > 0
-                        ? Math.Min(backoffMs, config.MaxRetryDelayMs.Value)
-                        : backoffMs;
+                recoveryLease?.ReportTransientFailure(retryAfterDelay);
+                var delayMs = ComputeRetryDelayMs(backoffMs, retryAfterDelay, config);
+                await EmitRecoveryAsync(AttemptObservation(
+                        ProviderRecoveryStage.RetryScheduled,
+                        attempt + 1,
+                        TimeSpan.FromMilliseconds(delayMs)))
+                    .ConfigureAwait(false);
                 await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
                 attempt++;
                 backoffMs *= 2;
                 continue;
             }
-            catch
+            catch (Exception ex)
             {
+                if (ex is ProviderInBandFailureException inBand)
+                    DiagnosticNotification.Report(config.DiagnosticObserver, inBand.DiagnosticDetail);
+                if (ClassifyFailure(ex) == ProviderFailureClass.Transient)
+                {
+                    recoveryLease?.ReportTransientFailure((ex as ProviderRateLimitException)?.RetryAfter);
+                    await EmitRecoveryAsync(AttemptObservation(ProviderRecoveryStage.Exhausted, attempt + 1))
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    recoveryLease?.ReportNonTransientFailure();
+                }
+
                 RestoreMessagesAfterFailedStream(messages, messageCountBeforeStream);
                 throw;
             }
@@ -520,7 +1313,24 @@ public static class AgentLoopRunner
         messages.RemoveRange(expectedCount, messages.Count - expectedCount);
     }
 
-    private static IReadOnlyList<AgentMessage> CompactForOverflow(IReadOnlyList<AgentMessage> messages)
+    /// <summary>
+    /// Truncates the transcript after a provider context-overflow so the retry has room, keeping the
+    /// most recent messages.
+    /// <para>
+    /// The cut index is <em>aligned forward</em> to the next turn boundary (#3014). A raw count-based
+    /// cut can land in the middle of a tool turn, leaving the retained tail beginning with a
+    /// <see cref="ToolResultAgentMessage"/> whose originating assistant tool call was dropped.
+    /// Anthropic and the Copilot messages API reject that shape with a hard 400, and overflow
+    /// recovery is allowed exactly once, so the recoverable overflow would become a terminal turn
+    /// failure. Advancing past any leading tool results costs at most a few extra dropped messages
+    /// and guarantees a structurally valid transcript at the seam that produced it.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// Internal rather than private so the boundary invariant can be asserted directly; the cut index
+    /// is not observable from <c>RunAsync</c> alone.
+    /// </remarks>
+    internal static IReadOnlyList<AgentMessage> CompactForOverflow(IReadOnlyList<AgentMessage> messages)
     {
         if (messages.Count <= 12)
         {
@@ -528,28 +1338,27 @@ public static class AgentLoopRunner
         }
 
         var keep = Math.Max(8, messages.Count / 3);
-        return messages.Skip(messages.Count - keep).ToList();
-    }
+        var start = messages.Count - keep;
 
-    private static bool IsTransientError(Exception exception)
-    {
-        if (exception is ProviderRateLimitException)
-            return true;
-
-        var message = exception.Message;
-        if (string.IsNullOrWhiteSpace(message))
+        // Advance past any tool results stranded at the head of the retained tail. Their originating
+        // assistant tool call sits before the cut and is being dropped, so emitting them would produce
+        // an orphan tool_result block.
+        while (start < messages.Count && messages[start] is ToolResultAgentMessage)
         {
-            return false;
+            start++;
         }
 
-        return message.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("too many requests", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("temporarily unavailable", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("service unavailable", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("429", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("502", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("503", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("504", StringComparison.OrdinalIgnoreCase);
+        return messages.Skip(start).ToList();
     }
+
+    /// <summary>
+    /// Resolves the retry lane for a provider failure (#3015). Delegates to
+    /// <see cref="TransientErrorClassifier"/> so the loop's retry decision and the classifier's
+    /// tested pattern table can never drift apart (issue #2856) -- the loop must never grow a
+    /// second, divergent copy of the classification rules.
+    /// </summary>
+    private static ProviderFailureClass ClassifyFailure(Exception exception)
+        => exception is ProviderInBandFailureException inBand
+            ? inBand.FailureClass
+            : TransientErrorClassifier.Classify(exception);
 }

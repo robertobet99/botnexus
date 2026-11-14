@@ -2,8 +2,10 @@ using System.Text;
 using System.Text.Json;
 using BotNexus.Agent.Core.Tools;
 using BotNexus.Agent.Core.Types;
+using BotNexus.Domain.Text;
 using BotNexus.Extensions.WebTools.Search;
 using BotNexus.Agent.Providers.Core.Models;
+using BotNexus.Gateway.Abstractions.Security;
 using Microsoft.Extensions.Logging;
 
 namespace BotNexus.Extensions.WebTools;
@@ -21,6 +23,16 @@ public sealed class WebSearchTool : IAgentTool, IDisposable, IAsyncDisposable
     private readonly string? _copilotApiEndpoint;
     private readonly ILogger<WebSearchTool> _logger;
     private readonly ILoggerFactory? _loggerFactory;
+
+    /// <summary>
+    /// Optional secret redactor (#3360). Consumed at exactly one place -- <see cref="ErrorResult"/> --
+    /// so a future <c>catch</c> branch cannot reach an unredacted message by forgetting to call it,
+    /// mirroring the single-choke-point discipline
+    /// <see cref="BotNexus.Agent.Providers.Core.ProviderHttpErrorHelper.ThrowForFailedResponse"/>
+    /// established for the provider path in #2881.
+    /// </summary>
+    private readonly ISecretRedactor? _secretRedactor;
+
     private readonly object _providerGate = new();
     private ISearchProvider? _provider;
     private bool _disposed;
@@ -31,9 +43,11 @@ public sealed class WebSearchTool : IAgentTool, IDisposable, IAsyncDisposable
         Func<CancellationToken, Task<string?>>? copilotApiKeyResolver = null,
         string? copilotApiEndpoint = null,
         ILogger<WebSearchTool>? logger = null,
-        ILoggerFactory? loggerFactory = null)
+        ILoggerFactory? loggerFactory = null,
+        ISecretRedactor? secretRedactor = null)
     {
         _config = config;
+        _secretRedactor = secretRedactor;
         _copilotApiKeyResolver = copilotApiKeyResolver;
         _copilotApiEndpoint = copilotApiEndpoint;
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<WebSearchTool>.Instance;
@@ -59,6 +73,9 @@ public sealed class WebSearchTool : IAgentTool, IDisposable, IAsyncDisposable
 
     /// <inheritdoc />
     public string Label => "Web Search";
+
+    /// <summary>Content source classification for turn-taint accumulation (#2519). Result titles and snippets are attacker-influenceable remote text (SEO-poisonable).</summary>
+    public string ContentSource => ToolContentSource.Network;
 
     /// <inheritdoc />
     public Tool Definition => new(
@@ -170,22 +187,57 @@ public sealed class WebSearchTool : IAgentTool, IDisposable, IAsyncDisposable
                 output.AppendLine();
             }
 
-            return TextResult(output.ToString().TrimEnd());
+            // THE untrusted-content boundary for this tool (#2813). Titles, URLs and snippets are
+            // written by whoever ranks for the query, so they are attacker-influenced text about to
+            // be spliced into the turn - and, via the transcript, into durable memory.
+            //
+            // Applied EXACTLY ONCE, here, over the assembled document rather than per field or per
+            // provider. Four providers already carry four verbatim copies of the size-cap decision;
+            // a fifth duplicated decision - and five places for a new marker to be added to only
+            // four of - is the defect this issue exists to prevent. Sanitizing the whole document
+            // also catches markup a marker split ACROSS fields would smuggle past a per-field pass.
+            // ISearchProvider therefore stays a pure transport contract: providers parse, this tool
+            // sanitizes. WebSearchToolSanitizationTests pins that division.
+            return TextResult(UntrustedContentSanitizer.Sanitize(output.ToString().TrimEnd()));
         }
         catch (HttpRequestException ex)
         {
             _logger.LogError(ex, "WebSearch HTTP error: provider={Provider} query={Query} status={Status}", providerName, query, ex.StatusCode);
-            return TextResult($"Search API error: {ex.Message}");
+            return ErrorResult($"Search API error: {ex.Message}");
         }
         catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return TextResult("Search cancelled.");
+            return ErrorResult("Search cancelled.");
         }
         catch (Exception ex)
         {
-            return TextResult($"Error performing search: {ex.Message}");
+            return ErrorResult($"Error performing search: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// THE model-visible error boundary for this tool (#3360). Every failure branch returns through
+    /// here so redaction is one decision rather than one-per-<c>catch</c>.
+    ///
+    /// <para>
+    /// <b>Why error text needs this at all when success bodies already pass
+    /// <c>UntrustedContentSanitizer</c> (#2813).</b> That sanitizer is a prompt-injection markup
+    /// filter, not a secret redactor, and it never ran on these branches. Search providers echo
+    /// request headers into 401/403 error pages, and an intermediary proxy can put a credential in
+    /// any exception message; the resulting text is persisted to the transcript, which the memory
+    /// indexer reads, so a leak here survives session deletion.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>A null redactor is a deliberate pass-through, not a blanket drop.</b> Same contract as
+    /// <c>ProviderHttpErrorHelper.Redact</c>: a host that has not wired the redactor keeps its
+    /// diagnostics rather than silently losing them, so nothing breaks by omission.
+    /// </para>
+    /// </summary>
+    private AgentToolResult ErrorResult(string message)
+        => TextResult(_secretRedactor is null || string.IsNullOrEmpty(message)
+            ? message
+            : _secretRedactor.Redact(message));
 
     private ISearchProvider? CreateProvider(string? apiKey)
     {
